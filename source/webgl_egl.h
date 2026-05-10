@@ -13,7 +13,13 @@ bool nx_webgl_egl_is_bridge_enabled(nx_webgl_egl_t *backend);
 void nx_webgl_egl_set_bridge_resolution(nx_webgl_egl_t *backend,
 										int width,
 										int height);
+void nx_webgl_egl_delete_cached_texture(nx_webgl_egl_t *backend,
+										uint32_t texture_id);
 bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas);
+bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
+										  nx_canvas_t *canvas,
+										  bool scissor_enabled,
+										  const int *scissor_box);
 bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										nx_canvas_t *canvas,
 										const float *clip_xy,
@@ -21,7 +27,10 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										const float *color,
 										bool blend,
 										uint32_t blend_src,
-										uint32_t blend_dst);
+										uint32_t blend_dst,
+										const int *viewport,
+										bool scissor_enabled,
+										const int *scissor_box);
 bool nx_webgl_egl_draw_textured_triangles_bridge(
 	nx_webgl_egl_t *backend,
 	nx_canvas_t *canvas,
@@ -38,7 +47,10 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	uint32_t wrap_t,
 	bool blend,
 	uint32_t blend_src,
-	uint32_t blend_dst);
+	uint32_t blend_dst,
+	const int *viewport,
+	bool scissor_enabled,
+	const int *scissor_box);
 bool nx_webgl_egl_clear_prototype(nx_webgl_egl_t *backend,
 								  nx_canvas_t *canvas);
 bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas);

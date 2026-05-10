@@ -15,6 +15,12 @@ export type WebGLBuffer = object;
 export type WebGLUniformLocation = object;
 export type WebGLTexture = object;
 
+export interface WebGLActiveInfo {
+	name: string;
+	size: number;
+	type: number;
+}
+
 export interface WebGLBackendInfo {
 	target: string;
 	built: boolean;
@@ -100,6 +106,7 @@ export class WebGLRenderingContext {
 	declare readonly BLEND_SRC_ALPHA: number;
 	declare readonly BLEND_DST_ALPHA: number;
 	declare readonly SCISSOR_TEST: number;
+	declare readonly SCISSOR_BOX: number;
 	declare readonly STENCIL_TEST: number;
 	declare readonly VIEWPORT: number;
 	declare readonly DEPTH_CLEAR_VALUE: number;
@@ -117,6 +124,7 @@ export class WebGLRenderingContext {
 	declare readonly ATTACHED_SHADERS: number;
 	declare readonly CURRENT_PROGRAM: number;
 	declare readonly ACTIVE_UNIFORMS: number;
+	declare readonly ACTIVE_ATTRIBUTES: number;
 	declare readonly ACTIVE_TEXTURE: number;
 	declare readonly BYTE: number;
 	declare readonly UNSIGNED_BYTE: number;
@@ -125,6 +133,10 @@ export class WebGLRenderingContext {
 	declare readonly INT: number;
 	declare readonly UNSIGNED_INT: number;
 	declare readonly FLOAT: number;
+	declare readonly FLOAT_VEC2: number;
+	declare readonly FLOAT_VEC4: number;
+	declare readonly FLOAT_MAT4: number;
+	declare readonly SAMPLER_2D: number;
 	declare readonly ARRAY_BUFFER: number;
 	declare readonly ARRAY_BUFFER_BINDING: number;
 	declare readonly ELEMENT_ARRAY_BUFFER: number;
@@ -146,8 +158,15 @@ export class WebGLRenderingContext {
 	declare readonly CLAMP_TO_EDGE: number;
 	declare readonly REPEAT: number;
 	declare readonly RGBA: number;
+	declare readonly SRC_COLOR: number;
+	declare readonly ONE_MINUS_SRC_COLOR: number;
 	declare readonly SRC_ALPHA: number;
 	declare readonly ONE_MINUS_SRC_ALPHA: number;
+	declare readonly DST_ALPHA: number;
+	declare readonly ONE_MINUS_DST_ALPHA: number;
+	declare readonly DST_COLOR: number;
+	declare readonly ONE_MINUS_DST_COLOR: number;
+	declare readonly SRC_ALPHA_SATURATE: number;
 	declare readonly MAX_TEXTURE_SIZE: number;
 	declare readonly MAX_VIEWPORT_DIMS: number;
 	declare readonly MAX_VERTEX_ATTRIBS: number;
@@ -221,6 +240,14 @@ export class WebGLRenderingContext {
 		stub();
 	}
 
+	getActiveAttrib(program: WebGLProgram, index: number): WebGLActiveInfo | null {
+		stub();
+	}
+
+	getActiveUniform(program: WebGLProgram, index: number): WebGLActiveInfo | null {
+		stub();
+	}
+
 	deleteProgram(program: WebGLProgram | null): void {
 		stub();
 	}
@@ -234,6 +261,10 @@ export class WebGLRenderingContext {
 	}
 
 	bufferData(target: number, data: ArrayBufferView | ArrayBuffer | number, usage: number): void {
+		stub();
+	}
+
+	bufferSubData(target: number, offset: number, data: ArrayBufferView | ArrayBuffer): void {
 		stub();
 	}
 
@@ -263,6 +294,20 @@ export class WebGLRenderingContext {
 		format: number,
 		type: number,
 		pixels: ArrayBufferView | ArrayBuffer | null,
+	): void {
+		stub();
+	}
+
+	texSubImage2D(
+		target: number,
+		level: number,
+		xoffset: number,
+		yoffset: number,
+		width: number,
+		height: number,
+		format: number,
+		type: number,
+		pixels: ArrayBufferView | ArrayBuffer,
 	): void {
 		stub();
 	}
@@ -353,6 +398,10 @@ export class WebGLRenderingContext {
 	}
 
 	viewport(x: number, y: number, width: number, height: number): void {
+		stub();
+	}
+
+	scissor(x: number, y: number, width: number, height: number): void {
 		stub();
 	}
 

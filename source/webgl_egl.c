@@ -89,6 +89,14 @@ static void define_double(JSContext *ctx, JSValue obj, const char *name,
 							  JS_PROP_C_W);
 }
 
+static int clamp_int(int value, int min_value, int max_value) {
+	if (value < min_value)
+		return min_value;
+	if (value > max_value)
+		return max_value;
+	return value;
+}
+
 static JSValue make_triangle_result(JSContext *ctx, bool ok,
 									const char *status,
 									const uint8_t *pixel) {
@@ -342,6 +350,69 @@ static void bridge_render_size(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 		*width = (int)canvas->width;
 	if (*height <= 0)
 		*height = (int)canvas->height;
+}
+
+static void bridge_scale_rect(nx_canvas_t *canvas, int render_width,
+							  int render_height, const int *rect, int *x,
+							  int *y, int *width, int *height) {
+	int canvas_width = (int)canvas->width;
+	int canvas_height = (int)canvas->height;
+	int rx = rect ? rect[0] : 0;
+	int ry = rect ? rect[1] : 0;
+	int rw = rect ? rect[2] : canvas_width;
+	int rh = rect ? rect[3] : canvas_height;
+	int x0 = clamp_int(rx, 0, canvas_width);
+	int y0 = clamp_int(ry, 0, canvas_height);
+	int x1 = clamp_int(rx + rw, 0, canvas_width);
+	int y1 = clamp_int(ry + rh, 0, canvas_height);
+	if (x1 < x0)
+		x1 = x0;
+	if (y1 < y0)
+		y1 = y0;
+
+	int sx0 = (int)(((int64_t)x0 * render_width) / canvas_width);
+	int sx1 = (int)(((int64_t)x1 * render_width + canvas_width - 1) /
+					canvas_width);
+	int sy0_top = (int)(((int64_t)y0 * render_height) / canvas_height);
+	int sy1_top = (int)(((int64_t)y1 * render_height + canvas_height - 1) /
+						canvas_height);
+	*x = clamp_int(sx0, 0, render_width);
+	*width = clamp_int(sx1, 0, render_width) - *x;
+	*y = render_height - clamp_int(sy1_top, 0, render_height);
+	*height = clamp_int(sy1_top, 0, render_height) -
+			  clamp_int(sy0_top, 0, render_height);
+	if (*width < 0)
+		*width = 0;
+	if (*height < 0)
+		*height = 0;
+}
+
+static void bridge_apply_viewport(nx_canvas_t *canvas, int render_width,
+								  int render_height, const int *viewport) {
+	int x;
+	int y;
+	int width;
+	int height;
+	bridge_scale_rect(canvas, render_width, render_height, viewport, &x, &y,
+					  &width, &height);
+	glViewport(x, y, width, height);
+}
+
+static void bridge_apply_scissor(nx_canvas_t *canvas, int render_width,
+								 int render_height, bool enabled,
+								 const int *scissor_box) {
+	if (!enabled) {
+		glDisable(GL_SCISSOR_TEST);
+		return;
+	}
+	int x;
+	int y;
+	int width;
+	int height;
+	bridge_scale_rect(canvas, render_width, render_height, scissor_box, &x, &y,
+					  &width, &height);
+	glEnable(GL_SCISSOR_TEST);
+	glScissor(x, y, width, height);
 }
 
 static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
@@ -849,10 +920,39 @@ void nx_webgl_egl_set_bridge_resolution(nx_webgl_egl_t *backend, int width,
 #endif
 }
 
+void nx_webgl_egl_delete_cached_texture(nx_webgl_egl_t *backend,
+										uint32_t texture_id) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend;
+	(void)texture_id;
+#else
+	if (!backend || texture_id == 0)
+		return;
+	for (int i = 0; i < NX_WEBGL_EGL_TEXTURE_CACHE_SIZE; i++) {
+		nx_webgl_egl_texture_cache_entry_t *entry = &backend->texture_cache[i];
+		if (entry->texture_id == texture_id) {
+			if (entry->handle)
+				glDeleteTextures(1, &entry->handle);
+			memset(entry, 0, sizeof(*entry));
+			return;
+		}
+	}
+#endif
+}
+
 bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
+	return nx_webgl_egl_clear_bridge_with_state(backend, canvas, false, NULL);
+}
+
+bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
+										  nx_canvas_t *canvas,
+										  bool scissor_enabled,
+										  const int *scissor_box) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
+	(void)scissor_enabled;
+	(void)scissor_box;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -876,11 +976,13 @@ bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
 	glViewport(0, 0, width, height);
+	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
 	glClearColor((GLfloat)backend->clear_color[0],
 				 (GLfloat)backend->clear_color[1],
 				 (GLfloat)backend->clear_color[2],
 				 (GLfloat)backend->clear_color[3]);
 	glClear(GL_COLOR_BUFFER_BIT);
+	glDisable(GL_SCISSOR_TEST);
 	GLenum error = glGetError();
 	if (error != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),
@@ -902,7 +1004,10 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										const float *color,
 										bool blend,
 										uint32_t blend_src,
-										uint32_t blend_dst) {
+										uint32_t blend_dst,
+										const int *viewport,
+										bool scissor_enabled,
+										const int *scissor_box) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -912,6 +1017,9 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	(void)blend;
 	(void)blend_src;
 	(void)blend_dst;
+	(void)viewport;
+	(void)scissor_enabled;
+	(void)scissor_box;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -936,7 +1044,7 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		return false;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
-	glViewport(0, 0, width, height);
+	bridge_apply_viewport(canvas, width, height, viewport);
 	glUseProgram(backend->bridge_color_program);
 	GLint color_location =
 		glGetUniformLocation(backend->bridge_color_program, "u_color");
@@ -954,13 +1062,14 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		glDisable(GL_BLEND);
 	}
 	glDisable(GL_DEPTH_TEST);
-	glDisable(GL_SCISSOR_TEST);
+	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
 	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
 	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
 				 backend->bridge_readback);
 	GLenum error = glGetError();
 	glFinish();
 	glDisableVertexAttribArray(0);
+	glDisable(GL_SCISSOR_TEST);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (error != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),
@@ -993,7 +1102,10 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	uint32_t wrap_t,
 	bool blend,
 	uint32_t blend_src,
-	uint32_t blend_dst) {
+	uint32_t blend_dst,
+	const int *viewport,
+	bool scissor_enabled,
+	const int *scissor_box) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -1011,6 +1123,9 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)blend;
 	(void)blend_src;
 	(void)blend_dst;
+	(void)viewport;
+	(void)scissor_enabled;
+	(void)scissor_box;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -1043,7 +1158,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		return false;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
-	glViewport(0, 0, width, height);
+	bridge_apply_viewport(canvas, width, height, viewport);
 	glUseProgram(backend->bridge_texture_program);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, texture_handle);
@@ -1066,7 +1181,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		glDisable(GL_BLEND);
 	}
 	glDisable(GL_DEPTH_TEST);
-	glDisable(GL_SCISSOR_TEST);
+	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
 	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
 	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
 				 backend->bridge_readback);
@@ -1074,6 +1189,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	glFinish();
 	glDisableVertexAttribArray(1);
 	glDisableVertexAttribArray(0);
+	glDisable(GL_SCISSOR_TEST);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (error != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),

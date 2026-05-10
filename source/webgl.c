@@ -34,6 +34,7 @@
 #define GL_BLEND_DST_ALPHA 0x80CA
 #define GL_SCISSOR_TEST 0x0C11
 #define GL_STENCIL_TEST 0x0B90
+#define GL_SCISSOR_BOX 0x0C10
 #define GL_VIEWPORT 0x0BA2
 #define GL_DEPTH_CLEAR_VALUE 0x0B73
 #define GL_DEPTH_FUNC 0x0B74
@@ -59,6 +60,7 @@
 #define GL_ATTACHED_SHADERS 0x8B85
 #define GL_CURRENT_PROGRAM 0x8B8D
 #define GL_ACTIVE_UNIFORMS 0x8B86
+#define GL_ACTIVE_ATTRIBUTES 0x8B89
 #define GL_ACTIVE_TEXTURE 0x84E0
 #define GL_BYTE 0x1400
 #define GL_UNSIGNED_BYTE 0x1401
@@ -67,6 +69,10 @@
 #define GL_INT 0x1404
 #define GL_UNSIGNED_INT 0x1405
 #define GL_FLOAT 0x1406
+#define GL_FLOAT_VEC2 0x8B50
+#define GL_FLOAT_VEC4 0x8B52
+#define GL_FLOAT_MAT4 0x8B5C
+#define GL_SAMPLER_2D 0x8B5E
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_ARRAY_BUFFER_BINDING 0x8894
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
@@ -88,8 +94,15 @@
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_REPEAT 0x2901
 #define GL_RGBA 0x1908
+#define GL_SRC_COLOR 0x0300
+#define GL_ONE_MINUS_SRC_COLOR 0x0301
 #define GL_SRC_ALPHA 0x0302
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_DST_ALPHA 0x0304
+#define GL_ONE_MINUS_DST_ALPHA 0x0305
+#define GL_DST_COLOR 0x0306
+#define GL_ONE_MINUS_DST_COLOR 0x0307
+#define GL_SRC_ALPHA_SATURATE 0x0308
 #define GL_POLYGON_OFFSET_FILL 0x8037
 #define GL_SAMPLE_ALPHA_TO_COVERAGE 0x809E
 #define GL_SAMPLE_COVERAGE 0x80A0
@@ -122,6 +135,7 @@ typedef struct {
 	double clear_color[4];
 	double clear_depth;
 	int viewport[4];
+	int scissor_box[4];
 	uint32_t depth_func;
 	uint32_t enabled_caps;
 	uint32_t blend_src;
@@ -210,12 +224,31 @@ typedef struct {
 	nx_webgl_uniform_kind_t kind;
 } nx_webgl_uniform_location_t;
 
+typedef struct {
+	const char *name;
+	int size;
+	uint32_t type;
+} nx_webgl_active_info_t;
+
 static JSClassID nx_webgl_context_class_id;
 static JSClassID nx_webgl_shader_class_id;
 static JSClassID nx_webgl_program_class_id;
 static JSClassID nx_webgl_buffer_class_id;
 static JSClassID nx_webgl_uniform_location_class_id;
 static JSClassID nx_webgl_texture_class_id;
+
+static const nx_webgl_active_info_t active_attributes[] = {
+	{"position", 1, GL_FLOAT_VEC2},
+	{"color", 1, GL_FLOAT_VEC4},
+	{"uv", 1, GL_FLOAT_VEC2},
+};
+
+static const nx_webgl_active_info_t active_uniforms[] = {
+	{"u_matrix", 1, GL_FLOAT_MAT4},
+	{"u_color", 1, GL_FLOAT_VEC4},
+	{"u_offset", 1, GL_FLOAT_VEC2},
+	{"u_texture", 1, GL_SAMPLER_2D},
+};
 
 static double clamp01(double value) {
 	if (isnan(value) || value < 0.)
@@ -276,7 +309,11 @@ static bool is_vertex_attrib_type(uint32_t type) {
 
 static bool is_blend_factor(uint32_t factor) {
 	return factor == GL_ZERO || factor == GL_ONE || factor == GL_SRC_ALPHA ||
-		   factor == GL_ONE_MINUS_SRC_ALPHA;
+		   factor == GL_ONE_MINUS_SRC_ALPHA || factor == GL_DST_ALPHA ||
+		   factor == GL_ONE_MINUS_DST_ALPHA || factor == GL_DST_COLOR ||
+		   factor == GL_ONE_MINUS_DST_COLOR || factor == GL_SRC_COLOR ||
+		   factor == GL_ONE_MINUS_SRC_COLOR ||
+		   factor == GL_SRC_ALPHA_SATURATE;
 }
 
 static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
@@ -300,6 +337,20 @@ static int clamp_int(int value, int min_value, int max_value) {
 	if (value > max_value)
 		return max_value;
 	return value;
+}
+
+static JSValue new_active_info(JSContext *ctx,
+							   const nx_webgl_active_info_t *info) {
+	JSValue obj = JS_NewObject(ctx);
+	if (JS_IsException(obj))
+		return obj;
+	JS_DefinePropertyValueStr(ctx, obj, "name", JS_NewString(ctx, info->name),
+							  JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "size", JS_NewInt32(ctx, info->size),
+							  JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, obj, "type",
+							  JS_NewUint32(ctx, info->type), JS_PROP_C_W_E);
+	return obj;
 }
 
 static float edge_function(nx_webgl_vec2_t a, nx_webgl_vec2_t b,
@@ -425,6 +476,10 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	context->viewport[1] = 0;
 	context->viewport[2] = canvas->width;
 	context->viewport[3] = canvas->height;
+	context->scissor_box[0] = 0;
+	context->scissor_box[1] = 0;
+	context->scissor_box[2] = canvas->width;
+	context->scissor_box[3] = canvas->height;
 	context->clear_depth = 1.;
 	context->depth_func = GL_LESS;
 	context->enabled_caps = GL_CAP_DITHER;
@@ -556,10 +611,24 @@ static void clear_canvas_software(nx_webgl_context_t *context) {
 
 	uint32_t packed = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
 					  ((uint32_t)g << 8) | (uint32_t)b;
-	size_t pixel_count = (size_t)canvas->width * canvas->height;
 	uint32_t *pixels = (uint32_t *)canvas->data;
-	for (size_t i = 0; i < pixel_count; i++)
-		pixels[i] = packed;
+	int min_x = 0;
+	int min_y = 0;
+	int max_x = (int)canvas->width;
+	int max_y = (int)canvas->height;
+	if ((context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0) {
+		min_x = clamp_int(context->scissor_box[0], 0, (int)canvas->width);
+		min_y = clamp_int(context->scissor_box[1], 0, (int)canvas->height);
+		max_x = clamp_int(context->scissor_box[0] + context->scissor_box[2],
+						  0, (int)canvas->width);
+		max_y = clamp_int(context->scissor_box[1] + context->scissor_box[3],
+						  0, (int)canvas->height);
+	}
+	for (int y = min_y; y < max_y; y++) {
+		uint32_t *row = pixels + (size_t)y * canvas->width;
+		for (int x = min_x; x < max_x; x++)
+			row[x] = packed;
+	}
 
 	if (canvas->surface)
 		cairo_surface_mark_dirty(canvas->surface);
@@ -596,7 +665,10 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_UNDEFINED;
 
 	if (nx_webgl_egl_is_bridge_enabled(context->egl) &&
-		nx_webgl_egl_clear_bridge(context->egl, canvas)) {
+		nx_webgl_egl_clear_bridge_with_state(
+			context->egl, canvas,
+			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+			context->scissor_box)) {
 		context->bridge_clear_pending = true;
 		return JS_UNDEFINED;
 	}
@@ -912,7 +984,9 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 		return JS_NewUint32(ctx, count);
 	}
 	case GL_ACTIVE_UNIFORMS:
-		return JS_NewUint32(ctx, 3);
+		return JS_NewUint32(ctx, countof(active_uniforms));
+	case GL_ACTIVE_ATTRIBUTES:
+		return JS_NewUint32(ctx, countof(active_attributes));
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
@@ -933,6 +1007,56 @@ static JSValue nx_webgl_get_program_info_log(JSContext *ctx,
 	}
 
 	return JS_NewString(ctx, program->info_log ? program->info_log : "");
+}
+
+static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
+										  JSValueConst this_val, int argc,
+										  JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || program->deleted) {
+		context->error = GL_INVALID_VALUE;
+		return JS_NULL;
+	}
+	if (!program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+
+	uint32_t index;
+	if (JS_ToUint32(ctx, &index, argv[1]))
+		return JS_EXCEPTION;
+	if (index >= countof(active_attributes))
+		return JS_NULL;
+	return new_active_info(ctx, &active_attributes[index]);
+}
+
+static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
+										   JSValueConst this_val, int argc,
+										   JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || program->deleted) {
+		context->error = GL_INVALID_VALUE;
+		return JS_NULL;
+	}
+	if (!program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+
+	uint32_t index;
+	if (JS_ToUint32(ctx, &index, argv[1]))
+		return JS_EXCEPTION;
+	if (index >= countof(active_uniforms))
+		return JS_NULL;
+	return new_active_info(ctx, &active_uniforms[index]);
 }
 
 static JSValue nx_webgl_delete_program(JSContext *ctx, JSValueConst this_val,
@@ -1082,6 +1206,56 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 	buffer->size = size;
 	buffer->usage = usage;
 	buffer->target = target;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
+										int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t target;
+	int32_t offset;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &offset, argv[1]))
+		return JS_EXCEPTION;
+	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (offset < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	nx_webgl_buffer_t *buffer =
+		nx_get_webgl_buffer(target == GL_ARRAY_BUFFER
+								? context->array_buffer_binding
+								: context->element_array_buffer_binding);
+	if (!buffer || buffer->deleted || buffer->target != target) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	size_t byte_length = 0;
+	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[2]);
+	if (!source) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	size_t byte_offset = (size_t)offset;
+	if (byte_offset > buffer->size || byte_length > buffer->size - byte_offset) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (byte_length > 0) {
+		if (!buffer->data) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		memcpy(buffer->data + byte_offset, source, byte_length);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -1244,6 +1418,33 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 	}
 }
 
+static void update_texture_alpha_rows(nx_webgl_texture_t *texture, int start_y,
+									  int row_count) {
+	if (!texture || !texture->data || !texture->alpha_min_x ||
+		!texture->alpha_max_x)
+		return;
+	int end_y = start_y + row_count;
+	if (start_y < 0)
+		start_y = 0;
+	if (end_y > (int)texture->height)
+		end_y = (int)texture->height;
+	for (int y = start_y; y < end_y; y++) {
+		int min_x = (int)texture->width;
+		int max_x = -1;
+		for (int x = 0; x < (int)texture->width; x++) {
+			uint8_t alpha =
+				texture->data[((size_t)y * texture->width + (size_t)x) * 4 + 3];
+			if (alpha != 0) {
+				if (min_x == (int)texture->width)
+					min_x = x;
+				max_x = x;
+			}
+		}
+		texture->alpha_min_x[y] = min_x;
+		texture->alpha_max_x[y] = max_x;
+	}
+}
+
 static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 									 int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -1305,20 +1506,6 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		js_free(ctx, alpha_max_x);
 		return JS_EXCEPTION;
 	}
-	for (int y = 0; y < height; y++) {
-		int min_x = width;
-		int max_x = -1;
-		for (int x = 0; x < width; x++) {
-			uint8_t alpha = copy[((size_t)y * (size_t)width + (size_t)x) * 4 + 3];
-			if (alpha != 0) {
-				if (min_x == width)
-					min_x = x;
-				max_x = x;
-			}
-		}
-		alpha_min_x[y] = min_x;
-		alpha_max_x[y] = max_x;
-	}
 
 	js_free(ctx, texture->data);
 	js_free(ctx, texture->alpha_min_x);
@@ -1329,6 +1516,75 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	texture->width = width;
 	texture->height = height;
 	texture->target = target;
+	update_texture_alpha_rows(texture, 0, height);
+	texture->revision++;
+	if (texture->revision == 0)
+		texture->revision = 1;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
+										 int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t target;
+	int32_t level;
+	int32_t xoffset;
+	int32_t yoffset;
+	int32_t width;
+	int32_t height;
+	uint32_t format;
+	uint32_t type;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToInt32(ctx, &xoffset, argv[2]) ||
+		JS_ToInt32(ctx, &yoffset, argv[3]) ||
+		JS_ToInt32(ctx, &width, argv[4]) || JS_ToInt32(ctx, &height, argv[5]) ||
+		JS_ToUint32(ctx, &format, argv[6]) || JS_ToUint32(ctx, &type, argv[7]))
+		return JS_EXCEPTION;
+
+	if (target != GL_TEXTURE_2D || format != GL_RGBA ||
+		type != GL_UNSIGNED_BYTE) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (level != 0 || xoffset < 0 || yoffset < 0 || width < 0 || height < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	nx_webgl_texture_t *texture =
+		nx_get_webgl_texture(context->texture_2d_binding);
+	if (!texture || texture->deleted || !texture->data) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (xoffset + width > (int32_t)texture->width ||
+		yoffset + height > (int32_t)texture->height) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (width == 0 || height == 0)
+		return JS_UNDEFINED;
+
+	size_t byte_length = 0;
+	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[8]);
+	size_t expected = (size_t)width * (size_t)height * 4;
+	if (!source || byte_length < expected) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	for (int y = 0; y < height; y++) {
+		uint8_t *dst =
+			texture->data + (((size_t)yoffset + (size_t)y) * texture->width +
+							 (size_t)xoffset) *
+								4;
+		memcpy(dst, source + (size_t)y * (size_t)width * 4,
+			   (size_t)width * 4);
+	}
+	update_texture_alpha_rows(texture, yoffset, height);
 	texture->revision++;
 	if (texture->revision == 0)
 		texture->revision = 1;
@@ -1349,6 +1605,7 @@ static JSValue nx_webgl_delete_texture(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 	texture->deleted = true;
+	nx_webgl_egl_delete_cached_texture(context->egl, texture->bridge_id);
 	if (nx_get_webgl_texture(context->texture_2d_binding) == texture) {
 		JS_FreeValue(ctx, context->texture_2d_binding);
 		context->texture_2d_binding = JS_UNDEFINED;
@@ -1874,24 +2131,32 @@ static inline uint32_t blend_pixel(uint32_t dst, uint32_t src,
 	uint8_t dst_g = (dst >> 8) & 0xff;
 	uint8_t dst_r = (dst >> 16) & 0xff;
 	uint8_t dst_a = (dst >> 24) & 0xff;
-	float sf = src_factor == GL_ONE	   ? 1.f
-			   : src_factor == GL_ZERO ? 0.f
-			   : src_factor == GL_SRC_ALPHA
-				   ? (float)src_a / 255.f
-				   : 1.f - (float)src_a / 255.f;
-	float df = dst_factor == GL_ONE	   ? 1.f
-			   : dst_factor == GL_ZERO ? 0.f
-			   : dst_factor == GL_SRC_ALPHA
-				   ? (float)src_a / 255.f
-				   : 1.f - (float)src_a / 255.f;
-	uint8_t out_b = (uint8_t)clamp_int((int)(src_b * sf + dst_b * df + 0.5f),
-									   0, 255);
-	uint8_t out_g = (uint8_t)clamp_int((int)(src_g * sf + dst_g * df + 0.5f),
-									   0, 255);
-	uint8_t out_r = (uint8_t)clamp_int((int)(src_r * sf + dst_r * df + 0.5f),
-									   0, 255);
-	uint8_t out_a = (uint8_t)clamp_int((int)(src_a * sf + dst_a * df + 0.5f),
-									   0, 255);
+	int sat = src_a < 255 - dst_a ? src_a : 255 - dst_a;
+#define BLEND_FACTOR_VALUE(factor, src_c, dst_c)                               \
+	((factor) == GL_ONE				  ? 255                                \
+	 : (factor) == GL_ZERO			  ? 0                                  \
+	 : (factor) == GL_SRC_ALPHA		  ? src_a                              \
+	 : (factor) == GL_ONE_MINUS_SRC_ALPHA ? 255 - src_a                     \
+	 : (factor) == GL_DST_ALPHA		  ? dst_a                              \
+	 : (factor) == GL_ONE_MINUS_DST_ALPHA ? 255 - dst_a                     \
+	 : (factor) == GL_SRC_COLOR		  ? (src_c)                            \
+	 : (factor) == GL_ONE_MINUS_SRC_COLOR ? 255 - (src_c)                   \
+	 : (factor) == GL_DST_COLOR		  ? (dst_c)                            \
+	 : (factor) == GL_ONE_MINUS_DST_COLOR ? 255 - (dst_c)                   \
+	 : (factor) == GL_SRC_ALPHA_SATURATE ? sat                              \
+									  : 255)
+#define BLEND_CHANNEL(src_c, dst_c)                                            \
+	(uint8_t)clamp_int(                                                       \
+		((src_c) * BLEND_FACTOR_VALUE(src_factor, (src_c), (dst_c)) +         \
+		 (dst_c) * BLEND_FACTOR_VALUE(dst_factor, (src_c), (dst_c)) + 127) /  \
+			255,                                                               \
+		0, 255)
+	uint8_t out_b = BLEND_CHANNEL(src_b, dst_b);
+	uint8_t out_g = BLEND_CHANNEL(src_g, dst_g);
+	uint8_t out_r = BLEND_CHANNEL(src_r, dst_r);
+	uint8_t out_a = BLEND_CHANNEL(src_a, dst_a);
+#undef BLEND_CHANNEL
+#undef BLEND_FACTOR_VALUE
 	return ((uint32_t)out_a << 24) | ((uint32_t)out_r << 16) |
 		   ((uint32_t)out_g << 8) | (uint32_t)out_b;
 }
@@ -2124,51 +2389,36 @@ static bool draw_axis_aligned_textured_quads(
 	return true;
 }
 
-static bool draw_indexed_textured_quads_bridge(
+static bool draw_indexed_textured_triangles_bridge(
 	JSContext *ctx, nx_webgl_context_t *context, nx_webgl_program_t *program,
 	nx_webgl_vertex_attrib_t *position, nx_webgl_vertex_attrib_t *texcoord,
 	nx_webgl_texture_t *texture, uint16_t *indices, int count, bool blend) {
 	if (!nx_webgl_egl_is_bridge_enabled(context->egl) || !texture ||
 		!texture->data || texture->deleted || texture->revision == 0 ||
-		texture->bridge_id == 0 || count <= 0 || count % 6 != 0)
+		texture->bridge_id == 0 || count <= 0 || count % 3 != 0)
 		return false;
 
-	int quad_count = count / 6;
-	int vertex_count = quad_count * 6;
+	int vertex_count = count;
 	float *clip_uv =
 		js_malloc(ctx, (size_t)vertex_count * 4 * sizeof(float));
 	if (!clip_uv)
 		return false;
 
 	bool loaded = true;
-	for (int quad = 0; quad < quad_count; quad++) {
-		int offset = quad * 6;
-		uint16_t i0 = indices[offset + 0];
-		uint16_t i1 = indices[offset + 1];
-		uint16_t i2 = indices[offset + 2];
-		uint16_t i3 = indices[offset + 5];
-		if (indices[offset + 3] != i0 || indices[offset + 4] != i2) {
+	for (int i = 0; i < vertex_count; i++) {
+		nx_webgl_vec2_t clip;
+		nx_webgl_vec2_t uv;
+		if (!read_attrib_vec2(context, position, indices[i], &clip) ||
+			!read_attrib_vec2(context, texcoord, indices[i], &uv)) {
 			loaded = false;
 			break;
 		}
-		uint16_t expanded[6] = {i0, i1, i2, i0, i2, i3};
-		for (int i = 0; i < 6; i++) {
-			nx_webgl_vec2_t clip;
-			nx_webgl_vec2_t uv;
-			if (!read_attrib_vec2(context, position, expanded[i], &clip) ||
-				!read_attrib_vec2(context, texcoord, expanded[i], &uv)) {
-				loaded = false;
-				break;
-			}
-			clip = transform_position(program, clip);
-			int out = (quad * 6 + i) * 4;
-			clip_uv[out + 0] = clip.x;
-			clip_uv[out + 1] = clip.y;
-			clip_uv[out + 2] = uv.x;
-			clip_uv[out + 3] = uv.y;
-		}
-		if (!loaded)
-			break;
+		clip = transform_position(program, clip);
+		int out = i * 4;
+		clip_uv[out + 0] = clip.x;
+		clip_uv[out + 1] = clip.y;
+		clip_uv[out + 2] = uv.x;
+		clip_uv[out + 3] = uv.y;
 	}
 
 	bool drew = false;
@@ -2178,7 +2428,9 @@ static bool draw_indexed_textured_quads_bridge(
 			texture->bridge_id, texture->revision, (int)texture->width,
 			(int)texture->height, texture->data, texture->min_filter,
 			texture->mag_filter, texture->wrap_s, texture->wrap_t, blend,
-			context->blend_src, context->blend_dst);
+			context->blend_src, context->blend_dst, context->viewport,
+			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+			context->scissor_box);
 	}
 	js_free(ctx, clip_uv);
 	return drew;
@@ -2397,7 +2649,9 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 												  : fallback_color;
 			bool drew = nx_webgl_egl_draw_triangles_bridge(
 				context->egl, canvas, clip_xy, vertex_count, gpu_color, blend,
-				context->blend_src, context->blend_dst);
+				context->blend_src, context->blend_dst, context->viewport,
+				(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+				context->scissor_box);
 			js_free(ctx, clip_xy);
 			if (drew) {
 				context->bridge_clear_pending = false;
@@ -2509,9 +2763,9 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
 	uint32_t color = program_color(program);
 	if (use_texture &&
-		draw_indexed_textured_quads_bridge(ctx, context, program, position,
-										   texcoord, texture, indices, count,
-										   blend)) {
+		draw_indexed_textured_triangles_bridge(ctx, context, program, position,
+											   texcoord, texture, indices,
+											   count, blend)) {
 		context->bridge_clear_pending = false;
 		return JS_UNDEFINED;
 	}
@@ -2658,6 +2912,29 @@ static JSValue nx_webgl_viewport(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static JSValue nx_webgl_scissor(JSContext *ctx, JSValueConst this_val,
+								int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		if (JS_ToInt32(ctx, &values[i], argv[i]))
+			return JS_EXCEPTION;
+	}
+
+	if (values[2] < 0 || values[3] < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	for (int i = 0; i < 4; i++)
+		context->scissor_box[i] = values[i];
+
+	return JS_UNDEFINED;
+}
+
 static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 									  int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -2687,6 +2964,8 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		return JS_NewUint32(ctx, context->blend_dst);
 	case GL_VIEWPORT:
 		return new_int_array(ctx, context->viewport, 4);
+	case GL_SCISSOR_BOX:
+		return new_int_array(ctx, context->scissor_box, 4);
 	case GL_VENDOR:
 		return JS_NewString(ctx, "nx.js");
 	case GL_RENDERER:
@@ -2884,15 +3163,19 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "getProgramParameter", nx_webgl_get_program_parameter,
 				2);
 	NX_DEF_FUNC(proto, "getProgramInfoLog", nx_webgl_get_program_info_log, 1);
+	NX_DEF_FUNC(proto, "getActiveAttrib", nx_webgl_get_active_attrib, 2);
+	NX_DEF_FUNC(proto, "getActiveUniform", nx_webgl_get_active_uniform, 2);
 	NX_DEF_FUNC(proto, "deleteProgram", nx_webgl_delete_program, 1);
 	NX_DEF_FUNC(proto, "createBuffer", nx_webgl_create_buffer, 0);
 	NX_DEF_FUNC(proto, "bindBuffer", nx_webgl_bind_buffer, 2);
 	NX_DEF_FUNC(proto, "bufferData", nx_webgl_buffer_data, 3);
+	NX_DEF_FUNC(proto, "bufferSubData", nx_webgl_buffer_sub_data, 3);
 	NX_DEF_FUNC(proto, "deleteBuffer", nx_webgl_delete_buffer, 1);
 	NX_DEF_FUNC(proto, "createTexture", nx_webgl_create_texture, 0);
 	NX_DEF_FUNC(proto, "activeTexture", nx_webgl_active_texture, 1);
 	NX_DEF_FUNC(proto, "bindTexture", nx_webgl_bind_texture, 2);
 	NX_DEF_FUNC(proto, "texImage2D", nx_webgl_tex_image_2d, 9);
+	NX_DEF_FUNC(proto, "texSubImage2D", nx_webgl_tex_sub_image_2d, 9);
 	NX_DEF_FUNC(proto, "texParameteri", nx_webgl_tex_parameteri, 3);
 	NX_DEF_FUNC(proto, "deleteTexture", nx_webgl_delete_texture, 1);
 	NX_DEF_FUNC(proto, "getUniformLocation", nx_webgl_get_uniform_location, 2);
@@ -2914,6 +3197,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "depthFunc", nx_webgl_depth_func, 1);
 	NX_DEF_FUNC(proto, "blendFunc", nx_webgl_blend_func, 2);
 	NX_DEF_FUNC(proto, "viewport", nx_webgl_viewport, 4);
+	NX_DEF_FUNC(proto, "scissor", nx_webgl_scissor, 4);
 	NX_DEF_FUNC(proto, "getParameter", nx_webgl_get_parameter, 1);
 	NX_DEF_FUNC(proto, "getError", nx_webgl_get_error, 0);
 	NX_DEF_FUNC(proto, "getBackendInfo", nx_webgl_get_backend_info, 0);
@@ -2958,6 +3242,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "BLEND_SRC_ALPHA", GL_BLEND_SRC_ALPHA);
 	define_constant(ctx, proto, "BLEND_DST_ALPHA", GL_BLEND_DST_ALPHA);
 	define_constant(ctx, proto, "SCISSOR_TEST", GL_SCISSOR_TEST);
+	define_constant(ctx, proto, "SCISSOR_BOX", GL_SCISSOR_BOX);
 	define_constant(ctx, proto, "STENCIL_TEST", GL_STENCIL_TEST);
 	define_constant(ctx, proto, "VIEWPORT", GL_VIEWPORT);
 	define_constant(ctx, proto, "DEPTH_CLEAR_VALUE", GL_DEPTH_CLEAR_VALUE);
@@ -2975,6 +3260,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "ATTACHED_SHADERS", GL_ATTACHED_SHADERS);
 	define_constant(ctx, proto, "CURRENT_PROGRAM", GL_CURRENT_PROGRAM);
 	define_constant(ctx, proto, "ACTIVE_UNIFORMS", GL_ACTIVE_UNIFORMS);
+	define_constant(ctx, proto, "ACTIVE_ATTRIBUTES", GL_ACTIVE_ATTRIBUTES);
 	define_constant(ctx, proto, "BYTE", GL_BYTE);
 	define_constant(ctx, proto, "UNSIGNED_BYTE", GL_UNSIGNED_BYTE);
 	define_constant(ctx, proto, "SHORT", GL_SHORT);
@@ -2982,6 +3268,10 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "INT", GL_INT);
 	define_constant(ctx, proto, "UNSIGNED_INT", GL_UNSIGNED_INT);
 	define_constant(ctx, proto, "FLOAT", GL_FLOAT);
+	define_constant(ctx, proto, "FLOAT_VEC2", GL_FLOAT_VEC2);
+	define_constant(ctx, proto, "FLOAT_VEC4", GL_FLOAT_VEC4);
+	define_constant(ctx, proto, "FLOAT_MAT4", GL_FLOAT_MAT4);
+	define_constant(ctx, proto, "SAMPLER_2D", GL_SAMPLER_2D);
 	define_constant(ctx, proto, "ARRAY_BUFFER", GL_ARRAY_BUFFER);
 	define_constant(ctx, proto, "ARRAY_BUFFER_BINDING", GL_ARRAY_BUFFER_BINDING);
 	define_constant(ctx, proto, "ELEMENT_ARRAY_BUFFER", GL_ELEMENT_ARRAY_BUFFER);
@@ -3005,9 +3295,16 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "CLAMP_TO_EDGE", GL_CLAMP_TO_EDGE);
 	define_constant(ctx, proto, "REPEAT", GL_REPEAT);
 	define_constant(ctx, proto, "RGBA", GL_RGBA);
+	define_constant(ctx, proto, "SRC_COLOR", GL_SRC_COLOR);
+	define_constant(ctx, proto, "ONE_MINUS_SRC_COLOR", GL_ONE_MINUS_SRC_COLOR);
 	define_constant(ctx, proto, "SRC_ALPHA", GL_SRC_ALPHA);
 	define_constant(ctx, proto, "ONE_MINUS_SRC_ALPHA",
 					GL_ONE_MINUS_SRC_ALPHA);
+	define_constant(ctx, proto, "DST_ALPHA", GL_DST_ALPHA);
+	define_constant(ctx, proto, "ONE_MINUS_DST_ALPHA", GL_ONE_MINUS_DST_ALPHA);
+	define_constant(ctx, proto, "DST_COLOR", GL_DST_COLOR);
+	define_constant(ctx, proto, "ONE_MINUS_DST_COLOR", GL_ONE_MINUS_DST_COLOR);
+	define_constant(ctx, proto, "SRC_ALPHA_SATURATE", GL_SRC_ALPHA_SATURATE);
 	define_constant(ctx, proto, "MAX_TEXTURE_SIZE", GL_MAX_TEXTURE_SIZE);
 	define_constant(ctx, proto, "MAX_VIEWPORT_DIMS", GL_MAX_VIEWPORT_DIMS);
 	define_constant(ctx, proto, "MAX_VERTEX_ATTRIBS", GL_MAX_VERTEX_ATTRIBS);
