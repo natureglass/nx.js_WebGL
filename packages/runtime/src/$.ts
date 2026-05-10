@@ -1,5 +1,6 @@
 import type { PromiseState } from '@nx.js/inspect';
 import type { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
+import type { WebGLRenderingContext } from './canvas/webgl-rendering-context';
 import type { ImageBitmap } from './canvas/image-bitmap';
 import type { OffscreenCanvas } from './canvas/offscreen-canvas';
 import type { OffscreenCanvasRenderingContext2D } from './canvas/offscreen-canvas-rendering-context-2d';
@@ -98,6 +99,8 @@ export interface Init {
 	canvasContext2dInitClass(
 		c: ClassOf<CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D>,
 	): void;
+	webglContextNew(c: Screen): WebGLRenderingContext;
+	webglContextInitClass(c: ClassOf<WebGLRenderingContext>): void;
 	canvasContext2dGetImageData(
 		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
 		sx: number,

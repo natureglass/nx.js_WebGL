@@ -133,6 +133,8 @@ typedef struct {
 	uint32_t active_texture;
 	nx_webgl_vertex_attrib_t vertex_attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
 	nx_webgl_egl_t *egl;
+	bool bridge_clear_pending;
+	uint32_t next_texture_id;
 	uint32_t error;
 } nx_webgl_context_t;
 
@@ -179,6 +181,8 @@ typedef struct {
 	uint8_t *data;
 	int *alpha_min_x;
 	int *alpha_max_x;
+	uint32_t bridge_id;
+	uint32_t revision;
 	bool deleted;
 } nx_webgl_texture_t;
 
@@ -431,6 +435,7 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	context->element_array_buffer_binding = JS_UNDEFINED;
 	context->texture_2d_binding = JS_UNDEFINED;
 	context->active_texture = GL_TEXTURE0;
+	context->next_texture_id = 1;
 	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 		context->vertex_attribs[i].buffer = JS_UNDEFINED;
 	context->egl = nx_webgl_egl_create(ctx, canvas);
@@ -539,6 +544,34 @@ static JSValue nx_webgl_clear_color(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static void clear_canvas_software(nx_webgl_context_t *context) {
+	nx_canvas_t *canvas = context->canvas;
+	if (!canvas || !canvas->data || canvas->width == 0 || canvas->height == 0)
+		return;
+
+	uint8_t r = to_u8(context->clear_color[0]);
+	uint8_t g = to_u8(context->clear_color[1]);
+	uint8_t b = to_u8(context->clear_color[2]);
+	uint8_t a = to_u8(context->clear_color[3]);
+
+	uint32_t packed = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+					  ((uint32_t)g << 8) | (uint32_t)b;
+	size_t pixel_count = (size_t)canvas->width * canvas->height;
+	uint32_t *pixels = (uint32_t *)canvas->data;
+	for (size_t i = 0; i < pixel_count; i++)
+		pixels[i] = packed;
+
+	if (canvas->surface)
+		cairo_surface_mark_dirty(canvas->surface);
+}
+
+static void flush_pending_bridge_clear_to_software(nx_webgl_context_t *context) {
+	if (!context || !context->bridge_clear_pending)
+		return;
+	context->bridge_clear_pending = false;
+	clear_canvas_software(context);
+}
+
 static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 							  JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -562,20 +595,14 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
-	uint8_t r = to_u8(context->clear_color[0]);
-	uint8_t g = to_u8(context->clear_color[1]);
-	uint8_t b = to_u8(context->clear_color[2]);
-	uint8_t a = to_u8(context->clear_color[3]);
+	if (nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		nx_webgl_egl_clear_bridge(context->egl, canvas)) {
+		context->bridge_clear_pending = true;
+		return JS_UNDEFINED;
+	}
 
-	uint32_t packed = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
-					  ((uint32_t)g << 8) | (uint32_t)b;
-	size_t pixel_count = (size_t)canvas->width * canvas->height;
-	uint32_t *pixels = (uint32_t *)canvas->data;
-	for (size_t i = 0; i < pixel_count; i++)
-		pixels[i] = packed;
-
-	if (canvas->surface)
-		cairo_surface_mark_dirty(canvas->surface);
+	context->bridge_clear_pending = false;
+	clear_canvas_software(context);
 
 	return JS_UNDEFINED;
 }
@@ -1105,6 +1132,9 @@ static JSValue nx_webgl_create_texture(JSContext *ctx, JSValueConst this_val,
 	texture->mag_filter = GL_NEAREST;
 	texture->wrap_s = GL_CLAMP_TO_EDGE;
 	texture->wrap_t = GL_CLAMP_TO_EDGE;
+	texture->bridge_id = context->next_texture_id++;
+	if (texture->bridge_id == 0)
+		texture->bridge_id = context->next_texture_id++;
 	JS_SetOpaque(obj, texture);
 	return obj;
 }
@@ -1299,6 +1329,9 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	texture->width = width;
 	texture->height = height;
 	texture->target = target;
+	texture->revision++;
+	if (texture->revision == 0)
+		texture->revision = 1;
 	return JS_UNDEFINED;
 }
 
@@ -2091,6 +2124,66 @@ static bool draw_axis_aligned_textured_quads(
 	return true;
 }
 
+static bool draw_indexed_textured_quads_bridge(
+	JSContext *ctx, nx_webgl_context_t *context, nx_webgl_program_t *program,
+	nx_webgl_vertex_attrib_t *position, nx_webgl_vertex_attrib_t *texcoord,
+	nx_webgl_texture_t *texture, uint16_t *indices, int count, bool blend) {
+	if (!nx_webgl_egl_is_bridge_enabled(context->egl) || !texture ||
+		!texture->data || texture->deleted || texture->revision == 0 ||
+		texture->bridge_id == 0 || count <= 0 || count % 6 != 0)
+		return false;
+
+	int quad_count = count / 6;
+	int vertex_count = quad_count * 6;
+	float *clip_uv =
+		js_malloc(ctx, (size_t)vertex_count * 4 * sizeof(float));
+	if (!clip_uv)
+		return false;
+
+	bool loaded = true;
+	for (int quad = 0; quad < quad_count; quad++) {
+		int offset = quad * 6;
+		uint16_t i0 = indices[offset + 0];
+		uint16_t i1 = indices[offset + 1];
+		uint16_t i2 = indices[offset + 2];
+		uint16_t i3 = indices[offset + 5];
+		if (indices[offset + 3] != i0 || indices[offset + 4] != i2) {
+			loaded = false;
+			break;
+		}
+		uint16_t expanded[6] = {i0, i1, i2, i0, i2, i3};
+		for (int i = 0; i < 6; i++) {
+			nx_webgl_vec2_t clip;
+			nx_webgl_vec2_t uv;
+			if (!read_attrib_vec2(context, position, expanded[i], &clip) ||
+				!read_attrib_vec2(context, texcoord, expanded[i], &uv)) {
+				loaded = false;
+				break;
+			}
+			clip = transform_position(program, clip);
+			int out = (quad * 6 + i) * 4;
+			clip_uv[out + 0] = clip.x;
+			clip_uv[out + 1] = clip.y;
+			clip_uv[out + 2] = uv.x;
+			clip_uv[out + 3] = uv.y;
+		}
+		if (!loaded)
+			break;
+	}
+
+	bool drew = false;
+	if (loaded) {
+		drew = nx_webgl_egl_draw_textured_triangles_bridge(
+			context->egl, context->canvas, clip_uv, vertex_count,
+			texture->bridge_id, texture->revision, (int)texture->width,
+			(int)texture->height, texture->data, texture->min_filter,
+			texture->mag_filter, texture->wrap_s, texture->wrap_t, blend,
+			context->blend_src, context->blend_dst);
+	}
+	js_free(ctx, clip_uv);
+	return drew;
+}
+
 static void rasterize_triangle(nx_canvas_t *canvas, nx_webgl_vec2_t v0,
 							   nx_webgl_vec2_t v1, nx_webgl_vec2_t v2,
 							   uint32_t color, bool blend,
@@ -2269,6 +2362,52 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
 	uint32_t color = program_color(program);
 	int triangle_count = count / 3;
+	if (triangle_count == 0)
+		return JS_UNDEFINED;
+
+	if (nx_webgl_egl_is_bridge_enabled(context->egl) && !use_texture) {
+		int vertex_count = triangle_count * 3;
+		float *clip_xy =
+			js_malloc(ctx, (size_t)vertex_count * 2 * sizeof(float));
+		if (clip_xy) {
+			bool loaded = true;
+			for (int i = 0; i < vertex_count; i++) {
+				int vertex_index = first + i;
+				nx_webgl_vec2_t clip;
+				if (!read_attrib_vec2(context, position, vertex_index, &clip)) {
+					loaded = false;
+					break;
+				}
+				clip = transform_position(program, clip);
+				clip_xy[i * 2 + 0] = clip.x;
+				clip_xy[i * 2 + 1] = clip.y;
+			}
+			if (!loaded) {
+				js_free(ctx, clip_xy);
+				context->error = GL_INVALID_OPERATION;
+				return JS_UNDEFINED;
+			}
+			float fallback_color[4] = {
+				68.f / 255.f,
+				215.f / 255.f,
+				182.f / 255.f,
+				1.f,
+			};
+			float *gpu_color = program->has_color ? program->color
+												  : fallback_color;
+			bool drew = nx_webgl_egl_draw_triangles_bridge(
+				context->egl, canvas, clip_xy, vertex_count, gpu_color, blend,
+				context->blend_src, context->blend_dst);
+			js_free(ctx, clip_xy);
+			if (drew) {
+				context->bridge_clear_pending = false;
+				return JS_UNDEFINED;
+			}
+		}
+	}
+
+	flush_pending_bridge_clear_to_software(context);
+
 	for (int triangle = 0; triangle < triangle_count; triangle++) {
 		nx_webgl_vec2_t clip[3];
 		nx_webgl_vec2_t uv[3];
@@ -2369,6 +2508,14 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
 	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
 	uint32_t color = program_color(program);
+	if (use_texture &&
+		draw_indexed_textured_quads_bridge(ctx, context, program, position,
+										   texcoord, texture, indices, count,
+										   blend)) {
+		context->bridge_clear_pending = false;
+		return JS_UNDEFINED;
+	}
+	flush_pending_bridge_clear_to_software(context);
 	if (use_texture &&
 		draw_axis_aligned_textured_quads(ctx, context, program, position, texcoord,
 										 texture, indices, count, blend)) {
@@ -2617,6 +2764,94 @@ static JSValue nx_webgl_clear_gpu_prototype(JSContext *ctx,
 		ctx, nx_webgl_egl_clear_prototype(context->egl, context->canvas));
 }
 
+static JSValue nx_webgl_probe_gpu_prototype_step(JSContext *ctx,
+												 JSValueConst this_val,
+												 int argc,
+												 JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	return JS_NewBool(
+		ctx, nx_webgl_egl_probe_step(context->egl, context->canvas));
+}
+
+static JSValue nx_webgl_triangle_gpu_prototype(JSContext *ctx,
+											   JSValueConst this_val,
+											   int argc,
+											   JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	return nx_webgl_egl_triangle_readback(ctx, context->egl, context->canvas);
+}
+
+static JSValue nx_webgl_bridge_gpu_prototype(JSContext *ctx,
+											 JSValueConst this_val,
+											 int argc,
+											 JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	return nx_webgl_egl_bridge_framebuffer(ctx, context->egl, context->canvas);
+}
+
+static JSValue nx_webgl_bridge_gpu_benchmark_prototype(JSContext *ctx,
+													   JSValueConst this_val,
+													   int argc,
+													   JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	int frame_count = 120;
+	int width = 256;
+	int height = 144;
+	if (argc > 0 && !JS_IsUndefined(argv[0]) &&
+		JS_ToInt32(ctx, &frame_count, argv[0]))
+		return JS_EXCEPTION;
+	if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+		JS_ToInt32(ctx, &width, argv[1]))
+		return JS_EXCEPTION;
+	if (argc > 2 && !JS_IsUndefined(argv[2]) &&
+		JS_ToInt32(ctx, &height, argv[2]))
+		return JS_EXCEPTION;
+	return nx_webgl_egl_bridge_benchmark(ctx, context->egl, context->canvas,
+										 frame_count, width, height);
+}
+
+static JSValue nx_webgl_enable_gpu_bridge_prototype(JSContext *ctx,
+													JSValueConst this_val,
+													int argc,
+													JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	bool enabled = true;
+	if (argc > 0 && !JS_IsUndefined(argv[0]))
+		enabled = JS_ToBool(ctx, argv[0]);
+	nx_webgl_egl_set_bridge_enabled(context->egl, enabled);
+	if (!enabled)
+		context->bridge_clear_pending = false;
+	return JS_NewBool(ctx, nx_webgl_egl_is_bridge_enabled(context->egl));
+}
+
+static JSValue nx_webgl_set_gpu_bridge_resolution_prototype(
+	JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	int32_t width = 0;
+	int32_t height = 0;
+	if (argc > 0 && !JS_IsUndefined(argv[0]) &&
+		JS_ToInt32(ctx, &width, argv[0]))
+		return JS_EXCEPTION;
+	if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+		JS_ToInt32(ctx, &height, argv[1]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_set_bridge_resolution(context->egl, width, height);
+	context->bridge_clear_pending = false;
+	return JS_NewBool(ctx, true);
+}
+
 static void define_constant(JSContext *ctx, JSValueConst obj, const char *name,
 							int32_t value) {
 	JS_DefinePropertyValueStr(ctx, obj, name, JS_NewInt32(ctx, value),
@@ -2683,6 +2918,18 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "getError", nx_webgl_get_error, 0);
 	NX_DEF_FUNC(proto, "getBackendInfo", nx_webgl_get_backend_info, 0);
 	NX_DEF_FUNC(proto, "clearGpuPrototype", nx_webgl_clear_gpu_prototype, 0);
+	NX_DEF_FUNC(proto, "probeGpuPrototypeStep",
+				nx_webgl_probe_gpu_prototype_step, 0);
+	NX_DEF_FUNC(proto, "triangleGpuPrototype",
+				nx_webgl_triangle_gpu_prototype, 0);
+	NX_DEF_FUNC(proto, "bridgeGpuPrototype",
+				nx_webgl_bridge_gpu_prototype, 0);
+	NX_DEF_FUNC(proto, "bridgeGpuBenchmarkPrototype",
+				nx_webgl_bridge_gpu_benchmark_prototype, 3);
+	NX_DEF_FUNC(proto, "enableGpuBridgePrototype",
+				nx_webgl_enable_gpu_bridge_prototype, 1);
+	NX_DEF_FUNC(proto, "setGpuBridgeResolutionPrototype",
+				nx_webgl_set_gpu_bridge_resolution_prototype, 2);
 
 	define_constant(ctx, proto, "NO_ERROR", GL_NO_ERROR);
 	define_constant(ctx, proto, "INVALID_ENUM", GL_INVALID_ENUM);

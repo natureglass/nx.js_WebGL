@@ -167,6 +167,10 @@ import './canvas/canvas-rendering-context-2d';
 
 export type * from './canvas/canvas-rendering-context-2d';
 
+import './canvas/webgl-rendering-context';
+
+export type * from './canvas/webgl-rendering-context';
+
 import './canvas/offscreen-canvas';
 
 export type * from './canvas/offscreen-canvas';

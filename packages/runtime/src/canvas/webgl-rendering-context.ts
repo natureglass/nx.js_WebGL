@@ -20,11 +20,32 @@ export interface WebGLBackendInfo {
 	built: boolean;
 	available: boolean;
 	status: string;
+	probeStep: number;
 	eglMajor: number;
 	eglMinor: number;
 	glVendor: string;
 	glVersion: string;
 	glRenderer: string;
+	bridgeRequestedWidth: number;
+	bridgeRequestedHeight: number;
+	bridgeRenderWidth: number;
+	bridgeRenderHeight: number;
+}
+
+export interface WebGLGpuPrototypeResult {
+	ok: boolean;
+	status: string;
+	width?: number;
+	height?: number;
+	copiedPixels?: number;
+	frameCount?: number;
+	elapsedMs?: number;
+	averageFrameMs?: number;
+	fps?: number;
+	red: number;
+	green: number;
+	blue: number;
+	alpha: number;
 }
 
 /**
@@ -348,6 +369,34 @@ export class WebGLRenderingContext {
 	}
 
 	clearGpuPrototype(): boolean {
+		stub();
+	}
+
+	probeGpuPrototypeStep(): boolean {
+		stub();
+	}
+
+	triangleGpuPrototype(): WebGLGpuPrototypeResult {
+		stub();
+	}
+
+	bridgeGpuPrototype(): WebGLGpuPrototypeResult {
+		stub();
+	}
+
+	bridgeGpuBenchmarkPrototype(
+		frameCount?: number,
+		width?: number,
+		height?: number,
+	): WebGLGpuPrototypeResult {
+		stub();
+	}
+
+	enableGpuBridgePrototype(enabled?: boolean): boolean {
+		stub();
+	}
+
+	setGpuBridgeResolutionPrototype(width?: number, height?: number): boolean {
 		stub();
 	}
 }

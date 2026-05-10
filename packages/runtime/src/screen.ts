@@ -11,11 +11,13 @@ import { Blob } from './polyfills/blob';
 import { EventTarget } from './polyfills/event-target';
 import { INTERNAL_SYMBOL } from './internal';
 import { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
+import { WebGLRenderingContext } from './canvas/webgl-rendering-context';
 import { initTouchscreen } from './touchscreen';
 import type { TouchEvent } from './polyfills/event';
 
 interface ScreenInternal {
 	context2d?: CanvasRenderingContext2D;
+	webgl?: WebGLRenderingContext;
 }
 
 const _ = createInternal<Screen, ScreenInternal>();
@@ -72,13 +74,24 @@ export class Screen extends EventTarget implements globalThis.Screen {
 	declare readonly height: number;
 
 	getContext(contextId: '2d'): CanvasRenderingContext2D;
-	getContext(contextId: string): null;
-	getContext(contextId: string): CanvasRenderingContext2D | null {
-		if (contextId !== '2d') {
+	getContext(contextId: 'webgl' | 'experimental-webgl'): WebGLRenderingContext;
+	getContext(contextId: string): CanvasRenderingContext2D | WebGLRenderingContext | null {
+		if (contextId !== '2d' && contextId !== 'webgl' && contextId !== 'experimental-webgl') {
 			return null;
 		}
 
 		const i = _(this);
+		if (contextId === 'webgl' || contextId === 'experimental-webgl') {
+			if (!i.webgl) {
+				i.webgl = new WebGLRenderingContext(
+					// @ts-expect-error Internal constructor
+					INTERNAL_SYMBOL,
+					this,
+				);
+			}
+			return i.webgl;
+		}
+
 		if (!i.context2d) {
 			i.context2d = new CanvasRenderingContext2D(
 				// @ts-expect-error Internal constructor

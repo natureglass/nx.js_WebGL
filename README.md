@@ -1,4 +1,15 @@
-# nx.js
+# nx.js (with WebGL Support)
+
+## Current WebGL State:
+
+- EGL/OpenGL ES
+- EGL version: 1.4
+- GL vendor: nouveau
+- GL renderer: NV120
+- GL version: OpenGL ES 3.2 Mesa 20.1.0-rc3
+- Bridge benchmark 120 frames 256x144: 1.47ms/f 679.1fps
+- Bridge benchmark 120 frames 640x360: 4.28ms/f 233.5fps
+- Bridge benchmark 120 frames 1280x720: 14.15ms/f 70.7fps
 
 <img align="right" width="200" height="200" src="./assets/logo.png">
 

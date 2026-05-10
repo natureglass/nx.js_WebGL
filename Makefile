@@ -72,6 +72,21 @@ LIBS	:=  -pthread -lmbedtls -lmbedx509 -lmbedcrypto -lharfbuzz `aarch64-none-elf
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
 
+EGL_GLES_FILES := \
+	$(PORTLIBS)/include/EGL/egl.h \
+	$(PORTLIBS)/include/GLES2/gl2.h \
+	$(PORTLIBS)/lib/libEGL.a \
+	$(PORTLIBS)/lib/libGLESv2.a \
+	$(PORTLIBS)/lib/libglapi.a \
+	$(PORTLIBS)/lib/libdrm_nouveau.a
+
+ifeq ($(strip $(foreach file,$(EGL_GLES_FILES),$(wildcard $(file)))),$(strip $(EGL_GLES_FILES)))
+	CFLAGS += -DNXJS_HAS_EGL_GLES=1 -DEGL_NO_X11
+	LIBS := -lEGL -ldrm_nouveau -lGLESv2 -lglapi $(LIBS)
+else
+	CFLAGS += -DNXJS_HAS_EGL_GLES=0
+endif
+
 
 #---------------------------------------------------------------------------------
 # no real need to edit anything past this point unless you need to add additional

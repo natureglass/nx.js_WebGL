@@ -25,3 +25,6 @@ node_modules
 /.vscode/cache.db*
 test/runtime/build/
 test/runtime/dist/
+
+.pnpm-store/
+npmjs-ca-chain.pem
