@@ -21,6 +21,23 @@ export interface WebGLActiveInfo {
 	type: number;
 }
 
+export interface WebGLContextAttributes {
+	alpha: boolean;
+	depth: boolean;
+	stencil: boolean;
+	antialias: boolean;
+	premultipliedAlpha: boolean;
+	preserveDrawingBuffer: boolean;
+	powerPreference?: string;
+	failIfMajorPerformanceCaveat?: boolean;
+}
+
+export interface WebGLShaderPrecisionFormat {
+	rangeMin: number;
+	rangeMax: number;
+	precision: number;
+}
+
 export interface WebGLBackendInfo {
 	target: string;
 	built: boolean;
@@ -98,9 +115,20 @@ export class WebGLRenderingContext {
 	declare readonly STENCIL_BUFFER_BIT: number;
 	declare readonly COLOR_BUFFER_BIT: number;
 	declare readonly CULL_FACE: number;
+	declare readonly CULL_FACE_MODE: number;
+	declare readonly FRONT_FACE: number;
+	declare readonly FRONT: number;
+	declare readonly BACK: number;
+	declare readonly FRONT_AND_BACK: number;
+	declare readonly CW: number;
+	declare readonly CCW: number;
 	declare readonly DEPTH_TEST: number;
 	declare readonly DITHER: number;
 	declare readonly BLEND: number;
+	declare readonly FUNC_ADD: number;
+	declare readonly BLEND_EQUATION: number;
+	declare readonly BLEND_EQUATION_RGB: number;
+	declare readonly BLEND_EQUATION_ALPHA: number;
 	declare readonly BLEND_SRC_RGB: number;
 	declare readonly BLEND_DST_RGB: number;
 	declare readonly BLEND_SRC_ALPHA: number;
@@ -108,15 +136,44 @@ export class WebGLRenderingContext {
 	declare readonly SCISSOR_TEST: number;
 	declare readonly SCISSOR_BOX: number;
 	declare readonly STENCIL_TEST: number;
+	declare readonly STENCIL_CLEAR_VALUE: number;
+	declare readonly STENCIL_WRITEMASK: number;
+	declare readonly STENCIL_FUNC: number;
+	declare readonly STENCIL_REF: number;
+	declare readonly STENCIL_VALUE_MASK: number;
+	declare readonly STENCIL_FAIL: number;
+	declare readonly STENCIL_PASS_DEPTH_FAIL: number;
+	declare readonly STENCIL_PASS_DEPTH_PASS: number;
+	declare readonly KEEP: number;
 	declare readonly VIEWPORT: number;
+	declare readonly ALIASED_POINT_SIZE_RANGE: number;
+	declare readonly ALIASED_LINE_WIDTH_RANGE: number;
 	declare readonly DEPTH_CLEAR_VALUE: number;
 	declare readonly DEPTH_FUNC: number;
+	declare readonly DEPTH_WRITEMASK: number;
 	declare readonly COLOR_CLEAR_VALUE: number;
+	declare readonly COLOR_WRITEMASK: number;
+	declare readonly POLYGON_OFFSET_FACTOR: number;
+	declare readonly POLYGON_OFFSET_UNITS: number;
+	declare readonly RED_BITS: number;
+	declare readonly GREEN_BITS: number;
+	declare readonly BLUE_BITS: number;
+	declare readonly ALPHA_BITS: number;
+	declare readonly DEPTH_BITS: number;
+	declare readonly STENCIL_BITS: number;
+	declare readonly UNPACK_ALIGNMENT: number;
+	declare readonly PACK_ALIGNMENT: number;
 	declare readonly VENDOR: number;
 	declare readonly RENDERER: number;
 	declare readonly VERSION: number;
 	declare readonly VERTEX_SHADER: number;
 	declare readonly FRAGMENT_SHADER: number;
+	declare readonly LOW_FLOAT: number;
+	declare readonly MEDIUM_FLOAT: number;
+	declare readonly HIGH_FLOAT: number;
+	declare readonly LOW_INT: number;
+	declare readonly MEDIUM_INT: number;
+	declare readonly HIGH_INT: number;
 	declare readonly COMPILE_STATUS: number;
 	declare readonly LINK_STATUS: number;
 	declare readonly DELETE_STATUS: number;
@@ -141,6 +198,9 @@ export class WebGLRenderingContext {
 	declare readonly ARRAY_BUFFER_BINDING: number;
 	declare readonly ELEMENT_ARRAY_BUFFER: number;
 	declare readonly ELEMENT_ARRAY_BUFFER_BINDING: number;
+	declare readonly FRAMEBUFFER: number;
+	declare readonly FRAMEBUFFER_BINDING: number;
+	declare readonly RENDERBUFFER_BINDING: number;
 	declare readonly BUFFER_SIZE: number;
 	declare readonly BUFFER_USAGE: number;
 	declare readonly STREAM_DRAW: number;
@@ -148,6 +208,14 @@ export class WebGLRenderingContext {
 	declare readonly DYNAMIC_DRAW: number;
 	declare readonly TEXTURE_2D: number;
 	declare readonly TEXTURE_BINDING_2D: number;
+	declare readonly TEXTURE_CUBE_MAP: number;
+	declare readonly TEXTURE_BINDING_CUBE_MAP: number;
+	declare readonly TEXTURE_CUBE_MAP_POSITIVE_X: number;
+	declare readonly TEXTURE_CUBE_MAP_NEGATIVE_X: number;
+	declare readonly TEXTURE_CUBE_MAP_POSITIVE_Y: number;
+	declare readonly TEXTURE_CUBE_MAP_NEGATIVE_Y: number;
+	declare readonly TEXTURE_CUBE_MAP_POSITIVE_Z: number;
+	declare readonly TEXTURE_CUBE_MAP_NEGATIVE_Z: number;
 	declare readonly TEXTURE0: number;
 	declare readonly TEXTURE_MIN_FILTER: number;
 	declare readonly TEXTURE_MAG_FILTER: number;
@@ -175,16 +243,42 @@ export class WebGLRenderingContext {
 	declare readonly MAX_COMBINED_TEXTURE_IMAGE_UNITS: number;
 	declare readonly MAX_CUBE_MAP_TEXTURE_SIZE: number;
 	declare readonly MAX_RENDERBUFFER_SIZE: number;
+	declare readonly MAX_VERTEX_UNIFORM_VECTORS: number;
+	declare readonly MAX_FRAGMENT_UNIFORM_VECTORS: number;
+	declare readonly MAX_VARYING_VECTORS: number;
 	declare readonly SHADING_LANGUAGE_VERSION: number;
 	declare readonly POLYGON_OFFSET_FILL: number;
 	declare readonly SAMPLE_ALPHA_TO_COVERAGE: number;
 	declare readonly SAMPLE_COVERAGE: number;
+
+	getContextAttributes(): WebGLContextAttributes {
+		stub();
+	}
+
+	getSupportedExtensions(): string[] {
+		stub();
+	}
+
+	getExtension(name: string): unknown | null {
+		stub();
+	}
+
+	getShaderPrecisionFormat(
+		shaderType: number,
+		precisionType: number,
+	): WebGLShaderPrecisionFormat | null {
+		stub();
+	}
 
 	clearColor(red: number, green: number, blue: number, alpha: number): void {
 		stub();
 	}
 
 	clearDepth(depth: number): void {
+		stub();
+	}
+
+	clearStencil(stencil: number): void {
 		stub();
 	}
 
@@ -393,7 +487,64 @@ export class WebGLRenderingContext {
 		stub();
 	}
 
+	depthMask(flag: boolean): void {
+		stub();
+	}
+
+	colorMask(red: boolean, green: boolean, blue: boolean, alpha: boolean): void {
+		stub();
+	}
+
+	blendEquation(mode: number): void {
+		stub();
+	}
+
 	blendFunc(sfactor: number, dfactor: number): void {
+		stub();
+	}
+
+	blendFuncSeparate(
+		srcRGB: number,
+		dstRGB: number,
+		srcAlpha: number,
+		dstAlpha: number,
+	): void {
+		stub();
+	}
+
+	blendColor(red: number, green: number, blue: number, alpha: number): void {
+		stub();
+	}
+
+	cullFace(mode: number): void {
+		stub();
+	}
+
+	frontFace(mode: number): void {
+		stub();
+	}
+
+	polygonOffset(factor: number, units: number): void {
+		stub();
+	}
+
+	stencilMask(mask: number): void {
+		stub();
+	}
+
+	stencilFunc(func: number, ref: number, mask: number): void {
+		stub();
+	}
+
+	stencilOp(fail: number, zfail: number, zpass: number): void {
+		stub();
+	}
+
+	bindFramebuffer(target: number, framebuffer: null): void {
+		stub();
+	}
+
+	lineWidth(width: number): void {
 		stub();
 	}
 
