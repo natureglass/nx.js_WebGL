@@ -67,3 +67,23 @@ JSValue nx_webgl_egl_bridge_benchmark(JSContext *ctx,
 									  int requested_width,
 									  int requested_height);
 JSValue nx_webgl_egl_get_backend_info(JSContext *ctx, nx_webgl_egl_t *backend);
+bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend,
+								 nx_canvas_t *canvas,
+								 uint32_t shader_type,
+								 const char *source,
+								 uint32_t *shader_handle,
+								 bool *compile_status,
+								 char *info_log,
+								 size_t info_log_size);
+void nx_webgl_egl_delete_shader(nx_webgl_egl_t *backend,
+								uint32_t shader_handle);
+bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend,
+							   nx_canvas_t *canvas,
+							   uint32_t vertex_shader_handle,
+							   uint32_t fragment_shader_handle,
+							   uint32_t *program_handle,
+							   bool *link_status,
+							   char *info_log,
+							   size_t info_log_size);
+void nx_webgl_egl_delete_program(nx_webgl_egl_t *backend,
+								 uint32_t program_handle);

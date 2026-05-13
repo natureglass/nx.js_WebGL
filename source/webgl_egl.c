@@ -1986,3 +1986,159 @@ JSValue nx_webgl_egl_get_backend_info(JSContext *ctx,
 
 	return obj;
 }
+
+bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
+								 uint32_t shader_type, const char *source,
+								 uint32_t *shader_handle,
+								 bool *compile_status, char *info_log,
+								 size_t info_log_size) {
+	if (compile_status)
+		*compile_status = false;
+	if (info_log && info_log_size > 0)
+		info_log[0] = '\0';
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->bridge_enabled || !source)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "shader compile: eglMakeCurrent() failed: 0x%x",
+				 eglGetError());
+		return false;
+	}
+
+	if (shader_handle && *shader_handle) {
+		glDeleteShader((GLuint)*shader_handle);
+		*shader_handle = 0;
+	}
+
+	GLuint handle = glCreateShader((GLenum)shader_type);
+	if (!handle) {
+		if (info_log && info_log_size > 0)
+			snprintf(info_log, info_log_size, "glCreateShader failed: 0x%x",
+					 glGetError());
+		return true;
+	}
+
+	const GLchar *sources[1] = {(const GLchar *)source};
+	glShaderSource(handle, 1, sources, NULL);
+	glCompileShader(handle);
+
+	GLint ok = GL_FALSE;
+	glGetShaderiv(handle, GL_COMPILE_STATUS, &ok);
+	if (compile_status)
+		*compile_status = ok == GL_TRUE;
+	if (info_log && info_log_size > 0) {
+		GLsizei written = 0;
+		glGetShaderInfoLog(handle, (GLsizei)info_log_size, &written, info_log);
+		info_log[info_log_size - 1] = '\0';
+	}
+	if (shader_handle)
+		*shader_handle = (uint32_t)handle;
+	return true;
+#else
+	(void)backend;
+	(void)canvas;
+	(void)shader_type;
+	(void)source;
+	(void)shader_handle;
+	(void)info_log;
+	(void)info_log_size;
+	return false;
+#endif
+}
+
+void nx_webgl_egl_delete_shader(nx_webgl_egl_t *backend,
+								uint32_t shader_handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !shader_handle || !backend->available)
+		return;
+	if (eglMakeCurrent(backend->display, backend->surface, backend->surface,
+					   backend->context))
+		glDeleteShader((GLuint)shader_handle);
+#else
+	(void)backend;
+	(void)shader_handle;
+#endif
+}
+
+bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
+							   uint32_t vertex_shader_handle,
+							   uint32_t fragment_shader_handle,
+							   uint32_t *program_handle, bool *link_status,
+							   char *info_log, size_t info_log_size) {
+	if (link_status)
+		*link_status = false;
+	if (info_log && info_log_size > 0)
+		info_log[0] = '\0';
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->bridge_enabled || !vertex_shader_handle ||
+		!fragment_shader_handle)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "program link: eglMakeCurrent() failed: 0x%x",
+				 eglGetError());
+		return false;
+	}
+
+	if (program_handle && *program_handle) {
+		glDeleteProgram((GLuint)*program_handle);
+		*program_handle = 0;
+	}
+
+	GLuint handle = glCreateProgram();
+	if (!handle) {
+		if (info_log && info_log_size > 0)
+			snprintf(info_log, info_log_size, "glCreateProgram failed: 0x%x",
+					 glGetError());
+		return true;
+	}
+
+	glAttachShader(handle, (GLuint)vertex_shader_handle);
+	glAttachShader(handle, (GLuint)fragment_shader_handle);
+	glLinkProgram(handle);
+
+	GLint ok = GL_FALSE;
+	glGetProgramiv(handle, GL_LINK_STATUS, &ok);
+	if (link_status)
+		*link_status = ok == GL_TRUE;
+	if (info_log && info_log_size > 0) {
+		GLsizei written = 0;
+		glGetProgramInfoLog(handle, (GLsizei)info_log_size, &written,
+							info_log);
+		info_log[info_log_size - 1] = '\0';
+	}
+	if (program_handle)
+		*program_handle = (uint32_t)handle;
+	return true;
+#else
+	(void)backend;
+	(void)canvas;
+	(void)vertex_shader_handle;
+	(void)fragment_shader_handle;
+	(void)program_handle;
+	(void)info_log;
+	(void)info_log_size;
+	return false;
+#endif
+}
+
+void nx_webgl_egl_delete_program(nx_webgl_egl_t *backend,
+								 uint32_t program_handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available)
+		return;
+	if (eglMakeCurrent(backend->display, backend->surface, backend->surface,
+					   backend->context))
+		glDeleteProgram((GLuint)program_handle);
+#else
+	(void)backend;
+	(void)program_handle;
+#endif
+}

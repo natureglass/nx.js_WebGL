@@ -238,7 +238,9 @@ typedef struct {
 	uint32_t type;
 	char *source;
 	char *info_log;
+	uint32_t gles_handle;
 	bool compile_status;
+	bool gles_compile_attempted;
 	bool deleted;
 } nx_webgl_shader_t;
 
@@ -246,6 +248,7 @@ typedef struct {
 	JSValue vertex_shader;
 	JSValue fragment_shader;
 	char *info_log;
+	uint32_t gles_handle;
 	float matrix4[16];
 	float projection_matrix[16];
 	float model_view_matrix[16];
@@ -259,6 +262,7 @@ typedef struct {
 	int sampler0;
 	bool has_sampler0;
 	bool link_status;
+	bool gles_link_attempted;
 	bool deleted;
 } nx_webgl_program_t;
 
@@ -1090,6 +1094,18 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	char gles_log[2048];
+	bool gles_status = false;
+	if (nx_webgl_egl_compile_shader(context->egl, context->canvas, shader->type,
+									shader->source, &shader->gles_handle,
+									&gles_status, gles_log,
+									sizeof(gles_log))) {
+		shader->gles_compile_attempted = true;
+		shader->compile_status = gles_status;
+		replace_string(ctx, &shader->info_log, gles_log);
+		return JS_UNDEFINED;
+	}
+
 	shader->compile_status = true;
 	replace_string(ctx, &shader->info_log, "");
 	return JS_UNDEFINED;
@@ -1157,6 +1173,10 @@ static JSValue nx_webgl_delete_shader(JSContext *ctx, JSValueConst this_val,
 	}
 
 	shader->deleted = true;
+	if (shader->gles_handle) {
+		nx_webgl_egl_delete_shader(context->egl, shader->gles_handle);
+		shader->gles_handle = 0;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -1239,6 +1259,21 @@ static JSValue nx_webgl_link_program(JSContext *ctx, JSValueConst this_val,
 		replace_string(ctx, &program->info_log,
 					   "attached shaders must compile before linking");
 		return JS_UNDEFINED;
+	}
+
+	if (vertex->gles_handle && fragment->gles_handle) {
+		char gles_log[2048];
+		bool gles_status = false;
+		if (nx_webgl_egl_link_program(context->egl, context->canvas,
+									  vertex->gles_handle,
+									  fragment->gles_handle,
+									  &program->gles_handle, &gles_status,
+									  gles_log, sizeof(gles_log))) {
+			program->gles_link_attempted = true;
+			program->link_status = gles_status;
+			replace_string(ctx, &program->info_log, gles_log);
+			return JS_UNDEFINED;
+		}
 	}
 
 	program->link_status = true;
@@ -1395,6 +1430,10 @@ static JSValue nx_webgl_delete_program(JSContext *ctx, JSValueConst this_val,
 	}
 
 	program->deleted = true;
+	if (program->gles_handle) {
+		nx_webgl_egl_delete_program(context->egl, program->gles_handle);
+		program->gles_handle = 0;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2998,6 +3037,50 @@ static bool draw_indexed_textured_triangles_bridge(
 	return drew;
 }
 
+static bool draw_indexed_triangles_bridge(
+	JSContext *ctx, nx_webgl_context_t *context, nx_webgl_program_t *program,
+	nx_webgl_vertex_attrib_t *position, uint16_t *indices, int count,
+	uint32_t color, bool blend) {
+	if (!nx_webgl_egl_is_bridge_enabled(context->egl) || count <= 0 ||
+		count % 3 != 0)
+		return false;
+
+	int vertex_count = count;
+	float *clip_xy =
+		js_malloc(ctx, (size_t)vertex_count * 2 * sizeof(float));
+	if (!clip_xy)
+		return false;
+
+	bool loaded = true;
+	for (int i = 0; i < vertex_count; i++) {
+		nx_webgl_vec3_t position3;
+		if (!read_attrib_vec3(context, position, indices[i], &position3)) {
+			loaded = false;
+			break;
+		}
+		nx_webgl_vec2_t clip = transform_position3(program, position3);
+		clip_xy[i * 2 + 0] = clip.x;
+		clip_xy[i * 2 + 1] = clip.y;
+	}
+
+	bool drew = false;
+	if (loaded) {
+		float gpu_color[4] = {
+			(float)((color >> 16) & 0xff) / 255.f,
+			(float)((color >> 8) & 0xff) / 255.f,
+			(float)(color & 0xff) / 255.f,
+			(float)((color >> 24) & 0xff) / 255.f,
+		};
+		drew = nx_webgl_egl_draw_triangles_bridge(
+			context->egl, context->canvas, clip_xy, vertex_count, gpu_color,
+			blend, context->blend_src, context->blend_dst, context->viewport,
+			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+			context->scissor_box);
+	}
+	js_free(ctx, clip_xy);
+	return drew;
+}
+
 static void rasterize_triangle(nx_canvas_t *canvas, nx_webgl_vec2_t v0,
 							   nx_webgl_vec2_t v1, nx_webgl_vec2_t v2,
 							   uint32_t color, bool blend,
@@ -3327,6 +3410,12 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
 	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
 	uint32_t color = program_color(program);
+	if (!use_texture &&
+		draw_indexed_triangles_bridge(ctx, context, program, position, indices,
+									  count, color, blend)) {
+		context->bridge_clear_pending = false;
+		return JS_UNDEFINED;
+	}
 	if (use_texture &&
 		draw_indexed_textured_triangles_bridge(ctx, context, program, position,
 											   texcoord, texture, indices,
