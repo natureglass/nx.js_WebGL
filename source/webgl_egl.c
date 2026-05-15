@@ -50,13 +50,28 @@ struct nx_webgl_egl_s {
 	int bridge_width;
 	int bridge_height;
 	GLuint bridge_texture;
-	GLuint bridge_framebuffer;
-	GLuint bridge_color_program;
+GLuint bridge_framebuffer;
+GLuint bridge_depth_renderbuffer;
+GLuint bridge_color_program;
 	GLuint bridge_color_vertex_shader;
 	GLuint bridge_color_fragment_shader;
 	GLuint bridge_texture_program;
 	GLuint bridge_texture_vertex_shader;
 	GLuint bridge_texture_fragment_shader;
+	GLuint bridge_line_program;
+	GLuint bridge_line_vertex_shader;
+	GLuint bridge_line_fragment_shader;
+	GLuint bridge_line_distance_buffer;
+	GLuint bridge_line_color_buffer;
+	GLuint bridge_triangle_color_buffer;
+	GLint bridge_line_color_loc;
+	GLint bridge_line_scale_loc;
+	GLint bridge_line_dash_loc;
+	GLint bridge_line_total_loc;
+	GLint bridge_color_color_loc;
+	GLint bridge_texture_sampler_loc;
+	bool bridge_pending_readback;
+	uint32_t bridge_last_draw_gl_error;
 	GLuint bridge_vertex_buffer;
 	uint8_t *bridge_readback;
 	size_t bridge_readback_size;
@@ -186,9 +201,37 @@ static void destroy_bridge_resources(nx_webgl_egl_t *backend) {
 		glDeleteShader(backend->bridge_texture_fragment_shader);
 		backend->bridge_texture_fragment_shader = 0;
 	}
+	if (backend->bridge_line_distance_buffer) {
+		glDeleteBuffers(1, &backend->bridge_line_distance_buffer);
+		backend->bridge_line_distance_buffer = 0;
+	}
+	if (backend->bridge_line_color_buffer) {
+		glDeleteBuffers(1, &backend->bridge_line_color_buffer);
+		backend->bridge_line_color_buffer = 0;
+	}
+	if (backend->bridge_triangle_color_buffer) {
+		glDeleteBuffers(1, &backend->bridge_triangle_color_buffer);
+		backend->bridge_triangle_color_buffer = 0;
+	}
+	if (backend->bridge_line_program) {
+		glDeleteProgram(backend->bridge_line_program);
+		backend->bridge_line_program = 0;
+	}
+	if (backend->bridge_line_vertex_shader) {
+		glDeleteShader(backend->bridge_line_vertex_shader);
+		backend->bridge_line_vertex_shader = 0;
+	}
+	if (backend->bridge_line_fragment_shader) {
+		glDeleteShader(backend->bridge_line_fragment_shader);
+		backend->bridge_line_fragment_shader = 0;
+	}
 	if (backend->bridge_framebuffer) {
 		glDeleteFramebuffers(1, &backend->bridge_framebuffer);
 		backend->bridge_framebuffer = 0;
+	}
+	if (backend->bridge_depth_renderbuffer) {
+		glDeleteRenderbuffers(1, &backend->bridge_depth_renderbuffer);
+		backend->bridge_depth_renderbuffer = 0;
 	}
 	if (backend->bridge_texture) {
 		glDeleteTextures(1, &backend->bridge_texture);
@@ -199,6 +242,13 @@ static void destroy_bridge_resources(nx_webgl_egl_t *backend) {
 	backend->bridge_readback_size = 0;
 	backend->bridge_width = 0;
 	backend->bridge_height = 0;
+	backend->bridge_line_color_loc = -1;
+	backend->bridge_line_scale_loc = -1;
+	backend->bridge_line_dash_loc = -1;
+	backend->bridge_line_total_loc = -1;
+	backend->bridge_color_color_loc = -1;
+	backend->bridge_texture_sampler_loc = -1;
+	backend->bridge_pending_readback = false;
 }
 
 static void destroy_texture_cache(nx_webgl_egl_t *backend) {
@@ -245,10 +295,17 @@ static bool ensure_bridge_resources(nx_webgl_egl_t *backend, int width,
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
 				 GL_UNSIGNED_BYTE, NULL);
 
+	glGenRenderbuffers(1, &backend->bridge_depth_renderbuffer);
+	glBindRenderbuffer(GL_RENDERBUFFER, backend->bridge_depth_renderbuffer);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+
 	glGenFramebuffers(1, &backend->bridge_framebuffer);
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 						   GL_TEXTURE_2D, backend->bridge_texture, 0);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+							  GL_RENDERBUFFER,
+							  backend->bridge_depth_renderbuffer);
 	GLenum framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 	if (framebuffer_status != GL_FRAMEBUFFER_COMPLETE) {
 		snprintf(backend->status, sizeof(backend->status),
@@ -416,63 +473,93 @@ static void bridge_apply_scissor(nx_canvas_t *canvas, int render_width,
 }
 
 static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
-	if (backend->bridge_color_program && backend->bridge_vertex_buffer)
+	if (backend->bridge_color_program && backend->bridge_vertex_buffer &&
+		backend->bridge_triangle_color_buffer)
 		return true;
 
+	// Untextured triangle shader pair.
+	// - Position: a_position (vec3 NDC at location 0). CPU already did the
+	//   model-view-projection transform + perspective divide; the shader just
+	//   passes the result through. Z is preserved so GL_DEPTH_TEST works.
+	// - Per-vertex color: a_color (location 1), output = u_color * vec4(v_color, 1).
+	//   Callers that don't bind a color buffer use glVertexAttrib3f(1, 1, 1, 1) so
+	//   v_color defaults to white and output collapses to u_color.
 	static const char vertex_source[] =
-		"attribute vec2 a_position;\n"
+		"attribute vec3 a_position;\n"
+		"attribute vec3 a_color;\n"
+		"varying vec3 v_color;\n"
 		"void main() {\n"
-		"  gl_Position = vec4(a_position, 0.0, 1.0);\n"
+		"  v_color = a_color;\n"
+		"  gl_Position = vec4(a_position, 1.0);\n"
 		"}\n";
 	static const char fragment_source[] =
 		"precision mediump float;\n"
 		"uniform vec4 u_color;\n"
+		"varying vec3 v_color;\n"
 		"void main() {\n"
-		"  gl_FragColor = u_color;\n"
+		"  gl_FragColor = u_color * vec4(v_color, 1.0);\n"
 		"}\n";
 
-	backend->bridge_color_vertex_shader =
-		compile_triangle_shader(GL_VERTEX_SHADER, vertex_source,
-								backend->status, sizeof(backend->status));
-	if (!backend->bridge_color_vertex_shader)
-		return false;
-	backend->bridge_color_fragment_shader =
-		compile_triangle_shader(GL_FRAGMENT_SHADER, fragment_source,
-								backend->status, sizeof(backend->status));
-	if (!backend->bridge_color_fragment_shader)
-		return false;
+	if (!backend->bridge_color_vertex_shader) {
+		backend->bridge_color_vertex_shader =
+			compile_triangle_shader(GL_VERTEX_SHADER, vertex_source,
+									backend->status, sizeof(backend->status));
+		if (!backend->bridge_color_vertex_shader)
+			return false;
+	}
+	if (!backend->bridge_color_fragment_shader) {
+		backend->bridge_color_fragment_shader =
+			compile_triangle_shader(GL_FRAGMENT_SHADER, fragment_source,
+									backend->status, sizeof(backend->status));
+		if (!backend->bridge_color_fragment_shader)
+			return false;
+	}
 
-	backend->bridge_color_program = glCreateProgram();
 	if (!backend->bridge_color_program) {
+		backend->bridge_color_program = glCreateProgram();
+		if (!backend->bridge_color_program) {
+			snprintf(backend->status, sizeof(backend->status),
+					 "GPU bridge draw: glCreateProgram() failed: 0x%x",
+					 glGetError());
+			return false;
+		}
+		glAttachShader(backend->bridge_color_program,
+					   backend->bridge_color_vertex_shader);
+		glAttachShader(backend->bridge_color_program,
+					   backend->bridge_color_fragment_shader);
+		glBindAttribLocation(backend->bridge_color_program, 0, "a_position");
+		glBindAttribLocation(backend->bridge_color_program, 1, "a_color");
+		glLinkProgram(backend->bridge_color_program);
+
+		GLint linked = GL_FALSE;
+		glGetProgramiv(backend->bridge_color_program, GL_LINK_STATUS, &linked);
+		if (!linked) {
+			GLchar log[128];
+			GLsizei log_length = 0;
+			glGetProgramInfoLog(backend->bridge_color_program, sizeof(log),
+								&log_length, log);
+			snprintf(backend->status, sizeof(backend->status),
+					 "GPU bridge draw: glLinkProgram() failed: %.*s",
+					 (int)log_length, log);
+			return false;
+		}
+		backend->bridge_color_color_loc =
+			glGetUniformLocation(backend->bridge_color_program, "u_color");
+	}
+
+	if (!backend->bridge_vertex_buffer)
+		glGenBuffers(1, &backend->bridge_vertex_buffer);
+	if (!backend->bridge_vertex_buffer) {
 		snprintf(backend->status, sizeof(backend->status),
-				 "GPU bridge draw: glCreateProgram() failed: 0x%x",
+				 "GPU bridge draw: position glGenBuffers() failed: 0x%x",
 				 glGetError());
 		return false;
 	}
-	glAttachShader(backend->bridge_color_program,
-				   backend->bridge_color_vertex_shader);
-	glAttachShader(backend->bridge_color_program,
-				   backend->bridge_color_fragment_shader);
-	glBindAttribLocation(backend->bridge_color_program, 0, "a_position");
-	glLinkProgram(backend->bridge_color_program);
-
-	GLint linked = GL_FALSE;
-	glGetProgramiv(backend->bridge_color_program, GL_LINK_STATUS, &linked);
-	if (!linked) {
-		GLchar log[128];
-		GLsizei log_length = 0;
-		glGetProgramInfoLog(backend->bridge_color_program, sizeof(log),
-							&log_length, log);
+	if (!backend->bridge_triangle_color_buffer)
+		glGenBuffers(1, &backend->bridge_triangle_color_buffer);
+	if (!backend->bridge_triangle_color_buffer) {
 		snprintf(backend->status, sizeof(backend->status),
-				 "GPU bridge draw: glLinkProgram() failed: %.*s",
-				 (int)log_length, log);
-		return false;
-	}
-
-	glGenBuffers(1, &backend->bridge_vertex_buffer);
-	if (!backend->bridge_vertex_buffer) {
-		snprintf(backend->status, sizeof(backend->status),
-				 "GPU bridge draw: glGenBuffers() failed: 0x%x",
+				 "GPU bridge draw: triangle color glGenBuffers() failed: 0x%x",
 				 glGetError());
 		return false;
 	}
@@ -484,12 +571,12 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		return true;
 
 	static const char vertex_source[] =
-		"attribute vec2 a_position;\n"
+		"attribute vec3 a_position;\n"
 		"attribute vec2 a_uv;\n"
 		"varying vec2 v_uv;\n"
 		"void main() {\n"
 		"  v_uv = a_uv;\n"
-		"  gl_Position = vec4(a_position, 0.0, 1.0);\n"
+		"  gl_Position = vec4(a_position, 1.0);\n"
 		"}\n";
 	static const char fragment_source[] =
 		"precision mediump float;\n"
@@ -537,12 +624,136 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 				 (int)log_length, log);
 		return false;
 	}
+	backend->bridge_texture_sampler_loc =
+		glGetUniformLocation(backend->bridge_texture_program, "u_texture");
 
 	if (!backend->bridge_vertex_buffer)
 		glGenBuffers(1, &backend->bridge_vertex_buffer);
 	if (!backend->bridge_vertex_buffer) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge texture draw: glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	return true;
+}
+
+static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
+	if (backend->bridge_line_program && backend->bridge_vertex_buffer &&
+		backend->bridge_line_distance_buffer &&
+		backend->bridge_line_color_buffer)
+		return true;
+
+	// Dashed/colored-line shader pair.
+	// - Position: a_position (vec3 NDC at location 0). CPU did the MVP +
+	//   perspective divide. Passing z through is required for wireframe
+	//   overlays so back-facing edges depth-test out against front faces.
+	// - LineDashedMaterial support: a_lineDistance (location 1), u_scale,
+	//   u_dashSize, u_totalSize. u_totalSize == 0 means solid (no dash mask).
+	// - Per-vertex color support (LineBasicMaterial vertexColors:true):
+	//   a_color (location 2), output = u_color * vec4(v_color, 1.0). Callers
+	//   that do not bind a color buffer use glVertexAttrib3f(2, 1, 1, 1) so
+	//   v_color defaults to white and the output collapses to u_color.
+	static const char vertex_source[] =
+		"attribute vec3 a_position;\n"
+		"attribute float a_lineDistance;\n"
+		"attribute vec3 a_color;\n"
+		"uniform float u_scale;\n"
+		"varying float v_lineDistance;\n"
+		"varying vec3 v_color;\n"
+		"void main() {\n"
+		"  v_lineDistance = u_scale * a_lineDistance;\n"
+		"  v_color = a_color;\n"
+		"  gl_Position = vec4(a_position, 1.0);\n"
+		"}\n";
+	static const char fragment_source[] =
+		"precision mediump float;\n"
+		"uniform vec4 u_color;\n"
+		"uniform float u_dashSize;\n"
+		"uniform float u_totalSize;\n"
+		"varying float v_lineDistance;\n"
+		"varying vec3 v_color;\n"
+		"void main() {\n"
+		"  if (u_totalSize > 0.0) {\n"
+		"    if (mod(v_lineDistance, u_totalSize) > u_dashSize) discard;\n"
+		"  }\n"
+		"  gl_FragColor = u_color * vec4(v_color, 1.0);\n"
+		"}\n";
+
+	if (!backend->bridge_line_vertex_shader)
+		backend->bridge_line_vertex_shader =
+			compile_triangle_shader(GL_VERTEX_SHADER, vertex_source,
+									backend->status, sizeof(backend->status));
+	if (!backend->bridge_line_vertex_shader)
+		return false;
+	if (!backend->bridge_line_fragment_shader)
+		backend->bridge_line_fragment_shader =
+			compile_triangle_shader(GL_FRAGMENT_SHADER, fragment_source,
+									backend->status, sizeof(backend->status));
+	if (!backend->bridge_line_fragment_shader)
+		return false;
+
+	if (!backend->bridge_line_program) {
+		backend->bridge_line_program = glCreateProgram();
+		if (!backend->bridge_line_program) {
+			snprintf(backend->status, sizeof(backend->status),
+					 "GPU bridge line draw: glCreateProgram() failed: 0x%x",
+					 glGetError());
+			return false;
+		}
+		glAttachShader(backend->bridge_line_program,
+					   backend->bridge_line_vertex_shader);
+		glAttachShader(backend->bridge_line_program,
+					   backend->bridge_line_fragment_shader);
+		glBindAttribLocation(backend->bridge_line_program, 0, "a_position");
+		glBindAttribLocation(backend->bridge_line_program, 1,
+							 "a_lineDistance");
+		glBindAttribLocation(backend->bridge_line_program, 2, "a_color");
+		glLinkProgram(backend->bridge_line_program);
+
+		GLint linked = GL_FALSE;
+		glGetProgramiv(backend->bridge_line_program, GL_LINK_STATUS, &linked);
+		if (!linked) {
+			GLchar log[128];
+			GLsizei log_length = 0;
+			glGetProgramInfoLog(backend->bridge_line_program, sizeof(log),
+								&log_length, log);
+			snprintf(backend->status, sizeof(backend->status),
+					 "GPU bridge line draw: glLinkProgram() failed: %.*s",
+					 (int)log_length, log);
+			return false;
+		}
+		backend->bridge_line_color_loc =
+			glGetUniformLocation(backend->bridge_line_program, "u_color");
+		backend->bridge_line_scale_loc =
+			glGetUniformLocation(backend->bridge_line_program, "u_scale");
+		backend->bridge_line_dash_loc =
+			glGetUniformLocation(backend->bridge_line_program, "u_dashSize");
+		backend->bridge_line_total_loc =
+			glGetUniformLocation(backend->bridge_line_program, "u_totalSize");
+	}
+
+	if (!backend->bridge_vertex_buffer)
+		glGenBuffers(1, &backend->bridge_vertex_buffer);
+	if (!backend->bridge_vertex_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw: position glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_line_distance_buffer)
+		glGenBuffers(1, &backend->bridge_line_distance_buffer);
+	if (!backend->bridge_line_distance_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw: distance glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_line_color_buffer)
+		glGenBuffers(1, &backend->bridge_line_color_buffer);
+	if (!backend->bridge_line_color_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw: color glGenBuffers() failed: 0x%x",
 				 glGetError());
 		return false;
 	}
@@ -898,6 +1109,72 @@ bool nx_webgl_egl_is_bridge_enabled(nx_webgl_egl_t *backend) {
 #endif
 }
 
+void nx_webgl_egl_uniform1f(nx_webgl_egl_t *backend, int location, float x) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform1f(location, x);
+#endif
+}
+
+void nx_webgl_egl_uniform2f(nx_webgl_egl_t *backend, int location, float x, float y) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform2f(location, x, y);
+#endif
+}
+
+void nx_webgl_egl_uniform3f(nx_webgl_egl_t *backend, int location, float x, float y, float z) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform3f(location, x, y, z);
+#endif
+}
+
+void nx_webgl_egl_uniform4f(nx_webgl_egl_t *backend, int location, float x, float y, float z, float w) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform4f(location, x, y, z, w);
+#endif
+}
+
+void nx_webgl_egl_uniform1i(nx_webgl_egl_t *backend, int location, int x) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform1i(location, x);
+#endif
+}
+
+void nx_webgl_egl_uniform_matrix4fv(nx_webgl_egl_t *backend, int location, bool transpose, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniformMatrix4fv(location, 1, transpose ? GL_TRUE : GL_FALSE, value);
+#endif
+}
+
 void nx_webgl_egl_set_bridge_resolution(nx_webgl_egl_t *backend, int width,
 										int height) {
 	if (!backend)
@@ -940,19 +1217,84 @@ void nx_webgl_egl_delete_cached_texture(nx_webgl_egl_t *backend,
 #endif
 }
 
+uint32_t nx_webgl_egl_get_last_draw_gl_error(nx_webgl_egl_t *backend) {
+	if (!backend)
+		return 0;
+#if NXJS_HAS_EGL_GLES
+	return backend->bridge_last_draw_gl_error;
+#else
+	return 0;
+#endif
+}
+
+bool nx_webgl_egl_has_pending_readback(nx_webgl_egl_t *backend) {
+	if (!backend)
+		return false;
+#if NXJS_HAS_EGL_GLES
+	return backend->bridge_pending_readback;
+#else
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_flush_bridge_present(nx_webgl_egl_t *backend,
+									   nx_canvas_t *canvas) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend;
+	(void)canvas;
+	return false;
+#else
+	if (!backend || !backend->bridge_pending_readback)
+		return false;
+	if (!canvas || !canvas->data || canvas->width == 0 || canvas->height == 0)
+		return false;
+	if (!backend->bridge_framebuffer || !backend->bridge_readback)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge flush: eglMakeCurrent() failed: 0x%x",
+				 eglGetError());
+		return false;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
+	glReadPixels(0, 0, backend->bridge_width, backend->bridge_height, GL_RGBA,
+				 GL_UNSIGNED_BYTE, backend->bridge_readback);
+	GLenum error = glGetError();
+	glFinish();
+	if (error != GL_NO_ERROR) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge flush readback failed: 0x%x", error);
+		backend->bridge_pending_readback = false;
+		return false;
+	}
+	copy_rgba_readback_to_canvas_scaled(canvas, backend->bridge_readback,
+										backend->bridge_width,
+										backend->bridge_height);
+	backend->bridge_pending_readback = false;
+	if (canvas->surface)
+		cairo_surface_mark_dirty(canvas->surface);
+	return true;
+#endif
+}
+
 bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
-	return nx_webgl_egl_clear_bridge_with_state(backend, canvas, false, NULL);
+	return nx_webgl_egl_clear_bridge_with_state(backend, canvas, false, NULL, false);
 }
 
 bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 										  nx_canvas_t *canvas,
 										  bool scissor_enabled,
-										  const int *scissor_box) {
+										  const int *scissor_box,
+										  bool depth_enabled) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
 	(void)scissor_enabled;
 	(void)scissor_box;
+	(void)depth_enabled;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -974,6 +1316,7 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 	if (!ensure_bridge_resources(backend, width, height))
 		return false;
 
+	(void)depth_enabled;
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
 	glViewport(0, 0, width, height);
 	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
@@ -981,7 +1324,12 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 				 (GLfloat)backend->clear_color[1],
 				 (GLfloat)backend->clear_color[2],
 				 (GLfloat)backend->clear_color[3]);
-	glClear(GL_COLOR_BUFFER_BIT);
+	// Depth is unconditionally cleared so the depth attachment we added to the
+	// bridge FBO starts each frame at far (1.0). Triangle bridge draws that
+	// enable GL_DEPTH_TEST get correct front-vs-back ordering.
+	glClearDepthf(1.0f);
+	glDepthMask(GL_TRUE);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 	glDisable(GL_SCISSOR_TEST);
 	GLenum error = glGetError();
 	if (error != GL_NO_ERROR) {
@@ -999,7 +1347,8 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 
 bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										nx_canvas_t *canvas,
-										const float *clip_xy,
+										const float *clip_xyz,
+										const float *vertex_colors,
 										int vertex_count,
 										const float *color,
 										bool blend,
@@ -1007,11 +1356,13 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										uint32_t blend_dst,
 										const int *viewport,
 										bool scissor_enabled,
-										const int *scissor_box) {
+										const int *scissor_box,
+										bool depth_enabled) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
-	(void)clip_xy;
+	(void)clip_xyz;
+	(void)vertex_colors;
 	(void)vertex_count;
 	(void)color;
 	(void)blend;
@@ -1020,10 +1371,11 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	(void)viewport;
 	(void)scissor_enabled;
 	(void)scissor_box;
+	(void)depth_enabled;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
-		canvas->width == 0 || canvas->height == 0 || !clip_xy ||
+		canvas->width == 0 || canvas->height == 0 || !clip_xyz ||
 		vertex_count <= 0 || vertex_count % 3 != 0 || !color)
 		return false;
 	if (!nx_webgl_egl_initialize(backend, canvas))
@@ -1046,41 +1398,217 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
 	bridge_apply_viewport(canvas, width, height, viewport);
 	glUseProgram(backend->bridge_color_program);
-	GLint color_location =
-		glGetUniformLocation(backend->bridge_color_program, "u_color");
-	if (color_location >= 0)
-		glUniform4f(color_location, color[0], color[1], color[2], color[3]);
+	if (backend->bridge_color_color_loc >= 0)
+		glUniform4f(backend->bridge_color_color_loc, color[0], color[1],
+					color[2], color[3]);
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
-	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 2 * sizeof(float),
-				 clip_xy, GL_STREAM_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 3 * sizeof(float),
+				 clip_xyz, GL_STREAM_DRAW);
 	glEnableVertexAttribArray(0);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+
+	bool has_vertex_colors = vertex_colors != NULL;
+	if (has_vertex_colors) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_triangle_color_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), vertex_colors,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(1);
+		glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(1);
+		glVertexAttrib3f(1, 1.f, 1.f, 1.f);
+	}
+
 	if (blend) {
 		glEnable(GL_BLEND);
 		glBlendFunc(blend_src, blend_dst);
 	} else {
 		glDisable(GL_BLEND);
 	}
-	glDisable(GL_DEPTH_TEST);
+	if (depth_enabled) {
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		glDepthMask(GL_TRUE);
+		glDepthRangef(0.f, 1.f);
+	} else {
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+	}
 	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+	// Clear any stale GL error from prior setup so glGetError after the draw
+	// only reflects the draw itself, not unrelated state changes.
+	(void)glGetError();
 	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
-	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
-				 backend->bridge_readback);
 	GLenum error = glGetError();
-	glFinish();
+	backend->bridge_last_draw_gl_error = error;
 	glDisableVertexAttribArray(0);
+	if (has_vertex_colors)
+		glDisableVertexAttribArray(1);
 	glDisable(GL_SCISSOR_TEST);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (error != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),
-				 "GPU bridge draw failed: 0x%x", error);
+				 "GPU bridge draw failed: 0x%x (vc=%d)", error,
+				 has_vertex_colors);
 		return false;
 	}
 
-	copy_rgba_readback_to_canvas_scaled(canvas, backend->bridge_readback, width,
-										height);
+	backend->bridge_pending_readback = true;
 	snprintf(backend->status, sizeof(backend->status),
-			 "GPU bridge drew %d untextured vertices at %dx%d -> %ux%u",
+			 "GPU bridge queued %d untextured vertices (vc=%d) at %dx%d -> %ux%u",
+			 vertex_count, has_vertex_colors, width, height, canvas->width,
+			 canvas->height);
+	return true;
+#endif
+}
+
+bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
+									nx_canvas_t *canvas,
+									const float *clip_xyz,
+									const float *line_distance,
+									const float *vertex_colors,
+									int vertex_count,
+									const float *color,
+									float scale,
+									float dash_size,
+									float total_size,
+									bool blend,
+									uint32_t blend_src,
+									uint32_t blend_dst,
+									const int *viewport,
+									bool scissor_enabled,
+									const int *scissor_box,
+									bool depth_enabled) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend;
+	(void)canvas;
+	(void)clip_xyz;
+	(void)line_distance;
+	(void)vertex_colors;
+	(void)vertex_count;
+	(void)color;
+	(void)scale;
+	(void)dash_size;
+	(void)total_size;
+	(void)blend;
+	(void)blend_src;
+	(void)blend_dst;
+	(void)viewport;
+	(void)scissor_enabled;
+	(void)scissor_box;
+	(void)depth_enabled;
+	return false;
+#else
+	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
+		canvas->width == 0 || canvas->height == 0 || !clip_xyz ||
+		vertex_count <= 0 || vertex_count % 2 != 0 || !color)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw: eglMakeCurrent() failed: 0x%x",
+				 eglGetError());
+		return false;
+	}
+
+	int width = 0;
+	int height = 0;
+	bridge_render_size(backend, canvas, &width, &height);
+	if (!ensure_bridge_resources(backend, width, height) ||
+		!ensure_bridge_line_program(backend))
+		return false;
+
+	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
+	bridge_apply_viewport(canvas, width, height, viewport);
+	glUseProgram(backend->bridge_line_program);
+	if (backend->bridge_line_color_loc >= 0)
+		glUniform4f(backend->bridge_line_color_loc, color[0], color[1],
+					color[2], color[3]);
+	if (backend->bridge_line_scale_loc >= 0)
+		glUniform1f(backend->bridge_line_scale_loc, scale);
+	if (backend->bridge_line_dash_loc >= 0)
+		glUniform1f(backend->bridge_line_dash_loc, dash_size);
+	if (backend->bridge_line_total_loc >= 0)
+		glUniform1f(backend->bridge_line_total_loc, total_size);
+
+	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
+	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 3 * sizeof(float),
+				 clip_xyz, GL_STREAM_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+
+	bool has_line_distance = line_distance != NULL;
+	if (has_line_distance) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_line_distance_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * sizeof(float), line_distance,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(1);
+		glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(1);
+		glVertexAttrib1f(1, 0.f);
+	}
+
+	bool has_vertex_colors = vertex_colors != NULL;
+	if (has_vertex_colors) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_line_color_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), vertex_colors,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(2);
+		glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(2);
+		glVertexAttrib3f(2, 1.f, 1.f, 1.f);
+	}
+
+	if (blend) {
+		glEnable(GL_BLEND);
+		glBlendFunc(blend_src, blend_dst);
+	} else {
+		glDisable(GL_BLEND);
+	}
+	if (depth_enabled) {
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		// Wireframe overlays sit at the same NDC z as their underlying
+		// triangle edges. Disable depth writes so the line doesn't push a
+		// fresh depth value into the buffer (which would then occlude further
+		// front-facing triangles drawn in the same frame). Read-only depth
+		// test still correctly culls back-facing lines.
+		glDepthMask(GL_FALSE);
+		glDepthRangef(0.f, 1.f);
+	} else {
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+	}
+	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+
+	(void)glGetError();
+	glDrawArrays(GL_LINES, 0, vertex_count);
+	GLenum error = glGetError();
+	backend->bridge_last_draw_gl_error = error;
+
+	glDisableVertexAttribArray(0);
+	if (has_line_distance)
+		glDisableVertexAttribArray(1);
+	if (has_vertex_colors)
+		glDisableVertexAttribArray(2);
+	glDisable(GL_SCISSOR_TEST);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	if (error != GL_NO_ERROR) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw failed: 0x%x", error);
+		return false;
+	}
+
+	backend->bridge_pending_readback = true;
+	snprintf(backend->status, sizeof(backend->status),
+			 "GPU bridge queued %d line vertices at %dx%d -> %ux%u",
 			 vertex_count, width, height, canvas->width, canvas->height);
 	return true;
 #endif
@@ -1089,7 +1617,7 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 bool nx_webgl_egl_draw_textured_triangles_bridge(
 	nx_webgl_egl_t *backend,
 	nx_canvas_t *canvas,
-	const float *clip_uv,
+	const float *clip_xyzuv,
 	int vertex_count,
 	uint32_t texture_id,
 	uint32_t texture_revision,
@@ -1105,11 +1633,12 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	uint32_t blend_dst,
 	const int *viewport,
 	bool scissor_enabled,
-	const int *scissor_box) {
+	const int *scissor_box,
+	bool depth_enabled) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
-	(void)clip_uv;
+	(void)clip_xyzuv;
 	(void)vertex_count;
 	(void)texture_id;
 	(void)texture_revision;
@@ -1126,10 +1655,11 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)viewport;
 	(void)scissor_enabled;
 	(void)scissor_box;
+	(void)depth_enabled;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
-		canvas->width == 0 || canvas->height == 0 || !clip_uv ||
+		canvas->width == 0 || canvas->height == 0 || !clip_xyzuv ||
 		vertex_count <= 0 || vertex_count % 3 != 0 || !texture_rgba ||
 		texture_id == 0 || texture_revision == 0 || texture_width <= 0 ||
 		texture_height <= 0)
@@ -1162,31 +1692,35 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	glUseProgram(backend->bridge_texture_program);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, texture_handle);
-	GLint sampler_location =
-		glGetUniformLocation(backend->bridge_texture_program, "u_texture");
-	if (sampler_location >= 0)
-		glUniform1i(sampler_location, 0);
+	if (backend->bridge_texture_sampler_loc >= 0)
+		glUniform1i(backend->bridge_texture_sampler_loc, 0);
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
-	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 4 * sizeof(float),
-				 clip_uv, GL_STREAM_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 5 * sizeof(float),
+				 clip_xyzuv, GL_STREAM_DRAW);
 	glEnableVertexAttribArray(0);
 	glEnableVertexAttribArray(1);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, 0);
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4,
-						  (const void *)(sizeof(float) * 2));
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 5, 0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 5,
+						  (const void *)(sizeof(float) * 3));
 	if (blend) {
 		glEnable(GL_BLEND);
 		glBlendFunc(blend_src, blend_dst);
 	} else {
 		glDisable(GL_BLEND);
 	}
-	glDisable(GL_DEPTH_TEST);
+	if (depth_enabled) {
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		glDepthMask(GL_TRUE);
+		glDepthRangef(0.f, 1.f);
+	} else {
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+	}
 	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+	(void)glGetError();
 	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
-	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
-				 backend->bridge_readback);
 	GLenum error = glGetError();
-	glFinish();
 	glDisableVertexAttribArray(1);
 	glDisableVertexAttribArray(0);
 	glDisable(GL_SCISSOR_TEST);
@@ -1197,10 +1731,9 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		return false;
 	}
 
-	copy_rgba_readback_to_canvas_scaled(canvas, backend->bridge_readback, width,
-										height);
+	backend->bridge_pending_readback = true;
 	snprintf(backend->status, sizeof(backend->status),
-			 "GPU bridge textured draw %d vertices at %dx%d -> %ux%u",
+			 "GPU bridge queued textured %d vertices at %dx%d -> %ux%u",
 			 vertex_count, width, height, canvas->width, canvas->height);
 	return true;
 #endif
@@ -1997,7 +2530,7 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 	if (info_log && info_log_size > 0)
 		info_log[0] = '\0';
 #if NXJS_HAS_EGL_GLES
-	if (!backend || !backend->bridge_enabled || !source)
+	if (!backend || !source)
 		return false;
 	if (!nx_webgl_egl_initialize(backend, canvas))
 		return false;
@@ -2074,8 +2607,7 @@ bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 	if (info_log && info_log_size > 0)
 		info_log[0] = '\0';
 #if NXJS_HAS_EGL_GLES
-	if (!backend || !backend->bridge_enabled || !vertex_shader_handle ||
-		!fragment_shader_handle)
+	if (!backend || !vertex_shader_handle || !fragment_shader_handle)
 		return false;
 	if (!nx_webgl_egl_initialize(backend, canvas))
 		return false;
@@ -2102,6 +2634,14 @@ bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 
 	glAttachShader(handle, (GLuint)vertex_shader_handle);
 	glAttachShader(handle, (GLuint)fragment_shader_handle);
+	// The runtime's bridge draw paths read the position attribute from
+	// vertex_attribs[0], so pin "position" to location 0 in every linked
+	// program. GLES linkers otherwise free-assign attribute locations, which
+	// breaks any time another used attribute (e.g. "color" with vertexColors:
+	// true) gets put at 0 instead. Other attribute names are tracked
+	// per-program via getAttribLocation reflection (see color_attrib_index /
+	// line_distance_attrib_index in webgl.c).
+	glBindAttribLocation(handle, 0, "position");
 	glLinkProgram(handle);
 
 	GLint ok = GL_FALSE;
@@ -2140,5 +2680,99 @@ void nx_webgl_egl_delete_program(nx_webgl_egl_t *backend,
 #else
 	(void)backend;
 	(void)program_handle;
+#endif
+}
+
+int nx_webgl_egl_get_attrib_location(nx_webgl_egl_t *backend,
+									uint32_t program_handle,
+									const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available || !name)
+		return -1;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return -1;
+	return glGetAttribLocation((GLuint)program_handle, name);
+#else
+	(void)backend;
+	(void)program_handle;
+	(void)name;
+	return -1;
+#endif
+}
+
+int nx_webgl_egl_get_uniform_location(nx_webgl_egl_t *backend,
+									 uint32_t program_handle,
+									 const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available || !name)
+		return -1;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return -1;
+	return glGetUniformLocation((GLuint)program_handle, name);
+#else
+	(void)backend;
+	(void)program_handle;
+	(void)name;
+	return -1;
+#endif
+}
+
+bool nx_webgl_egl_get_active_attrib(nx_webgl_egl_t *backend,
+									uint32_t program_handle,
+									uint32_t index,
+									char *name,
+									size_t name_size,
+									int *size,
+									uint32_t *type) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available || !name ||
+		name_size == 0)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return false;
+	glGetActiveAttrib((GLuint)program_handle, index, (GLsizei)name_size, NULL,
+					  (GLint *)size, (GLenum *)type, name);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend;
+	(void)program_handle;
+	(void)index;
+	(void)name;
+	(void)name_size;
+	(void)size;
+	(void)type;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_get_active_uniform(nx_webgl_egl_t *backend,
+									 uint32_t program_handle,
+									 uint32_t index,
+									 char *name,
+									 size_t name_size,
+									 int *size,
+									 uint32_t *type) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available || !name ||
+		name_size == 0)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return false;
+	glGetActiveUniform((GLuint)program_handle, index, (GLsizei)name_size, NULL,
+					   (GLint *)size, (GLenum *)type, name);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend;
+	(void)program_handle;
+	(void)index;
+	(void)name;
+	(void)name_size;
+	(void)size;
+	(void)type;
+	return false;
 #endif
 }

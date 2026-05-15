@@ -100,6 +100,10 @@ export class WebGLRenderingContext {
 	declare readonly INVALID_ENUM: number;
 	declare readonly INVALID_VALUE: number;
 	declare readonly INVALID_OPERATION: number;
+	declare readonly POINTS: number;
+	declare readonly LINES: number;
+	declare readonly LINE_LOOP: number;
+	declare readonly LINE_STRIP: number;
 	declare readonly TRIANGLES: number;
 	declare readonly ZERO: number;
 	declare readonly ONE: number;

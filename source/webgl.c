@@ -12,6 +12,10 @@
 #define GL_INVALID_ENUM 0x0500
 #define GL_INVALID_VALUE 0x0501
 #define GL_INVALID_OPERATION 0x0502
+#define GL_POINTS 0x0000
+#define GL_LINES 0x0001
+#define GL_LINE_LOOP 0x0002
+#define GL_LINE_STRIP 0x0003
 #define GL_TRIANGLES 0x0004
 #define GL_ZERO 0
 #define GL_ONE 1
@@ -254,6 +258,13 @@ typedef struct {
 	float model_view_matrix[16];
 	float color[4];
 	float offset[2];
+	float line_scale;
+	float line_dash_size;
+	float line_total_size;
+	int line_distance_attrib_index;
+	int color_attrib_index;
+	int position_attrib_index;
+	int uv_attrib_index;
 	bool has_matrix4;
 	bool has_projection_matrix;
 	bool has_model_view_matrix;
@@ -261,6 +272,13 @@ typedef struct {
 	bool has_offset;
 	int sampler0;
 	bool has_sampler0;
+	bool has_line_scale;
+	bool has_line_dash_size;
+	bool has_line_total_size;
+	bool has_line_distance_attrib_index;
+	bool has_color_attrib_index;
+	bool has_position_attrib_index;
+	bool has_uv_attrib_index;
 	bool link_status;
 	bool gles_link_attempted;
 	bool deleted;
@@ -321,12 +339,16 @@ typedef enum {
 	NX_WEBGL_UNIFORM_OPACITY,
 	NX_WEBGL_UNIFORM_OFFSET,
 	NX_WEBGL_UNIFORM_SAMPLER,
+	NX_WEBGL_UNIFORM_LINE_SCALE,
+	NX_WEBGL_UNIFORM_LINE_DASH_SIZE,
+	NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE,
 } nx_webgl_uniform_kind_t;
 
 typedef struct {
 	JSValue program;
 	char *name;
 	nx_webgl_uniform_kind_t kind;
+	int location;
 } nx_webgl_uniform_location_t;
 
 typedef struct {
@@ -346,6 +368,7 @@ static const nx_webgl_active_info_t active_attributes[] = {
 	{"position", 1, GL_FLOAT_VEC3},
 	{"color", 1, GL_FLOAT_VEC4},
 	{"uv", 1, GL_FLOAT_VEC2},
+	{"lineDistance", 1, GL_FLOAT},
 };
 
 static const nx_webgl_active_info_t active_uniforms[] = {
@@ -354,6 +377,9 @@ static const nx_webgl_active_info_t active_uniforms[] = {
 	{"diffuse", 1, GL_FLOAT_VEC3},
 	{"opacity", 1, GL_FLOAT},
 	{"map", 1, GL_SAMPLER_2D},
+	{"scale", 1, GL_FLOAT},
+	{"dashSize", 1, GL_FLOAT},
+	{"totalSize", 1, GL_FLOAT},
 	{"u_matrix", 1, GL_FLOAT_MAT4},
 	{"u_color", 1, GL_FLOAT_VEC4},
 	{"u_offset", 1, GL_FLOAT_VEC2},
@@ -487,6 +513,12 @@ static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
 		strcmp(name, "u_sampler") == 0 || strcmp(name, "sampler") == 0 ||
 		strcmp(name, "map") == 0)
 		return NX_WEBGL_UNIFORM_SAMPLER;
+	if (strcmp(name, "scale") == 0)
+		return NX_WEBGL_UNIFORM_LINE_SCALE;
+	if (strcmp(name, "dashSize") == 0)
+		return NX_WEBGL_UNIFORM_LINE_DASH_SIZE;
+	if (strcmp(name, "totalSize") == 0)
+		return NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE;
 	return NX_WEBGL_UNIFORM_UNKNOWN;
 }
 
@@ -928,7 +960,23 @@ static void clear_canvas_software(nx_webgl_context_t *context) {
 }
 
 static void flush_pending_bridge_clear_to_software(nx_webgl_context_t *context) {
-	if (!context || !context->bridge_clear_pending)
+	if (!context)
+		return;
+	// If the GLES bridge accumulated draws this frame, flush them to the
+	// canvas first so software fallbacks can compose on top instead of
+	// clobbering bridge content.
+	if (context->egl && nx_webgl_egl_has_pending_readback(context->egl)) {
+		nx_canvas_t *canvas = context->canvas;
+		if (canvas) {
+			nx_webgl_egl_flush_bridge_present(context->egl, canvas);
+		}
+		// Once the bridge content is on the canvas, treat the canvas as
+		// already-cleared-and-drawn so the upcoming software draw does not
+		// erase what the bridge just produced.
+		context->bridge_clear_pending = false;
+		return;
+	}
+	if (!context->bridge_clear_pending)
 		return;
 	context->bridge_clear_pending = false;
 	clear_canvas_software(context);
@@ -957,11 +1005,23 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
-	if (nx_webgl_egl_is_bridge_enabled(context->egl) &&
+	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		// Flush any accumulated bridge draws from the previous frame so the
+		// presented canvas shows their pixels (one readback per frame instead
+		// of one per draw call).
+		if (nx_webgl_egl_has_pending_readback(context->egl)) {
+			nx_webgl_egl_flush_bridge_present(context->egl, canvas);
+		}
+		// Actually clear the GLES FBO so the new frame starts on a clean
+		// surface, honoring the user's clearColor + scissor state.
 		nx_webgl_egl_clear_bridge_with_state(
 			context->egl, canvas,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
-			context->scissor_box)) {
+			context->scissor_box,
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+		// Mark canvas as still needing a software clear in case a software
+		// fallback draw happens before any bridge draw this frame; the canvas
+		// currently holds the previous frame's bridge readback.
 		context->bridge_clear_pending = true;
 		return JS_UNDEFINED;
 	}
@@ -1206,6 +1266,13 @@ static JSValue nx_webgl_create_program(JSContext *ctx, JSValueConst this_val,
 	program->color[2] = 182.f / 255.f;
 	program->color[3] = 1.f;
 	program->sampler0 = 0;
+	program->line_scale = 1.f;
+	program->line_dash_size = 1.f;
+	program->line_total_size = 2.f;
+	program->line_distance_attrib_index = -1;
+	program->color_attrib_index = -1;
+	program->position_attrib_index = -1;
+	program->uv_attrib_index = -1;
 	JS_SetOpaque(obj, program);
 	return obj;
 }
@@ -2118,18 +2185,21 @@ static JSValue nx_webgl_uniform2f(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_OFFSET) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
 	double x;
 	double y;
 	if (JS_ToFloat64(ctx, &x, argv[1]) || JS_ToFloat64(ctx, &y, argv[2]))
 		return JS_EXCEPTION;
-	program->offset[0] = (float)x;
-	program->offset[1] = (float)y;
-	program->has_offset = true;
+
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform2f(context->egl, location->location, (float)x, (float)y);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_OFFSET) {
+		program->offset[0] = (float)x;
+		program->offset[1] = (float)y;
+		program->has_offset = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2148,16 +2218,28 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_OPACITY) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
 	double value;
 	if (JS_ToFloat64(ctx, &value, argv[1]))
 		return JS_EXCEPTION;
-	program->color[3] = (float)clamp01(value);
-	program->has_color = true;
+
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform1f(context->egl, location->location, (float)value);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_OPACITY) {
+		program->color[3] = (float)clamp01(value);
+		program->has_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LINE_SCALE) {
+		program->line_scale = (float)value;
+		program->has_line_scale = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LINE_DASH_SIZE) {
+		program->line_dash_size = (float)value;
+		program->has_line_dash_size = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE) {
+		program->line_total_size = (float)value;
+		program->has_line_total_size = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2176,20 +2258,27 @@ static JSValue nx_webgl_uniform3f(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_COLOR) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
+	float values[3];
 	for (int i = 0; i < 3; i++) {
 		double value;
 		if (JS_ToFloat64(ctx, &value, argv[i + 1]))
 			return JS_EXCEPTION;
-		program->color[i] = (float)clamp01(value);
+		values[i] = (float)value;
 	}
-	if (!program->has_color)
-		program->color[3] = 1.f;
-	program->has_color = true;
+
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform3f(context->egl, location->location, values[0], values[1], values[2]);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_COLOR) {
+		for (int i = 0; i < 3; i++) {
+			program->color[i] = clamp01(values[i]);
+		}
+		if (!program->has_color)
+			program->color[3] = 1.f;
+		program->has_color = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2241,18 +2330,25 @@ static JSValue nx_webgl_uniform4f(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_COLOR) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
+	float values[4];
 	for (int i = 0; i < 4; i++) {
 		double value;
 		if (JS_ToFloat64(ctx, &value, argv[i + 1]))
 			return JS_EXCEPTION;
-		program->color[i] = (float)clamp01(value);
+		values[i] = (float)value;
 	}
-	program->has_color = true;
+
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform4f(context->egl, location->location, values[0], values[1], values[2], values[3]);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_COLOR) {
+		for (int i = 0; i < 4; i++) {
+			program->color[i] = clamp01(values[i]);
+		}
+		program->has_color = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2313,12 +2409,6 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_MATRIX4 &&
-		location->kind != NX_WEBGL_UNIFORM_PROJECTION_MATRIX &&
-		location->kind != NX_WEBGL_UNIFORM_MODEL_VIEW_MATRIX) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
 	size_t byte_length = 0;
 	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[2]);
@@ -2327,15 +2417,23 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		return JS_UNDEFINED;
 	}
 
-	if (location->kind == NX_WEBGL_UNIFORM_PROJECTION_MATRIX) {
-		memcpy(program->projection_matrix, source, sizeof(float) * 16);
-		program->has_projection_matrix = true;
-	} else if (location->kind == NX_WEBGL_UNIFORM_MODEL_VIEW_MATRIX) {
-		memcpy(program->model_view_matrix, source, sizeof(float) * 16);
-		program->has_model_view_matrix = true;
-	} else {
-		memcpy(program->matrix4, source, sizeof(float) * 16);
-		program->has_matrix4 = true;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform_matrix4fv(context->egl, location->location, transpose, (const float *)source);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_MATRIX4 ||
+		location->kind == NX_WEBGL_UNIFORM_PROJECTION_MATRIX ||
+		location->kind == NX_WEBGL_UNIFORM_MODEL_VIEW_MATRIX) {
+		if (location->kind == NX_WEBGL_UNIFORM_PROJECTION_MATRIX) {
+			memcpy(program->projection_matrix, source, sizeof(float) * 16);
+			program->has_projection_matrix = true;
+		} else if (location->kind == NX_WEBGL_UNIFORM_MODEL_VIEW_MATRIX) {
+			memcpy(program->model_view_matrix, source, sizeof(float) * 16);
+			program->has_model_view_matrix = true;
+		} else {
+			memcpy(program->matrix4, source, sizeof(float) * 16);
+			program->has_matrix4 = true;
+		}
 	}
 	return JS_UNDEFINED;
 }
@@ -2362,13 +2460,45 @@ static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
 		return JS_EXCEPTION;
 
 	int32_t location = -1;
-	if (strcmp(name, "position") == 0 || strcmp(name, "a_position") == 0)
-		location = 0;
-	else if (strcmp(name, "color") == 0 || strcmp(name, "a_color") == 0)
-		location = 1;
-	else if (strcmp(name, "texcoord") == 0 || strcmp(name, "texCoord") == 0 ||
-			 strcmp(name, "uv") == 0 || strcmp(name, "a_uv") == 0)
-		location = 2;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle) {
+		location = nx_webgl_egl_get_attrib_location(context->egl,
+													program->gles_handle, name);
+	} else {
+		if (strcmp(name, "position") == 0 || strcmp(name, "a_position") == 0)
+			location = 0;
+		else if (strcmp(name, "color") == 0 || strcmp(name, "a_color") == 0)
+			location = 1;
+		else if (strcmp(name, "texcoord") == 0 || strcmp(name, "texCoord") == 0 ||
+				 strcmp(name, "uv") == 0 || strcmp(name, "a_uv") == 0)
+			location = 2;
+		else if (strcmp(name, "lineDistance") == 0 ||
+				 strcmp(name, "a_lineDistance") == 0)
+			location = 3;
+	}
+
+	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
+		(strcmp(name, "lineDistance") == 0 ||
+		 strcmp(name, "a_lineDistance") == 0)) {
+		program->line_distance_attrib_index = location;
+		program->has_line_distance_attrib_index = true;
+	}
+	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
+		(strcmp(name, "color") == 0 || strcmp(name, "a_color") == 0)) {
+		program->color_attrib_index = location;
+		program->has_color_attrib_index = true;
+	}
+	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
+		(strcmp(name, "position") == 0 || strcmp(name, "a_position") == 0)) {
+		program->position_attrib_index = location;
+		program->has_position_attrib_index = true;
+	}
+	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
+		(strcmp(name, "uv") == 0 || strcmp(name, "a_uv") == 0 ||
+		 strcmp(name, "texcoord") == 0 || strcmp(name, "texCoord") == 0)) {
+		program->uv_attrib_index = location;
+		program->has_uv_attrib_index = true;
+	}
 
 	JS_FreeCString(ctx, name);
 	return JS_NewInt32(ctx, location);
@@ -2499,6 +2629,23 @@ static bool read_attrib_vec3(nx_webgl_context_t *context,
 	if (attrib->size >= 3 && offset + sizeof(float) * 3 <= buffer->size)
 		memcpy(&out->z, buffer->data + offset + sizeof(float) * 2,
 			   sizeof(float));
+	return true;
+}
+
+static bool read_attrib_float(nx_webgl_context_t *context,
+							  nx_webgl_vertex_attrib_t *attrib,
+							  int vertex_index, float *out) {
+	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(attrib->buffer);
+	if (!buffer || buffer->deleted || !buffer->data)
+		return false;
+
+	int stride = attrib->stride == 0 ? attrib->size * (int)sizeof(float)
+									 : attrib->stride;
+	size_t offset = (size_t)attrib->offset + (size_t)vertex_index * stride;
+	if (offset + sizeof(float) > buffer->size)
+		return false;
+
+	memcpy(out, buffer->data + offset, sizeof(float));
 	return true;
 }
 
@@ -3000,9 +3147,9 @@ static bool draw_indexed_textured_triangles_bridge(
 		return false;
 
 	int vertex_count = count;
-	float *clip_uv =
-		js_malloc(ctx, (size_t)vertex_count * 4 * sizeof(float));
-	if (!clip_uv)
+	float *clip_xyzuv =
+		js_malloc(ctx, (size_t)vertex_count * 5 * sizeof(float));
+	if (!clip_xyzuv)
 		return false;
 
 	bool loaded = true;
@@ -3014,26 +3161,28 @@ static bool draw_indexed_textured_triangles_bridge(
 			loaded = false;
 			break;
 		}
-		nx_webgl_vec2_t clip = transform_position3(program, position3);
-		int out = i * 4;
-		clip_uv[out + 0] = clip.x;
-		clip_uv[out + 1] = clip.y;
-		clip_uv[out + 2] = uv.x;
-		clip_uv[out + 3] = uv.y;
+		nx_webgl_vec3_t clip = transform_position3_depth(program, position3);
+		int out = i * 5;
+		clip_xyzuv[out + 0] = clip.x;
+		clip_xyzuv[out + 1] = clip.y;
+		clip_xyzuv[out + 2] = clip.z;
+		clip_xyzuv[out + 3] = uv.x;
+		clip_xyzuv[out + 4] = uv.y;
 	}
 
 	bool drew = false;
 	if (loaded) {
 		drew = nx_webgl_egl_draw_textured_triangles_bridge(
-			context->egl, context->canvas, clip_uv, vertex_count,
+			context->egl, context->canvas, clip_xyzuv, vertex_count,
 			texture->bridge_id, texture->revision, (int)texture->width,
 			(int)texture->height, texture->data, texture->min_filter,
 			texture->mag_filter, texture->wrap_s, texture->wrap_t, blend,
 			context->blend_src, context->blend_dst, context->viewport,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
-			context->scissor_box);
+			context->scissor_box,
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
 	}
-	js_free(ctx, clip_uv);
+	js_free(ctx, clip_xyzuv);
 	return drew;
 }
 
@@ -3046,10 +3195,30 @@ static bool draw_indexed_triangles_bridge(
 		return false;
 
 	int vertex_count = count;
-	float *clip_xy =
-		js_malloc(ctx, (size_t)vertex_count * 2 * sizeof(float));
-	if (!clip_xy)
+	int color_index = program->has_color_attrib_index
+						  ? program->color_attrib_index
+						  : 1;
+	if (color_index < 0 || color_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		color_index = 1;
+	nx_webgl_vertex_attrib_t *color_attr =
+		&context->vertex_attribs[color_index];
+	bool has_vertex_color = color_attr->enabled &&
+							color_attr->type == GL_FLOAT &&
+							color_attr->size >= 3;
+
+	float *clip_xyz =
+		js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+	if (!clip_xyz)
 		return false;
+	float *vertex_color_data = NULL;
+	if (has_vertex_color) {
+		vertex_color_data =
+			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+		if (!vertex_color_data) {
+			js_free(ctx, clip_xyz);
+			return false;
+		}
+	}
 
 	bool loaded = true;
 	for (int i = 0; i < vertex_count; i++) {
@@ -3058,9 +3227,20 @@ static bool draw_indexed_triangles_bridge(
 			loaded = false;
 			break;
 		}
-		nx_webgl_vec2_t clip = transform_position3(program, position3);
-		clip_xy[i * 2 + 0] = clip.x;
-		clip_xy[i * 2 + 1] = clip.y;
+		nx_webgl_vec3_t clip = transform_position3_depth(program, position3);
+		clip_xyz[i * 3 + 0] = clip.x;
+		clip_xyz[i * 3 + 1] = clip.y;
+		clip_xyz[i * 3 + 2] = clip.z;
+		if (has_vertex_color) {
+			nx_webgl_vec3_t col;
+			if (!read_attrib_vec3(context, color_attr, indices[i], &col)) {
+				loaded = false;
+				break;
+			}
+			vertex_color_data[i * 3 + 0] = col.x;
+			vertex_color_data[i * 3 + 1] = col.y;
+			vertex_color_data[i * 3 + 2] = col.z;
+		}
 	}
 
 	bool drew = false;
@@ -3072,13 +3252,150 @@ static bool draw_indexed_triangles_bridge(
 			(float)((color >> 24) & 0xff) / 255.f,
 		};
 		drew = nx_webgl_egl_draw_triangles_bridge(
-			context->egl, context->canvas, clip_xy, vertex_count, gpu_color,
-			blend, context->blend_src, context->blend_dst, context->viewport,
+			context->egl, context->canvas, clip_xyz,
+			has_vertex_color ? vertex_color_data : NULL, vertex_count,
+			gpu_color, blend, context->blend_src, context->blend_dst,
+			context->viewport,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
-			context->scissor_box);
+			context->scissor_box,
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
 	}
-	js_free(ctx, clip_xy);
+	js_free(ctx, clip_xyz);
+	js_free(ctx, vertex_color_data);
 	return drew;
+}
+
+// Software DDA line rasterizer.
+// Dashes are applied when dashed is true: a pixel is drawn only when
+//   fmod(scale * lineDistance, total_size) <= dash_size.
+// lineDistance is linearly interpolated between endpoints.
+// vc0/vc1 are optional per-vertex RGB colors; when colored == true the per-pixel
+// color is the lerp of vc0/vc1 modulated by uniform_color (0..1).
+static void rasterize_line(nx_webgl_context_t *context,
+						   nx_canvas_t *canvas, nx_webgl_vec2_t p0,
+						   nx_webgl_vec2_t p1, float d0, float d1,
+						   bool dashed, float scale, float dash_size,
+						   float total_size, uint32_t color, bool blend,
+						   uint32_t blend_src, uint32_t blend_dst,
+						   bool colored, const float *vc0, const float *vc1,
+						   const float *uniform_color) {
+	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
+		return;
+
+	int clip_min_x = 0;
+	int clip_min_y = 0;
+	int clip_max_x = (int)canvas->width - 1;
+	int clip_max_y = (int)canvas->height - 1;
+	if ((context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0) {
+		clip_min_x = clamp_int(context->scissor_box[0], 0,
+							   (int)canvas->width - 1);
+		clip_min_y = clamp_int(context->scissor_box[1], 0,
+							   (int)canvas->height - 1);
+		clip_max_x = clamp_int(context->scissor_box[0] +
+								   context->scissor_box[2] - 1,
+							   0, (int)canvas->width - 1);
+		clip_max_y = clamp_int(context->scissor_box[1] +
+								   context->scissor_box[3] - 1,
+							   0, (int)canvas->height - 1);
+	}
+	if (clip_max_x < clip_min_x || clip_max_y < clip_min_y)
+		return;
+
+	float dx = p1.x - p0.x;
+	float dy = p1.y - p0.y;
+	float adx = fabsf(dx);
+	float ady = fabsf(dy);
+	float steps_f = adx > ady ? adx : ady;
+	int steps = (int)ceilf(steps_f);
+	uint32_t *pixels = (uint32_t *)canvas->data;
+	int width = (int)canvas->width;
+	float uniform_a = uniform_color ? uniform_color[3] : 1.f;
+	float uniform_r = uniform_color ? uniform_color[0] : 1.f;
+	float uniform_g = uniform_color ? uniform_color[1] : 1.f;
+	float uniform_b = uniform_color ? uniform_color[2] : 1.f;
+
+	if (steps <= 0) {
+		int xi = (int)floorf(p0.x);
+		int yi = (int)floorf(p0.y);
+		if (xi < clip_min_x || xi > clip_max_x || yi < clip_min_y ||
+			yi > clip_max_y)
+			return;
+		if (dashed && total_size > 0.f) {
+			float fd = fmodf(scale * d0, total_size);
+			if (fd < 0.f)
+				fd += total_size;
+			if (fd > dash_size)
+				return;
+		}
+		uint32_t pixel_color = color;
+		if (colored && vc0) {
+			uint8_t r = to_u8(vc0[0] * uniform_r);
+			uint8_t g = to_u8(vc0[1] * uniform_g);
+			uint8_t b = to_u8(vc0[2] * uniform_b);
+			uint8_t a = to_u8(uniform_a);
+			pixel_color = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+						  ((uint32_t)g << 8) | (uint32_t)b;
+		}
+		size_t pi = (size_t)yi * canvas->width + xi;
+		pixels[pi] = blend ? blend_pixel(pixels[pi], pixel_color, blend_src,
+										 blend_dst)
+						   : pixel_color;
+		return;
+	}
+
+	float inv_steps = 1.f / (float)steps;
+	float step_x = dx * inv_steps;
+	float step_y = dy * inv_steps;
+	float step_d = (d1 - d0) * inv_steps;
+	float fx = p0.x;
+	float fy = p0.y;
+	float fd = d0;
+	float inv_total = (dashed && total_size > 0.f) ? (1.f / total_size) : 0.f;
+	float cr0 = 0.f, cg0 = 0.f, cb0 = 0.f, dcr = 0.f, dcg = 0.f, dcb = 0.f;
+	if (colored && vc0 && vc1) {
+		cr0 = vc0[0];
+		cg0 = vc0[1];
+		cb0 = vc0[2];
+		dcr = (vc1[0] - vc0[0]) * inv_steps;
+		dcg = (vc1[1] - vc0[1]) * inv_steps;
+		dcb = (vc1[2] - vc0[2]) * inv_steps;
+	}
+
+	for (int i = 0; i <= steps; i++) {
+		int xi = (int)floorf(fx + 0.5f);
+		int yi = (int)floorf(fy + 0.5f);
+		if (xi >= clip_min_x && xi <= clip_max_x && yi >= clip_min_y &&
+			yi <= clip_max_y) {
+			bool draw = true;
+			if (dashed && total_size > 0.f) {
+				float td = scale * fd;
+				float m = td - floorf(td * inv_total) * total_size;
+				if (m > dash_size)
+					draw = false;
+			}
+			if (draw) {
+				uint32_t pixel_color = color;
+				if (colored && vc0 && vc1) {
+					uint8_t r = to_u8(cr0 * uniform_r);
+					uint8_t g = to_u8(cg0 * uniform_g);
+					uint8_t b = to_u8(cb0 * uniform_b);
+					uint8_t a = to_u8(uniform_a);
+					pixel_color = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+								  ((uint32_t)g << 8) | (uint32_t)b;
+				}
+				size_t pi = (size_t)yi * width + xi;
+				pixels[pi] = blend ? blend_pixel(pixels[pi], pixel_color,
+												 blend_src, blend_dst)
+								   : pixel_color;
+			}
+		}
+		fx += step_x;
+		fy += step_y;
+		fd += step_d;
+		cr0 += dcr;
+		cg0 += dcg;
+		cb0 += dcb;
+	}
 }
 
 static void rasterize_triangle(nx_canvas_t *canvas, nx_webgl_vec2_t v0,
@@ -3212,6 +3529,476 @@ next_pixel:
 	}
 }
 
+// Build a flat LINES-pair vertex list from any line primitive mode.
+// Returns the number of LINES-pair vertices written, or -1 on read failure.
+// clip_xy: 2 floats per vertex (clip-space x/y).
+// line_distance: 1 float per vertex when has_line_distance == true.
+// vertex_colors: 3 floats per vertex when has_vertex_color == true.
+// When indices != NULL the primitive walk reads through the index buffer
+// (drawElements path); otherwise it uses sequential indices first..first+count
+// (drawArrays path).
+static int expand_lines_to_pairs(nx_webgl_context_t *context,
+								 nx_webgl_program_t *program,
+								 nx_webgl_vertex_attrib_t *position,
+								 nx_webgl_vertex_attrib_t *line_distance_attr,
+								 bool has_line_distance,
+								 nx_webgl_vertex_attrib_t *color_attr,
+								 bool has_vertex_color, uint32_t mode,
+								 int32_t first, int32_t count,
+								 const uint16_t *indices, float *clip_xyz,
+								 float *line_distance, float *vertex_colors) {
+	int segment_count = 0;
+	if (mode == GL_LINES)
+		segment_count = count / 2;
+	else if (mode == GL_LINE_STRIP)
+		segment_count = count > 1 ? count - 1 : 0;
+	else if (mode == GL_LINE_LOOP)
+		segment_count = count > 1 ? count : 0;
+	if (segment_count <= 0)
+		return 0;
+
+	int out_vertex = 0;
+	for (int s = 0; s < segment_count; s++) {
+		int i0;
+		int i1;
+		if (mode == GL_LINES) {
+			i0 = indices ? (int)indices[s * 2]
+						 : first + s * 2;
+			i1 = indices ? (int)indices[s * 2 + 1]
+						 : i0 + 1;
+		} else if (mode == GL_LINE_STRIP) {
+			i0 = indices ? (int)indices[s]
+						 : first + s;
+			i1 = indices ? (int)indices[s + 1]
+						 : i0 + 1;
+		} else {
+			int s_next = (s + 1) % count;
+			i0 = indices ? (int)indices[s]
+						 : first + s;
+			i1 = indices ? (int)indices[s_next]
+						 : first + s_next;
+		}
+
+		nx_webgl_vec3_t pos0;
+		nx_webgl_vec3_t pos1;
+		if (!read_attrib_vec3(context, position, i0, &pos0) ||
+			!read_attrib_vec3(context, position, i1, &pos1))
+			return -1;
+		nx_webgl_vec3_t c0 = transform_position3_depth(program, pos0);
+		nx_webgl_vec3_t c1 = transform_position3_depth(program, pos1);
+		if ((c0.z < -1.f && c1.z < -1.f) || (c0.z > 1.f && c1.z > 1.f))
+			continue;
+
+		clip_xyz[out_vertex * 3 + 0] = c0.x;
+		clip_xyz[out_vertex * 3 + 1] = c0.y;
+		clip_xyz[out_vertex * 3 + 2] = c0.z;
+		clip_xyz[(out_vertex + 1) * 3 + 0] = c1.x;
+		clip_xyz[(out_vertex + 1) * 3 + 1] = c1.y;
+		clip_xyz[(out_vertex + 1) * 3 + 2] = c1.z;
+		if (has_line_distance && line_distance) {
+			float d0 = 0.f;
+			float d1 = 0.f;
+			if (!read_attrib_float(context, line_distance_attr, i0, &d0) ||
+				!read_attrib_float(context, line_distance_attr, i1, &d1))
+				return -1;
+			line_distance[out_vertex] = d0;
+			line_distance[out_vertex + 1] = d1;
+		}
+		if (has_vertex_color && vertex_colors) {
+			nx_webgl_vec3_t col0;
+			nx_webgl_vec3_t col1;
+			if (!read_attrib_vec3(context, color_attr, i0, &col0) ||
+				!read_attrib_vec3(context, color_attr, i1, &col1))
+				return -1;
+			vertex_colors[out_vertex * 3 + 0] = col0.x;
+			vertex_colors[out_vertex * 3 + 1] = col0.y;
+			vertex_colors[out_vertex * 3 + 2] = col0.z;
+			vertex_colors[(out_vertex + 1) * 3 + 0] = col1.x;
+			vertex_colors[(out_vertex + 1) * 3 + 1] = col1.y;
+			vertex_colors[(out_vertex + 1) * 3 + 2] = col1.z;
+		}
+		out_vertex += 2;
+	}
+	return out_vertex;
+}
+
+static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
+							  nx_webgl_program_t *program, uint32_t mode,
+							  int32_t first, int32_t count) {
+	int position_index = program->has_position_attrib_index
+							 ? program->position_attrib_index
+							 : 0;
+	if (position_index < 0 || position_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		position_index = 0;
+	nx_webgl_vertex_attrib_t *position =
+		&context->vertex_attribs[position_index];
+	int line_distance_index = program->has_line_distance_attrib_index
+								  ? program->line_distance_attrib_index
+								  : 3;
+	if (line_distance_index < 0 ||
+		line_distance_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		line_distance_index = 3;
+	nx_webgl_vertex_attrib_t *line_distance_attr =
+		&context->vertex_attribs[line_distance_index];
+	bool has_line_distance = line_distance_attr->enabled &&
+							 line_distance_attr->type == GL_FLOAT;
+
+	int color_index = program->has_color_attrib_index
+						  ? program->color_attrib_index
+						  : 1;
+	if (color_index < 0 || color_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		color_index = 1;
+	nx_webgl_vertex_attrib_t *color_attr =
+		&context->vertex_attribs[color_index];
+	bool has_vertex_color = color_attr->enabled &&
+							color_attr->type == GL_FLOAT &&
+							color_attr->size >= 3;
+
+	bool dashed = program->has_line_total_size && program->line_total_size > 0.f &&
+				  program->has_line_dash_size && has_line_distance;
+	float scale = program->has_line_scale ? program->line_scale : 1.f;
+	float dash_size = program->has_line_dash_size ? program->line_dash_size
+												  : 1.f;
+	float total_size = dashed && program->has_line_total_size
+						   ? program->line_total_size
+						   : 0.f;
+
+	nx_canvas_t *canvas = context->canvas;
+	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
+	uint32_t color = program_color(program);
+	float fallback_color[4] = {
+		68.f / 255.f,
+		215.f / 255.f,
+		182.f / 255.f,
+		1.f,
+	};
+	float *uniform_color = program->has_color ? program->color
+											  : fallback_color;
+
+	int max_segment_count = 0;
+	if (mode == GL_LINES)
+		max_segment_count = count / 2;
+	else if (mode == GL_LINE_STRIP)
+		max_segment_count = count > 1 ? count - 1 : 0;
+	else if (mode == GL_LINE_LOOP)
+		max_segment_count = count > 1 ? count : 0;
+	if (max_segment_count <= 0)
+		return;
+
+	int max_vertex_count = max_segment_count * 2;
+
+	// Try GPU bridge first when enabled.
+	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		float *clip_xyz =
+			js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
+		float *line_distance_data = NULL;
+		float *vertex_color_data = NULL;
+		if (clip_xyz && has_line_distance) {
+			line_distance_data =
+				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
+		}
+		if (clip_xyz && has_vertex_color) {
+			vertex_color_data =
+				js_malloc(ctx,
+						  (size_t)max_vertex_count * 3 * sizeof(float));
+		}
+		if (clip_xyz && (!has_line_distance || line_distance_data) &&
+			(!has_vertex_color || vertex_color_data)) {
+			int written = expand_lines_to_pairs(
+				context, program, position, line_distance_attr,
+				has_line_distance, color_attr, has_vertex_color, mode, first,
+				count, NULL, clip_xyz, line_distance_data, vertex_color_data);
+			if (written < 0) {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				context->error = GL_INVALID_OPERATION;
+				return;
+			}
+			if (written > 0) {
+				bool drew = nx_webgl_egl_draw_lines_bridge(
+					context->egl, canvas, clip_xyz,
+					dashed ? line_distance_data : NULL,
+					has_vertex_color ? vertex_color_data : NULL, written,
+					uniform_color, scale, dash_size, total_size, blend,
+					context->blend_src, context->blend_dst, context->viewport,
+					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+					context->scissor_box,
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				if (drew) {
+					context->bridge_clear_pending = false;
+					return;
+				}
+			} else {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				return;
+			}
+		} else {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, line_distance_data);
+			js_free(ctx, vertex_color_data);
+		}
+	}
+
+	// Software fallback path.
+	flush_pending_bridge_clear_to_software(context);
+
+	for (int s = 0; s < max_segment_count; s++) {
+		int i0;
+		int i1;
+		if (mode == GL_LINES) {
+			i0 = first + s * 2;
+			i1 = i0 + 1;
+		} else if (mode == GL_LINE_STRIP) {
+			i0 = first + s;
+			i1 = i0 + 1;
+		} else {
+			i0 = first + s;
+			i1 = first + ((s + 1) % count);
+		}
+
+		nx_webgl_vec3_t pos0;
+		nx_webgl_vec3_t pos1;
+		if (!read_attrib_vec3(context, position, i0, &pos0) ||
+			!read_attrib_vec3(context, position, i1, &pos1)) {
+			context->error = GL_INVALID_OPERATION;
+			return;
+		}
+		nx_webgl_vec3_t c0 = transform_position3_depth(program, pos0);
+		nx_webgl_vec3_t c1 = transform_position3_depth(program, pos1);
+		if ((c0.z < -1.f && c1.z < -1.f) || (c0.z > 1.f && c1.z > 1.f))
+			continue;
+		nx_webgl_vec2_t p0 = clip_to_pixel(
+			context, (nx_webgl_vec2_t){c0.x, c0.y});
+		nx_webgl_vec2_t p1 = clip_to_pixel(
+			context, (nx_webgl_vec2_t){c1.x, c1.y});
+
+		float d0 = 0.f;
+		float d1 = 0.f;
+		bool sw_dashed = dashed;
+		if (sw_dashed) {
+			if (!read_attrib_float(context, line_distance_attr, i0, &d0) ||
+				!read_attrib_float(context, line_distance_attr, i1, &d1)) {
+				sw_dashed = false;
+			}
+		}
+
+		nx_webgl_vec3_t col0 = {1.f, 1.f, 1.f};
+		nx_webgl_vec3_t col1 = {1.f, 1.f, 1.f};
+		bool sw_colored = has_vertex_color;
+		if (sw_colored) {
+			if (!read_attrib_vec3(context, color_attr, i0, &col0) ||
+				!read_attrib_vec3(context, color_attr, i1, &col1)) {
+				sw_colored = false;
+			}
+		}
+
+		float vc0[3] = {col0.x, col0.y, col0.z};
+		float vc1[3] = {col1.x, col1.y, col1.z};
+		rasterize_line(context, canvas, p0, p1, d0, d1, sw_dashed, scale,
+					   dash_size, total_size, color, blend,
+					   context->blend_src, context->blend_dst, sw_colored,
+					   sw_colored ? vc0 : NULL, sw_colored ? vc1 : NULL,
+					   uniform_color);
+	}
+
+	if (canvas->surface)
+		cairo_surface_mark_dirty(canvas->surface);
+}
+
+// Indexed-line dispatch used by gl.drawElements(LINES/LINE_STRIP/LINE_LOOP).
+// Mirrors draw_arrays_lines but reads vertex indices from the bound element
+// array buffer (Three.js's wireframe path generates this index buffer).
+static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
+								nx_webgl_program_t *program,
+								nx_webgl_vertex_attrib_t *position,
+								uint32_t mode, const uint16_t *indices,
+								int count) {
+	int line_distance_index = program->has_line_distance_attrib_index
+								  ? program->line_distance_attrib_index
+								  : 3;
+	if (line_distance_index < 0 ||
+		line_distance_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		line_distance_index = 3;
+	nx_webgl_vertex_attrib_t *line_distance_attr =
+		&context->vertex_attribs[line_distance_index];
+	bool has_line_distance = line_distance_attr->enabled &&
+							 line_distance_attr->type == GL_FLOAT;
+
+	int color_index = program->has_color_attrib_index
+						  ? program->color_attrib_index
+						  : 1;
+	if (color_index < 0 || color_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		color_index = 1;
+	nx_webgl_vertex_attrib_t *color_attr =
+		&context->vertex_attribs[color_index];
+	bool has_vertex_color = color_attr->enabled &&
+							color_attr->type == GL_FLOAT &&
+							color_attr->size >= 3;
+
+	bool dashed = program->has_line_total_size && program->line_total_size > 0.f &&
+				  program->has_line_dash_size && has_line_distance;
+	float scale = program->has_line_scale ? program->line_scale : 1.f;
+	float dash_size = program->has_line_dash_size ? program->line_dash_size
+												  : 1.f;
+	float total_size = dashed && program->has_line_total_size
+						   ? program->line_total_size
+						   : 0.f;
+
+	nx_canvas_t *canvas = context->canvas;
+	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
+	uint32_t color = program_color(program);
+	float fallback_color[4] = {
+		68.f / 255.f,
+		215.f / 255.f,
+		182.f / 255.f,
+		1.f,
+	};
+	float *uniform_color = program->has_color ? program->color
+											  : fallback_color;
+
+	int max_segment_count = 0;
+	if (mode == GL_LINES)
+		max_segment_count = count / 2;
+	else if (mode == GL_LINE_STRIP)
+		max_segment_count = count > 1 ? count - 1 : 0;
+	else if (mode == GL_LINE_LOOP)
+		max_segment_count = count > 1 ? count : 0;
+	if (max_segment_count <= 0)
+		return;
+
+	int max_vertex_count = max_segment_count * 2;
+
+	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		float *clip_xyz =
+			js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
+		float *line_distance_data = NULL;
+		float *vertex_color_data = NULL;
+		if (clip_xyz && has_line_distance) {
+			line_distance_data =
+				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
+		}
+		if (clip_xyz && has_vertex_color) {
+			vertex_color_data =
+				js_malloc(ctx,
+						  (size_t)max_vertex_count * 3 * sizeof(float));
+		}
+		if (clip_xyz && (!has_line_distance || line_distance_data) &&
+			(!has_vertex_color || vertex_color_data)) {
+			int written = expand_lines_to_pairs(
+				context, program, position, line_distance_attr,
+				has_line_distance, color_attr, has_vertex_color, mode,
+				0, count, indices, clip_xyz, line_distance_data,
+				vertex_color_data);
+			if (written < 0) {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				context->error = GL_INVALID_OPERATION;
+				return;
+			}
+			if (written > 0) {
+				bool drew = nx_webgl_egl_draw_lines_bridge(
+					context->egl, canvas, clip_xyz,
+					dashed ? line_distance_data : NULL,
+					has_vertex_color ? vertex_color_data : NULL, written,
+					uniform_color, scale, dash_size, total_size, blend,
+					context->blend_src, context->blend_dst, context->viewport,
+					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+					context->scissor_box,
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				if (drew) {
+					context->bridge_clear_pending = false;
+					return;
+				}
+			} else {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, line_distance_data);
+				js_free(ctx, vertex_color_data);
+				return;
+			}
+		} else {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, line_distance_data);
+			js_free(ctx, vertex_color_data);
+		}
+	}
+
+	// Software fallback.
+	flush_pending_bridge_clear_to_software(context);
+
+	for (int s = 0; s < max_segment_count; s++) {
+		int i0;
+		int i1;
+		if (mode == GL_LINES) {
+			i0 = indices[s * 2];
+			i1 = indices[s * 2 + 1];
+		} else if (mode == GL_LINE_STRIP) {
+			i0 = indices[s];
+			i1 = indices[s + 1];
+		} else {
+			int s_next = (s + 1) % count;
+			i0 = indices[s];
+			i1 = indices[s_next];
+		}
+
+		nx_webgl_vec3_t pos0;
+		nx_webgl_vec3_t pos1;
+		if (!read_attrib_vec3(context, position, i0, &pos0) ||
+			!read_attrib_vec3(context, position, i1, &pos1)) {
+			context->error = GL_INVALID_OPERATION;
+			return;
+		}
+		nx_webgl_vec3_t c0 = transform_position3_depth(program, pos0);
+		nx_webgl_vec3_t c1 = transform_position3_depth(program, pos1);
+		if ((c0.z < -1.f && c1.z < -1.f) || (c0.z > 1.f && c1.z > 1.f))
+			continue;
+		nx_webgl_vec2_t p0 = clip_to_pixel(
+			context, (nx_webgl_vec2_t){c0.x, c0.y});
+		nx_webgl_vec2_t p1 = clip_to_pixel(
+			context, (nx_webgl_vec2_t){c1.x, c1.y});
+
+		float d0 = 0.f;
+		float d1 = 0.f;
+		bool sw_dashed = dashed;
+		if (sw_dashed) {
+			if (!read_attrib_float(context, line_distance_attr, i0, &d0) ||
+				!read_attrib_float(context, line_distance_attr, i1, &d1)) {
+				sw_dashed = false;
+			}
+		}
+
+		nx_webgl_vec3_t col0 = {1.f, 1.f, 1.f};
+		nx_webgl_vec3_t col1 = {1.f, 1.f, 1.f};
+		bool sw_colored = has_vertex_color;
+		if (sw_colored) {
+			if (!read_attrib_vec3(context, color_attr, i0, &col0) ||
+				!read_attrib_vec3(context, color_attr, i1, &col1)) {
+				sw_colored = false;
+			}
+		}
+
+		float vc0[3] = {col0.x, col0.y, col0.z};
+		float vc1[3] = {col1.x, col1.y, col1.z};
+		rasterize_line(context, canvas, p0, p1, d0, d1, sw_dashed, scale,
+					   dash_size, total_size, color, blend,
+					   context->blend_src, context->blend_dst, sw_colored,
+					   sw_colored ? vc0 : NULL, sw_colored ? vc1 : NULL,
+					   uniform_color);
+	}
+
+	if (canvas->surface)
+		cairo_surface_mark_dirty(canvas->surface);
+}
+
 static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 									int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -3225,7 +4012,8 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		JS_ToInt32(ctx, &count, argv[2]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES) {
+	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
+		mode != GL_LINE_LOOP) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -3242,7 +4030,13 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
-	nx_webgl_vertex_attrib_t *position = &context->vertex_attribs[0];
+	int position_index = program->has_position_attrib_index
+							 ? program->position_attrib_index
+							 : 0;
+	if (position_index < 0 || position_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		position_index = 0;
+	nx_webgl_vertex_attrib_t *position =
+		&context->vertex_attribs[position_index];
 	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
@@ -3252,8 +4046,16 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
+	if (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) {
+		draw_arrays_lines(ctx, context, program, mode, first, count);
+		return JS_UNDEFINED;
+	}
+
 	nx_webgl_texture_t *texture = active_texture_for_program(context, program);
-	nx_webgl_vertex_attrib_t *texcoord = &context->vertex_attribs[2];
+	int uv_index = program->has_uv_attrib_index ? program->uv_attrib_index : 2;
+	if (uv_index < 0 || uv_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		uv_index = 2;
+	nx_webgl_vertex_attrib_t *texcoord = &context->vertex_attribs[uv_index];
 	bool use_texture = texture && texcoord->enabled && texcoord->type == GL_FLOAT &&
 					   texcoord->size >= 2;
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
@@ -3264,9 +4066,25 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 
 	if (nx_webgl_egl_is_bridge_enabled(context->egl) && !use_texture) {
 		int vertex_count = triangle_count * 3;
-		float *clip_xy =
-			js_malloc(ctx, (size_t)vertex_count * 2 * sizeof(float));
-		if (clip_xy) {
+		int color_index = program->has_color_attrib_index
+							  ? program->color_attrib_index
+							  : 1;
+		if (color_index < 0 || color_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+			color_index = 1;
+		nx_webgl_vertex_attrib_t *color_attr =
+			&context->vertex_attribs[color_index];
+		bool has_vertex_color = color_attr->enabled &&
+								color_attr->type == GL_FLOAT &&
+								color_attr->size >= 3;
+
+		float *clip_xyz =
+			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+		float *vertex_color_data = NULL;
+		if (clip_xyz && has_vertex_color) {
+			vertex_color_data =
+				js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+		}
+		if (clip_xyz && (!has_vertex_color || vertex_color_data)) {
 			bool loaded = true;
 			for (int i = 0; i < vertex_count; i++) {
 				int vertex_index = first + i;
@@ -3276,12 +4094,26 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 					loaded = false;
 					break;
 				}
-				nx_webgl_vec2_t clip = transform_position3(program, position3);
-				clip_xy[i * 2 + 0] = clip.x;
-				clip_xy[i * 2 + 1] = clip.y;
+				nx_webgl_vec3_t clip =
+					transform_position3_depth(program, position3);
+				clip_xyz[i * 3 + 0] = clip.x;
+				clip_xyz[i * 3 + 1] = clip.y;
+				clip_xyz[i * 3 + 2] = clip.z;
+				if (has_vertex_color) {
+					nx_webgl_vec3_t col;
+					if (!read_attrib_vec3(context, color_attr, vertex_index,
+										  &col)) {
+						loaded = false;
+						break;
+					}
+					vertex_color_data[i * 3 + 0] = col.x;
+					vertex_color_data[i * 3 + 1] = col.y;
+					vertex_color_data[i * 3 + 2] = col.z;
+				}
 			}
 			if (!loaded) {
-				js_free(ctx, clip_xy);
+				js_free(ctx, clip_xyz);
+				js_free(ctx, vertex_color_data);
 				context->error = GL_INVALID_OPERATION;
 				return JS_UNDEFINED;
 			}
@@ -3294,15 +4126,22 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			float *gpu_color = program->has_color ? program->color
 												  : fallback_color;
 			bool drew = nx_webgl_egl_draw_triangles_bridge(
-				context->egl, canvas, clip_xy, vertex_count, gpu_color, blend,
-				context->blend_src, context->blend_dst, context->viewport,
+				context->egl, canvas, clip_xyz,
+				has_vertex_color ? vertex_color_data : NULL, vertex_count,
+				gpu_color, blend, context->blend_src, context->blend_dst,
+				context->viewport,
 				(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
-				context->scissor_box);
-			js_free(ctx, clip_xy);
+				context->scissor_box,
+				(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+			js_free(ctx, clip_xyz);
+			js_free(ctx, vertex_color_data);
 			if (drew) {
 				context->bridge_clear_pending = false;
 				return JS_UNDEFINED;
 			}
+		} else {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, vertex_color_data);
 		}
 	}
 
@@ -3360,7 +4199,8 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &type, argv[2]) || JS_ToInt32(ctx, &offset, argv[3]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES) {
+	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
+		mode != GL_LINE_LOOP) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -3381,7 +4221,13 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
-	nx_webgl_vertex_attrib_t *position = &context->vertex_attribs[0];
+	int position_index = program->has_position_attrib_index
+							 ? program->position_attrib_index
+							 : 0;
+	if (position_index < 0 || position_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		position_index = 0;
+	nx_webgl_vertex_attrib_t *position =
+		&context->vertex_attribs[position_index];
 	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
@@ -3403,12 +4249,22 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
+	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
+
+	if (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) {
+		draw_elements_lines(ctx, context, program, position, mode, indices,
+							count);
+		return JS_UNDEFINED;
+	}
+
 	nx_webgl_texture_t *texture = active_texture_for_program(context, program);
-	nx_webgl_vertex_attrib_t *texcoord = &context->vertex_attribs[2];
+	int uv_index = program->has_uv_attrib_index ? program->uv_attrib_index : 2;
+	if (uv_index < 0 || uv_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		uv_index = 2;
+	nx_webgl_vertex_attrib_t *texcoord = &context->vertex_attribs[uv_index];
 	bool use_texture = texture && texcoord->enabled && texcoord->type == GL_FLOAT &&
 					   texcoord->size >= 2;
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
-	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
 	uint32_t color = program_color(program);
 	if (!use_texture &&
 		draw_indexed_triangles_bridge(ctx, context, program, position, indices,
@@ -4207,6 +5063,10 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "INVALID_ENUM", GL_INVALID_ENUM);
 	define_constant(ctx, proto, "INVALID_VALUE", GL_INVALID_VALUE);
 	define_constant(ctx, proto, "INVALID_OPERATION", GL_INVALID_OPERATION);
+	define_constant(ctx, proto, "POINTS", GL_POINTS);
+	define_constant(ctx, proto, "LINES", GL_LINES);
+	define_constant(ctx, proto, "LINE_LOOP", GL_LINE_LOOP);
+	define_constant(ctx, proto, "LINE_STRIP", GL_LINE_STRIP);
 	define_constant(ctx, proto, "TRIANGLES", GL_TRIANGLES);
 	define_constant(ctx, proto, "ZERO", GL_ZERO);
 	define_constant(ctx, proto, "ONE", GL_ONE);
