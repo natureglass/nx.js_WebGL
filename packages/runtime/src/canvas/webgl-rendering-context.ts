@@ -560,6 +560,18 @@ export class WebGLRenderingContext {
 		stub();
 	}
 
+	readPixels(
+		x: number,
+		y: number,
+		width: number,
+		height: number,
+		format: number,
+		type: number,
+		pixels: ArrayBufferView,
+	): void {
+		stub();
+	}
+
 	getParameter(pname: number): unknown {
 		stub();
 	}

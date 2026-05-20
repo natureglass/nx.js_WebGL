@@ -14,6 +14,12 @@
 
 #define NX_WEBGL_EGL_TEXTURE_CACHE_SIZE 32
 
+// Soft limit for the per-program active-attribute mask used by the
+// passthrough dispatch. Matches the implementation-wide
+// NX_WEBGL_MAX_VERTEX_ATTRIBS (8) but kept self-contained here so
+// webgl_egl.c doesn't have to pull in webgl.c's internal headers.
+#define NX_WEBGL_MAX_VERTEX_ATTRIBS_LIMIT 16
+
 typedef struct {
 	uint32_t texture_id;
 	uint32_t revision;
@@ -64,18 +70,180 @@ GLuint bridge_color_program;
 	GLuint bridge_line_distance_buffer;
 	GLuint bridge_line_color_buffer;
 	GLuint bridge_triangle_color_buffer;
+	// Shared by all three bridge programs (color, texture, line). Each draw
+	// re-uploads to it before glDrawArrays, so cross-program reuse is safe.
+	GLuint bridge_fog_depth_buffer;
+	// Shared between bridge_color_program and bridge_texture_program for
+	// per-vertex view-space normals (lighting). Lines don't use lighting.
+	GLuint bridge_normal_buffer;
+	// Shared between bridge_color_program and bridge_texture_program for
+	// per-vertex view-space positions (point-light direction calc).
+	GLuint bridge_view_position_buffer;
 	GLint bridge_line_color_loc;
 	GLint bridge_line_scale_loc;
 	GLint bridge_line_dash_loc;
 	GLint bridge_line_total_loc;
+	GLint bridge_line_fog_enabled_loc;
+	GLint bridge_line_fog_color_loc;
+	GLint bridge_line_fog_near_loc;
+	GLint bridge_line_fog_far_loc;
 	GLint bridge_color_color_loc;
+	GLint bridge_color_fog_enabled_loc;
+	GLint bridge_color_fog_color_loc;
+	GLint bridge_color_fog_near_loc;
+	GLint bridge_color_fog_far_loc;
+	GLint bridge_color_lighting_enabled_loc;
+	GLint bridge_color_light_direction_loc;
+	GLint bridge_color_light_color_loc;
+	GLint bridge_color_ambient_light_color_loc;
+	GLint bridge_color_point_light_enabled_loc;
+	GLint bridge_color_point_light_position_loc;
+	GLint bridge_color_point_light_color_loc;
+	GLint bridge_color_point_light_distance_loc;
+	GLint bridge_color_point_light_decay_loc;
+	GLint bridge_color_light2_enabled_loc;
+	GLint bridge_color_light_direction2_loc;
+	GLint bridge_color_light_color2_loc;
+	GLint bridge_color_fog_density_loc;
+	GLint bridge_color_fog_exp2_enabled_loc;
 	GLint bridge_texture_sampler_loc;
+	GLint bridge_texture_fog_enabled_loc;
+	GLint bridge_texture_fog_color_loc;
+	GLint bridge_texture_fog_near_loc;
+	GLint bridge_texture_fog_far_loc;
+	GLint bridge_texture_lighting_enabled_loc;
+	GLint bridge_texture_light_direction_loc;
+	GLint bridge_texture_light_color_loc;
+	GLint bridge_texture_ambient_light_color_loc;
+	GLint bridge_texture_point_light_enabled_loc;
+	GLint bridge_texture_point_light_position_loc;
+	GLint bridge_texture_point_light_color_loc;
+	GLint bridge_texture_point_light_distance_loc;
+	GLint bridge_texture_point_light_decay_loc;
+	GLint bridge_texture_light2_enabled_loc;
+	GLint bridge_texture_light_direction2_loc;
+	GLint bridge_texture_light_color2_loc;
+	GLint bridge_texture_fog_density_loc;
+	GLint bridge_texture_fog_exp2_enabled_loc;
+	GLint bridge_texture_map_transform_loc;
+	GLint bridge_texture_map_transform_enabled_loc;
+	GLint bridge_texture_diffuse_loc;
+	GLint bridge_texture_specular_enabled_loc;
+	GLint bridge_texture_specular_loc;
+	GLint bridge_texture_emissive_loc;
+	GLint bridge_texture_shininess_loc;
+	GLint bridge_color_specular_enabled_loc;
+	GLint bridge_color_specular_loc;
+	GLint bridge_color_emissive_loc;
+	GLint bridge_color_shininess_loc;
+	// OES_standard_derivatives derivative-normals fallback (milestone #16).
+	// When `lighting_enabled && !has_normals`, the dispatch sets
+	// `u_useDerivativeNormals = 1` and the fragment shader computes
+	// per-fragment normals via `normalize(cross(dFdx(v_viewPosition),
+	// dFdy(v_viewPosition)))` instead of `normalize(v_normal)`. Closes
+	// the [[bridge-flatshading-gap]] for `flatShading: true` materials
+	// (Three.js's optimizer drops the `normal` attribute in that mode).
+	GLint bridge_color_use_derivative_normals_loc;
+	GLint bridge_texture_use_derivative_normals_loc;
+	// Temporary diagnostic: webgl.c dispatch sites write per-draw state
+	// here so JS can read via gl.getBackendInfo().debugDispatchState.
+	char debug_dispatch_state[512];
 	bool bridge_pending_readback;
+	// Set to true on each bridge clear (and on first bridge init) to signal
+	// that the next textured-triangle draw is the "first textured draw of the
+	// frame" — the GPU pipeline state hasn't fully validated yet, and the
+	// first 1-2 primitives of that draw render with corrupted varying
+	// interpolation (the entire face samples one near-white texel; previously
+	// surfaced as the "one face white" bug on the Three.js r162 cube demo).
+	// The textured-draw path consumes this flag by issuing a color/depth-
+	// masked warmup drawArrays(0,3) ahead of the real draw — invisible, but
+	// it absorbs the corrupted output. See [[bridge-first-textured-draw-lost]].
+	bool bridge_pending_textured_warmup;
+	// When false, suppress the automatic `flush_bridge_present` that
+	// normally fires on `gl.clear` if pending=true. Clients that drive
+	// readback explicitly via `gl.readPixels` (inline-canvas WebGL, the
+	// canvas-runner in switch-web-browser) don't need it — the auto-
+	// flush would do a redundant 1280×720 readback + write-to-screen
+	// every frame, slow and visibly flashing on the first frame before
+	// the page paint covers it. Defaults to true for back-compat with
+	// the GpuCompositor pattern.
+	bool bridge_auto_flush_enabled;
+	// Tracks whether the auto-flush flag has been explicitly written by
+	// either side (the initial default-on at first `set_bridge_enabled(true)`
+	// counts, as does a later `setBridgeAutoFlush(...)`). Without this, a
+	// re-call of `enableGpuBridgePrototype(true)` from a different page
+	// can't distinguish "client opted out" from "never set" and silently
+	// re-defaults to TRUE, undoing the swb runner's explicit
+	// `setBridgeAutoFlush(false)`. The user-visible symptom is the
+	// bridge FBO getting painted to the screen at (0,0) on every
+	// `gl.clear`, which after navigating BACK from a page that called
+	// `enableGpuBridgePrototype` shows up as a ghost copy of the new
+	// page's WebGL canvas at the top-left.
+	bool bridge_auto_flush_initialized;
 	uint32_t bridge_last_draw_gl_error;
 	GLuint bridge_vertex_buffer;
 	uint8_t *bridge_readback;
 	size_t bridge_readback_size;
+	// Tessellation-fix scaffolding for the Tegra X1 TBR per-tile
+	// interpolator coherency bug ([[threejs-cube-white-face]]). When
+	// enabled, the bridge subdivides large screen-space triangles
+	// (recursive midpoint, 4 children per level) before drawing.
+	// `tessellation_scratch` is a persistent grow-only float buffer
+	// reused each draw to hold the subdivided vertex stream
+	// (interleaved position+UV, or position-only depending on the path).
+	//
+	// IMPORTANT: This workaround does NOT currently fix the bug — the
+	// scaffolding works but midpoint-in-NDC subdivision produces
+	// uniformly-sized sub-triangles that still trigger the rasterizer
+	// artifact. See the big STATE comment above `tessellate_one_triangle`
+	// in this file for the full investigation and the
+	// clip-space-correct refactor it would take to actually fix.
+	// Defaults to `false`; toggled via `gl.setTessellationFix(bool)`.
+	bool tessellation_fix_enabled;
+	float *tessellation_scratch;
+	size_t tessellation_scratch_capacity_floats;
 	nx_webgl_egl_texture_cache_entry_t texture_cache[NX_WEBGL_EGL_TEXTURE_CACHE_SIZE];
+	// Milestone #15 probe: presence of GL_EXT_instanced_arrays in the GLES
+	// extensions string + dlsym-style resolution of the three entry points
+	// it adds. Filled in once at backend init (step 8 of the probe) and
+	// surfaced through getBackendInfo() so a page can confirm hardware
+	// support before the full instancing wiring lands. Function pointers
+	// are typed `void *` here to keep the struct headers GLES2-only; the
+	// dispatch path will cast through the typedef'd PFN types.
+	bool ext_instanced_arrays_present;
+	void *fn_vertex_attrib_divisor_ext;
+	void *fn_draw_arrays_instanced_ext;
+	void *fn_draw_elements_instanced_ext;
+	// Mesa-on-Citron gives us a GLES 3.2 context (even when we request ES2),
+	// and ES 3.0+ requires an explicit VAO to be bound — the default VAO
+	// (object 0) is reserved for ES 2.x and is not valid in ES 3 core.
+	// Without a bound VAO, all vertex attribute state (incl. divisor) is
+	// silently ignored. We create one VAO at init and bind it before every
+	// passthrough draw. Resolved via eglGetProcAddress alongside the
+	// instancing entry points; NULL on drivers that don't support VAOs.
+	void *fn_gen_vertex_arrays;
+	void *fn_bind_vertex_array;
+	void *fn_delete_vertex_arrays;
+	uint32_t passthrough_vao;
+	// First ~1024 chars of glGetString(GL_EXTENSIONS), so the probe page
+	// can show what the driver advertises even if the EXT_instanced_arrays
+	// token is absent or spelled differently.
+	char gl_extensions[1024];
+	// User-supplied FBO currently bound via gl.bindFramebuffer(GL_FRAMEBUFFER,
+	// fb). 0 means "no user FBO bound" — bridge dispatch falls back to its
+	// own bridge_framebuffer + canvas-y top-down viewport convention +
+	// readback-on-present path. Non-zero means subsequent bridge dispatch
+	// draws into the user's FBO directly (skipping bridge_framebuffer + the
+	// readback flag) using STANDARD GL bottom-up viewport / scissor coords
+	// — Three.js's WebGLRenderer + EffectComposer flow uses GL-native
+	// conventions inside FBOs and the next pass samples those textures with
+	// standard 0..1 UVs, so any canvas-y flip would invert the chain.
+	// Width/height come from the FBO's color attachment via
+	// nx_webgl_egl_set_user_framebuffer; the bridge uses these for its
+	// CPU-side perspective-divide viewport scaling.
+	GLuint current_user_framebuffer;
+	int current_user_framebuffer_width;
+	int current_user_framebuffer_height;
 #endif
 };
 
@@ -212,6 +380,18 @@ static void destroy_bridge_resources(nx_webgl_egl_t *backend) {
 	if (backend->bridge_triangle_color_buffer) {
 		glDeleteBuffers(1, &backend->bridge_triangle_color_buffer);
 		backend->bridge_triangle_color_buffer = 0;
+	}
+	if (backend->bridge_fog_depth_buffer) {
+		glDeleteBuffers(1, &backend->bridge_fog_depth_buffer);
+		backend->bridge_fog_depth_buffer = 0;
+	}
+	if (backend->bridge_normal_buffer) {
+		glDeleteBuffers(1, &backend->bridge_normal_buffer);
+		backend->bridge_normal_buffer = 0;
+	}
+	if (backend->bridge_view_position_buffer) {
+		glDeleteBuffers(1, &backend->bridge_view_position_buffer);
+		backend->bridge_view_position_buffer = 0;
 	}
 	if (backend->bridge_line_program) {
 		glDeleteProgram(backend->bridge_line_program);
@@ -472,9 +652,98 @@ static void bridge_apply_scissor(nx_canvas_t *canvas, int render_width,
 	glScissor(x, y, width, height);
 }
 
+// Target framebuffer for the next bridge dispatch. Either the bridge's own
+// FBO (sized to the canvas, top-down y) or a user FBO (sized to whatever
+// Three.js asked for via WebGLRenderTarget, standard GL bottom-up y).
+typedef struct {
+	GLuint fbo;
+	int width;
+	int height;
+	bool is_user_fbo;
+} bridge_target_t;
+
+// Resolve the current bridge target. If the user has bound a non-null FBO via
+// gl.bindFramebuffer, return that; otherwise ensure_bridge_resources for the
+// canvas-derived size and return the bridge's own FBO. Failure means we
+// can't draw (callers should bail out).
+static bool bridge_acquire_target(nx_webgl_egl_t *backend,
+                                  nx_canvas_t *canvas,
+                                  bridge_target_t *out) {
+	if (!backend || !canvas || !out)
+		return false;
+	if (backend->current_user_framebuffer) {
+		out->fbo = backend->current_user_framebuffer;
+		out->width = backend->current_user_framebuffer_width > 0
+			? backend->current_user_framebuffer_width
+			: (int)canvas->width;
+		out->height = backend->current_user_framebuffer_height > 0
+			? backend->current_user_framebuffer_height
+			: (int)canvas->height;
+		out->is_user_fbo = true;
+		return true;
+	}
+	int w = 0;
+	int h = 0;
+	bridge_render_size(backend, canvas, &w, &h);
+	if (!ensure_bridge_resources(backend, w, h))
+		return false;
+	out->fbo = backend->bridge_framebuffer;
+	out->width = w;
+	out->height = h;
+	out->is_user_fbo = false;
+	return true;
+}
+
+// Bind the resolved target FBO and apply viewport + scissor in its native
+// coordinate system. For user FBOs that's standard GL (origin bottom-left,
+// viewport rect interpreted directly). For the bridge FBO we keep the
+// canvas-y top-down convention via bridge_apply_viewport/scissor.
+static void bridge_bind_target(const bridge_target_t *t,
+                               nx_canvas_t *canvas,
+                               const int *viewport,
+                               bool scissor_enabled,
+                               const int *scissor_box) {
+	glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+	if (t->is_user_fbo) {
+		int rx = viewport ? viewport[0] : 0;
+		int ry = viewport ? viewport[1] : 0;
+		int rw = viewport ? viewport[2] : t->width;
+		int rh = viewport ? viewport[3] : t->height;
+		glViewport(rx, ry, rw, rh);
+		if (scissor_enabled) {
+			int sx = scissor_box ? scissor_box[0] : 0;
+			int sy = scissor_box ? scissor_box[1] : 0;
+			int sw = scissor_box ? scissor_box[2] : t->width;
+			int sh = scissor_box ? scissor_box[3] : t->height;
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(sx, sy, sw, sh);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+	} else {
+		bridge_apply_viewport(canvas, t->width, t->height, viewport);
+		bridge_apply_scissor(canvas, t->width, t->height, scissor_enabled,
+		                     scissor_box);
+	}
+}
+
+// After a successful bridge dispatch, schedule the present-time readback ONLY
+// if we drew into the bridge's own FBO. Draws into a user FBO leave the
+// canvas untouched — the next pass will sample the FBO's color texture and
+// the final OutputPass renders back to bridge_framebuffer (which DOES set
+// this flag in the usual way).
+static inline void bridge_mark_readback(nx_webgl_egl_t *backend,
+                                        const bridge_target_t *t) {
+	if (!t->is_user_fbo)
+		backend->bridge_pending_readback = true;
+}
+
 static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 	if (backend->bridge_color_program && backend->bridge_vertex_buffer &&
-		backend->bridge_triangle_color_buffer)
+		backend->bridge_triangle_color_buffer &&
+		backend->bridge_fog_depth_buffer &&
+		backend->bridge_normal_buffer &&
+		backend->bridge_view_position_buffer)
 		return true;
 
 	// Untextured triangle shader pair.
@@ -484,20 +753,143 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 	// - Per-vertex color: a_color (location 1), output = u_color * vec4(v_color, 1).
 	//   Callers that don't bind a color buffer use glVertexAttrib3f(1, 1, 1, 1) so
 	//   v_color defaults to white and output collapses to u_color.
+	// - Linear fog: a_fogDepth (location 2) = view-space -mz (Three.js's
+	//   vFogDepth). Fragment shader mixes in u_fogColor by smoothstep(near,
+	//   far, depth) when u_fogEnabled > 0.5 — matching Three.js's `Fog`
+	//   linear variant.
+	// - Single directional light: a_normal (location 3) = view-space normal
+	//   (CPU pre-transformed by `normalMatrix = inverseTranspose(modelView)`).
+	//   Fragment shader applies Lambert diffuse `dot(N, L)` against
+	//   `u_lightDirection` (view-space, toward light) plus u_ambientLightColor,
+	//   modulated by u_lightColor when u_lightingEnabled > 0.5.
+	// - Single point light: a_viewPosition (location 4) = per-vertex view-
+	//   space position (CPU pre-transformed by modelView). Fragment shader
+	//   computes per-fragment light direction `normalize(pointLightPosition
+	//   - v_viewPosition)`, Lambert diffuse against it, optionally with
+	//   distance + decay attenuation. Either or both light kinds can be
+	//   enabled per frame (Three.js sends both sets of uniforms when both
+	//   light types are in the scene). Multi-light not yet supported —
+	//   only first directional + first point.
 	static const char vertex_source[] =
 		"attribute vec3 a_position;\n"
 		"attribute vec3 a_color;\n"
+		"attribute float a_fogDepth;\n"
+		"attribute vec3 a_normal;\n"
+		"attribute vec3 a_viewPosition;\n"
 		"varying vec3 v_color;\n"
+		"varying float v_fogDepth;\n"
+		"varying vec3 v_normal;\n"
+		"varying vec3 v_viewPosition;\n"
 		"void main() {\n"
 		"  v_color = a_color;\n"
+		"  v_fogDepth = a_fogDepth;\n"
+		"  v_normal = a_normal;\n"
+		"  v_viewPosition = a_viewPosition;\n"
 		"  gl_Position = vec4(a_position, 1.0);\n"
 		"}\n";
 	static const char fragment_source[] =
+		// GL_OES_standard_derivatives needed for dFdx/dFdy in the derivative-
+		// normals fallback (milestone #16). Tegra X1 (Maxwell GLES 3.2)
+		// supports it; the bridge gates dispatch on the extension's runtime
+		// availability through `u_useDerivativeNormals`. Default-off so
+		// drivers without the extension are unaffected when the dispatch
+		// keeps the uniform at 0 (which the static `0.0 > 0.5` branch the
+		// optimizer folds away).
+		"#extension GL_OES_standard_derivatives : enable\n"
 		"precision mediump float;\n"
 		"uniform vec4 u_color;\n"
+		"uniform float u_fogEnabled;\n"
+		"uniform float u_fogExp2Enabled;\n"
+		"uniform vec3 u_fogColor;\n"
+		"uniform float u_fogNear;\n"
+		"uniform float u_fogFar;\n"
+		"uniform float u_fogDensity;\n"
+		"uniform float u_lightingEnabled;\n"
+		"uniform vec3 u_lightDirection;\n"
+		"uniform vec3 u_lightColor;\n"
+		"uniform float u_light2Enabled;\n"
+		"uniform vec3 u_lightDirection2;\n"
+		"uniform vec3 u_lightColor2;\n"
+		"uniform vec3 u_ambientLightColor;\n"
+		"uniform float u_pointLightEnabled;\n"
+		"uniform vec3 u_pointLightPosition;\n"
+		"uniform vec3 u_pointLightColor;\n"
+		"uniform float u_pointLightDistance;\n"
+		"uniform float u_pointLightDecay;\n"
+		"uniform float u_specularEnabled;\n"
+		"uniform vec3 u_specular;\n"
+		"uniform float u_shininess;\n"
+		"uniform vec3 u_emissive;\n"
+		"uniform float u_useDerivativeNormals;\n"
 		"varying vec3 v_color;\n"
+		"varying float v_fogDepth;\n"
+		"varying vec3 v_normal;\n"
+		"varying vec3 v_viewPosition;\n"
 		"void main() {\n"
-		"  gl_FragColor = u_color * vec4(v_color, 1.0);\n"
+		"  vec4 base = u_color * vec4(v_color, 1.0);\n"
+		"  if (u_lightingEnabled > 0.5) {\n"
+		// Three.js's `flatShading: true` materials cause the GLES driver
+		// to dead-code the `normal` attribute, so the bridge sees no
+		// per-vertex normal. When the dispatch detects this it sets
+		// u_useDerivativeNormals=1 and we derive the per-fragment normal
+		// from view-position derivatives (constant within a triangle →
+		// effectively flat-shaded, which matches Three.js's
+		// `flatShading: true` visual intent).
+		"    vec3 N;\n"
+		"    if (u_useDerivativeNormals > 0.5) {\n"
+		"      N = normalize(cross(dFdx(v_viewPosition), dFdy(v_viewPosition)));\n"
+		"    } else {\n"
+		"      N = normalize(v_normal);\n"
+		"    }\n"
+		"    vec3 V = normalize(-v_viewPosition);\n"
+		"    vec3 diffuse = u_lightColor * max(dot(N, u_lightDirection), 0.0);\n"
+		"    vec3 specular = vec3(0.0);\n"
+		"    if (u_specularEnabled > 0.5) {\n"
+		"      vec3 H = normalize(u_lightDirection + V);\n"
+		"      specular += u_lightColor * pow(max(dot(N, H), 0.0), u_shininess);\n"
+		"    }\n"
+		"    if (u_light2Enabled > 0.5) {\n"
+		"      diffuse += u_lightColor2 * max(dot(N, u_lightDirection2), 0.0);\n"
+		"      if (u_specularEnabled > 0.5) {\n"
+		"        vec3 H2 = normalize(u_lightDirection2 + V);\n"
+		"        specular += u_lightColor2 * pow(max(dot(N, H2), 0.0), u_shininess);\n"
+		"      }\n"
+		"    }\n"
+		"    if (u_pointLightEnabled > 0.5) {\n"
+		"      vec3 lightVec = u_pointLightPosition - v_viewPosition;\n"
+		"      float distance = length(lightVec);\n"
+		"      vec3 L = lightVec / max(distance, 0.0001);\n"
+		"      float NdotL = max(dot(N, L), 0.0);\n"
+		"      float atten = 1.0;\n"
+		"      if (u_pointLightDecay > 0.0)\n"
+		"        atten = 1.0 / max(pow(distance, u_pointLightDecay), 1.0);\n"
+		"      if (u_pointLightDistance > 0.0)\n"
+		"        atten *= max(0.0, 1.0 - distance / u_pointLightDistance);\n"
+		"      diffuse += u_pointLightColor * NdotL * atten;\n"
+		"      if (u_specularEnabled > 0.5) {\n"
+		"        vec3 Hp = normalize(L + V);\n"
+		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
+		"      }\n"
+		"    }\n"
+		"    vec3 lit = base.rgb * (u_ambientLightColor + diffuse) + u_specular * specular;\n"
+		"    gl_FragColor = vec4(lit, base.a);\n"
+		"  } else {\n"
+		"    gl_FragColor = base;\n"
+		"  }\n"
+		// Self-illumination from `material.emissive` (Three.js MeshLambert/
+		// Phong/Standard). Additive after lighting so it shows even in
+		// unlit regions; default zero so non-emissive materials unaffected.
+		// Applied BEFORE fog so emissive materials still fade with distance.
+		"  gl_FragColor.rgb += u_emissive;\n"
+		"  if (u_fogEnabled > 0.5) {\n"
+		"    float f;\n"
+		"    if (u_fogExp2Enabled > 0.5) {\n"
+		"      f = 1.0 - exp(-u_fogDensity * u_fogDensity * v_fogDepth * v_fogDepth);\n"
+		"    } else {\n"
+		"      f = smoothstep(u_fogNear, u_fogFar, v_fogDepth);\n"
+		"    }\n"
+		"    gl_FragColor.rgb = mix(gl_FragColor.rgb, u_fogColor, clamp(f, 0.0, 1.0));\n"
+		"  }\n"
 		"}\n";
 
 	if (!backend->bridge_color_vertex_shader) {
@@ -529,6 +921,9 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 					   backend->bridge_color_fragment_shader);
 		glBindAttribLocation(backend->bridge_color_program, 0, "a_position");
 		glBindAttribLocation(backend->bridge_color_program, 1, "a_color");
+		glBindAttribLocation(backend->bridge_color_program, 2, "a_fogDepth");
+		glBindAttribLocation(backend->bridge_color_program, 3, "a_normal");
+		glBindAttribLocation(backend->bridge_color_program, 4, "a_viewPosition");
 		glLinkProgram(backend->bridge_color_program);
 
 		GLint linked = GL_FALSE;
@@ -545,6 +940,52 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 		}
 		backend->bridge_color_color_loc =
 			glGetUniformLocation(backend->bridge_color_program, "u_color");
+		backend->bridge_color_fog_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogEnabled");
+		backend->bridge_color_fog_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogColor");
+		backend->bridge_color_fog_near_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogNear");
+		backend->bridge_color_fog_far_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogFar");
+		backend->bridge_color_lighting_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_lightingEnabled");
+		backend->bridge_color_light_direction_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_lightDirection");
+		backend->bridge_color_light_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_lightColor");
+		backend->bridge_color_ambient_light_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_ambientLightColor");
+		backend->bridge_color_point_light_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_pointLightEnabled");
+		backend->bridge_color_point_light_position_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_pointLightPosition");
+		backend->bridge_color_point_light_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_pointLightColor");
+		backend->bridge_color_point_light_distance_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_pointLightDistance");
+		backend->bridge_color_point_light_decay_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_pointLightDecay");
+		backend->bridge_color_light2_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_light2Enabled");
+		backend->bridge_color_light_direction2_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_lightDirection2");
+		backend->bridge_color_light_color2_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_lightColor2");
+		backend->bridge_color_fog_density_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogDensity");
+		backend->bridge_color_fog_exp2_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_fogExp2Enabled");
+		backend->bridge_color_specular_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_specularEnabled");
+		backend->bridge_color_specular_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_specular");
+		backend->bridge_color_shininess_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_shininess");
+		backend->bridge_color_emissive_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_emissive");
+		backend->bridge_color_use_derivative_normals_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_useDerivativeNormals");
 	}
 
 	if (!backend->bridge_vertex_buffer)
@@ -563,27 +1004,169 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 				 glGetError());
 		return false;
 	}
+	if (!backend->bridge_fog_depth_buffer)
+		glGenBuffers(1, &backend->bridge_fog_depth_buffer);
+	if (!backend->bridge_fog_depth_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge draw: fog depth glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_normal_buffer)
+		glGenBuffers(1, &backend->bridge_normal_buffer);
+	if (!backend->bridge_normal_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge draw: normal glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_view_position_buffer)
+		glGenBuffers(1, &backend->bridge_view_position_buffer);
+	if (!backend->bridge_view_position_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge draw: view position glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
 	return true;
 }
 
 static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
-	if (backend->bridge_texture_program && backend->bridge_vertex_buffer)
+	if (backend->bridge_texture_program && backend->bridge_vertex_buffer &&
+		backend->bridge_fog_depth_buffer &&
+		backend->bridge_normal_buffer &&
+		backend->bridge_view_position_buffer)
 		return true;
 
+	// Textured triangle shader pair.
+	// - Position+UV: interleaved (5 floats per vertex) in
+	//   `bridge_vertex_buffer`. a_position at location 0, a_uv at location 1.
+	// - Linear fog: a_fogDepth (location 2) supplied from a separate
+	//   `bridge_fog_depth_buffer`. See bridge_color_program for the same
+	//   pattern. Fragment shader mixes in u_fogColor when u_fogEnabled > 0.5.
+	// - Single directional light: a_normal (location 3) from a separate
+	//   `bridge_normal_buffer`. CPU pre-transforms by normalMatrix
+	//   (inverseTranspose of modelView). Fragment shader applies Lambert
+	//   diffuse + ambient when u_lightingEnabled > 0.5. Matches Three.js's
+	//   `MeshPhongMaterial({map: tex, shininess: 0})` shading.
+	// - Single point light: a_viewPosition (location 4) for the per-fragment
+	//   light direction calc. Same pattern as bridge_color_program.
 	static const char vertex_source[] =
 		"attribute vec3 a_position;\n"
 		"attribute vec2 a_uv;\n"
+		"attribute float a_fogDepth;\n"
+		"attribute vec3 a_normal;\n"
+		"attribute vec3 a_viewPosition;\n"
+		"uniform mat3 u_mapTransform;\n"
+		"uniform float u_mapTransformEnabled;\n"
 		"varying vec2 v_uv;\n"
+		"varying float v_fogDepth;\n"
+		"varying vec3 v_normal;\n"
+		"varying vec3 v_viewPosition;\n"
 		"void main() {\n"
-		"  v_uv = a_uv;\n"
+		"  if (u_mapTransformEnabled > 0.5) {\n"
+		"    v_uv = (u_mapTransform * vec3(a_uv, 1.0)).xy;\n"
+		"  } else {\n"
+		"    v_uv = a_uv;\n"
+		"  }\n"
+		"  v_fogDepth = a_fogDepth;\n"
+		"  v_normal = a_normal;\n"
+		"  v_viewPosition = a_viewPosition;\n"
 		"  gl_Position = vec4(a_position, 1.0);\n"
 		"}\n";
 	static const char fragment_source[] =
+		// See bridge_color_program's derivative-normals comment for the
+		// full rationale. Same extension + uniform + branch pattern.
+		"#extension GL_OES_standard_derivatives : enable\n"
 		"precision mediump float;\n"
 		"uniform sampler2D u_texture;\n"
+		"uniform vec3 u_diffuse;\n"
+		"uniform float u_fogEnabled;\n"
+		"uniform float u_fogExp2Enabled;\n"
+		"uniform vec3 u_fogColor;\n"
+		"uniform float u_fogNear;\n"
+		"uniform float u_fogFar;\n"
+		"uniform float u_fogDensity;\n"
+		"uniform float u_lightingEnabled;\n"
+		"uniform vec3 u_lightDirection;\n"
+		"uniform vec3 u_lightColor;\n"
+		"uniform float u_light2Enabled;\n"
+		"uniform vec3 u_lightDirection2;\n"
+		"uniform vec3 u_lightColor2;\n"
+		"uniform vec3 u_ambientLightColor;\n"
+		"uniform float u_pointLightEnabled;\n"
+		"uniform vec3 u_pointLightPosition;\n"
+		"uniform vec3 u_pointLightColor;\n"
+		"uniform float u_pointLightDistance;\n"
+		"uniform float u_pointLightDecay;\n"
+		"uniform float u_specularEnabled;\n"
+		"uniform vec3 u_specular;\n"
+		"uniform float u_shininess;\n"
+		"uniform vec3 u_emissive;\n"
+		"uniform float u_useDerivativeNormals;\n"
 		"varying vec2 v_uv;\n"
+		"varying float v_fogDepth;\n"
+		"varying vec3 v_normal;\n"
+		"varying vec3 v_viewPosition;\n"
 		"void main() {\n"
-		"  gl_FragColor = texture2D(u_texture, v_uv);\n"
+		"  vec4 base = texture2D(u_texture, v_uv);\n"
+		"  base.rgb *= u_diffuse;\n"
+		"  if (u_lightingEnabled > 0.5) {\n"
+		"    vec3 N;\n"
+		"    if (u_useDerivativeNormals > 0.5) {\n"
+		"      N = normalize(cross(dFdx(v_viewPosition), dFdy(v_viewPosition)));\n"
+		"    } else {\n"
+		"      N = normalize(v_normal);\n"
+		"    }\n"
+		"    vec3 V = normalize(-v_viewPosition);\n"
+		"    vec3 diffuse = u_lightColor * max(dot(N, u_lightDirection), 0.0);\n"
+		"    vec3 specular = vec3(0.0);\n"
+		"    if (u_specularEnabled > 0.5) {\n"
+		"      vec3 H = normalize(u_lightDirection + V);\n"
+		"      specular += u_lightColor * pow(max(dot(N, H), 0.0), u_shininess);\n"
+		"    }\n"
+		"    if (u_light2Enabled > 0.5) {\n"
+		"      diffuse += u_lightColor2 * max(dot(N, u_lightDirection2), 0.0);\n"
+		"      if (u_specularEnabled > 0.5) {\n"
+		"        vec3 H2 = normalize(u_lightDirection2 + V);\n"
+		"        specular += u_lightColor2 * pow(max(dot(N, H2), 0.0), u_shininess);\n"
+		"      }\n"
+		"    }\n"
+		"    if (u_pointLightEnabled > 0.5) {\n"
+		"      vec3 lightVec = u_pointLightPosition - v_viewPosition;\n"
+		"      float distance = length(lightVec);\n"
+		"      vec3 L = lightVec / max(distance, 0.0001);\n"
+		"      float NdotL = max(dot(N, L), 0.0);\n"
+		"      float atten = 1.0;\n"
+		"      if (u_pointLightDecay > 0.0)\n"
+		"        atten = 1.0 / max(pow(distance, u_pointLightDecay), 1.0);\n"
+		"      if (u_pointLightDistance > 0.0)\n"
+		"        atten *= max(0.0, 1.0 - distance / u_pointLightDistance);\n"
+		"      diffuse += u_pointLightColor * NdotL * atten;\n"
+		"      if (u_specularEnabled > 0.5) {\n"
+		"        vec3 Hp = normalize(L + V);\n"
+		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
+		"      }\n"
+		"    }\n"
+		"    vec3 lit = base.rgb * (u_ambientLightColor + diffuse) + u_specular * specular;\n"
+		"    gl_FragColor = vec4(lit, base.a);\n"
+		"  } else {\n"
+		"    gl_FragColor = base;\n"
+		"  }\n"
+		// Self-illumination from `material.emissive` (Three.js MeshLambert/
+		// Phong/Standard). Additive after lighting so it shows even in
+		// unlit regions; default zero so non-emissive materials unaffected.
+		// Applied BEFORE fog so emissive materials still fade with distance.
+		"  gl_FragColor.rgb += u_emissive;\n"
+		"  if (u_fogEnabled > 0.5) {\n"
+		"    float f;\n"
+		"    if (u_fogExp2Enabled > 0.5) {\n"
+		"      f = 1.0 - exp(-u_fogDensity * u_fogDensity * v_fogDepth * v_fogDepth);\n"
+		"    } else {\n"
+		"      f = smoothstep(u_fogNear, u_fogFar, v_fogDepth);\n"
+		"    }\n"
+		"    gl_FragColor.rgb = mix(gl_FragColor.rgb, u_fogColor, clamp(f, 0.0, 1.0));\n"
+		"  }\n"
 		"}\n";
 
 	backend->bridge_texture_vertex_shader =
@@ -610,6 +1193,9 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 				   backend->bridge_texture_fragment_shader);
 	glBindAttribLocation(backend->bridge_texture_program, 0, "a_position");
 	glBindAttribLocation(backend->bridge_texture_program, 1, "a_uv");
+	glBindAttribLocation(backend->bridge_texture_program, 2, "a_fogDepth");
+	glBindAttribLocation(backend->bridge_texture_program, 3, "a_normal");
+	glBindAttribLocation(backend->bridge_texture_program, 4, "a_viewPosition");
 	glLinkProgram(backend->bridge_texture_program);
 
 	GLint linked = GL_FALSE;
@@ -626,6 +1212,58 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 	}
 	backend->bridge_texture_sampler_loc =
 		glGetUniformLocation(backend->bridge_texture_program, "u_texture");
+	backend->bridge_texture_fog_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogEnabled");
+	backend->bridge_texture_fog_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogColor");
+	backend->bridge_texture_fog_near_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogNear");
+	backend->bridge_texture_fog_far_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogFar");
+	backend->bridge_texture_lighting_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_lightingEnabled");
+	backend->bridge_texture_light_direction_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_lightDirection");
+	backend->bridge_texture_light_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_lightColor");
+	backend->bridge_texture_ambient_light_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_ambientLightColor");
+	backend->bridge_texture_point_light_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_pointLightEnabled");
+	backend->bridge_texture_point_light_position_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_pointLightPosition");
+	backend->bridge_texture_point_light_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_pointLightColor");
+	backend->bridge_texture_point_light_distance_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_pointLightDistance");
+	backend->bridge_texture_point_light_decay_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_pointLightDecay");
+	backend->bridge_texture_light2_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_light2Enabled");
+	backend->bridge_texture_light_direction2_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_lightDirection2");
+	backend->bridge_texture_light_color2_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_lightColor2");
+	backend->bridge_texture_fog_density_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogDensity");
+	backend->bridge_texture_fog_exp2_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_fogExp2Enabled");
+	backend->bridge_texture_map_transform_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_mapTransform");
+	backend->bridge_texture_map_transform_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_mapTransformEnabled");
+	backend->bridge_texture_diffuse_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_diffuse");
+	backend->bridge_texture_specular_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_specularEnabled");
+	backend->bridge_texture_specular_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_specular");
+	backend->bridge_texture_shininess_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_shininess");
+	backend->bridge_texture_emissive_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_emissive");
+	backend->bridge_texture_use_derivative_normals_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_useDerivativeNormals");
 
 	if (!backend->bridge_vertex_buffer)
 		glGenBuffers(1, &backend->bridge_vertex_buffer);
@@ -635,13 +1273,38 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 				 glGetError());
 		return false;
 	}
+	if (!backend->bridge_fog_depth_buffer)
+		glGenBuffers(1, &backend->bridge_fog_depth_buffer);
+	if (!backend->bridge_fog_depth_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge texture draw: fog depth glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_normal_buffer)
+		glGenBuffers(1, &backend->bridge_normal_buffer);
+	if (!backend->bridge_normal_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge texture draw: normal glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_view_position_buffer)
+		glGenBuffers(1, &backend->bridge_view_position_buffer);
+	if (!backend->bridge_view_position_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge texture draw: view position glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
 	return true;
 }
 
 static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 	if (backend->bridge_line_program && backend->bridge_vertex_buffer &&
 		backend->bridge_line_distance_buffer &&
-		backend->bridge_line_color_buffer)
+		backend->bridge_line_color_buffer &&
+		backend->bridge_fog_depth_buffer)
 		return true;
 
 	// Dashed/colored-line shader pair.
@@ -654,16 +1317,22 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 	//   a_color (location 2), output = u_color * vec4(v_color, 1.0). Callers
 	//   that do not bind a color buffer use glVertexAttrib3f(2, 1, 1, 1) so
 	//   v_color defaults to white and the output collapses to u_color.
+	// - Linear fog: a_fogDepth (location 3). Fragment shader mixes in
+	//   u_fogColor when u_fogEnabled > 0.5. See ensure_bridge_color_program
+	//   for the same pattern.
 	static const char vertex_source[] =
 		"attribute vec3 a_position;\n"
 		"attribute float a_lineDistance;\n"
 		"attribute vec3 a_color;\n"
+		"attribute float a_fogDepth;\n"
 		"uniform float u_scale;\n"
 		"varying float v_lineDistance;\n"
 		"varying vec3 v_color;\n"
+		"varying float v_fogDepth;\n"
 		"void main() {\n"
 		"  v_lineDistance = u_scale * a_lineDistance;\n"
 		"  v_color = a_color;\n"
+		"  v_fogDepth = a_fogDepth;\n"
 		"  gl_Position = vec4(a_position, 1.0);\n"
 		"}\n";
 	static const char fragment_source[] =
@@ -671,13 +1340,22 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 		"uniform vec4 u_color;\n"
 		"uniform float u_dashSize;\n"
 		"uniform float u_totalSize;\n"
+		"uniform float u_fogEnabled;\n"
+		"uniform vec3 u_fogColor;\n"
+		"uniform float u_fogNear;\n"
+		"uniform float u_fogFar;\n"
 		"varying float v_lineDistance;\n"
 		"varying vec3 v_color;\n"
+		"varying float v_fogDepth;\n"
 		"void main() {\n"
 		"  if (u_totalSize > 0.0) {\n"
 		"    if (mod(v_lineDistance, u_totalSize) > u_dashSize) discard;\n"
 		"  }\n"
 		"  gl_FragColor = u_color * vec4(v_color, 1.0);\n"
+		"  if (u_fogEnabled > 0.5) {\n"
+		"    float f = smoothstep(u_fogNear, u_fogFar, v_fogDepth);\n"
+		"    gl_FragColor.rgb = mix(gl_FragColor.rgb, u_fogColor, f);\n"
+		"  }\n"
 		"}\n";
 
 	if (!backend->bridge_line_vertex_shader)
@@ -709,6 +1387,7 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 		glBindAttribLocation(backend->bridge_line_program, 1,
 							 "a_lineDistance");
 		glBindAttribLocation(backend->bridge_line_program, 2, "a_color");
+		glBindAttribLocation(backend->bridge_line_program, 3, "a_fogDepth");
 		glLinkProgram(backend->bridge_line_program);
 
 		GLint linked = GL_FALSE;
@@ -731,6 +1410,14 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 			glGetUniformLocation(backend->bridge_line_program, "u_dashSize");
 		backend->bridge_line_total_loc =
 			glGetUniformLocation(backend->bridge_line_program, "u_totalSize");
+		backend->bridge_line_fog_enabled_loc = glGetUniformLocation(
+			backend->bridge_line_program, "u_fogEnabled");
+		backend->bridge_line_fog_color_loc = glGetUniformLocation(
+			backend->bridge_line_program, "u_fogColor");
+		backend->bridge_line_fog_near_loc = glGetUniformLocation(
+			backend->bridge_line_program, "u_fogNear");
+		backend->bridge_line_fog_far_loc = glGetUniformLocation(
+			backend->bridge_line_program, "u_fogFar");
 	}
 
 	if (!backend->bridge_vertex_buffer)
@@ -754,6 +1441,14 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 	if (!backend->bridge_line_color_buffer) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge line draw: color glGenBuffers() failed: 0x%x",
+				 glGetError());
+		return false;
+	}
+	if (!backend->bridge_fog_depth_buffer)
+		glGenBuffers(1, &backend->bridge_fog_depth_buffer);
+	if (!backend->bridge_fog_depth_buffer) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge line draw: fog depth glGenBuffers() failed: 0x%x",
 				 glGetError());
 		return false;
 	}
@@ -814,6 +1509,11 @@ static GLuint ensure_bridge_cached_texture(nx_webgl_egl_t *backend,
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
 					bridge_texture_wrap(wrap_t));
 
+	// Clear any stale GL error left over from earlier bridge calls so
+	// the post-glTexImage2D check below only reflects this upload —
+	// otherwise an unrelated prior error gets misattributed to texture
+	// upload (see [[bridge-stale-glerror]]).
+	(void)glGetError();
 	if (slot->texture_id != texture_id || slot->revision != revision ||
 		slot->width != width || slot->height != height) {
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
@@ -906,7 +1606,19 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 		EGL_NONE,
 	};
-	EGLint context_attrs[] = {
+	// Try ES 3 first (so glDrawArraysInstanced / glVertexAttribDivisor are
+	// real ES3 core functions). Fall back to ES 2 if ES 3 context creation
+	// fails. Mesa+Citron will give us ES 3.2 unconditionally; Tegra hardware
+	// supports ES 3+. The previous "request ES 2" path was loading the ES3
+	// instancing functions via eglGetProcAddress but Mesa returns no-op
+	// stubs for ES3 entry points on an ES2-requested context — that's why
+	// `bridge dbg = P+6x4` confirms instanced dispatch ran but only
+	// instance 0 was visible in the milestone-#15 conformance test.
+	EGLint context_attrs_es3[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 3,
+		EGL_NONE,
+	};
+	EGLint context_attrs_es2[] = {
 		EGL_CONTEXT_CLIENT_VERSION, 2,
 		EGL_NONE,
 	};
@@ -1005,9 +1717,15 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 
 	case 6:
 		snprintf(backend->status, sizeof(backend->status),
-				 "step 7: calling eglCreateContext()");
+				 "step 7: calling eglCreateContext() ES3");
 	backend->context = eglCreateContext(backend->display, backend->config,
-										EGL_NO_CONTEXT, context_attrs);
+										EGL_NO_CONTEXT, context_attrs_es3);
+	if (backend->context == EGL_NO_CONTEXT) {
+		// ES 3 not available — fall back to ES 2 (instancing won't work
+		// natively, but at least basic rendering will).
+		backend->context = eglCreateContext(backend->display, backend->config,
+											EGL_NO_CONTEXT, context_attrs_es2);
+	}
 	if (backend->context == EGL_NO_CONTEXT) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "eglCreateContext() failed: 0x%x", eglGetError());
@@ -1038,6 +1756,95 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 	backend->vendor = (const char *)glGetString(GL_VENDOR);
 	backend->version = (const char *)glGetString(GL_VERSION);
 	backend->renderer = (const char *)glGetString(GL_RENDERER);
+
+	// Milestone #15 probe: presence of GL_EXT_instanced_arrays and its
+	// three entry points. Done here (once, at init) so getBackendInfo()
+	// always reports a final answer. Token check looks for both
+	// "GL_EXT_instanced_arrays" and the ANGLE-style alias the runtime
+	// might forward; entry-point load uses eglGetProcAddress and falls
+	// back through the core GLES3 names in case the driver exposes them
+	// unsuffixed.
+	{
+		const GLubyte *exts = glGetString(GL_EXTENSIONS);
+		if (exts) {
+			snprintf(backend->gl_extensions, sizeof(backend->gl_extensions),
+					 "%s", (const char *)exts);
+			backend->ext_instanced_arrays_present =
+				(strstr((const char *)exts, "GL_EXT_instanced_arrays") != NULL) ||
+				(strstr((const char *)exts, "GL_ANGLE_instanced_arrays") != NULL) ||
+				(strstr((const char *)exts, "GL_NV_draw_instanced") != NULL);
+		} else {
+			backend->gl_extensions[0] = '\0';
+			backend->ext_instanced_arrays_present = false;
+		}
+		// Preference order: core GLES3 unsuffixed name first (since GL_VERSION
+		// reports ES 3.2 on Mesa+Citron and Tegra is also GLES3-class), then
+		// extension-suffixed fallbacks. Mesa returns NULL for the EXT variant
+		// when EXT_instanced_arrays isn't advertised — that's correct — but
+		// some other drivers (and at least one Tegra revision) return a
+		// non-NULL stub that silently no-ops. Loading the core name first
+		// avoids that whole class of bug.
+		backend->fn_vertex_attrib_divisor_ext =
+			(void *)eglGetProcAddress("glVertexAttribDivisor");
+		if (!backend->fn_vertex_attrib_divisor_ext)
+			backend->fn_vertex_attrib_divisor_ext =
+				(void *)eglGetProcAddress("glVertexAttribDivisorEXT");
+		if (!backend->fn_vertex_attrib_divisor_ext)
+			backend->fn_vertex_attrib_divisor_ext =
+				(void *)eglGetProcAddress("glVertexAttribDivisorANGLE");
+		backend->fn_draw_arrays_instanced_ext =
+			(void *)eglGetProcAddress("glDrawArraysInstanced");
+		if (!backend->fn_draw_arrays_instanced_ext)
+			backend->fn_draw_arrays_instanced_ext =
+				(void *)eglGetProcAddress("glDrawArraysInstancedEXT");
+		if (!backend->fn_draw_arrays_instanced_ext)
+			backend->fn_draw_arrays_instanced_ext =
+				(void *)eglGetProcAddress("glDrawArraysInstancedANGLE");
+		if (!backend->fn_draw_arrays_instanced_ext)
+			backend->fn_draw_arrays_instanced_ext =
+				(void *)eglGetProcAddress("glDrawArraysInstancedNV");
+		backend->fn_draw_elements_instanced_ext =
+			(void *)eglGetProcAddress("glDrawElementsInstanced");
+		if (!backend->fn_draw_elements_instanced_ext)
+			backend->fn_draw_elements_instanced_ext =
+				(void *)eglGetProcAddress("glDrawElementsInstancedEXT");
+		if (!backend->fn_draw_elements_instanced_ext)
+			backend->fn_draw_elements_instanced_ext =
+				(void *)eglGetProcAddress("glDrawElementsInstancedANGLE");
+		if (!backend->fn_draw_elements_instanced_ext)
+			backend->fn_draw_elements_instanced_ext =
+				(void *)eglGetProcAddress("glDrawElementsInstancedNV");
+		// VAO functions for ES 3+ — required as soon as instancing is in
+		// play because the passthrough dispatch needs SOMEWHERE to bind
+		// the per-attrib divisor state. OES_vertex_array_object suffixes
+		// for ES 2 compatibility.
+		backend->fn_gen_vertex_arrays =
+			(void *)eglGetProcAddress("glGenVertexArrays");
+		if (!backend->fn_gen_vertex_arrays)
+			backend->fn_gen_vertex_arrays =
+				(void *)eglGetProcAddress("glGenVertexArraysOES");
+		backend->fn_bind_vertex_array =
+			(void *)eglGetProcAddress("glBindVertexArray");
+		if (!backend->fn_bind_vertex_array)
+			backend->fn_bind_vertex_array =
+				(void *)eglGetProcAddress("glBindVertexArrayOES");
+		backend->fn_delete_vertex_arrays =
+			(void *)eglGetProcAddress("glDeleteVertexArrays");
+		if (!backend->fn_delete_vertex_arrays)
+			backend->fn_delete_vertex_arrays =
+				(void *)eglGetProcAddress("glDeleteVertexArraysOES");
+		// Generate the persistent passthrough VAO immediately, while the
+		// context is current. All subsequent draws bind it before
+		// touching vertex attribute state.
+		if (backend->fn_gen_vertex_arrays && backend->fn_bind_vertex_array) {
+			typedef void (*pfn_gen_vao_t)(GLsizei, GLuint *);
+			pfn_gen_vao_t gen = (pfn_gen_vao_t)backend->fn_gen_vertex_arrays;
+			GLuint vao = 0;
+			gen(1, &vao);
+			backend->passthrough_vao = vao;
+		}
+	}
+
 	backend->available = true;
 		backend->step = 9;
 	snprintf(backend->status, sizeof(backend->status),
@@ -1072,6 +1879,9 @@ void nx_webgl_egl_destroy(JSRuntime *rt, nx_webgl_egl_t *backend) {
 			eglDestroySurface(backend->display, backend->surface);
 		eglTerminate(backend->display);
 	}
+	free(backend->tessellation_scratch);
+	backend->tessellation_scratch = NULL;
+	backend->tessellation_scratch_capacity_floats = 0;
 #endif
 	js_free_rt(rt, backend);
 }
@@ -1092,11 +1902,107 @@ void nx_webgl_egl_set_bridge_enabled(nx_webgl_egl_t *backend, bool enabled) {
 		return;
 #if NXJS_HAS_EGL_GLES
 	backend->bridge_enabled = enabled;
+	if (enabled && !backend->bridge_auto_flush_initialized) {
+		// First-time enable: default to true so existing apps
+		// (GpuCompositor and any future drawArrays user that relies on
+		// auto-present) work unchanged. Apps that drive their own
+		// readback can opt out via `gl.setBridgeAutoFlush(false)`.
+		//
+		// Gated on `!bridge_auto_flush_initialized` (NOT the
+		// `_enabled` flag itself) so a later re-call from a different
+		// page can't undo a deliberate `setBridgeAutoFlush(false)` —
+		// the C code can't tell "never set" from "explicitly false"
+		// just from the boolean value, but it can tell from this
+		// sticky one-shot init flag.
+		backend->bridge_auto_flush_enabled = true;
+		backend->bridge_auto_flush_initialized = true;
+	}
+	if (enabled) {
+		// The first textured draw after bridge-enable also needs the
+		// pipeline-state-validation warmup, in case the caller doesn't
+		// gl.clear() before its first draw (see bridge_pending_textured_warmup).
+		backend->bridge_pending_textured_warmup = true;
+	}
 	snprintf(backend->status, sizeof(backend->status),
 			 enabled ? "GPU bridge render mode enabled"
 					 : "GPU bridge render mode disabled");
 #else
 	(void)enabled;
+#endif
+}
+
+void nx_webgl_egl_set_dispatch_debug(nx_webgl_egl_t *backend,
+									 const char *label) {
+	if (!backend)
+		return;
+	snprintf(backend->debug_dispatch_state, sizeof(backend->debug_dispatch_state),
+			 "%s", label ? label : "");
+}
+
+// Append a short tag to the dispatch-debug ring. Used by the per-draw
+// instrumentation to record which path each draw took: bridge success,
+// bridge failed (with reason), software fallback, etc. Reset by
+// `nx_webgl_egl_reset_dispatch_debug` once per frame (via gl.clear).
+void nx_webgl_egl_append_dispatch_debug(nx_webgl_egl_t *backend,
+										const char *tag) {
+	if (!backend || !tag)
+		return;
+	size_t buf_size = sizeof(backend->debug_dispatch_state);
+	size_t cur = strnlen(backend->debug_dispatch_state, buf_size);
+	if (cur + 1 >= buf_size)
+		return;
+	size_t remaining = buf_size - cur;
+	snprintf(backend->debug_dispatch_state + cur, remaining, "%s ", tag);
+}
+
+void nx_webgl_egl_reset_dispatch_debug(nx_webgl_egl_t *backend) {
+	if (!backend)
+		return;
+	backend->debug_dispatch_state[0] = '\0';
+}
+
+void nx_webgl_egl_set_auto_flush(nx_webgl_egl_t *backend, bool enabled) {
+	if (!backend)
+		return;
+#if NXJS_HAS_EGL_GLES
+	backend->bridge_auto_flush_enabled = enabled;
+	// Explicit write — the auto-default-to-true branch in
+	// `set_bridge_enabled` should not override this on a later re-enable.
+	backend->bridge_auto_flush_initialized = true;
+	// If disabling while a pending flush exists, drop the flag too so
+	// the next gl.clear doesn't try to flush anyway through other paths.
+	if (!enabled)
+		backend->bridge_pending_readback = false;
+#else
+	(void)enabled;
+#endif
+}
+
+bool nx_webgl_egl_get_auto_flush(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->bridge_auto_flush_enabled;
+#else
+	(void)backend;
+	return false;
+#endif
+}
+
+void nx_webgl_egl_set_tessellation_fix(nx_webgl_egl_t *backend, bool enabled) {
+	if (!backend)
+		return;
+#if NXJS_HAS_EGL_GLES
+	backend->tessellation_fix_enabled = enabled;
+#else
+	(void)enabled;
+#endif
+}
+
+bool nx_webgl_egl_get_tessellation_fix(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->tessellation_fix_enabled;
+#else
+	(void)backend;
+	return false;
 #endif
 }
 
@@ -1175,6 +2081,589 @@ void nx_webgl_egl_uniform_matrix4fv(nx_webgl_egl_t *backend, int location, bool 
 #endif
 }
 
+void nx_webgl_egl_uniform_matrix3fv(nx_webgl_egl_t *backend, int location, bool transpose, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniformMatrix3fv(location, 1, transpose ? GL_TRUE : GL_FALSE, value);
+#endif
+}
+
+void nx_webgl_egl_uniform_matrix2fv(nx_webgl_egl_t *backend, int location, bool transpose, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniformMatrix2fv(location, 1, transpose ? GL_TRUE : GL_FALSE, value);
+#endif
+}
+
+void nx_webgl_egl_uniform1fv(nx_webgl_egl_t *backend, int location, int count, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform1fv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform2fv(nx_webgl_egl_t *backend, int location, int count, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform2fv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform3fv(nx_webgl_egl_t *backend, int location, int count, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform3fv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform4fv(nx_webgl_egl_t *backend, int location, int count, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform4fv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform2i(nx_webgl_egl_t *backend, int location, int x, int y) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform2i(location, x, y);
+#endif
+}
+
+void nx_webgl_egl_uniform3i(nx_webgl_egl_t *backend, int location, int x, int y, int z) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform3i(location, x, y, z);
+#endif
+}
+
+void nx_webgl_egl_uniform4i(nx_webgl_egl_t *backend, int location, int x, int y, int z, int w) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform4i(location, x, y, z, w);
+#endif
+}
+
+void nx_webgl_egl_uniform1iv(nx_webgl_egl_t *backend, int location, int count, const int *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform1iv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform2iv(nx_webgl_egl_t *backend, int location, int count, const int *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform2iv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform3iv(nx_webgl_egl_t *backend, int location, int count, const int *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform3iv(location, count, value);
+#endif
+}
+
+void nx_webgl_egl_uniform4iv(nx_webgl_egl_t *backend, int location, int count, const int *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || location < 0 || count <= 0 || !value)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUniform4iv(location, count, value);
+#endif
+}
+
+uint32_t nx_webgl_egl_create_native_buffer(nx_webgl_egl_t *backend,
+										   nx_canvas_t *canvas) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend)
+		return 0;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return 0;
+	GLuint handle = 0;
+	glGenBuffers(1, &handle);
+	return (uint32_t)handle;
+#else
+	(void)backend;
+	(void)canvas;
+	return 0;
+#endif
+}
+
+void nx_webgl_egl_delete_native_buffer(nx_webgl_egl_t *backend,
+									   uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || handle == 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	GLuint h = (GLuint)handle;
+	glDeleteBuffers(1, &h);
+#else
+	(void)backend;
+	(void)handle;
+#endif
+}
+
+void nx_webgl_egl_native_buffer_data(nx_webgl_egl_t *backend,
+									 uint32_t handle, uint32_t target,
+									 size_t size, const void *data,
+									 uint32_t usage) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || handle == 0)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	// Allocator + upload. Disrupts the current ARRAY_BUFFER /
+	// ELEMENT_ARRAY_BUFFER binding, but every bridge draw re-binds its own
+	// VBOs before reading, so we don't need to save/restore here.
+	glBindBuffer(target, (GLuint)handle);
+	glBufferData(target, (GLsizeiptr)size, data, usage);
+#else
+	(void)backend;
+	(void)handle;
+	(void)target;
+	(void)size;
+	(void)data;
+	(void)usage;
+#endif
+}
+
+void nx_webgl_egl_native_buffer_sub_data(nx_webgl_egl_t *backend,
+										 uint32_t handle, uint32_t target,
+										 size_t offset, size_t size,
+										 const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || handle == 0 || size == 0 || !data)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glBindBuffer(target, (GLuint)handle);
+	glBufferSubData(target, (GLintptr)offset, (GLsizeiptr)size, data);
+#else
+	(void)backend;
+	(void)handle;
+	(void)target;
+	(void)offset;
+	(void)size;
+	(void)data;
+#endif
+}
+
+void nx_webgl_egl_use_native_program(nx_webgl_egl_t *backend,
+									 uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	glUseProgram((GLuint)handle);
+#else
+	(void)backend;
+	(void)handle;
+#endif
+}
+
+// Raw-shader passthrough draw. Runs the user's linked GLES program against
+// user-uploaded buffers, with vertex-attribute state synced to native GL.
+// Bypasses the bridge's hardcoded-program swap so user GLSL (including
+// custom uniforms, fwidth(), gl_FrontFacing, etc.) executes as written.
+// See [[bridge-raw-shader-passthrough]] for the architectural background.
+//
+// Uniforms reach the program through the existing
+// `nx_webgl_egl_uniform*` helpers — by the time the user calls
+// `gl.drawXxx()`, their `gl.uniform*` setters have already uploaded values
+// to `program_handle` (via the `gl.useProgram → glUseProgram` plumbing in
+// `nx_webgl_use_program`).
+bool nx_webgl_egl_has_instancing(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend &&
+		   backend->fn_vertex_attrib_divisor_ext &&
+		   backend->fn_draw_arrays_instanced_ext &&
+		   backend->fn_draw_elements_instanced_ext;
+#else
+	(void)backend;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_draw_passthrough(
+	nx_webgl_egl_t *backend,
+	nx_canvas_t *canvas,
+	uint32_t program_handle,
+	uint32_t mode,
+	bool indexed,
+	int32_t first,
+	int32_t count,
+	uint32_t element_type,
+	uint32_t element_offset,
+	uint32_t element_buffer_handle,
+	const nx_webgl_egl_passthrough_attrib_t *attribs,
+	int attrib_count,
+	int32_t instance_count,
+	const int *viewport,
+	bool blend,
+	uint32_t blend_src, uint32_t blend_dst,
+	uint32_t blend_src_alpha, uint32_t blend_dst_alpha,
+	bool scissor_enabled,
+	const int *scissor_box,
+	bool depth_enabled,
+	bool cull_enabled,
+	uint32_t cull_face_mode,
+	uint32_t front_face) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)canvas; (void)program_handle; (void)mode;
+	(void)indexed; (void)first; (void)count; (void)element_type;
+	(void)element_offset; (void)element_buffer_handle; (void)attribs;
+	(void)attrib_count; (void)instance_count; (void)viewport; (void)blend;
+	(void)blend_src; (void)blend_dst; (void)blend_src_alpha;
+	(void)blend_dst_alpha; (void)scissor_enabled; (void)scissor_box;
+	(void)depth_enabled; (void)cull_enabled; (void)cull_face_mode;
+	(void)front_face;
+	return false;
+#else
+	// Function pointer typedefs for the runtime-loaded instancing entry
+	// points. Both EXT and core-GLES3 variants share these prototypes.
+	typedef void (*pfn_vertex_attrib_divisor_t)(GLuint index, GLuint divisor);
+	typedef void (*pfn_draw_arrays_instanced_t)(GLenum mode, GLint first,
+												 GLsizei count,
+												 GLsizei instance_count);
+	typedef void (*pfn_draw_elements_instanced_t)(GLenum mode, GLsizei count,
+													GLenum type,
+													const void *indices,
+													GLsizei instance_count);
+
+	// Instancing requested but driver lacks one of the entry points.
+	if (instance_count > 0 && !nx_webgl_egl_has_instancing(backend)) {
+		if (backend)
+			nx_webgl_egl_append_dispatch_debug(backend, "P-noinst");
+		return false;
+	}
+	if (!backend || !canvas || !program_handle || count <= 0 || !attribs)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		return false;
+	}
+
+	bridge_target_t target;
+	if (!bridge_acquire_target(backend, canvas, &target))
+		return false;
+
+	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+
+	// Bind the persistent passthrough VAO so vertex attribute state has
+	// somewhere to land. On ES 3+ the default VAO 0 is reserved (no
+	// attribute state, all draws no-op silently); on ES 2 with
+	// OES_vertex_array_object we get the same plumbing for free. If VAO
+	// support isn't available (fn_bind_vertex_array == NULL), fall through
+	// — we'll be on plain ES 2 and the default VAO 0 still works.
+	if (backend->fn_bind_vertex_array && backend->passthrough_vao) {
+		typedef void (*pfn_bind_vao_t)(GLuint);
+		pfn_bind_vao_t bind = (pfn_bind_vao_t)backend->fn_bind_vertex_array;
+		bind((GLuint)backend->passthrough_vao);
+	}
+
+	glUseProgram((GLuint)program_handle);
+
+	// Sync vertex-attribute state. Crucially, we MASK by the program's
+	// active attributes — any context->vertex_attribs[] slot that isn't
+	// referenced by the user's vertex shader gets force-disabled
+	// regardless of what `enabled`/buffer state the JS side has tracked.
+	//
+	// Why: nx.js's WebGL context is shared across inline-canvas pages
+	// (see [[swb-webgl-inline]]), so vertex-attrib enable bits leak from
+	// the previous page's draws. If a stale slot is left enabled with
+	// a no-longer-valid pointer/buffer, Tegra's GLES validator silently
+	// skips the entire glDrawArrays — even when the active program
+	// doesn't reference that slot. Disabling unused slots first
+	// restores the spec-aligned "what the program needs is what gets
+	// fed" contract.
+	bool location_is_used[NX_WEBGL_MAX_VERTEX_ATTRIBS_LIMIT] = {false};
+	{
+		GLint active_attribs = 0;
+		glGetProgramiv((GLuint)program_handle, GL_ACTIVE_ATTRIBUTES,
+					   &active_attribs);
+		GLint max_name_len = 64;
+		glGetProgramiv((GLuint)program_handle, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH,
+					   &max_name_len);
+		if (max_name_len <= 0 || max_name_len > 256) max_name_len = 256;
+		char name[256];
+		for (GLint i = 0; i < active_attribs; i++) {
+			GLsizei wlen = 0;
+			GLint size = 0;
+			GLenum type = 0;
+			glGetActiveAttrib((GLuint)program_handle, i,
+							  sizeof(name), &wlen, &size, &type, name);
+			GLint loc = glGetAttribLocation((GLuint)program_handle, name);
+			if (loc < 0)
+				continue;
+			// Matrix and array attributes occupy multiple consecutive
+			// locations. A `mat4` attribute (e.g. Three.js's
+			// `instanceMatrix`) is bound as 4 vec4 attributes at
+			// loc..loc+3; without expanding here, the per-instance rows
+			// 2/3/4 get force-disabled and the shader reads garbage.
+			int location_span = 1;
+			switch (type) {
+				case GL_FLOAT_MAT2: location_span = 2; break;
+				case GL_FLOAT_MAT3: location_span = 3; break;
+				case GL_FLOAT_MAT4: location_span = 4; break;
+				default: location_span = 1; break;
+			}
+			// `size > 1` indicates an attribute array — each element
+			// gets its own location run.
+			if (size > 1) location_span *= size;
+			for (int j = 0; j < location_span; j++) {
+				int slot = loc + j;
+				if (slot >= 0 && slot < attrib_count &&
+					slot < NX_WEBGL_MAX_VERTEX_ATTRIBS_LIMIT) {
+					location_is_used[slot] = true;
+				}
+			}
+		}
+	}
+
+	pfn_vertex_attrib_divisor_t fn_divisor =
+		(pfn_vertex_attrib_divisor_t)backend->fn_vertex_attrib_divisor_ext;
+
+	// Diagnostic for instancing bug: record what divisor we ASKED for AND
+	// what GL reports AFTER the set call. If the read-back doesn't match,
+	// fn_divisor is a stub. If they match but instances still don't advance,
+	// the bug is elsewhere (probably driver-side).
+	char div_tag[128];
+	int div_tag_len = 0;
+	div_tag[0] = '\0';
+
+	for (int i = 0; i < attrib_count; i++) {
+		const nx_webgl_egl_passthrough_attrib_t *a = &attribs[i];
+		if (!location_is_used[i]) {
+			glDisableVertexAttribArray((GLuint)i);
+			// Clear any stale divisor on disabled slots so a non-instanced
+			// re-bind later doesn't inherit it (passthrough state survives
+			// across draws on the shared screen GL context — see
+			// [[swb-shared-gl-state-leak]]).
+			if (fn_divisor)
+				fn_divisor((GLuint)i, 0u);
+			continue;
+		}
+		if (a->enabled && a->buffer_handle) {
+			glBindBuffer(GL_ARRAY_BUFFER, (GLuint)a->buffer_handle);
+			glEnableVertexAttribArray((GLuint)i);
+			glVertexAttribPointer((GLuint)i,
+								  a->size,
+								  a->type,
+								  a->normalized ? GL_TRUE : GL_FALSE,
+								  a->stride,
+								  (const void *)(uintptr_t)a->offset);
+			// Apply the JS-tracked divisor when the driver supports it.
+			// Always emit (even divisor 0) so stale divisor>0 state from a
+			// prior instanced draw doesn't leak into a per-vertex attrib —
+			// the shared screen GL context per [[swb-webgl-inline]] means
+			// per-attrib state survives across pages until we re-set it.
+			if (fn_divisor)
+				fn_divisor((GLuint)i, a->divisor);
+			// Drain any error the divisor call might have produced (some
+			// drivers reject high indices); a stale error here would make
+			// the post-draw glGetError() report it instead of the actual
+			// draw status.
+			(void)glGetError();
+			// Read back the divisor we just set so the dispatch-debug tag
+			// can report what native GL actually accepted. 0x88FE is
+			// GL_VERTEX_ATTRIB_ARRAY_DIVISOR.
+			GLint got_div = -1;
+			glGetVertexAttribiv((GLuint)i, 0x88FE, &got_div);
+			(void)glGetError();
+			int n = snprintf(div_tag + div_tag_len, sizeof(div_tag) - div_tag_len,
+							 "%d=%u/%d ", i, a->divisor, got_div);
+			if (n > 0 && (size_t)(div_tag_len + n) < sizeof(div_tag))
+				div_tag_len += n;
+		} else {
+			glDisableVertexAttribArray((GLuint)i);
+			if (fn_divisor)
+				fn_divisor((GLuint)i, 0u);
+			(void)glGetError();
+		}
+	}
+
+	if (blend) {
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(blend_src, blend_dst, blend_src_alpha,
+							blend_dst_alpha);
+	} else {
+		glDisable(GL_BLEND);
+	}
+
+	if (depth_enabled) {
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		glDepthMask(GL_TRUE);
+		glDepthRangef(0.f, 1.f);
+	} else {
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+	}
+
+	if (cull_enabled) {
+		GLenum gl_mode = GL_BACK;
+		if (cull_face_mode == 0x0404u) gl_mode = GL_FRONT;
+		else if (cull_face_mode == 0x0408u) gl_mode = GL_FRONT_AND_BACK;
+		glEnable(GL_CULL_FACE);
+		glCullFace(gl_mode);
+	} else {
+		glDisable(GL_CULL_FACE);
+	}
+	GLenum gl_front = GL_CCW;
+	if (front_face == 0x0900u) gl_front = GL_CW;
+	glFrontFace(gl_front);
+
+	(void)glGetError();  // drain stale errors
+
+	if (indexed) {
+		if (element_buffer_handle == 0) {
+			// No native element buffer — the user called drawElements
+			// before bufferData'ing their index buffer, or the buffer was
+			// deleted. Pre-WebIDL nx.js would have INVALID_OPERATION'd
+			// during validation; here we tag and bail rather than passing
+			// offset as a client-side pointer (undefined behavior).
+			nx_webgl_egl_append_dispatch_debug(backend, "P-noEAB");
+			glBindBuffer(GL_ARRAY_BUFFER, 0);
+			glDisable(GL_SCISSOR_TEST);
+			return false;
+		}
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)element_buffer_handle);
+		if (instance_count > 0) {
+			pfn_draw_elements_instanced_t fn =
+				(pfn_draw_elements_instanced_t)backend->fn_draw_elements_instanced_ext;
+			fn(mode, count, element_type,
+			   (const void *)(uintptr_t)element_offset, instance_count);
+		} else {
+			glDrawElements(mode, count, element_type,
+						   (const void *)(uintptr_t)element_offset);
+		}
+	} else {
+		if (instance_count > 0) {
+			pfn_draw_arrays_instanced_t fn =
+				(pfn_draw_arrays_instanced_t)backend->fn_draw_arrays_instanced_ext;
+			fn(mode, first, count, instance_count);
+		} else {
+			glDrawArrays(mode, first, count);
+		}
+	}
+	GLenum error = glGetError();
+	backend->bridge_last_draw_gl_error = error;
+
+	// Clean up: leave the bridge's own state mostly untouched. The bridge
+	// dispatch re-binds its own attribs/buffers/program before each draw,
+	// so the dirty attribute state we leave behind doesn't affect bridge-
+	// mode draws. We DO unbind buffers so subsequent gl.bufferData calls
+	// don't accidentally mutate the user's last-bound buffer.
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	glDisable(GL_SCISSOR_TEST);
+	// Unbind our passthrough VAO so bridge-mode draws (which rely on the
+	// default attribute state, not our per-attrib divisor stash) start
+	// clean. Bridge mode re-enables/re-binds attribs on every draw so VAO
+	// 0 is the right destination for them.
+	if (backend->fn_bind_vertex_array && backend->passthrough_vao) {
+		typedef void (*pfn_bind_vao_t)(GLuint);
+		pfn_bind_vao_t bind = (pfn_bind_vao_t)backend->fn_bind_vertex_array;
+		bind(0);
+	}
+
+	if (error != GL_NO_ERROR) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "passthrough draw GL error: 0x%x (mode=0x%x count=%d)",
+				 error, mode, count);
+		// Append a short tag to the dispatch-debug ring so the demo's
+		// status canvas can show it.
+		char tag[24];
+		snprintf(tag, sizeof(tag), "P-gl(0x%x)", error);
+		nx_webgl_egl_append_dispatch_debug(backend, tag);
+		bridge_mark_readback(backend, &target);
+		return false;
+	}
+
+	{
+		char tag[24];
+		if (instance_count > 0)
+			snprintf(tag, sizeof(tag), "P+%dx%d", count, instance_count);
+		else
+			snprintf(tag, sizeof(tag), "P+%d", count);
+		nx_webgl_egl_append_dispatch_debug(backend, tag);
+		// Append the divisor diagnostic — "i=asked/got" per enabled+used
+		// attrib. Lets us see if glVertexAttribDivisor took effect on
+		// native GL (got matches asked) or was silently dropped.
+		if (instance_count > 0 && div_tag[0]) {
+			char wrapper[160];
+			snprintf(wrapper, sizeof(wrapper), "[div %s]", div_tag);
+			nx_webgl_egl_append_dispatch_debug(backend, wrapper);
+		}
+	}
+	bridge_mark_readback(backend, &target);
+	return true;
+#endif
+}
+
 void nx_webgl_egl_set_bridge_resolution(nx_webgl_egl_t *backend, int width,
 										int height) {
 	if (!backend)
@@ -1214,6 +2703,345 @@ void nx_webgl_egl_delete_cached_texture(nx_webgl_egl_t *backend,
 			return;
 		}
 	}
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// FBO / renderbuffer / persistent-texture native entry points (milestone
+// #19, webgl_postprocessing). The bridge previously always rendered into
+// `bridge_framebuffer`; supporting Three.js's `WebGLRenderTarget` requires
+// (a) native FBOs/RBOs and persistent texture handles the user code can
+// attach as color/depth, and (b) the dispatch-target retargeting via
+// `bridge_acquire_target` above. These functions are the EGL-side shims
+// JS-facing code in webgl.c calls.
+
+uint32_t nx_webgl_egl_create_native_framebuffer(nx_webgl_egl_t *backend,
+												 nx_canvas_t *canvas) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)canvas;
+	return 0;
+#else
+	if (!backend || !canvas) return 0;
+	if (!nx_webgl_egl_initialize(backend, canvas)) return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return 0;
+	GLuint h = 0;
+	glGenFramebuffers(1, &h);
+	return (uint32_t)h;
+#endif
+}
+
+void nx_webgl_egl_delete_native_framebuffer(nx_webgl_egl_t *backend,
+                                             uint32_t handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle;
+#else
+	if (!backend || handle == 0) return;
+	GLuint h = (GLuint)handle;
+	// Unbind first if it's currently bound so subsequent draws don't keep
+	// targeting a zombie FBO via the cached current_user_framebuffer field.
+	if (backend->current_user_framebuffer == h) {
+		backend->current_user_framebuffer = 0;
+		backend->current_user_framebuffer_width = 0;
+		backend->current_user_framebuffer_height = 0;
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
+	glDeleteFramebuffers(1, &h);
+#endif
+}
+
+uint32_t nx_webgl_egl_create_native_renderbuffer(nx_webgl_egl_t *backend,
+                                                  nx_canvas_t *canvas) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)canvas;
+	return 0;
+#else
+	if (!backend || !canvas) return 0;
+	if (!nx_webgl_egl_initialize(backend, canvas)) return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return 0;
+	GLuint h = 0;
+	glGenRenderbuffers(1, &h);
+	return (uint32_t)h;
+#endif
+}
+
+void nx_webgl_egl_delete_native_renderbuffer(nx_webgl_egl_t *backend,
+                                              uint32_t handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle;
+#else
+	if (!backend || handle == 0) return;
+	GLuint h = (GLuint)handle;
+	glDeleteRenderbuffers(1, &h);
+#endif
+}
+
+bool nx_webgl_egl_renderbuffer_storage(nx_webgl_egl_t *backend,
+                                        uint32_t handle,
+                                        uint32_t internalformat,
+                                        int width, int height) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)internalformat;
+	(void)width; (void)height;
+	return false;
+#else
+	if (!backend || handle == 0 || width <= 0 || height <= 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)handle);
+	(void)glGetError();
+	glRenderbufferStorage(GL_RENDERBUFFER, (GLenum)internalformat, width,
+	                      height);
+	GLenum err = glGetError();
+	return err == GL_NO_ERROR;
+#endif
+}
+
+uint32_t nx_webgl_egl_create_persistent_texture(nx_webgl_egl_t *backend,
+                                                 nx_canvas_t *canvas) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)canvas;
+	return 0;
+#else
+	if (!backend || !canvas) return 0;
+	if (!nx_webgl_egl_initialize(backend, canvas)) return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return 0;
+	GLuint h = 0;
+	glGenTextures(1, &h);
+	return (uint32_t)h;
+#endif
+}
+
+void nx_webgl_egl_delete_persistent_texture(nx_webgl_egl_t *backend,
+                                             uint32_t handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle;
+#else
+	if (!backend || handle == 0) return;
+	GLuint h = (GLuint)handle;
+	glDeleteTextures(1, &h);
+#endif
+}
+
+bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
+                                                uint32_t handle,
+                                                int width, int height,
+                                                uint32_t internalformat,
+                                                uint32_t format,
+                                                uint32_t type,
+                                                const uint8_t *data,
+                                                uint32_t min_filter,
+                                                uint32_t mag_filter,
+                                                uint32_t wrap_s,
+                                                uint32_t wrap_t) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)width; (void)height;
+	(void)internalformat; (void)format; (void)type; (void)data;
+	(void)min_filter; (void)mag_filter; (void)wrap_s; (void)wrap_t;
+	return false;
+#else
+	if (!backend || handle == 0 || width <= 0 || height <= 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+	                bridge_texture_filter(min_filter));
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+	                bridge_texture_filter(mag_filter));
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+	                bridge_texture_wrap(wrap_s));
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+	                bridge_texture_wrap(wrap_t));
+	(void)glGetError();
+	// Promote unsized depth internalformats to their sized GLES3 equivalents.
+	// Mesa-on-Tegra runs on a GLES3 context (per [[bridge-instancing-support]]),
+	// and ES3 requires sized internalformats for depth+depth-stencil
+	// textures. Three.js already passes the sized forms in its
+	// WebGLTextures path, but external code (or older Three.js versions)
+	// may pass the unsized form — auto-promote to avoid silent failure.
+	GLint internal = (GLint)internalformat;
+	if (format == 0x1902 /* GL_DEPTH_COMPONENT */) {
+		if (internal == 0x1902 /* unsized */)
+			internal = 0x81A5 /* GL_DEPTH_COMPONENT16 */;
+	} else if (format == 0x84F9 /* GL_DEPTH_STENCIL */) {
+		if (internal == 0x84F9 /* unsized */)
+			internal = 0x88F0 /* GL_DEPTH24_STENCIL8 */;
+	}
+	// For UNSIGNED_INT_24_8_WEBGL the native enum is GL_UNSIGNED_INT_24_8
+	// which has the same value (0x84FA). No remap needed.
+	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
+	             (GLenum)format, (GLenum)type, data);
+	GLenum err = glGetError();
+	return err == GL_NO_ERROR;
+#endif
+}
+
+uint32_t nx_webgl_egl_check_framebuffer_status(nx_webgl_egl_t *backend,
+                                                 uint32_t handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle;
+	return 0;
+#else
+	if (!backend) return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return 0;
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)handle);
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	// Restore whichever FBO was bound so we don't surprise downstream
+	// draws by changing target as a side effect of a status query.
+	GLuint restore = backend->current_user_framebuffer
+	                     ? backend->current_user_framebuffer
+	                     : backend->bridge_framebuffer;
+	glBindFramebuffer(GL_FRAMEBUFFER, restore);
+	return (uint32_t)status;
+#endif
+}
+
+bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,
+                                          uint32_t framebuffer_handle,
+                                          uint32_t attachment,
+                                          uint32_t texture_handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)framebuffer_handle; (void)attachment;
+	(void)texture_handle;
+	return false;
+#else
+	if (!backend || framebuffer_handle == 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer_handle);
+	(void)glGetError();
+	glFramebufferTexture2D(GL_FRAMEBUFFER, (GLenum)attachment, GL_TEXTURE_2D,
+	                       (GLuint)texture_handle, 0);
+	GLenum err = glGetError();
+	GLuint restore = backend->current_user_framebuffer
+	                     ? backend->current_user_framebuffer
+	                     : backend->bridge_framebuffer;
+	glBindFramebuffer(GL_FRAMEBUFFER, restore);
+	return err == GL_NO_ERROR;
+#endif
+}
+
+bool nx_webgl_egl_framebuffer_renderbuffer(nx_webgl_egl_t *backend,
+                                            uint32_t framebuffer_handle,
+                                            uint32_t attachment,
+                                            uint32_t renderbuffer_handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)framebuffer_handle; (void)attachment;
+	(void)renderbuffer_handle;
+	return false;
+#else
+	if (!backend || framebuffer_handle == 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer_handle);
+	(void)glGetError();
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, (GLenum)attachment,
+	                          GL_RENDERBUFFER, (GLuint)renderbuffer_handle);
+	GLenum err = glGetError();
+	GLuint restore = backend->current_user_framebuffer
+	                     ? backend->current_user_framebuffer
+	                     : backend->bridge_framebuffer;
+	glBindFramebuffer(GL_FRAMEBUFFER, restore);
+	return err == GL_NO_ERROR;
+#endif
+}
+
+void nx_webgl_egl_set_user_framebuffer(nx_webgl_egl_t *backend,
+                                        uint32_t handle, int width,
+                                        int height) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)width; (void)height;
+#else
+	if (!backend) return;
+	// When transitioning AWAY from a user FBO (changing target or
+	// returning to default), force a flush so writes to the previous
+	// FBO's color and depth attachments are visible to subsequent
+	// sample-from-texture operations. Tegra's tiled rasterizer can
+	// otherwise leave depth writes in tile-local memory that the next
+	// pass's `texture2D(depthTex, ...)` returns as 0. Spec says this
+	// hazard should be handled implicitly but Mesa-on-Tegra doesn't.
+	// Symptom: milestone #19.5's webgl_depth_texture demo rendered the
+	// scene correctly into the color attachment but the depth-sampling
+	// post-pass returned 0 everywhere → uniform white output.
+	if (backend->current_user_framebuffer != 0 &&
+	    backend->current_user_framebuffer != (GLuint)handle) {
+		if (eglMakeCurrent(backend->display, backend->surface,
+		                    backend->surface, backend->context)) {
+			glFlush();
+		}
+	}
+	backend->current_user_framebuffer = (GLuint)handle;
+	backend->current_user_framebuffer_width = width;
+	backend->current_user_framebuffer_height = height;
+#endif
+}
+
+void nx_webgl_egl_forward_active_texture(nx_webgl_egl_t *backend,
+                                          uint32_t unit) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)unit;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glActiveTexture((GLenum)unit);
+#endif
+}
+
+void nx_webgl_egl_forward_bind_texture(nx_webgl_egl_t *backend,
+                                        uint32_t target, uint32_t handle) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)target; (void)handle;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glBindTexture((GLenum)target, (GLuint)handle);
+#endif
+}
+
+bool nx_webgl_egl_read_user_fbo_pixels(nx_webgl_egl_t *backend,
+                                        uint32_t fbo_handle,
+                                        int x, int y, int width, int height,
+                                        uint32_t format, uint32_t type,
+                                        uint8_t *dst) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)fbo_handle;
+	(void)x; (void)y; (void)width; (void)height;
+	(void)format; (void)type; (void)dst;
+	return false;
+#else
+	if (!backend || !dst || width <= 0 || height <= 0)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo_handle);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDisable(GL_SCISSOR_TEST);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	(void)glGetError();
+	glReadPixels(x, y, width, height, (GLenum)format, (GLenum)type, dst);
+	GLenum err = glGetError();
+	// Note: we do NOT restore the previous FBO binding here. Subsequent
+	// bridge dispatch consults `current_user_framebuffer` and re-binds
+	// itself via bridge_bind_target, and the FBO we bound IS the user's
+	// currently-bound FBO (per the caller's contract), so the binding is
+	// still correct by construction.
+	return err == GL_NO_ERROR;
 #endif
 }
 
@@ -1281,17 +3109,344 @@ bool nx_webgl_egl_flush_bridge_present(nx_webgl_egl_t *backend,
 }
 
 bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
-	return nx_webgl_egl_clear_bridge_with_state(backend, canvas, false, NULL, false);
+	// Default clear: color+depth with 1.0 depth, stencil=0, no scissor.
+	// Used by swb's compositor; not user-driven so keep upstream-compatible
+	// defaults. JS-side gl.clear path threads the user's actual state
+	// through nx_webgl_egl_clear_bridge_with_state directly.
+	return nx_webgl_egl_clear_bridge_with_state(backend, canvas,
+		0x4000 | 0x100 /* COLOR | DEPTH */, 1.0f, 0,
+		false, NULL, false);
+}
+
+bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
+									  nx_canvas_t *canvas,
+									  int x, int y, int width, int height,
+									  uint32_t format, uint32_t type,
+									  uint8_t *dst) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)canvas; (void)x; (void)y;
+	(void)width; (void)height; (void)format; (void)type; (void)dst;
+	return false;
+#else
+	(void)format;
+	(void)type;
+	if (!backend || !backend->bridge_enabled || !canvas || !dst)
+		return false;
+	if (width <= 0 || height <= 0)
+		return false;
+	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, canvas))
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context)) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge readPixels: eglMakeCurrent() failed: 0x%x",
+				 eglGetError());
+		return false;
+	}
+	int render_width = 0, render_height = 0;
+	bridge_render_size(backend, canvas, &render_width, &render_height);
+	if (!ensure_bridge_resources(backend, render_width, render_height))
+		return false;
+
+	// Clip the requested rect to the FBO bounds. Any rows/cols outside
+	// the FBO are zero-filled in `dst` — the caller's buffer must never
+	// contain uninitialized bytes.
+	int clip_x = x, clip_y = y, clip_w = width, clip_h = height;
+	int dst_off_x = 0, dst_off_y = 0;
+	if (clip_x < 0) {
+		dst_off_x = -clip_x;
+		clip_w += clip_x;
+		clip_x = 0;
+	}
+	if (clip_y < 0) {
+		dst_off_y = -clip_y;
+		clip_h += clip_y;
+		clip_y = 0;
+	}
+	if (clip_x + clip_w > render_width)
+		clip_w = render_width - clip_x;
+	if (clip_y + clip_h > render_height)
+		clip_h = render_height - clip_y;
+	const size_t row_bytes = (size_t)width * 4;
+	memset(dst, 0, row_bytes * (size_t)height);
+
+	if (clip_w <= 0 || clip_h <= 0)
+		return true;
+
+	// Defensive state: scissor must be off so reads aren't clipped to
+	// whatever the last bridge draw set; color mask must be all-on (it
+	// doesn't affect glReadPixels itself but we set it consistently with
+	// the bridge's own reads). Read the clipped sub-rect directly into
+	// the caller's buffer with the right destination row stride — when
+	// the rect is the full FBO this is identical to the old full-FBO
+	// path, but for typical inline-canvas usage (640×360 from a
+	// 1280×720 FBO) it's a quarter as much data.
+	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDisable(GL_SCISSOR_TEST);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	(void)glGetError();
+	uint8_t *clipped_start = NULL;
+	size_t clipped_row_bytes = 0;
+	size_t clipped_stride = 0;
+	if (dst_off_x == 0 && clip_w == width) {
+		// Common case: x-aligned. Read straight into dst at the correct
+		// row offset — one glReadPixels call, no per-row copies.
+		clipped_start = dst + (size_t)dst_off_y * row_bytes;
+		clipped_row_bytes = (size_t)clip_w * 4;
+		clipped_stride = row_bytes;
+		glReadPixels(clip_x, clip_y, clip_w, clip_h, GL_RGBA,
+		             GL_UNSIGNED_BYTE, clipped_start);
+	} else {
+		// x-clipped case: row stride differs between dst and the read
+		// rect. Fall back to a row-by-row scratch via bridge_readback
+		// (sized to fit the largest read; reuse it).
+		const size_t scratch_bytes = (size_t)clip_w * (size_t)clip_h * 4;
+		if (scratch_bytes <= backend->bridge_readback_size &&
+		    backend->bridge_readback) {
+			glReadPixels(clip_x, clip_y, clip_w, clip_h, GL_RGBA,
+			             GL_UNSIGNED_BYTE, backend->bridge_readback);
+			const size_t src_row_bytes = (size_t)clip_w * 4;
+			for (int row = 0; row < clip_h; row++) {
+				uint8_t *dst_row = dst + (size_t)(dst_off_y + row) * row_bytes
+				                       + (size_t)dst_off_x * 4;
+				const uint8_t *src_row = backend->bridge_readback +
+				                         (size_t)row * src_row_bytes;
+				memcpy(dst_row, src_row, src_row_bytes);
+			}
+			clipped_start = dst + (size_t)dst_off_y * row_bytes
+			                  + (size_t)dst_off_x * 4;
+			clipped_row_bytes = src_row_bytes;
+			clipped_stride = row_bytes;
+		}
+	}
+	GLenum err = glGetError();
+	glFinish();
+	if (err != GL_NO_ERROR) {
+		snprintf(backend->status, sizeof(backend->status),
+				 "GPU bridge readPixels failed: 0x%x", err);
+		return false;
+	}
+	// In-place row reverse to convert glReadPixels's GL bottom-up rows
+	// to canvas-y top-down — the convention nx.js's bridge already uses
+	// for `gl.viewport` / `gl.scissor` x/y inputs. Doing this here
+	// shaves ~95 ms/frame off the cube demo vs. the previous JS-side
+	// `TypedArray.set(subarray)` row-flip loop in canvas-runner.ts.
+	// Scratch is one row's worth (≤ 5 KB for the cube case).
+	if (clipped_start && clip_h > 1 && clipped_row_bytes > 0) {
+		uint8_t *scratch_row = malloc(clipped_row_bytes);
+		if (scratch_row) {
+			for (int top = 0; top < clip_h / 2; top++) {
+				int bot = clip_h - 1 - top;
+				uint8_t *row_top = clipped_start + (size_t)top * clipped_stride;
+				uint8_t *row_bot = clipped_start + (size_t)bot * clipped_stride;
+				memcpy(scratch_row, row_top, clipped_row_bytes);
+				memcpy(row_top, row_bot, clipped_row_bytes);
+				memcpy(row_bot, scratch_row, clipped_row_bytes);
+			}
+			free(scratch_row);
+		}
+	}
+	return true;
+#endif
+}
+
+// Read a sub-rect of the bridge FBO directly into a destination
+// `nx_canvas_t` (e.g., the screen canvas) at (dst_x, dst_y) with the
+// usual Y-flip + RGBA→cairo-ARGB32 swizzle, marking the destination
+// surface dirty. Skips the JS-visible Uint8ClampedArray buffer + a
+// putImageData hop + a drawImage overlay — for switch-web-browser's
+// animated inline-canvas WebGL path (Three.js cube), this collapses
+// the per-frame readPixels + putImageData + drawImage(offscreen)
+// chain into one glReadPixels + one C-level row copy.
+//
+// `src_x` / `src_y` are in GL bottom-up coordinates (the caller is
+// responsible for any canvas-y top translation, same convention as
+// the rest of this file). `dst_canvas` must be an ARGB32 image-surface
+// canvas (anything created via `nx_canvas_new` etc.). Pixels outside
+// the FBO's render rect or outside the destination canvas are
+// silently skipped.
+bool nx_webgl_egl_read_bridge_to_canvas_data(nx_webgl_egl_t *backend,
+                                              int src_x, int src_y,
+                                              int src_w, int src_h,
+                                              nx_canvas_t *dst_canvas,
+                                              int dst_x, int dst_y) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)src_x; (void)src_y; (void)src_w; (void)src_h;
+	(void)dst_canvas; (void)dst_x; (void)dst_y;
+	return false;
+#else
+	if (!backend || !backend->bridge_enabled || !dst_canvas || !dst_canvas->data)
+		return false;
+	if (src_w <= 0 || src_h <= 0)
+		return false;
+	if (dst_canvas->width == 0 || dst_canvas->height == 0)
+		return false;
+	if (!nx_webgl_egl_initialize(backend, dst_canvas))
+		return false;
+	// Only call eglMakeCurrent if our context isn't already the one
+	// bound to this thread. The call costs ~1 ms on Switch's driver
+	// even when it's a no-op rebind; skipping when we know the context
+	// is current saves that off every per-frame readback.
+	if (eglGetCurrentContext() != backend->context) {
+		if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+		                    backend->context)) {
+			snprintf(backend->status, sizeof(backend->status),
+			         "GPU bridge readToCanvas: eglMakeCurrent() failed: 0x%x",
+			         eglGetError());
+			return false;
+		}
+	}
+	int render_width = 0, render_height = 0;
+	bridge_render_size(backend, dst_canvas, &render_width, &render_height);
+	if (!ensure_bridge_resources(backend, render_width, render_height))
+		return false;
+
+	// Clip src rect to bridge FBO bounds.
+	int clip_x = src_x;
+	int clip_y = src_y;
+	int clip_w = src_w;
+	int clip_h = src_h;
+	int src_off_x = 0;
+	int src_off_y = 0;
+	if (clip_x < 0) {
+		src_off_x = -clip_x;
+		clip_w += clip_x;
+		clip_x = 0;
+	}
+	if (clip_y < 0) {
+		src_off_y = -clip_y;
+		clip_h += clip_y;
+		clip_y = 0;
+	}
+	if (clip_x + clip_w > render_width)
+		clip_w = render_width - clip_x;
+	if (clip_y + clip_h > render_height)
+		clip_h = render_height - clip_y;
+	if (clip_w <= 0 || clip_h <= 0)
+		return true;
+
+	// Clip the destination rect to the destination canvas bounds. We
+	// shift `dst_x`/`dst_y` for the parts of the src rect that fell
+	// outside the FBO above (src_off_x/y), so the dst position aligns
+	// with the *clipped* src.
+	int final_dst_x = dst_x + src_off_x;
+	int final_dst_y = dst_y + src_off_y;
+	int copy_w = clip_w;
+	int copy_h = clip_h;
+	int src_skip_x = 0;
+	int src_skip_y = 0;
+	if (final_dst_x < 0) {
+		src_skip_x = -final_dst_x;
+		copy_w -= src_skip_x;
+		final_dst_x = 0;
+	}
+	if (final_dst_y < 0) {
+		src_skip_y = -final_dst_y;
+		copy_h -= src_skip_y;
+		final_dst_y = 0;
+	}
+	if (final_dst_x + copy_w > (int)dst_canvas->width)
+		copy_w = (int)dst_canvas->width - final_dst_x;
+	if (final_dst_y + copy_h > (int)dst_canvas->height)
+		copy_h = (int)dst_canvas->height - final_dst_y;
+	if (copy_w <= 0 || copy_h <= 0)
+		return true;
+
+	// Read the clipped src rect into bridge_readback. Use the
+	// already-allocated buffer (sized to fit the full bridge FBO, so
+	// any sub-rect fits).
+	size_t needed = (size_t)clip_w * (size_t)clip_h * 4;
+	if (needed > backend->bridge_readback_size || !backend->bridge_readback)
+		return false;
+	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDisable(GL_SCISSOR_TEST);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	(void)glGetError();
+	glReadPixels(clip_x, clip_y, clip_w, clip_h, GL_RGBA, GL_UNSIGNED_BYTE,
+	             backend->bridge_readback);
+	GLenum err = glGetError();
+	glFinish();
+	if (err != GL_NO_ERROR) {
+		snprintf(backend->status, sizeof(backend->status),
+		         "GPU bridge readToCanvas readPixels failed: 0x%x", err);
+		return false;
+	}
+
+	// Y-flip + RGBA→ARGB32(premul) swizzle while copying into dst.
+	// Source rows are in GL bottom-up order; we map row r in dst to
+	// row (clip_h - 1 - r - src_skip_y) in src (i.e. the GL bottom-up
+	// row that visually corresponds to the top of the rect, plus any
+	// rows we skipped above the dst canvas top edge).
+	//
+	// `glReadPixels` writes 4-byte tuples (R, G, B, A) at each pixel
+	// offset; on little-endian (Switch is LE), reading as uint32 gives
+	// bit layout 0xAABBGGRR (low byte = R). Cairo's ARGB32 little-
+	// endian is 0xAARRGGBB. So the conversion is "swap R and B bytes"
+	// — a single bit-shift expression in the common opaque-alpha case.
+	// `bridge_readback` was malloc'd, so it's at least 8-byte aligned;
+	// uint32 reads are safe.
+	uint32_t *dst_pixels = (uint32_t *)dst_canvas->data;
+	const int dst_stride_pixels = (int)dst_canvas->width;
+	const int src_row_stride = clip_w * 4;
+	for (int row = 0; row < copy_h; row++) {
+		int src_row = clip_h - 1 - (row + src_skip_y);
+		if (src_row < 0 || src_row >= clip_h)
+			continue;
+		const uint32_t *src_row_p = (const uint32_t *)(
+		    backend->bridge_readback +
+		    (size_t)src_row * src_row_stride +
+		    (size_t)src_skip_x * 4);
+		uint32_t *dst_row_p = dst_pixels +
+		                      (size_t)(final_dst_y + row) * dst_stride_pixels +
+		                      final_dst_x;
+		for (int col = 0; col < copy_w; col++) {
+			uint32_t rgba = *src_row_p++;
+			uint32_t a = rgba >> 24;
+			if (__builtin_expect(a == 255, 1)) {
+				// Fast path: swap R and B in the uint32. Keep A and G
+				// in place. Three.js's textured-cube render fills this
+				// branch for every pixel (opaque clear + opaque mesh
+				// material), so it dominates the wall-clock cost.
+				*dst_row_p++ = (rgba & 0xff00ff00) |
+				               ((rgba & 0x000000ff) << 16) |
+				               ((rgba >> 16) & 0x000000ff);
+			} else if (a == 0) {
+				*dst_row_p++ = 0;
+			} else {
+				uint32_t r = rgba & 0xff;
+				uint32_t g = (rgba >> 8) & 0xff;
+				uint32_t b = (rgba >> 16) & 0xff;
+				uint32_t pr = (r * a + 127) / 255;
+				uint32_t pg = (g * a + 127) / 255;
+				uint32_t pb = (b * a + 127) / 255;
+				*dst_row_p++ = (a << 24) | (pr << 16) | (pg << 8) | pb;
+			}
+		}
+	}
+	if (dst_canvas->surface)
+		cairo_surface_mark_dirty(dst_canvas->surface);
+	return true;
+#endif
 }
 
 bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 										  nx_canvas_t *canvas,
+										  uint32_t mask,
+										  float depth_value,
+										  int32_t stencil_value,
 										  bool scissor_enabled,
 										  const int *scissor_box,
 										  bool depth_enabled) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
+	(void)mask;
+	(void)depth_value;
+	(void)stencil_value;
 	(void)scissor_enabled;
 	(void)scissor_box;
 	(void)depth_enabled;
@@ -1310,26 +3465,63 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 		return false;
 	}
 
-	int width = 0;
-	int height = 0;
-	bridge_render_size(backend, canvas, &width, &height);
-	if (!ensure_bridge_resources(backend, width, height))
+	bridge_target_t target;
+	if (!bridge_acquire_target(backend, canvas, &target))
 		return false;
+	int width = target.width;
+	int height = target.height;
 
 	(void)depth_enabled;
-	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
 	glViewport(0, 0, width, height);
-	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
-	glClearColor((GLfloat)backend->clear_color[0],
-				 (GLfloat)backend->clear_color[1],
-				 (GLfloat)backend->clear_color[2],
-				 (GLfloat)backend->clear_color[3]);
-	// Depth is unconditionally cleared so the depth attachment we added to the
-	// bridge FBO starts each frame at far (1.0). Triangle bridge draws that
-	// enable GL_DEPTH_TEST get correct front-vs-back ordering.
-	glClearDepthf(1.0f);
-	glDepthMask(GL_TRUE);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	if (target.is_user_fbo) {
+		if (scissor_enabled) {
+			int sx = scissor_box ? scissor_box[0] : 0;
+			int sy = scissor_box ? scissor_box[1] : 0;
+			int sw = scissor_box ? scissor_box[2] : width;
+			int sh = scissor_box ? scissor_box[3] : height;
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(sx, sy, sw, sh);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+	} else {
+		bridge_apply_scissor(canvas, width, height, scissor_enabled,
+		                     scissor_box);
+	}
+	// Defensively re-enable color writes; some callers (Three.js's
+	// WebGLState) leave the color mask in a mode that would silently
+	// turn glClear into a no-op.
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	// Honor the user's clearColor / clearDepth / clearStencil state AND
+	// the bit-mask argument to gl.clear. Pre-#19.5 this hardcoded
+	// glClearDepthf(1.0) and glClear(COLOR|DEPTH) regardless of either —
+	// works for Three.js's default render path (which always clears
+	// both with depth=1.0) but breaks any code that wants a different
+	// depth clear value or selective clears. Surfaced by milestone #19.5
+	// hw bring-up.
+	GLbitfield gl_mask = 0;
+	if (mask & 0x4000 /* GL_COLOR_BUFFER_BIT */) {
+		gl_mask |= GL_COLOR_BUFFER_BIT;
+		glClearColor((GLfloat)backend->clear_color[0],
+					 (GLfloat)backend->clear_color[1],
+					 (GLfloat)backend->clear_color[2],
+					 (GLfloat)backend->clear_color[3]);
+	}
+	if (mask & 0x100 /* GL_DEPTH_BUFFER_BIT */) {
+		gl_mask |= GL_DEPTH_BUFFER_BIT;
+		glClearDepthf(depth_value);
+		glDepthMask(GL_TRUE);
+	}
+	if (mask & 0x400 /* GL_STENCIL_BUFFER_BIT */) {
+		gl_mask |= GL_STENCIL_BUFFER_BIT;
+		glClearStencil((GLint)stencil_value);
+	}
+	// Clear stale errors so the post-clear check only reflects this op
+	// (see [[bridge-stale-glerror]]).
+	(void)glGetError();
+	if (gl_mask)
+		glClear(gl_mask);
 	glDisable(GL_SCISSOR_TEST);
 	GLenum error = glGetError();
 	if (error != GL_NO_ERROR) {
@@ -1337,6 +3529,12 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 				 "GPU bridge clear failed: 0x%x", error);
 		return false;
 	}
+	// Next textured draw is the first of the frame — the bridge needs a
+	// pipeline-state-validation warmup before it (see field comment).
+	// Only relevant when clearing the bridge's own FBO; user FBOs don't
+	// suffer the warmup quirk (the bug is bridge-FBO-pipeline-specific).
+	if (!target.is_user_fbo)
+		backend->bridge_pending_textured_warmup = true;
 
 	snprintf(backend->status, sizeof(backend->status),
 			 "GPU bridge clear queued %dx%d -> %ux%u", width, height,
@@ -1344,6 +3542,233 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 	return true;
 #endif
 }
+
+#if NXJS_HAS_EGL_GLES
+
+/* ─────────────────────────────────────────────────────────────────────
+ * TESSELLATION-FIX WORKAROUND — STATE AS OF 2026-05-17
+ *
+ * Original goal: a bridge-side workaround for the Tegra X1 rasterizer
+ * "white face / dark face" bug on Three.js demos drawing BoxGeometry-
+ * sized triangles via Citron (see the `threejs-cube-white-face`
+ * memory). The bug manifests as: a face-sized triangle renders with
+ * every fragment sampling one corner of the bound texture, painting
+ * the whole face uniformly. JS-side manual tessellation
+ * (`BoxGeometry(1,1,1,8,8,8)`) eliminates the bug, presumably because
+ * no single triangle is "too big" anymore.
+ *
+ * The hypothesis was: subdivide large triangles bridge-side too, so
+ * every demo Just Works without per-demo BoxGeometry tweaks.
+ *
+ * Implementation (the code below): recursive midpoint subdivision of
+ * each input triangle in NDC space (post-perspective-divide, which is
+ * the only space the bridge has). Threshold based on projected screen
+ * area; recursion depth capped to bound the worst-case blowup.
+ *
+ *    !!! THIS WORKAROUND DOES NOT ACTUALLY FIX THE BUG. !!!
+ *
+ * Evidence: with `tessellation_fix_enabled = true` and the threshold
+ * dialled all the way down to force the same 64× blowup that manual
+ * `BoxGeometry(1,1,1,8,8,8)` uses, the wedge artifact still appears
+ * on the cube demo. Same triangle count, same per-leaf area — yet
+ * Three.js's grid produces a working cube and the bridge's
+ * subdivision does not.
+ *
+ * Why the difference: Three.js generates grid vertices in OBJECT
+ * space and then projects each one, so an angled face's far-edge
+ * sub-triangles end up foreshortened (tiny in screen). The bridge
+ * midpoints in NDC space (post-divide), producing UNIFORMLY-sized
+ * sub-triangles across the face. Apparently the rasterizer bug is
+ * sensitive to where in screen space the sub-triangles land, not
+ * just their size. Three.js's foreshortened pattern dodges it; the
+ * bridge's uniform pattern still triggers it.
+ *
+ * To actually fix this bridge-side, the bridge needs to subdivide in
+ * pre-divide CLIP space — i.e. keep `w` through the pipeline so
+ * midpoints are computed before perspective foreshortening. That's a
+ * larger refactor: callers in `webgl.c::draw_*_textured_triangles_*`
+ * currently do the perspective divide themselves and hand the bridge
+ * NDC vertices. We'd need to push the divide down into the bridge so
+ * it can subdivide first and then divide per leaf vertex.
+ *
+ * Operational state:
+ *   - `tessellation_fix_enabled` defaults to `false` (see backend init).
+ *   - switch-web-browser does NOT call `gl.setTessellationFix` — it
+ *     uses JS-side `BoxGeometry(w,h,d,8,8,8)` tessellation instead,
+ *     which is the only thing currently known to work.
+ *   - The `gl.setTessellationFix(bool)` JS API is still exposed so a
+ *     future revisitor (or an experiment) can flip it on without
+ *     touching this code. Just understand: in the current
+ *     implementation, flipping it on costs CPU per draw and does NOT
+ *     produce the visual fix Three.js demos need.
+ *
+ * Why this code is still here (not deleted): the scaffolding —
+ * scratch buffer, recursion helper, JS API, integration in both
+ * textured and untextured bridge draw paths — is exactly what a
+ * future clip-space-correct version would need. Keeping it
+ * documented-but-dormant means the next attempt picks up the
+ * infrastructure for free. Deleting and rebuilding from scratch
+ * months later would be a waste.
+ * ───────────────────────────────────────────────────────────────── */
+
+/* Recursively splits a single triangle by midpoints into 4 children
+ * until each child's projected screen area falls below `max_pixel_area`
+ * (or `max_depth` is reached).
+ *
+ * Vertices are interleaved at `stride` floats each. The FIRST TWO
+ * floats are interpreted as NDC x,y for the area test; the rest
+ * (z, optional uv, optional rgb, etc.) are linearly interpolated as
+ * opaque payload.
+ *
+ * Worst-case output per input triangle is `4^max_depth` sub-triangles
+ * = `4^max_depth * 3` vertices = `4^max_depth * 3 * stride` floats.
+ * For max_depth=4 that's a 256× blowup ceiling; the caller must
+ * pre-size the output buffer accordingly. */
+static void tessellate_one_triangle(
+    const float *v0, const float *v1, const float *v2,
+    int stride,
+    int screen_w, int screen_h,
+    float max_pixel_area,
+    int max_depth,
+    float *out_buf, int out_capacity_vertices, int *out_pos /* in/out */) {
+	/* If we're full, drop further geometry rather than overflow. The
+	 * caller pre-sized for the worst case so this should never fire,
+	 * but defending against it keeps a misbehaving frame from
+	 * trashing memory. */
+	if (*out_pos + 3 > out_capacity_vertices)
+		return;
+
+	/* Pixel-area test in screen space. NDC range [-1,1] maps to
+	 * [0,screen] so each NDC unit = screen/2 pixels. Twice the signed
+	 * area of the triangle (no /2) is fine for comparison. */
+	float dx01 = (v1[0] - v0[0]) * 0.5f * (float)screen_w;
+	float dy01 = (v1[1] - v0[1]) * 0.5f * (float)screen_h;
+	float dx02 = (v2[0] - v0[0]) * 0.5f * (float)screen_w;
+	float dy02 = (v2[1] - v0[1]) * 0.5f * (float)screen_h;
+	float double_area = dx01 * dy02 - dx02 * dy01;
+	if (double_area < 0.f)
+		double_area = -double_area;
+
+	if (max_depth <= 0 || double_area <= max_pixel_area * 2.f) {
+		/* Leaf: emit as-is. */
+		float *dst = out_buf + (size_t)(*out_pos) * (size_t)stride;
+		for (int k = 0; k < stride; k++) {
+			dst[k] = v0[k];
+			dst[stride + k] = v1[k];
+			dst[2 * stride + k] = v2[k];
+		}
+		*out_pos += 3;
+		return;
+	}
+
+	/* Midpoint each edge. Stride is bounded by the small list of bridge
+	 * vertex layouts (3 for position-only, 5 for textured position+uv);
+	 * a 16-float local scratch is plenty. */
+	float m01[16];
+	float m12[16];
+	float m20[16];
+	for (int k = 0; k < stride; k++) {
+		m01[k] = (v0[k] + v1[k]) * 0.5f;
+		m12[k] = (v1[k] + v2[k]) * 0.5f;
+		m20[k] = (v2[k] + v0[k]) * 0.5f;
+	}
+
+	/* Four sub-triangles in CCW order matching the parent. */
+	tessellate_one_triangle(v0, m01, m20, stride, screen_w, screen_h,
+							max_pixel_area, max_depth - 1, out_buf,
+							out_capacity_vertices, out_pos);
+	tessellate_one_triangle(m01, v1, m12, stride, screen_w, screen_h,
+							max_pixel_area, max_depth - 1, out_buf,
+							out_capacity_vertices, out_pos);
+	tessellate_one_triangle(m20, m12, v2, stride, screen_w, screen_h,
+							max_pixel_area, max_depth - 1, out_buf,
+							out_capacity_vertices, out_pos);
+	tessellate_one_triangle(m01, m12, m20, stride, screen_w, screen_h,
+							max_pixel_area, max_depth - 1, out_buf,
+							out_capacity_vertices, out_pos);
+}
+
+/* Ensure tessellation_scratch is at least `needed_floats` floats. Grows
+ * geometrically so repeated small bumps don't churn the heap.
+ * Returns true if the buffer is sized; false on allocation failure
+ * (in which case the caller should skip tessellation and draw the
+ * original geometry). */
+static bool ensure_tessellation_scratch(nx_webgl_egl_t *backend,
+										size_t needed_floats) {
+	if (backend->tessellation_scratch_capacity_floats >= needed_floats)
+		return true;
+	size_t cap = backend->tessellation_scratch_capacity_floats
+				 ? backend->tessellation_scratch_capacity_floats
+				 : 4096;
+	while (cap < needed_floats)
+		cap *= 2;
+	float *new_buf = realloc(backend->tessellation_scratch,
+							 cap * sizeof(float));
+	if (!new_buf)
+		return false;
+	backend->tessellation_scratch = new_buf;
+	backend->tessellation_scratch_capacity_floats = cap;
+	return true;
+}
+
+/* Returns the worst-case vertex blowup factor at `max_depth`. */
+static int tessellation_max_blowup(int max_depth) {
+	/* Each level of subdivision turns one triangle into four, so
+	 * `4^max_depth` triangles in the worst case. Each contributes 3
+	 * vertices, but vertex_count already counts 3 per triangle, so
+	 * the blowup factor for total vertex count is just `4^max_depth`. */
+	int factor = 1;
+	for (int i = 0; i < max_depth; i++)
+		factor *= 4;
+	return factor;
+}
+
+/* Subdivide an interleaved triangle-soup buffer. Returns the resulting
+ * vertex count on success; on failure (allocation, no work to do, or
+ * fix disabled) returns 0 and the caller falls back to the original
+ * geometry.
+ *
+ *   stride: floats per vertex (3 for position-only, 5 for pos+uv).
+ *   First two floats of each vertex are interpreted as NDC x,y for the
+ *   area test; everything else is opaque payload that gets linearly
+ *   interpolated. */
+static int tessellate_textured_soup(nx_webgl_egl_t *backend,
+									const float *src, int vertex_count,
+									int stride, int screen_w, int screen_h) {
+	if (!backend->tessellation_fix_enabled || !src || vertex_count < 3 ||
+		vertex_count % 3 != 0 || screen_w <= 0 || screen_h <= 0)
+		return 0;
+
+	/* Threshold + depth tuning is moot in the current implementation
+	 * because the workaround doesn't actually fix the bug (see the big
+	 * comment block above the helpers). These values are kept at the
+	 * size-based heuristic that *would* be reasonable if the underlying
+	 * approach worked: ~16 hardware tiles per leaf, depth ceiling for
+	 * pathological close-up cases. */
+	const int max_depth = 4;
+	const float max_pixel_area = 4096.f; /* ~16 tiles of 16×16 px */
+
+	int blowup = tessellation_max_blowup(max_depth);
+	size_t needed_floats = (size_t)vertex_count * (size_t)blowup *
+						   (size_t)stride;
+	if (!ensure_tessellation_scratch(backend, needed_floats))
+		return 0;
+
+	int out_pos = 0;
+	int out_capacity_vertices = (int)((size_t)vertex_count * (size_t)blowup);
+	for (int i = 0; i < vertex_count; i += 3) {
+		const float *v0 = src + (size_t)(i + 0) * (size_t)stride;
+		const float *v1 = src + (size_t)(i + 1) * (size_t)stride;
+		const float *v2 = src + (size_t)(i + 2) * (size_t)stride;
+		tessellate_one_triangle(v0, v1, v2, stride, screen_w, screen_h,
+								max_pixel_area, max_depth,
+								backend->tessellation_scratch,
+								out_capacity_vertices, &out_pos);
+	}
+	return out_pos;
+}
+
+#endif /* NXJS_HAS_EGL_GLES */
 
 bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										nx_canvas_t *canvas,
@@ -1354,10 +3779,40 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										bool blend,
 										uint32_t blend_src,
 										uint32_t blend_dst,
+										uint32_t blend_src_alpha,
+										uint32_t blend_dst_alpha,
 										const int *viewport,
 										bool scissor_enabled,
 										const int *scissor_box,
-										bool depth_enabled) {
+										bool depth_enabled,
+										const float *fog_depth,
+										bool fog_enabled,
+										const float *fog_color,
+										float fog_near,
+										float fog_far,
+										const float *normals,
+										bool lighting_enabled,
+										const float *light_direction,
+										const float *light_color,
+										const float *ambient_light_color,
+										const float *view_positions,
+										bool point_light_enabled,
+										const float *point_light_position,
+										const float *point_light_color,
+										float point_light_distance,
+										float point_light_decay,
+										bool light2_enabled,
+										const float *light_direction2,
+										const float *light_color2,
+										bool fog_exp2_enabled,
+										float fog_density,
+										bool cull_enabled,
+										uint32_t cull_face_mode,
+										bool specular_enabled,
+										const float *specular_color,
+										float shininess,
+										const float *emissive_color,
+										bool use_derivative_normals) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -1368,10 +3823,40 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	(void)blend;
 	(void)blend_src;
 	(void)blend_dst;
+	(void)blend_src_alpha;
+	(void)blend_dst_alpha;
 	(void)viewport;
 	(void)scissor_enabled;
 	(void)scissor_box;
 	(void)depth_enabled;
+	(void)fog_depth;
+	(void)fog_enabled;
+	(void)fog_color;
+	(void)fog_near;
+	(void)fog_far;
+	(void)normals;
+	(void)lighting_enabled;
+	(void)light_direction;
+	(void)light_color;
+	(void)ambient_light_color;
+	(void)view_positions;
+	(void)point_light_enabled;
+	(void)point_light_position;
+	(void)point_light_color;
+	(void)point_light_distance;
+	(void)point_light_decay;
+	(void)light2_enabled;
+	(void)light_direction2;
+	(void)light_color2;
+	(void)fog_exp2_enabled;
+	(void)fog_density;
+	(void)cull_enabled;
+	(void)cull_face_mode;
+	(void)specular_enabled;
+	(void)specular_color;
+	(void)shininess;
+	(void)emissive_color;
+	(void)use_derivative_normals;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -1388,22 +3873,145 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		return false;
 	}
 
-	int width = 0;
-	int height = 0;
-	bridge_render_size(backend, canvas, &width, &height);
-	if (!ensure_bridge_resources(backend, width, height) ||
+	bridge_target_t target;
+	if (!bridge_acquire_target(backend, canvas, &target) ||
 		!ensure_bridge_color_program(backend))
 		return false;
+	int width = target.width;
+	int height = target.height;
 
-	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
-	bridge_apply_viewport(canvas, width, height, viewport);
+	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	// Honor Three.js's `gl.enable(GL_CULL_FACE)` + `gl.cullFace(...)` state
+	// so single-sided materials (MeshPhongMaterial default
+	// `side: FrontSide`) don't render their back-facing triangles. Without
+	// this, the visible silhouette of solid extruded shapes shows
+	// ambient-only back faces leaking through what should be only the
+	// lit front cap, producing the "darker than expected" look.
+	if (cull_enabled) {
+		GLenum gl_mode = GL_BACK;
+		if (cull_face_mode == 0x0404u) gl_mode = GL_FRONT;
+		else if (cull_face_mode == 0x0408u) gl_mode = GL_FRONT_AND_BACK;
+		glEnable(GL_CULL_FACE);
+		glCullFace(gl_mode);
+	} else {
+		glDisable(GL_CULL_FACE);
+	}
 	glUseProgram(backend->bridge_color_program);
 	if (backend->bridge_color_color_loc >= 0)
 		glUniform4f(backend->bridge_color_color_loc, color[0], color[1],
 					color[2], color[3]);
+	bool fog_active = fog_enabled && fog_depth && fog_color;
+	if (backend->bridge_color_fog_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_fog_enabled_loc,
+					fog_active ? 1.f : 0.f);
+	if (backend->bridge_color_fog_exp2_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_fog_exp2_enabled_loc,
+					(fog_active && fog_exp2_enabled) ? 1.f : 0.f);
+	if (fog_active) {
+		if (backend->bridge_color_fog_color_loc >= 0)
+			glUniform3f(backend->bridge_color_fog_color_loc, fog_color[0],
+						fog_color[1], fog_color[2]);
+		if (backend->bridge_color_fog_near_loc >= 0)
+			glUniform1f(backend->bridge_color_fog_near_loc, fog_near);
+		if (backend->bridge_color_fog_far_loc >= 0)
+			glUniform1f(backend->bridge_color_fog_far_loc, fog_far);
+		if (backend->bridge_color_fog_density_loc >= 0)
+			glUniform1f(backend->bridge_color_fog_density_loc, fog_density);
+	}
+	// Lighting requires per-fragment normals — sourced from either the
+	// `normals` buffer (per-vertex view-space normals, populated CPU-side)
+	// or from view-position derivatives (`u_useDerivativeNormals` path,
+	// milestone #16). The derivative path needs view-positions populated
+	// regardless, which the dispatch already guarantees when lit.
+	bool normals_available = normals != NULL || use_derivative_normals;
+	bool light_active = lighting_enabled && normals_available &&
+						light_direction && light_color && ambient_light_color;
+	if (backend->bridge_color_lighting_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_lighting_enabled_loc,
+					light_active ? 1.f : 0.f);
+	if (backend->bridge_color_use_derivative_normals_loc >= 0)
+		glUniform1f(backend->bridge_color_use_derivative_normals_loc,
+					(light_active && use_derivative_normals) ? 1.f : 0.f);
+	if (light_active) {
+		if (backend->bridge_color_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_color_light_direction_loc,
+						light_direction[0], light_direction[1],
+						light_direction[2]);
+		if (backend->bridge_color_light_color_loc >= 0)
+			glUniform3f(backend->bridge_color_light_color_loc, light_color[0],
+						light_color[1], light_color[2]);
+		if (backend->bridge_color_ambient_light_color_loc >= 0)
+			glUniform3f(backend->bridge_color_ambient_light_color_loc,
+						ambient_light_color[0], ambient_light_color[1],
+						ambient_light_color[2]);
+	}
+	bool light2_active = light_active && light2_enabled && light_direction2 &&
+						 light_color2;
+	if (backend->bridge_color_light2_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_light2_enabled_loc,
+					light2_active ? 1.f : 0.f);
+	if (light2_active) {
+		if (backend->bridge_color_light_direction2_loc >= 0)
+			glUniform3f(backend->bridge_color_light_direction2_loc,
+						light_direction2[0], light_direction2[1],
+						light_direction2[2]);
+		if (backend->bridge_color_light_color2_loc >= 0)
+			glUniform3f(backend->bridge_color_light_color2_loc,
+						light_color2[0], light_color2[1], light_color2[2]);
+	}
+	// view_positions tracks whether `a_viewPosition` is populated. Used by
+	// both the point-light path AND the new specular path — both need
+	// per-vertex view-space positions.
+	bool view_positions_active = light_active && view_positions != NULL;
+	bool point_active = view_positions_active && point_light_enabled &&
+						point_light_position && point_light_color;
+	if (backend->bridge_color_point_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_point_light_enabled_loc,
+					point_active ? 1.f : 0.f);
+	if (point_active) {
+		if (backend->bridge_color_point_light_position_loc >= 0)
+			glUniform3f(backend->bridge_color_point_light_position_loc,
+						point_light_position[0], point_light_position[1],
+						point_light_position[2]);
+		if (backend->bridge_color_point_light_color_loc >= 0)
+			glUniform3f(backend->bridge_color_point_light_color_loc,
+						point_light_color[0], point_light_color[1],
+						point_light_color[2]);
+		if (backend->bridge_color_point_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_color_point_light_distance_loc,
+						point_light_distance);
+		if (backend->bridge_color_point_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_color_point_light_decay_loc,
+						point_light_decay);
+	}
+	// Blinn-Phong specular. Active when the program has both `specular`
+	// (vec3) and `shininess` (float) bound AND view-positions are
+	// available (V = normalize(-v_viewPosition) is needed for the halfway
+	// vector). Three.js's MeshPhongMaterial uploads both — see
+	// [[bridge-lighting-support]].
+	bool specular_active = view_positions_active && specular_enabled &&
+						   specular_color;
+	if (backend->bridge_color_specular_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_specular_enabled_loc,
+					specular_active ? 1.f : 0.f);
+	if (specular_active) {
+		if (backend->bridge_color_specular_loc >= 0)
+			glUniform3f(backend->bridge_color_specular_loc, specular_color[0],
+						specular_color[1], specular_color[2]);
+		if (backend->bridge_color_shininess_loc >= 0)
+			glUniform1f(backend->bridge_color_shininess_loc, shininess);
+	}
+	// Always upload emissive so a prior program's value can't leak. Default
+	// zero is a no-op (additive term `gl_FragColor.rgb += u_emissive`).
+	if (backend->bridge_color_emissive_loc >= 0) {
+		if (emissive_color) {
+			glUniform3f(backend->bridge_color_emissive_loc, emissive_color[0],
+						emissive_color[1], emissive_color[2]);
+		} else {
+			glUniform3f(backend->bridge_color_emissive_loc, 0.f, 0.f, 0.f);
+		}
+	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
-	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 3 * sizeof(float),
-				 clip_xyz, GL_STREAM_DRAW);
 	glEnableVertexAttribArray(0);
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
 
@@ -1420,9 +4028,50 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		glVertexAttrib3f(1, 1.f, 1.f, 1.f);
 	}
 
+	if (fog_active) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_fog_depth_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * sizeof(float), fog_depth,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(2);
+		glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(2);
+		glVertexAttrib1f(2, 0.f);
+	}
+
+	// Only upload to the normal attribute when we actually have per-vertex
+	// normals. Under derivative-normals (milestone #16) the buffer is NULL
+	// and the fragment shader computes per-fragment normals from
+	// `v_viewPosition` derivatives — the unused `a_normal` is harmless
+	// (driver dead-codes it since v_normal isn't read on that branch).
+	if (light_active && normals) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_normal_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), normals,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(3);
+		glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(3);
+		glVertexAttrib3f(3, 0.f, 0.f, 1.f);
+	}
+
+	if (view_positions_active) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_view_position_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), view_positions,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(4);
+		glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(4);
+		glVertexAttrib3f(4, 0.f, 0.f, 0.f);
+	}
+
 	if (blend) {
 		glEnable(GL_BLEND);
-		glBlendFunc(blend_src, blend_dst);
+		glBlendFuncSeparate(blend_src, blend_dst, blend_src_alpha, blend_dst_alpha);
 	} else {
 		glDisable(GL_BLEND);
 	}
@@ -1435,16 +4084,74 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		glDisable(GL_DEPTH_TEST);
 		glDepthMask(GL_FALSE);
 	}
-	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+	// Viewport + scissor already applied by bridge_bind_target above.
+
+	// Same "first draw of frame loses 1-2 primitives" workaround as the
+	// textured path. See that block for iteration history. Position
+	// attribute is 3 floats (no UVs in this path), so 18 floats total
+	// (6 verts × 3 floats) for the off-screen 6-vert warmup.
+	if (backend->bridge_pending_textured_warmup) {
+		backend->bridge_pending_textured_warmup = false;
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
+		static const float bridge_warmup_off_screen_xyz[18] = {
+			10.f, 0.f, 0.f,
+			11.f, 0.f, 0.f,
+			10.f, 1.f, 0.f,
+			11.f, 0.f, 0.f,
+			11.f, 1.f, 0.f,
+			10.f, 1.f, 0.f,
+		};
+		glBufferData(GL_ARRAY_BUFFER, sizeof(bridge_warmup_off_screen_xyz),
+					 bridge_warmup_off_screen_xyz, GL_STREAM_DRAW);
+		glDrawArrays(GL_TRIANGLES, 0, 6);
+		(void)glGetError();
+	}
+
+	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
+
+	// Tessellation-fix hook (untextured triangles, stride 3: x,y,z).
+	// Same disclaimer as the textured path: off by default, current
+	// implementation does NOT fix the rasterizer bug — see the STATE
+	// comment block above `tessellate_one_triangle` for the full
+	// rationale and what would actually work. Hook kept in place as
+	// scaffolding for a future clip-space-correct re-implementation.
+	//
+	// Gated on `!has_vertex_colors` because the per-vertex-color case
+	// uses two separate buffers (positions + colors in independent
+	// glBufferData uploads); to subdivide it we'd have to interleave,
+	// subdivide, then de-interleave. Per-vertex coloring is rare in
+	// the demos we're porting so we skip it rather than complicate the
+	// scaffolding. A future revisit could either fold colors into a
+	// single interleaved buffer or extend `tessellate_textured_soup`
+	// to subdivide N parallel streams.
+	const float *draw_xyz = clip_xyz;
+	int draw_vertex_count = vertex_count;
+	if (backend->tessellation_fix_enabled && !has_vertex_colors) {
+		int subdivided = tessellate_textured_soup(
+			backend, clip_xyz, vertex_count, 3, width, height);
+		if (subdivided >= 3) {
+			draw_xyz = backend->tessellation_scratch;
+			draw_vertex_count = subdivided;
+		}
+	}
+
+	glBufferData(GL_ARRAY_BUFFER, (size_t)draw_vertex_count * 3 * sizeof(float),
+				 draw_xyz, GL_STREAM_DRAW);
 	// Clear any stale GL error from prior setup so glGetError after the draw
 	// only reflects the draw itself, not unrelated state changes.
 	(void)glGetError();
-	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+	glDrawArrays(GL_TRIANGLES, 0, draw_vertex_count);
 	GLenum error = glGetError();
 	backend->bridge_last_draw_gl_error = error;
 	glDisableVertexAttribArray(0);
 	if (has_vertex_colors)
 		glDisableVertexAttribArray(1);
+	if (fog_active)
+		glDisableVertexAttribArray(2);
+	if (light_active && normals)
+		glDisableVertexAttribArray(3);
+	if (point_active)
+		glDisableVertexAttribArray(4);
 	glDisable(GL_SCISSOR_TEST);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (error != GL_NO_ERROR) {
@@ -1454,11 +4161,12 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		return false;
 	}
 
-	backend->bridge_pending_readback = true;
+	bridge_mark_readback(backend, &target);
 	snprintf(backend->status, sizeof(backend->status),
-			 "GPU bridge queued %d untextured vertices (vc=%d) at %dx%d -> %ux%u",
-			 vertex_count, has_vertex_colors, width, height, canvas->width,
-			 canvas->height);
+			 "vc=%d lit=%d L2=%d pt=%d fog=%d exp2=%d normPtr=%d",
+			 vertex_count, light_active ? 1 : 0, light2_active ? 1 : 0,
+			 point_active ? 1 : 0, fog_active ? 1 : 0,
+			 fog_exp2_enabled ? 1 : 0, normals != NULL ? 1 : 0);
 	return true;
 #endif
 }
@@ -1476,10 +4184,17 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 									bool blend,
 									uint32_t blend_src,
 									uint32_t blend_dst,
+									uint32_t blend_src_alpha,
+									uint32_t blend_dst_alpha,
 									const int *viewport,
 									bool scissor_enabled,
 									const int *scissor_box,
-									bool depth_enabled) {
+									bool depth_enabled,
+									const float *fog_depth,
+									bool fog_enabled,
+									const float *fog_color,
+									float fog_near,
+									float fog_far) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -1494,10 +4209,17 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 	(void)blend;
 	(void)blend_src;
 	(void)blend_dst;
+	(void)blend_src_alpha;
+	(void)blend_dst_alpha;
 	(void)viewport;
 	(void)scissor_enabled;
 	(void)scissor_box;
 	(void)depth_enabled;
+	(void)fog_depth;
+	(void)fog_enabled;
+	(void)fog_color;
+	(void)fog_near;
+	(void)fog_far;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -1514,15 +4236,14 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		return false;
 	}
 
-	int width = 0;
-	int height = 0;
-	bridge_render_size(backend, canvas, &width, &height);
-	if (!ensure_bridge_resources(backend, width, height) ||
+	bridge_target_t target;
+	if (!bridge_acquire_target(backend, canvas, &target) ||
 		!ensure_bridge_line_program(backend))
 		return false;
+	int width = target.width;
+	int height = target.height;
 
-	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
-	bridge_apply_viewport(canvas, width, height, viewport);
+	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
 	glUseProgram(backend->bridge_line_program);
 	if (backend->bridge_line_color_loc >= 0)
 		glUniform4f(backend->bridge_line_color_loc, color[0], color[1],
@@ -1533,6 +4254,19 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		glUniform1f(backend->bridge_line_dash_loc, dash_size);
 	if (backend->bridge_line_total_loc >= 0)
 		glUniform1f(backend->bridge_line_total_loc, total_size);
+	bool fog_active = fog_enabled && fog_depth && fog_color;
+	if (backend->bridge_line_fog_enabled_loc >= 0)
+		glUniform1f(backend->bridge_line_fog_enabled_loc,
+					fog_active ? 1.f : 0.f);
+	if (fog_active) {
+		if (backend->bridge_line_fog_color_loc >= 0)
+			glUniform3f(backend->bridge_line_fog_color_loc, fog_color[0],
+						fog_color[1], fog_color[2]);
+		if (backend->bridge_line_fog_near_loc >= 0)
+			glUniform1f(backend->bridge_line_fog_near_loc, fog_near);
+		if (backend->bridge_line_fog_far_loc >= 0)
+			glUniform1f(backend->bridge_line_fog_far_loc, fog_far);
+	}
 
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 3 * sizeof(float),
@@ -1566,9 +4300,21 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		glVertexAttrib3f(2, 1.f, 1.f, 1.f);
 	}
 
+	if (fog_active) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_fog_depth_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * sizeof(float), fog_depth,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(3);
+		glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(3);
+		glVertexAttrib1f(3, 0.f);
+	}
+
 	if (blend) {
 		glEnable(GL_BLEND);
-		glBlendFunc(blend_src, blend_dst);
+		glBlendFuncSeparate(blend_src, blend_dst, blend_src_alpha, blend_dst_alpha);
 	} else {
 		glDisable(GL_BLEND);
 	}
@@ -1586,7 +4332,7 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		glDisable(GL_DEPTH_TEST);
 		glDepthMask(GL_FALSE);
 	}
-	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+	// Viewport + scissor already applied by bridge_bind_target above.
 
 	(void)glGetError();
 	glDrawArrays(GL_LINES, 0, vertex_count);
@@ -1598,6 +4344,8 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		glDisableVertexAttribArray(1);
 	if (has_vertex_colors)
 		glDisableVertexAttribArray(2);
+	if (fog_active)
+		glDisableVertexAttribArray(3);
 	glDisable(GL_SCISSOR_TEST);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	if (error != GL_NO_ERROR) {
@@ -1606,7 +4354,7 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 		return false;
 	}
 
-	backend->bridge_pending_readback = true;
+	bridge_mark_readback(backend, &target);
 	snprintf(backend->status, sizeof(backend->status),
 			 "GPU bridge queued %d line vertices at %dx%d -> %ux%u",
 			 vertex_count, width, height, canvas->width, canvas->height);
@@ -1624,6 +4372,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	int texture_width,
 	int texture_height,
 	const uint8_t *texture_rgba,
+	uint32_t texture_persistent_handle,
 	uint32_t min_filter,
 	uint32_t mag_filter,
 	uint32_t wrap_s,
@@ -1631,10 +4380,43 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	bool blend,
 	uint32_t blend_src,
 	uint32_t blend_dst,
+	uint32_t blend_src_alpha,
+	uint32_t blend_dst_alpha,
 	const int *viewport,
 	bool scissor_enabled,
 	const int *scissor_box,
-	bool depth_enabled) {
+	bool depth_enabled,
+	const float *fog_depth,
+	bool fog_enabled,
+	const float *fog_color,
+	float fog_near,
+	float fog_far,
+	const float *normals,
+	bool lighting_enabled,
+	const float *light_direction,
+	const float *light_color,
+	const float *ambient_light_color,
+	const float *view_positions,
+	bool point_light_enabled,
+	const float *point_light_position,
+	const float *point_light_color,
+	float point_light_distance,
+	float point_light_decay,
+	bool light2_enabled,
+	const float *light_direction2,
+	const float *light_color2,
+	bool fog_exp2_enabled,
+	float fog_density,
+	const float *map_transform,
+	bool has_map_transform,
+	bool cull_enabled,
+	uint32_t cull_face_mode,
+	const float *diffuse_color,
+	bool specular_enabled,
+	const float *specular_color,
+	float shininess,
+	const float *emissive_color,
+	bool use_derivative_normals) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -1645,6 +4427,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)texture_width;
 	(void)texture_height;
 	(void)texture_rgba;
+	(void)texture_persistent_handle;
 	(void)min_filter;
 	(void)mag_filter;
 	(void)wrap_s;
@@ -1652,59 +4435,298 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)blend;
 	(void)blend_src;
 	(void)blend_dst;
+	(void)blend_src_alpha;
+	(void)blend_dst_alpha;
 	(void)viewport;
 	(void)scissor_enabled;
 	(void)scissor_box;
 	(void)depth_enabled;
+	(void)fog_depth;
+	(void)fog_enabled;
+	(void)fog_color;
+	(void)fog_near;
+	(void)fog_far;
+	(void)normals;
+	(void)lighting_enabled;
+	(void)light_direction;
+	(void)light_color;
+	(void)ambient_light_color;
+	(void)view_positions;
+	(void)point_light_enabled;
+	(void)point_light_position;
+	(void)point_light_color;
+	(void)point_light_distance;
+	(void)point_light_decay;
+	(void)light2_enabled;
+	(void)light_direction2;
+	(void)light_color2;
+	(void)fog_exp2_enabled;
+	(void)fog_density;
+	(void)map_transform;
+	(void)has_map_transform;
+	(void)cull_enabled;
+	(void)cull_face_mode;
+	(void)diffuse_color;
+	(void)specular_enabled;
+	(void)specular_color;
+	(void)shininess;
+	(void)emissive_color;
+	(void)use_derivative_normals;
 	return false;
 #else
+	// Persistent-handle textures (FBO color attachments) have no CPU `data` —
+	// `texture_rgba` is NULL and `texture_id` may be 0 too. Treat that case as
+	// valid: the dispatch will bind `texture_persistent_handle` directly,
+	// skipping the per-draw `ensure_bridge_cached_texture` upload entirely.
+	bool persistent_path = texture_persistent_handle != 0;
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
 		canvas->width == 0 || canvas->height == 0 || !clip_xyzuv ||
-		vertex_count <= 0 || vertex_count % 3 != 0 || !texture_rgba ||
-		texture_id == 0 || texture_revision == 0 || texture_width <= 0 ||
-		texture_height <= 0)
+		vertex_count <= 0 || vertex_count % 3 != 0 ||
+		texture_width <= 0 || texture_height <= 0) {
+		nx_webgl_egl_append_dispatch_debug(backend, "T-args");
 		return false;
-	if (!nx_webgl_egl_initialize(backend, canvas))
+	}
+	if (!persistent_path && (!texture_rgba || texture_id == 0 ||
+	                          texture_revision == 0)) {
+		nx_webgl_egl_append_dispatch_debug(backend, "T-args");
 		return false;
+	}
+	if (!nx_webgl_egl_initialize(backend, canvas)) {
+		nx_webgl_egl_append_dispatch_debug(backend, "T-init");
+		return false;
+	}
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context)) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge texture draw: eglMakeCurrent() failed: 0x%x",
 				 eglGetError());
+		nx_webgl_egl_append_dispatch_debug(backend, "T-mkcur");
 		return false;
 	}
 
-	int width = 0;
-	int height = 0;
-	bridge_render_size(backend, canvas, &width, &height);
-	if (!ensure_bridge_resources(backend, width, height) ||
-		!ensure_bridge_texture_program(backend))
+	bridge_target_t target;
+	if (!bridge_acquire_target(backend, canvas, &target) ||
+		!ensure_bridge_texture_program(backend)) {
+		nx_webgl_egl_append_dispatch_debug(backend, "T-rsrc");
 		return false;
+	}
+	int width = target.width;
+	int height = target.height;
 
-	GLuint texture_handle = ensure_bridge_cached_texture(
-		backend, texture_id, texture_revision, texture_width, texture_height,
-		texture_rgba, min_filter, mag_filter, wrap_s, wrap_t);
-	if (!texture_handle)
-		return false;
+	GLuint texture_handle;
+	if (persistent_path) {
+		// Persistent texture (FBO color attachment or createTexture+texImage2D
+		// path). Apply sampler state directly to the user's GL texture each
+		// draw so wrap/filter changes between bindings take effect.
+		texture_handle = (GLuint)texture_persistent_handle;
+		glBindTexture(GL_TEXTURE_2D, texture_handle);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+		                bridge_texture_filter(min_filter));
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+		                bridge_texture_filter(mag_filter));
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+		                bridge_texture_wrap(wrap_s));
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+		                bridge_texture_wrap(wrap_t));
+	} else {
+		texture_handle = ensure_bridge_cached_texture(
+			backend, texture_id, texture_revision, texture_width,
+			texture_height, texture_rgba, min_filter, mag_filter, wrap_s,
+			wrap_t);
+		if (!texture_handle) {
+			nx_webgl_egl_append_dispatch_debug(backend, "T-tex");
+			return false;
+		}
+	}
 
-	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
-	bridge_apply_viewport(canvas, width, height, viewport);
+	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	// See cull_enabled comment in nx_webgl_egl_draw_triangles_bridge.
+	if (cull_enabled) {
+		GLenum gl_mode = GL_BACK;
+		if (cull_face_mode == 0x0404u) gl_mode = GL_FRONT;
+		else if (cull_face_mode == 0x0408u) gl_mode = GL_FRONT_AND_BACK;
+		glEnable(GL_CULL_FACE);
+		glCullFace(gl_mode);
+	} else {
+		glDisable(GL_CULL_FACE);
+	}
 	glUseProgram(backend->bridge_texture_program);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, texture_handle);
 	if (backend->bridge_texture_sampler_loc >= 0)
 		glUniform1i(backend->bridge_texture_sampler_loc, 0);
+	// Apply Three.js's texture-transform mat3 (`texture.repeat` / `.offset`
+	// / `.rotation` / `.center` baked into a 3x3 affine) to a_uv before
+	// passing v_uv to the fragment shader. When not set, the shader uses
+	// a_uv unchanged so callers that don't bind a transform are unaffected.
+	if (backend->bridge_texture_map_transform_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_map_transform_enabled_loc,
+					has_map_transform ? 1.f : 0.f);
+	if (has_map_transform && map_transform &&
+		backend->bridge_texture_map_transform_loc >= 0)
+		glUniformMatrix3fv(backend->bridge_texture_map_transform_loc, 1, GL_FALSE,
+						   map_transform);
+	// Apply Three.js's `diffuse` / `u_color` uniform as a per-pixel multiplier
+	// on the sampled texture color. Three.js's MeshBasicMaterial /
+	// MeshLambertMaterial / MeshPhongMaterial all upload `diffuse` (vec3) and
+	// the shader computes `diffuseColor *= map`. Default to identity (1,1,1)
+	// when the caller doesn't bind a diffuse so existing demos that relied
+	// on the un-tinted texture path are unaffected. Also fixes milestone #8's
+	// per-sprite `material.color.setHSL` tint, which uploads to the same
+	// `diffuse` uniform on SpriteMaterial.
+	if (backend->bridge_texture_diffuse_loc >= 0) {
+		if (diffuse_color) {
+			glUniform3f(backend->bridge_texture_diffuse_loc, diffuse_color[0],
+						diffuse_color[1], diffuse_color[2]);
+		} else {
+			glUniform3f(backend->bridge_texture_diffuse_loc, 1.f, 1.f, 1.f);
+		}
+	}
+	bool fog_active = fog_enabled && fog_depth && fog_color;
+	if (backend->bridge_texture_fog_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_fog_enabled_loc,
+					fog_active ? 1.f : 0.f);
+	if (backend->bridge_texture_fog_exp2_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_fog_exp2_enabled_loc,
+					(fog_active && fog_exp2_enabled) ? 1.f : 0.f);
+	if (fog_active) {
+		if (backend->bridge_texture_fog_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_fog_color_loc, fog_color[0],
+						fog_color[1], fog_color[2]);
+		if (backend->bridge_texture_fog_near_loc >= 0)
+			glUniform1f(backend->bridge_texture_fog_near_loc, fog_near);
+		if (backend->bridge_texture_fog_far_loc >= 0)
+			glUniform1f(backend->bridge_texture_fog_far_loc, fog_far);
+		if (backend->bridge_texture_fog_density_loc >= 0)
+			glUniform1f(backend->bridge_texture_fog_density_loc, fog_density);
+	}
+	// See color-path comment for the derivative-normals path. Same gating.
+	bool normals_available = normals != NULL || use_derivative_normals;
+	bool light_active = lighting_enabled && normals_available &&
+						light_direction && light_color && ambient_light_color;
+	if (backend->bridge_texture_lighting_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_lighting_enabled_loc,
+					light_active ? 1.f : 0.f);
+	if (backend->bridge_texture_use_derivative_normals_loc >= 0)
+		glUniform1f(backend->bridge_texture_use_derivative_normals_loc,
+					(light_active && use_derivative_normals) ? 1.f : 0.f);
+	if (light_active) {
+		if (backend->bridge_texture_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_texture_light_direction_loc,
+						light_direction[0], light_direction[1],
+						light_direction[2]);
+		if (backend->bridge_texture_light_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_light_color_loc, light_color[0],
+						light_color[1], light_color[2]);
+		if (backend->bridge_texture_ambient_light_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_ambient_light_color_loc,
+						ambient_light_color[0], ambient_light_color[1],
+						ambient_light_color[2]);
+	}
+	bool light2_active = light_active && light2_enabled && light_direction2 &&
+						 light_color2;
+	if (backend->bridge_texture_light2_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_light2_enabled_loc,
+					light2_active ? 1.f : 0.f);
+	if (light2_active) {
+		if (backend->bridge_texture_light_direction2_loc >= 0)
+			glUniform3f(backend->bridge_texture_light_direction2_loc,
+						light_direction2[0], light_direction2[1],
+						light_direction2[2]);
+		if (backend->bridge_texture_light_color2_loc >= 0)
+			glUniform3f(backend->bridge_texture_light_color2_loc,
+						light_color2[0], light_color2[1], light_color2[2]);
+	}
+	bool view_positions_active = light_active && view_positions != NULL;
+	bool point_active = view_positions_active && point_light_enabled &&
+						point_light_position && point_light_color;
+	if (backend->bridge_texture_point_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_point_light_enabled_loc,
+					point_active ? 1.f : 0.f);
+	if (point_active) {
+		if (backend->bridge_texture_point_light_position_loc >= 0)
+			glUniform3f(backend->bridge_texture_point_light_position_loc,
+						point_light_position[0], point_light_position[1],
+						point_light_position[2]);
+		if (backend->bridge_texture_point_light_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_point_light_color_loc,
+						point_light_color[0], point_light_color[1],
+						point_light_color[2]);
+		if (backend->bridge_texture_point_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_texture_point_light_distance_loc,
+						point_light_distance);
+		if (backend->bridge_texture_point_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_texture_point_light_decay_loc,
+						point_light_decay);
+	}
+	// Blinn-Phong specular (textured path) — same gating as the color path:
+	// needs view-positions (for V) AND specular+shininess uniforms bound.
+	bool specular_active = view_positions_active && specular_enabled &&
+						   specular_color;
+	if (backend->bridge_texture_specular_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_specular_enabled_loc,
+					specular_active ? 1.f : 0.f);
+	if (specular_active) {
+		if (backend->bridge_texture_specular_loc >= 0)
+			glUniform3f(backend->bridge_texture_specular_loc, specular_color[0],
+						specular_color[1], specular_color[2]);
+		if (backend->bridge_texture_shininess_loc >= 0)
+			glUniform1f(backend->bridge_texture_shininess_loc, shininess);
+	}
+	// Always upload emissive so a prior program's value can't leak. Default
+	// zero is a no-op (additive term `gl_FragColor.rgb += u_emissive`).
+	if (backend->bridge_texture_emissive_loc >= 0) {
+		if (emissive_color) {
+			glUniform3f(backend->bridge_texture_emissive_loc, emissive_color[0],
+						emissive_color[1], emissive_color[2]);
+		} else {
+			glUniform3f(backend->bridge_texture_emissive_loc, 0.f, 0.f, 0.f);
+		}
+	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
-	glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * 5 * sizeof(float),
-				 clip_xyzuv, GL_STREAM_DRAW);
 	glEnableVertexAttribArray(0);
 	glEnableVertexAttribArray(1);
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 5, 0);
 	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 5,
 						  (const void *)(sizeof(float) * 3));
+	if (fog_active) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_fog_depth_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * sizeof(float), fog_depth,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(2);
+		glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(2);
+		glVertexAttrib1f(2, 0.f);
+	}
+	// See color-path comment: normals buffer skipped under derivative-normals.
+	if (light_active && normals) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_normal_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), normals,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(3);
+		glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(3);
+		glVertexAttrib3f(3, 0.f, 0.f, 1.f);
+	}
+	if (view_positions_active) {
+		glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_view_position_buffer);
+		glBufferData(GL_ARRAY_BUFFER,
+					 (size_t)vertex_count * 3 * sizeof(float), view_positions,
+					 GL_STREAM_DRAW);
+		glEnableVertexAttribArray(4);
+		glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, 0, 0);
+	} else {
+		glDisableVertexAttribArray(4);
+		glVertexAttrib3f(4, 0.f, 0.f, 0.f);
+	}
+	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	if (blend) {
 		glEnable(GL_BLEND);
-		glBlendFunc(blend_src, blend_dst);
+		glBlendFuncSeparate(blend_src, blend_dst, blend_src_alpha, blend_dst_alpha);
 	} else {
 		glDisable(GL_BLEND);
 	}
@@ -1717,10 +4739,77 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		glDisable(GL_DEPTH_TEST);
 		glDepthMask(GL_FALSE);
 	}
-	bridge_apply_scissor(canvas, width, height, scissor_enabled, scissor_box);
+	// Viewport + scissor already applied by bridge_bind_target above.
+
+	// Workaround for the bridge "first draw of frame loses its first ~1-2
+	// primitives" bug. The GPU pipeline state hasn't fully validated by the
+	// time the first drawArrays after gl.clear() runs, and 1-2 primitives
+	// emit corrupted output (textured: stuck on one bright texel; untextured:
+	// no output at all).
+	//
+	// Iteration history:
+	//   (1) Color-masked warmup — failed: drivers optimize away fully-masked
+	//       draws (no output → no rasterization needed → state never
+	//       validates), and the real draw is still effectively "first".
+	//   (2) Degenerate (zero-area) warmup — failed: drivers also optimize
+	//       away zero-area triangles before/during the rasterizer, so vertex
+	//       shader execution may be skipped and state doesn't validate.
+	//   (3) Off-screen 6-vertex (2 triangles) warmup — current: vertices at
+	//       NDC x=10 are real, non-degenerate triangles. They go through the
+	//       vertex shader (state validates), THEN the clip stage rejects
+	//       them (entirely outside [-1,1] NDC volume). Rasterizer never
+	//       sees them, no visible fragments emitted. 2 triangles absorbs
+	//       up to 2 corrupted primitives.
+	if (backend->bridge_pending_textured_warmup) {
+		backend->bridge_pending_textured_warmup = false;
+		// 6 vertices forming 2 triangles, all at NDC x in [10,11] —
+		// entirely outside the [-1,1] NDC volume, clipped after vertex
+		// shader runs but before rasterization. Layout: 5 floats per
+		// vertex (x, y, z, u, v) matching the textured shader's attribs.
+		static const float bridge_warmup_off_screen_xyzuv[30] = {
+			10.f, 0.f, 0.f, 0.f, 0.f,
+			11.f, 0.f, 0.f, 0.f, 0.f,
+			10.f, 1.f, 0.f, 0.f, 0.f,
+			11.f, 0.f, 0.f, 0.f, 0.f,
+			11.f, 1.f, 0.f, 0.f, 0.f,
+			10.f, 1.f, 0.f, 0.f, 0.f,
+		};
+		glBufferData(GL_ARRAY_BUFFER, sizeof(bridge_warmup_off_screen_xyzuv),
+					 bridge_warmup_off_screen_xyzuv, GL_STREAM_DRAW);
+		glDrawArrays(GL_TRIANGLES, 0, 6);
+		(void)glGetError();
+	}
+
+	// Tessellation-fix hook (textured triangles, stride 5: x,y,z,u,v).
+	// Subdivides screen-large input triangles into smaller leaves
+	// before the underlying glDrawArrays. Off by default and does NOT
+	// fix the white-face/dark-face rasterizer bug in its current form
+	// — see the big STATE comment block above `tessellate_one_triangle`
+	// for why and what would actually work. Hook kept in place as
+	// scaffolding for a future clip-space-correct re-implementation.
+	const float *draw_xyzuv = clip_xyzuv;
+	int draw_vertex_count = vertex_count;
+	if (backend->tessellation_fix_enabled) {
+		int subdivided = tessellate_textured_soup(
+			backend, clip_xyzuv, vertex_count, 5, width, height);
+		if (subdivided >= 3) {
+			draw_xyzuv = backend->tessellation_scratch;
+			draw_vertex_count = subdivided;
+		}
+	}
+
+	glBufferData(GL_ARRAY_BUFFER, (size_t)draw_vertex_count * 5 * sizeof(float),
+				 draw_xyzuv, GL_STREAM_DRAW);
+
 	(void)glGetError();
-	glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+	glDrawArrays(GL_TRIANGLES, 0, draw_vertex_count);
 	GLenum error = glGetError();
+	if (point_active)
+		glDisableVertexAttribArray(4);
+	if (light_active && normals)
+		glDisableVertexAttribArray(3);
+	if (fog_active)
+		glDisableVertexAttribArray(2);
 	glDisableVertexAttribArray(1);
 	glDisableVertexAttribArray(0);
 	glDisable(GL_SCISSOR_TEST);
@@ -1728,13 +4817,22 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	if (error != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge texture draw failed: 0x%x", error);
+		char tag[32];
+		snprintf(tag, sizeof(tag), "T-gl(0x%x)", error);
+		nx_webgl_egl_append_dispatch_debug(backend, tag);
 		return false;
 	}
 
-	backend->bridge_pending_readback = true;
+	bridge_mark_readback(backend, &target);
 	snprintf(backend->status, sizeof(backend->status),
-			 "GPU bridge queued textured %d vertices at %dx%d -> %ux%u",
-			 vertex_count, width, height, canvas->width, canvas->height);
+			 "GPU bridge queued textured %d vertices (in=%d) at %dx%d -> %ux%u",
+			 draw_vertex_count, vertex_count, width, height,
+			 canvas->width, canvas->height);
+	{
+		char tag[16];
+		snprintf(tag, sizeof(tag), "T+%d", vertex_count / 3);
+		nx_webgl_egl_append_dispatch_debug(backend, tag);
+	}
 	return true;
 #endif
 }
@@ -2490,6 +5588,8 @@ JSValue nx_webgl_egl_get_backend_info(JSContext *ctx,
 	define_string(ctx, obj, "status",
 				  backend ? backend->status : "EGL backend was not allocated");
 	define_int(ctx, obj, "probeStep", backend ? backend->step : 0);
+	define_string(ctx, obj, "debugDispatchState",
+				  backend ? backend->debug_dispatch_state : "");
 
 #if NXJS_HAS_EGL_GLES
 	define_int(ctx, obj, "eglMajor", backend ? backend->major : 0);
@@ -2505,6 +5605,35 @@ JSValue nx_webgl_egl_get_backend_info(JSContext *ctx,
 			   backend ? backend->bridge_width : 0);
 	define_int(ctx, obj, "bridgeRenderHeight",
 			   backend ? backend->bridge_height : 0);
+	define_bool(ctx, obj, "extInstancedArraysPresent",
+				backend && backend->ext_instanced_arrays_present);
+	define_bool(ctx, obj, "fnVertexAttribDivisor",
+				backend && backend->fn_vertex_attrib_divisor_ext != NULL);
+	define_bool(ctx, obj, "fnDrawArraysInstanced",
+				backend && backend->fn_draw_arrays_instanced_ext != NULL);
+	define_bool(ctx, obj, "fnDrawElementsInstanced",
+				backend && backend->fn_draw_elements_instanced_ext != NULL);
+	define_string(ctx, obj, "glExtensions",
+				  backend ? backend->gl_extensions : "");
+	// Bug-hunt: show the raw function pointer addresses + the address of
+	// glDrawArrays for comparison. If glDrawArraysInstanced ===
+	// glDrawArrays, eglGetProcAddress returned the wrong fn (silently
+	// ignoring instance_count) and we need a different loading strategy.
+	{
+		char buf[64];
+		void *pda = (void *)&glDrawArrays;
+		void *pde = (void *)&glDrawElements;
+		snprintf(buf, sizeof(buf), "%p", (void *)backend->fn_draw_arrays_instanced_ext);
+		define_string(ctx, obj, "fnDrawArraysInstancedAddr", buf);
+		snprintf(buf, sizeof(buf), "%p", pda);
+		define_string(ctx, obj, "fnDrawArraysAddr", buf);
+		snprintf(buf, sizeof(buf), "%p", (void *)backend->fn_draw_elements_instanced_ext);
+		define_string(ctx, obj, "fnDrawElementsInstancedAddr", buf);
+		snprintf(buf, sizeof(buf), "%p", pde);
+		define_string(ctx, obj, "fnDrawElementsAddr", buf);
+		snprintf(buf, sizeof(buf), "%p", (void *)backend->fn_vertex_attrib_divisor_ext);
+		define_string(ctx, obj, "fnVertexAttribDivisorAddr", buf);
+	}
 #else
 	define_int(ctx, obj, "eglMajor", 0);
 	define_int(ctx, obj, "eglMinor", 0);
@@ -2515,6 +5644,11 @@ JSValue nx_webgl_egl_get_backend_info(JSContext *ctx,
 	define_int(ctx, obj, "bridgeRequestedHeight", 0);
 	define_int(ctx, obj, "bridgeRenderWidth", 0);
 	define_int(ctx, obj, "bridgeRenderHeight", 0);
+	define_bool(ctx, obj, "extInstancedArraysPresent", false);
+	define_bool(ctx, obj, "fnVertexAttribDivisor", false);
+	define_bool(ctx, obj, "fnDrawArraysInstanced", false);
+	define_bool(ctx, obj, "fnDrawElementsInstanced", false);
+	define_string(ctx, obj, "glExtensions", "");
 #endif
 
 	return obj;
@@ -2600,6 +5734,8 @@ void nx_webgl_egl_delete_shader(nx_webgl_egl_t *backend,
 bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 							   uint32_t vertex_shader_handle,
 							   uint32_t fragment_shader_handle,
+							   const nx_webgl_attrib_binding_t *bindings,
+							   int binding_count,
 							   uint32_t *program_handle, bool *link_status,
 							   char *info_log, size_t info_log_size) {
 	if (link_status)
@@ -2642,13 +5778,64 @@ bool nx_webgl_egl_link_program(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 	// per-program via getAttribLocation reflection (see color_attrib_index /
 	// line_distance_attrib_index in webgl.c).
 	glBindAttribLocation(handle, 0, "position");
+	// Apply user-side bindAttribLocation calls collected program-side
+	// in webgl.c. Later glBindAttribLocation calls override earlier
+	// ones for the same name — which is what we want: explicit user
+	// binds beat our default "position" pin if names collide.
+	if (bindings && binding_count > 0) {
+		for (int i = 0; i < binding_count; i++) {
+			if (bindings[i].name) {
+				glBindAttribLocation(handle, (GLuint)bindings[i].location,
+									 bindings[i].name);
+			}
+		}
+	}
 	glLinkProgram(handle);
 
 	GLint ok = GL_FALSE;
 	glGetProgramiv(handle, GL_LINK_STATUS, &ok);
+	bool link_ok = (ok == GL_TRUE);
+
+	// WebGL conformance: when the user binds two attributes to the same
+	// location via bindAttribLocation AND both attributes are active in
+	// the linked program, the link must fail. The Tegra X1 GLES driver
+	// is permissive and lets such aliased active attributes link, so we
+	// enforce the rule JS-side. (When binding_count < 2 there can be no
+	// aliasing among user binds; skip.)
+	if (link_ok && bindings && binding_count >= 2) {
+		GLint num_active = 0;
+		glGetProgramiv(handle, GL_ACTIVE_ATTRIBUTES, &num_active);
+		// Build an "is active" flag per binding by querying each name's
+		// location through glGetAttribLocation — returns -1 if the name
+		// isn't an active attribute. Much cheaper than enumerating all
+		// active attributes (avoids the GetActiveAttrib loop).
+		bool active[16];  // matches NX_WEBGL_MAX_ATTRIB_BINDINGS in webgl.c
+		int n = binding_count < 16 ? binding_count : 16;
+		for (int i = 0; i < n; i++) {
+			active[i] = bindings[i].name &&
+						glGetAttribLocation(handle, bindings[i].name) >= 0;
+		}
+		for (int i = 0; i < n && link_ok; i++) {
+			if (!active[i]) continue;
+			for (int j = i + 1; j < n; j++) {
+				if (!active[j]) continue;
+				if (bindings[i].location == bindings[j].location) {
+					link_ok = false;
+					if (info_log && info_log_size > 0) {
+						snprintf(info_log, info_log_size,
+							"active attributes '%s' and '%s' aliased to location %d",
+							bindings[i].name, bindings[j].name,
+							bindings[i].location);
+					}
+					break;
+				}
+			}
+		}
+	}
+
 	if (link_status)
-		*link_status = ok == GL_TRUE;
-	if (info_log && info_log_size > 0) {
+		*link_status = link_ok;
+	if (link_ok && info_log && info_log_size > 0) {
 		GLsizei written = 0;
 		glGetProgramInfoLog(handle, (GLsizei)info_log_size, &written,
 							info_log);
@@ -2773,6 +5960,31 @@ bool nx_webgl_egl_get_active_uniform(nx_webgl_egl_t *backend,
 	(void)name_size;
 	(void)size;
 	(void)type;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_get_program_iv(nx_webgl_egl_t *backend,
+								 uint32_t program_handle,
+								 uint32_t pname,
+								 int *out_value) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !program_handle || !backend->available || !out_value)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return false;
+	GLint v = 0;
+	glGetProgramiv((GLuint)program_handle, (GLenum)pname, &v);
+	if (glGetError() != GL_NO_ERROR)
+		return false;
+	*out_value = (int)v;
+	return true;
+#else
+	(void)backend;
+	(void)program_handle;
+	(void)pname;
+	(void)out_value;
 	return false;
 #endif
 }

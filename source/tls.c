@@ -8,6 +8,14 @@
 #include <mbedtls/x509_crt.h>
 #include <switch/services/ssl.h>
 
+// Mozilla CA bundle baked in via `bin2s` from `data/cacert.bin`. Used
+// to supplement (or substitute for) Switch's built-in system CAs when
+// `sslGetCertificates` returns nothing usable — on some firmware /
+// boot-environment combinations that produces an empty CA chain and
+// every HTTPS handshake fails with `X509 - Certificate verification
+// failed`.
+#include "cacert_bin.h"
+
 static JSClassID nx_tls_context_class_id;
 
 static nx_tls_context_t *nx_tls_context_get(JSContext *ctx, JSValueConst obj) {
@@ -102,61 +110,85 @@ static int nx_tls_load_ca_certs(nx_context_t *nx_ctx) {
 
 	mbedtls_x509_crt_init(&nx_ctx->ca_chain);
 
+	// 1) Try the Switch's built-in SSL service first. Provides Nintendo
+	// roots + a curated set of common CAs the system already trusts.
+	// Don't bail on failure — fall through to the bundled Mozilla
+	// bundle instead so HTTPS still works.
 	Result rc = sslInitialize(1);
-	if (R_FAILED(rc)) {
-		fprintf(stderr, "sslInitialize() failed: 0x%x\n", rc);
-		return -1;
-	}
+	if (R_SUCCEEDED(rc)) {
+		int total = (int)(sizeof(nx_ca_cert_ids) / sizeof(nx_ca_cert_ids[0]));
+		for (int i = 0; i < total; i++) {
+			u32 id = nx_ca_cert_ids[i];
+			u32 buf_size = 0;
 
-	int loaded = 0;
-	int total = (int)(sizeof(nx_ca_cert_ids) / sizeof(nx_ca_cert_ids[0]));
-
-	for (int i = 0; i < total; i++) {
-		u32 id = nx_ca_cert_ids[i];
-		u32 buf_size = 0;
-
-		rc = sslGetCertificateBufSize(&id, 1, &buf_size);
-		if (R_FAILED(rc)) {
-			// Cert may not exist on this firmware version, skip it
-			continue;
-		}
-
-		void *cert_buffer = malloc(buf_size);
-		if (!cert_buffer) {
-			continue;
-		}
-
-		u32 out_count = 0;
-		rc = sslGetCertificates(cert_buffer, buf_size, &id, 1, &out_count);
-		if (R_FAILED(rc)) {
-			free(cert_buffer);
-			continue;
-		}
-
-		SslBuiltInCertificateInfo *info = (SslBuiltInCertificateInfo *)cert_buffer;
-		for (u32 j = 0; j < out_count; j++) {
-			if (info[j].status != SslTrustedCertStatus_EnabledTrusted) {
+			rc = sslGetCertificateBufSize(&id, 1, &buf_size);
+			if (R_FAILED(rc)) {
+				// Cert may not exist on this firmware version, skip it.
 				continue;
 			}
-			if (info[j].cert_data && info[j].cert_size > 0) {
-				int ret = mbedtls_x509_crt_parse_der(
-					&nx_ctx->ca_chain,
-					info[j].cert_data,
-					info[j].cert_size);
-				if (ret == 0) {
-					loaded++;
+
+			void *cert_buffer = malloc(buf_size);
+			if (!cert_buffer) {
+				continue;
+			}
+
+			u32 out_count = 0;
+			rc = sslGetCertificates(cert_buffer, buf_size, &id, 1, &out_count);
+			if (R_FAILED(rc)) {
+				free(cert_buffer);
+				continue;
+			}
+
+			SslBuiltInCertificateInfo *info = (SslBuiltInCertificateInfo *)cert_buffer;
+			for (u32 j = 0; j < out_count; j++) {
+				if (info[j].status != SslTrustedCertStatus_EnabledTrusted) {
+					continue;
+				}
+				if (info[j].cert_data && info[j].cert_size > 0) {
+					mbedtls_x509_crt_parse_der(
+						&nx_ctx->ca_chain,
+						info[j].cert_data,
+						info[j].cert_size);
 				}
 			}
-		}
 
-		free(cert_buffer);
+			free(cert_buffer);
+		}
+		sslExit();
+	} else {
+		fprintf(stderr, "sslInitialize() failed: 0x%x — skipping system CAs\n", rc);
 	}
 
-	sslExit();
+	// 2) Supplement (or substitute) with the bundled Mozilla CA bundle.
+	// The mbedtls PEM parser requires a NUL-terminated buffer, so copy
+	// onto the heap with an extra byte rather than passing the read-only
+	// linked data directly.
+	unsigned char *pem_buf = malloc(cacert_bin_size + 1);
+	if (pem_buf) {
+		memcpy(pem_buf, cacert_bin, cacert_bin_size);
+		pem_buf[cacert_bin_size] = '\0';
+		// Return value is non-negative on at-least-partial success;
+		// individual cert failures are tolerated. We measure success
+		// by walking the chain afterwards.
+		mbedtls_x509_crt_parse(&nx_ctx->ca_chain, pem_buf, cacert_bin_size + 1);
+		free(pem_buf);
+	}
 
-	fprintf(stderr, "Loaded %d system CA certificates\n", loaded);
+	// Count what actually landed in the chain. After
+	// `mbedtls_x509_crt_init` the head node is zeroed; a parsed cert
+	// has `raw.len > 0`.
+	int chain_len = 0;
+	for (mbedtls_x509_crt *c = &nx_ctx->ca_chain; c != NULL; c = c->next) {
+		if (c->raw.len > 0) chain_len++;
+	}
+
+	fprintf(stderr, "TLS: %d CA certificates in chain (system + bundled)\n", chain_len);
 	nx_ctx->ca_certs_loaded = true;
-	return 0;
+
+	// If absolutely nothing loaded — neither libnx nor bundled — signal
+	// failure so the caller switches to VERIFY_NONE rather than guarantee
+	// every handshake fails.
+	return chain_len > 0 ? 0 : -1;
 }
 
 static void finalizer_tls_context(JSRuntime *rt, JSValue val) {

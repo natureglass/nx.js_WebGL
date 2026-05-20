@@ -1666,21 +1666,30 @@ static JSValue nx_canvas_context_2d_put_image_data(JSContext *ctx,
 	if (cols <= 0 || rows <= 0)
 		return JS_UNDEFINED;
 
+	// Build the swizzled BGRA-premultiplied pixels in a temporary
+	// buffer, then route them through cairo (set_source_surface +
+	// paint) onto the canvas's surface. Earlier versions wrote raw
+	// bytes directly to `canvas->data` + `cairo_surface_mark_dirty`,
+	// but cairo wasn't honoring the dirty mark for downstream
+	// `drawImage(source_surface, ...)` reads (the pixels were
+	// visible to `getImageData` but invisible when the canvas was
+	// used as a source for another cairo paint). Routing through
+	// cairo's own paint pipeline sidesteps that entirely.
+	size_t tmp_stride = (size_t)cols * 4;
+	size_t tmp_size = tmp_stride * (size_t)rows;
+	uint8_t *tmp = js_malloc(ctx, tmp_size);
+	if (!tmp)
+		return JS_EXCEPTION;
 	src += sy * srcStride + sx * 4;
-	dst += dstStride * dy + 4 * dx;
+	uint8_t *tmp_row = tmp;
 	for (int y = 0; y < rows; ++y) {
-		uint8_t *dstRow = dst;
+		uint8_t *dstRow = tmp_row;
 		uint8_t *srcRow = src;
 		for (int x = 0; x < cols; ++x) {
-			// rgba
 			uint8_t r = *srcRow++;
 			uint8_t g = *srcRow++;
 			uint8_t b = *srcRow++;
 			uint8_t a = *srcRow++;
-
-			// argb
-			// performance optimization: fully transparent/opaque pixels can be
-			// processed more efficiently.
 			if (a == 0) {
 				*dstRow++ = 0;
 				*dstRow++ = 0;
@@ -1699,12 +1708,33 @@ static JSValue nx_canvas_context_2d_put_image_data(JSContext *ctx,
 				*dstRow++ = a;
 			}
 		}
-		dst += dstStride;
+		tmp_row += tmp_stride;
 		src += srcStride;
 	}
+	(void)dst;
+	(void)dstStride;
+	cairo_surface_t *tmp_surface = cairo_image_surface_create_for_data(
+		tmp, CAIRO_FORMAT_ARGB32, cols, rows, (int)tmp_stride);
+	// Mark the temp surface dirty so cairo definitely sees the bytes
+	// we just wrote (the surface was created from a freshly malloc'd
+	// buffer; cairo might cache "blank" state otherwise).
+	cairo_surface_mark_dirty(tmp_surface);
+	cairo_save(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_set_source_surface(cr, tmp_surface, dx, dy);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
+	cairo_paint(cr);
+	// Reset the source so cairo's reference to tmp_surface is released
+	// before we destroy it. set_source_surface increments the pattern's
+	// surface refcount; clearing the source releases that hold.
+	cairo_set_source_rgba(cr, 0, 0, 0, 1);
+	cairo_restore(cr);
+	// Flush the destination so cairo finalizes pending writes to
+	// canvas->data before downstream callers read from canvas->surface.
+	cairo_surface_flush(context->canvas->surface);
 
-	cairo_surface_mark_dirty_rectangle(context->canvas->surface, dx, dy, cols,
-									   rows);
+	cairo_surface_destroy(tmp_surface);
+	js_free(ctx, tmp);
 
 	return JS_UNDEFINED;
 }
@@ -2039,12 +2069,19 @@ static JSValue nx_canvas_set_width(JSContext *ctx, JSValueConst this_val,
 	uint32_t new_width;
 	if (JS_ToUint32(ctx, &new_width, argv[0]))
 		return JS_EXCEPTION;
-	// Per spec, setting width always resets the canvas, even to the same value.
-	// Don't free surface/data here — the cairo context (owned by
-	// canvas_context_2d) still references them. Let ensure_surface handle
-	// cleanup when the next drawing operation runs.
-	canvas->width = new_width;
-	canvas->surface_dirty = true;
+	// Spec says setting width always resets the canvas even to the same
+	// value, BUT recreating the cairo surface for a same-size assignment
+	// breaks downstream `drawImage` reads of the canvas after a
+	// subsequent `putImageData` (the new cairo_t + paint with surface
+	// source doesn't propagate to the recreated surface's read path on
+	// nx.js's cairo build). Three.js's `setSize(W, H, false)` is the
+	// frequent caller hitting this — setting `canvas.width = 640` when
+	// it's already 640. Skip the dirty flag in the no-op case so the
+	// existing surface + cairo_t survive intact.
+	if (canvas->width != new_width) {
+		canvas->width = new_width;
+		canvas->surface_dirty = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2062,9 +2099,11 @@ static JSValue nx_canvas_set_height(JSContext *ctx, JSValueConst this_val,
 	uint32_t new_height;
 	if (JS_ToUint32(ctx, &new_height, argv[0]))
 		return JS_EXCEPTION;
-	// Per spec, setting height always resets the canvas, even to the same value.
-	canvas->height = new_height;
-	canvas->surface_dirty = true;
+	// See `nx_canvas_set_width` for the same-value skip rationale.
+	if (canvas->height != new_height) {
+		canvas->height = new_height;
+		canvas->surface_dirty = true;
+	}
 	return JS_UNDEFINED;
 }
 

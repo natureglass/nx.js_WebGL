@@ -7,11 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+
 #define GL_NO_ERROR 0
 #define GL_NONE 0
 #define GL_INVALID_ENUM 0x0500
 #define GL_INVALID_VALUE 0x0501
 #define GL_INVALID_OPERATION 0x0502
+#define GL_OUT_OF_MEMORY 0x0505
 #define GL_POINTS 0x0000
 #define GL_LINES 0x0001
 #define GL_LINE_LOOP 0x0002
@@ -125,15 +127,47 @@
 #define GL_FLOAT_VEC2 0x8B50
 #define GL_FLOAT_VEC3 0x8B51
 #define GL_FLOAT_VEC4 0x8B52
+#define GL_INT_VEC2 0x8B53
+#define GL_INT_VEC3 0x8B54
+#define GL_INT_VEC4 0x8B55
+#define GL_BOOL 0x8B56
+#define GL_BOOL_VEC2 0x8B57
+#define GL_BOOL_VEC3 0x8B58
+#define GL_BOOL_VEC4 0x8B59
+#define GL_FLOAT_MAT2 0x8B5A
+#define GL_FLOAT_MAT3 0x8B5B
 #define GL_FLOAT_MAT4 0x8B5C
 #define GL_SAMPLER_2D 0x8B5E
+#define GL_SAMPLER_CUBE 0x8B60
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_ARRAY_BUFFER_BINDING 0x8894
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
 #define GL_FRAMEBUFFER 0x8D40
 #define GL_FRAMEBUFFER_BINDING 0x8CA6
+#define GL_RENDERBUFFER 0x8D41
 #define GL_RENDERBUFFER_BINDING 0x8CA7
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_DEPTH_ATTACHMENT 0x8D00
+#define GL_STENCIL_ATTACHMENT 0x8D20
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT 0x8CD6
+#define GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT 0x8CD7
+#define GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS 0x8CD9
+#define GL_FRAMEBUFFER_UNSUPPORTED 0x8CDD
+#define GL_DEPTH_COMPONENT 0x1902
+#define GL_DEPTH_COMPONENT16 0x81A5
+#define GL_DEPTH_COMPONENT24 0x81A6
+#define GL_DEPTH_COMPONENT32F 0x8CAC
+#define GL_DEPTH_STENCIL 0x84F9
+#define GL_DEPTH24_STENCIL8 0x88F0
+#define GL_UNSIGNED_INT_24_8_WEBGL 0x84FA
+#define GL_STENCIL_INDEX8 0x8D48
+#define GL_RGB 0x1907
+#define GL_RGB565 0x8D62
+#define GL_RGBA4 0x8056
+#define GL_RGB5_A1 0x8057
 #define GL_BUFFER_SIZE 0x8764
 #define GL_BUFFER_USAGE 0x8765
 #define GL_STREAM_DRAW 0x88E0
@@ -172,6 +206,15 @@
 #define GL_SAMPLE_ALPHA_TO_COVERAGE 0x809E
 #define GL_SAMPLE_COVERAGE 0x80A0
 
+// gl.hint() pnames + values (milestone #16 added FRAGMENT_SHADER_DERIVATIVE
+// for the OES_standard_derivatives extension; GENERATE_MIPMAP_HINT is the
+// only other WebGL 1 pname per spec).
+#define GL_DONT_CARE 0x1100
+#define GL_FASTEST 0x1101
+#define GL_NICEST 0x1102
+#define GL_GENERATE_MIPMAP_HINT 0x8192
+#define GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES 0x8B8B
+
 #define GL_CAP_BLEND (1u << 0)
 #define GL_CAP_CULL_FACE (1u << 1)
 #define GL_CAP_DEPTH_TEST (1u << 2)
@@ -192,6 +235,11 @@ typedef struct {
 	int stride;
 	int offset;
 	JSValue buffer;
+	// ANGLE_instanced_arrays / GLES3 divisor. 0 = per-vertex (default);
+	// 1+ = advance once per N instances. Read by the passthrough dispatch
+	// to detect that an instanced draw is in flight (any used attrib with
+	// divisor>0 auto-promotes a non-instanced draw to passthrough too).
+	uint32_t divisor;
 } nx_webgl_vertex_attrib_t;
 
 typedef struct {
@@ -230,12 +278,25 @@ typedef struct {
 	JSValue element_array_buffer_binding;
 	JSValue texture_2d_binding;
 	JSValue texture_cube_binding;
+	// Currently bound user framebuffer / renderbuffer, JS_UNDEFINED if none
+	// (default-FBO bind = JS_UNDEFINED). Bridge dispatch consults the EGL
+	// backend's mirrored `current_user_framebuffer` field (set via
+	// nx_webgl_egl_set_user_framebuffer). See [[bridge-fbo-support]].
+	JSValue framebuffer_binding;
+	JSValue renderbuffer_binding;
 	uint32_t active_texture;
 	nx_webgl_vertex_attrib_t vertex_attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
 	nx_webgl_egl_t *egl;
 	bool bridge_clear_pending;
 	uint32_t next_texture_id;
 	uint32_t error;
+	// gl.hint() pname state. Currently the only pname we accept is
+	// `FRAGMENT_SHADER_DERIVATIVE_HINT_OES` (0x8B8B, milestone #16);
+	// `GENERATE_MIPMAP_HINT` (0x8192) is also accepted but stored only.
+	// Both default to GL_DONT_CARE (0x1100) per spec. Read back via
+	// getParameter.
+	uint32_t hint_fragment_shader_derivative;
+	uint32_t hint_generate_mipmap;
 } nx_webgl_context_t;
 
 typedef struct {
@@ -246,6 +307,14 @@ typedef struct {
 	bool compile_status;
 	bool gles_compile_attempted;
 	bool deleted;
+	// Set if the shader source contains `#pragma raw_passthrough` (anywhere
+	// in the source — comment lines are accepted, since we don't strip
+	// comments before scanning). When any attached shader has this flag,
+	// the linked program is marked `raw_passthrough` and its draws bypass
+	// the bridge's swap-in-hardcoded-program path; the user's native GLES
+	// program runs directly. See [[nxjs-no-custom-fragment-shader]] for
+	// the architectural background.
+	bool raw_passthrough;
 } nx_webgl_shader_t;
 
 typedef struct {
@@ -261,10 +330,40 @@ typedef struct {
 	float line_scale;
 	float line_dash_size;
 	float line_total_size;
+	float fog_color[3];
+	float fog_near;
+	float fog_far;
+	float light_direction[3];
+	float light_color[3];
+	float light_direction2[3];
+	float light_color2[3];
+	float ambient_light_color[3];
+	float point_light_position[3];
+	float point_light_color[3];
+	float point_light_distance;
+	float point_light_decay;
+	float fog_density;
+	float map_transform[9];
+	float model_matrix[16];
+	float sprite_center[2];
+	float sprite_rotation;
+	float point_size;
+	float specular[3];
+	float shininess;
+	float emissive[3];
 	int line_distance_attrib_index;
 	int color_attrib_index;
 	int position_attrib_index;
 	int uv_attrib_index;
+	int normal_attrib_index;
+	// Set at linkProgram if any attached shader has `#pragma raw_passthrough`.
+	// When true, draw dispatch bypasses the bridge's hardcoded-program swap
+	// and runs the user's linked GLES program directly via native
+	// glDrawArrays/glDrawElements. The user is responsible for vertex
+	// transformation in their own GLSL. Buffer data reaches the GPU via
+	// each `nx_webgl_buffer_t.gles_handle`; attribute pointers are forwarded
+	// to native GLES at draw time. See [[bridge-raw-shader-passthrough]].
+	bool raw_passthrough;
 	bool has_matrix4;
 	bool has_projection_matrix;
 	bool has_model_view_matrix;
@@ -275,14 +374,47 @@ typedef struct {
 	bool has_line_scale;
 	bool has_line_dash_size;
 	bool has_line_total_size;
+	bool has_fog_color;
+	bool has_fog_near;
+	bool has_fog_far;
+	bool has_light_direction;
+	bool has_light_color;
+	bool has_light_direction2;
+	bool has_light_color2;
+	bool has_ambient_light_color;
+	bool has_point_light_position;
+	bool has_point_light_color;
+	bool has_point_light_distance;
+	bool has_point_light_decay;
+	bool has_fog_density;
+	bool has_map_transform;
+	bool has_model_matrix;
+	bool has_sprite_center;
+	bool has_sprite_rotation;
+	bool has_point_size;
+	bool has_specular;
+	bool has_shininess;
+	bool has_emissive;
 	bool has_line_distance_attrib_index;
 	bool has_color_attrib_index;
 	bool has_position_attrib_index;
 	bool has_uv_attrib_index;
+	bool has_normal_attrib_index;
 	bool link_status;
 	bool gles_link_attempted;
 	bool deleted;
+	// User-side bindAttribLocation calls are queued here and replayed
+	// against the GLES program inside linkProgram (the GLES program
+	// doesn't exist before link). Capped at NX_WEBGL_MAX_ATTRIB_BINDINGS;
+	// past that the JS call sets GL_OUT_OF_MEMORY.
+	struct {
+		int location;
+		char *name;  // strdup'd; freed on program delete
+	} attrib_bindings[16];
+	int attrib_binding_count;
 } nx_webgl_program_t;
+
+#define NX_WEBGL_MAX_ATTRIB_BINDINGS 16
 
 typedef struct {
 	uint32_t target;
@@ -290,6 +422,11 @@ typedef struct {
 	size_t size;
 	uint8_t *data;
 	bool deleted;
+	// Native GLES buffer handle. 0 until first successful upload (lazy
+	// allocate in bufferData). Used only by the raw-shader passthrough
+	// draw path; bridge-mode draws read from the CPU-side `data` copy and
+	// upload to their own dedicated VBOs each frame.
+	uint32_t gles_handle;
 } nx_webgl_buffer_t;
 
 typedef struct {
@@ -305,8 +442,38 @@ typedef struct {
 	int *alpha_max_x;
 	uint32_t bridge_id;
 	uint32_t revision;
+	// Persistent native GLES texture handle. 0 until the texture is used as
+	// an FBO color attachment (`framebufferTexture2D`) or `texImage2D` is
+	// called with NULL data (storage-only allocation, the FBO-color-init
+	// pattern). When non-zero, bridge dispatch binds this handle directly
+	// instead of going through the per-draw `texture_cache` upload path.
+	// Set + populated by webgl_egl helpers; the texture finalizer frees it.
+	// See [[bridge-fbo-support]].
+	uint32_t gles_handle;
 	bool deleted;
 } nx_webgl_texture_t;
+
+// FBO + renderbuffer objects. Added for milestone #19 (webgl_postprocessing)
+// so Three.js's `WebGLRenderTarget` can be backed by real native GLES FBOs
+// and the bridge can be retargeted into them via
+// `nx_webgl_egl_set_user_framebuffer`. See [[bridge-fbo-support]].
+typedef struct {
+	uint32_t handle;          // Native GLES FBO handle (0 = unallocated).
+	int width;                // Derived from color attachment dims.
+	int height;
+	JSValue color_attachment;  // texture JSValue (dup'd) — kept alive while attached.
+	JSValue depth_attachment;  // renderbuffer JSValue (dup'd).
+	JSValue stencil_attachment;
+	bool deleted;
+} nx_webgl_framebuffer_t;
+
+typedef struct {
+	uint32_t handle;           // Native GLES RBO handle.
+	uint32_t internal_format;  // GL_DEPTH_COMPONENT16, etc.
+	int width;
+	int height;
+	bool deleted;
+} nx_webgl_renderbuffer_t;
 
 typedef struct {
 	float x;
@@ -342,6 +509,27 @@ typedef enum {
 	NX_WEBGL_UNIFORM_LINE_SCALE,
 	NX_WEBGL_UNIFORM_LINE_DASH_SIZE,
 	NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE,
+	NX_WEBGL_UNIFORM_FOG_COLOR,
+	NX_WEBGL_UNIFORM_FOG_NEAR,
+	NX_WEBGL_UNIFORM_FOG_FAR,
+	NX_WEBGL_UNIFORM_LIGHT_DIRECTION,
+	NX_WEBGL_UNIFORM_LIGHT_COLOR,
+	NX_WEBGL_UNIFORM_AMBIENT_LIGHT_COLOR,
+	NX_WEBGL_UNIFORM_POINT_LIGHT_POSITION,
+	NX_WEBGL_UNIFORM_POINT_LIGHT_COLOR,
+	NX_WEBGL_UNIFORM_POINT_LIGHT_DISTANCE,
+	NX_WEBGL_UNIFORM_POINT_LIGHT_DECAY,
+	NX_WEBGL_UNIFORM_LIGHT_DIRECTION_1,
+	NX_WEBGL_UNIFORM_LIGHT_COLOR_1,
+	NX_WEBGL_UNIFORM_FOG_DENSITY,
+	NX_WEBGL_UNIFORM_MAP_TRANSFORM,
+	NX_WEBGL_UNIFORM_MODEL_MATRIX,
+	NX_WEBGL_UNIFORM_SPRITE_CENTER,
+	NX_WEBGL_UNIFORM_SPRITE_ROTATION,
+	NX_WEBGL_UNIFORM_POINT_SIZE,
+	NX_WEBGL_UNIFORM_SPECULAR,
+	NX_WEBGL_UNIFORM_SHININESS,
+	NX_WEBGL_UNIFORM_EMISSIVE,
 } nx_webgl_uniform_kind_t;
 
 typedef struct {
@@ -363,7 +551,17 @@ static JSClassID nx_webgl_program_class_id;
 static JSClassID nx_webgl_buffer_class_id;
 static JSClassID nx_webgl_uniform_location_class_id;
 static JSClassID nx_webgl_texture_class_id;
+static JSClassID nx_webgl_framebuffer_class_id;
+static JSClassID nx_webgl_renderbuffer_class_id;
 
+// Fallback names returned by `gl.getActiveAttrib` / `gl.getActiveUniform`
+// when bridge mode is NOT active (or no GLES program is linked yet). When
+// bridge mode IS active with a real linked program, those functions
+// forward to native GLES and return the actual shader's attributes /
+// uniforms instead — see nx_webgl_get_active_attrib / nx_webgl_get_active_uniform.
+// Pre-declaring optional features (multi-light, point-light, fog) in this
+// fallback list would crash Three.js (it'd try to upload state for slots
+// the actual program may not have), so keep this list lean.
 static const nx_webgl_active_info_t active_attributes[] = {
 	{"position", 1, GL_FLOAT_VEC3},
 	{"color", 1, GL_FLOAT_VEC4},
@@ -511,7 +709,14 @@ static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
 		return NX_WEBGL_UNIFORM_OFFSET;
 	if (strcmp(name, "u_texture") == 0 || strcmp(name, "texture") == 0 ||
 		strcmp(name, "u_sampler") == 0 || strcmp(name, "sampler") == 0 ||
-		strcmp(name, "map") == 0)
+		strcmp(name, "map") == 0 ||
+		// Three.js's WebGLBackground.js uses `t2D` for the 2D-Texture
+		// background sampler (BackgroundShader). Without this, the bg
+		// plane's sampler binding is dropped, the dispatcher's
+		// `active_texture_for_program` returns NULL, and the bridge
+		// renders the fullscreen quad as a solid stale `program->color`
+		// instead of sampling the texture.
+		strcmp(name, "t2D") == 0)
 		return NX_WEBGL_UNIFORM_SAMPLER;
 	if (strcmp(name, "scale") == 0)
 		return NX_WEBGL_UNIFORM_LINE_SCALE;
@@ -519,6 +724,90 @@ static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
 		return NX_WEBGL_UNIFORM_LINE_DASH_SIZE;
 	if (strcmp(name, "totalSize") == 0)
 		return NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE;
+	if (strcmp(name, "fogColor") == 0)
+		return NX_WEBGL_UNIFORM_FOG_COLOR;
+	if (strcmp(name, "fogNear") == 0)
+		return NX_WEBGL_UNIFORM_FOG_NEAR;
+	if (strcmp(name, "fogFar") == 0)
+		return NX_WEBGL_UNIFORM_FOG_FAR;
+	// Three.js's stock directional-light uniform names (single light only,
+	// indexed-struct syntax). When `scene.add(new DirectionalLight(...))`
+	// fires, Three.js's WebGLRenderer issues `gl.uniform3f` against these
+	// exact names so the bridge program picks them up.
+	if (strcmp(name, "directionalLights[0].direction") == 0)
+		return NX_WEBGL_UNIFORM_LIGHT_DIRECTION;
+	if (strcmp(name, "directionalLights[0].color") == 0)
+		return NX_WEBGL_UNIFORM_LIGHT_COLOR;
+	if (strcmp(name, "ambientLightColor") == 0)
+		return NX_WEBGL_UNIFORM_AMBIENT_LIGHT_COLOR;
+	// Three.js point-light stock uniform names (single light only). Position
+	// is in view space when Three.js uploads it. distance=0 means infinite
+	// range; decay=0 means no falloff (legacy "physically incorrect" mode).
+	if (strcmp(name, "pointLights[0].position") == 0)
+		return NX_WEBGL_UNIFORM_POINT_LIGHT_POSITION;
+	if (strcmp(name, "pointLights[0].color") == 0)
+		return NX_WEBGL_UNIFORM_POINT_LIGHT_COLOR;
+	if (strcmp(name, "pointLights[0].distance") == 0)
+		return NX_WEBGL_UNIFORM_POINT_LIGHT_DISTANCE;
+	if (strcmp(name, "pointLights[0].decay") == 0)
+		return NX_WEBGL_UNIFORM_POINT_LIGHT_DECAY;
+	// Second directional light (max two for now — sufficient for scenes
+	// with key + fill lights like misc_controls_orbit, but multi-light
+	// support is still scope-limited).
+	if (strcmp(name, "directionalLights[1].direction") == 0)
+		return NX_WEBGL_UNIFORM_LIGHT_DIRECTION_1;
+	if (strcmp(name, "directionalLights[1].color") == 0)
+		return NX_WEBGL_UNIFORM_LIGHT_COLOR_1;
+	// Three.js's FogExp2 uniform. When set, the bridge applies the
+	// `1 - exp(-density² × depth²)` falloff instead of linear's
+	// smoothstep(fogNear, fogFar, depth).
+	if (strcmp(name, "fogDensity") == 0)
+		return NX_WEBGL_UNIFORM_FOG_DENSITY;
+	// Three.js's texture-transform mat3. Encodes texture.repeat / .offset /
+	// .rotation / .center as a 3x3 affine. Three.js's MeshPhongMaterial /
+	// MeshBasicMaterial use `mapTransform`; some older / lighter materials
+	// use `uvTransform`. Both go to the same slot — the bridge's textured
+	// vertex shader transforms `a_uv` through it before passing v_uv to
+	// the fragment shader, which lets `texture.repeat.set(...)` /
+	// `texture.offset.set(...)` actually take effect under the bridge.
+	if (strcmp(name, "mapTransform") == 0 ||
+		strcmp(name, "uvTransform") == 0)
+		return NX_WEBGL_UNIFORM_MAP_TRANSFORM;
+	// Three.js's `modelMatrix` is uploaded alongside `modelViewMatrix` for
+	// sprite materials; the sprite vertex shader extracts world-space scale
+	// from its column lengths. Our CPU-side sprite dispatch needs the same.
+	if (strcmp(name, "modelMatrix") == 0)
+		return NX_WEBGL_UNIFORM_MODEL_MATRIX;
+	// SpriteMaterial-specific uniforms — together they signal "this draw is
+	// a Three.js sprite" so the bridge can route through the sprite math
+	// path (CPU-side screen-aligned quad expansion) instead of the generic
+	// textured triangle path.
+	if (strcmp(name, "center") == 0)
+		return NX_WEBGL_UNIFORM_SPRITE_CENTER;
+	if (strcmp(name, "rotation") == 0)
+		return NX_WEBGL_UNIFORM_SPRITE_ROTATION;
+	// Three.js's PointsMaterial uploads `size` (= material.size × pixelRatio)
+	// alongside the existing `scale` uniform (= 0.5 × canvas height, for
+	// `sizeAttenuation`). The bridge reads `size` for the point-quad extent;
+	// `scale` is interpreted as line-scale OR attenuation-scale at the
+	// dispatch site based on whether we're drawing lines or points.
+	if (strcmp(name, "size") == 0)
+		return NX_WEBGL_UNIFORM_POINT_SIZE;
+	// Three.js's MeshPhongMaterial uploads `specular` (vec3 specular color,
+	// default 0x111111 = 0.067,0.067,0.067) and `shininess` (float exponent,
+	// default 30). The bridge adds an additive Blinn-Phong specular term to
+	// the fragment shader lighting compose when both are bound.
+	if (strcmp(name, "specular") == 0)
+		return NX_WEBGL_UNIFORM_SPECULAR;
+	if (strcmp(name, "shininess") == 0)
+		return NX_WEBGL_UNIFORM_SHININESS;
+	// Three.js's MeshLambert/Phong/Standard uploads `emissive` (vec3,
+	// default 0x000000). Bridge adds it as an additive term at the end
+	// of the fragment-shader compose so emissive materials self-illuminate
+	// (visible even on unlit fragments / against black bg). Default zero
+	// makes the additive a no-op when not set.
+	if (strcmp(name, "emissive") == 0)
+		return NX_WEBGL_UNIFORM_EMISSIVE;
 	return NX_WEBGL_UNIFORM_UNKNOWN;
 }
 
@@ -699,8 +988,12 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	context->element_array_buffer_binding = JS_UNDEFINED;
 	context->texture_2d_binding = JS_UNDEFINED;
 	context->texture_cube_binding = JS_UNDEFINED;
+	context->framebuffer_binding = JS_UNDEFINED;
+	context->renderbuffer_binding = JS_UNDEFINED;
 	context->active_texture = GL_TEXTURE0;
 	context->next_texture_id = 1;
+	context->hint_fragment_shader_derivative = GL_DONT_CARE;
+	context->hint_generate_mipmap = GL_DONT_CARE;
 	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 		context->vertex_attribs[i].buffer = JS_UNDEFINED;
 	context->egl = nx_webgl_egl_create(ctx, canvas);
@@ -719,6 +1012,8 @@ static void finalizer_webgl_context(JSRuntime *rt, JSValue val) {
 		JS_FreeValueRT(rt, context->element_array_buffer_binding);
 		JS_FreeValueRT(rt, context->texture_2d_binding);
 		JS_FreeValueRT(rt, context->texture_cube_binding);
+		JS_FreeValueRT(rt, context->framebuffer_binding);
+		JS_FreeValueRT(rt, context->renderbuffer_binding);
 		for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 			JS_FreeValueRT(rt, context->vertex_attribs[i].buffer);
 		nx_webgl_egl_destroy(rt, context->egl);
@@ -741,6 +1036,9 @@ static void finalizer_webgl_program(JSRuntime *rt, JSValue val) {
 		JS_FreeValueRT(rt, program->vertex_shader);
 		JS_FreeValueRT(rt, program->fragment_shader);
 		js_free_rt(rt, program->info_log);
+		for (int i = 0; i < program->attrib_binding_count; i++) {
+			js_free_rt(rt, program->attrib_bindings[i].name);
+		}
 		js_free_rt(rt, program);
 	}
 }
@@ -766,11 +1064,57 @@ static void finalizer_webgl_uniform_location(JSRuntime *rt, JSValue val) {
 static void finalizer_webgl_texture(JSRuntime *rt, JSValue val) {
 	nx_webgl_texture_t *texture = JS_GetOpaque(val, nx_webgl_texture_class_id);
 	if (texture) {
+		// Persistent native GLES texture handle (FBO color attachments and
+		// any texImage2D(NULL) call). The free happens here so the GPU
+		// resource follows the JS object's lifetime.
+		// NOTE: We don't have a context pointer in the finalizer; rely on
+		// the egl-side delete to NOT need a current context. (glDeleteTextures
+		// is documented as silently ignoring invalid handles, and in practice
+		// our destroy paths happen with the bridge context current.)
+		if (texture->gles_handle) {
+			// Best-effort cleanup. We can't reach the egl backend from a
+			// finalizer without storing a backend pointer on the texture
+			// struct; rather than leak, swb's existing pattern is to delete
+			// when the user explicitly calls gl.deleteTexture. Persistent
+			// handles unused at finalize-time are minor leaks for the
+			// lifetime of the EGL context.
+			texture->gles_handle = 0;
+		}
 		js_free_rt(rt, texture->data);
 		js_free_rt(rt, texture->alpha_min_x);
 		js_free_rt(rt, texture->alpha_max_x);
 		js_free_rt(rt, texture);
 	}
+}
+
+static nx_webgl_framebuffer_t *nx_get_webgl_framebuffer(JSValueConst obj) {
+	if (JS_IsUndefined(obj) || JS_IsNull(obj))
+		return NULL;
+	return JS_GetOpaque(obj, nx_webgl_framebuffer_class_id);
+}
+
+static nx_webgl_renderbuffer_t *nx_get_webgl_renderbuffer(JSValueConst obj) {
+	if (JS_IsUndefined(obj) || JS_IsNull(obj))
+		return NULL;
+	return JS_GetOpaque(obj, nx_webgl_renderbuffer_class_id);
+}
+
+static void finalizer_webgl_framebuffer(JSRuntime *rt, JSValue val) {
+	nx_webgl_framebuffer_t *fb =
+		JS_GetOpaque(val, nx_webgl_framebuffer_class_id);
+	if (fb) {
+		JS_FreeValueRT(rt, fb->color_attachment);
+		JS_FreeValueRT(rt, fb->depth_attachment);
+		JS_FreeValueRT(rt, fb->stencil_attachment);
+		js_free_rt(rt, fb);
+	}
+}
+
+static void finalizer_webgl_renderbuffer(JSRuntime *rt, JSValue val) {
+	nx_webgl_renderbuffer_t *rb =
+		JS_GetOpaque(val, nx_webgl_renderbuffer_class_id);
+	if (rb)
+		js_free_rt(rt, rb);
 }
 
 static JSValue nx_webgl_get_drawing_buffer_width(JSContext *ctx,
@@ -830,7 +1174,70 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
-	return JS_NewArray(ctx);
+	JSValue arr = JS_NewArray(ctx);
+	if (JS_IsException(arr))
+		return arr;
+	uint32_t idx = 0;
+	if (context->egl && nx_webgl_egl_has_instancing(context->egl)) {
+		JS_DefinePropertyValueUint32(ctx, arr, idx++,
+			JS_NewString(ctx, "ANGLE_instanced_arrays"), JS_PROP_C_W_E);
+	}
+	// Milestone #16: OES_standard_derivatives drives the bridge's
+	// derivative-normals fallback for `flatShading: true` materials AND
+	// is callable directly via passthrough programs that compile-in
+	// `#extension GL_OES_standard_derivatives : enable`. Tegra X1 supports
+	// it via the GLES 3 core (`fwidth`/`dFdx`/`dFdy` are core in ES3, the
+	// OES extension is the ES2 promotion-path token).
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_standard_derivatives"), JS_PROP_C_W_E);
+	// Milestone #19.5: WEBGL_depth_texture makes the FBO depth attachment
+	// a sampleable sampler2D returning normalized depth in .x. Required
+	// by Three.js's DepthTexture; gated by `renderer.extensions.has(...)`
+	// in the upstream webgl_depth_texture demo. Tegra GLES supports it
+	// natively (GLES3 has DEPTH_COMPONENT textures + OES_depth_texture
+	// promotion is widely available).
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "WEBGL_depth_texture"), JS_PROP_C_W_E);
+	// Sibling OES_depth_texture (the older spec). Three.js may probe
+	// either name; advertising both removes ambiguity.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_depth_texture"), JS_PROP_C_W_E);
+	return arr;
+}
+
+// Forward declarations of the gl-context-bound C functions the
+// ANGLE_instanced_arrays extension wraps (defined below near
+// nx_webgl_draw_elements).
+static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
+											   JSValueConst this_val, int argc,
+											   JSValueConst *argv);
+static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
+												 JSValueConst this_val,
+												 int argc, JSValueConst *argv);
+static JSValue nx_webgl_vertex_attrib_divisor(JSContext *ctx,
+											   JSValueConst this_val, int argc,
+											   JSValueConst *argv);
+
+// JS_NewCFunctionData closures for the ANGLE_instanced_arrays extension
+// methods. Each binds the gl context (in `func_data[0]`) so the wrapper can
+// forward to the underlying gl-proto C functions with the right `this`.
+static JSValue ext_inst_draw_arrays_w(JSContext *ctx, JSValueConst this_val,
+									   int argc, JSValueConst *argv,
+									   int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_draw_arrays_instanced(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_inst_draw_elements_w(JSContext *ctx, JSValueConst this_val,
+										 int argc, JSValueConst *argv,
+										 int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_draw_elements_instanced(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_inst_divisor_w(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv,
+								   int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_vertex_attrib_divisor(ctx, func_data[0], argc, argv);
 }
 
 static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
@@ -841,6 +1248,77 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 	const char *name = JS_ToCString(ctx, argv[0]);
 	if (!name)
 		return JS_EXCEPTION;
+
+	// ANGLE_instanced_arrays — return an object with the three extension
+	// methods bound to this gl context plus the VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE
+	// constant. Only advertise it when the driver actually loaded the native
+	// instancing entry points (probed at backend init). Three.js's
+	// WebGLCapabilities does the lookup once at renderer construction; null
+	// here drops it into the no-instancing fallback (no Mesh.InstancedMesh
+	// support).
+	if ((strcmp(name, "ANGLE_instanced_arrays") == 0) &&
+		context->egl && nx_webgl_egl_has_instancing(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext))
+			return ext;
+
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m_da = JS_NewCFunctionData(ctx, ext_inst_draw_arrays_w, 4, 0,
+											1, &gl);
+		JSValue m_de = JS_NewCFunctionData(ctx, ext_inst_draw_elements_w, 5, 0,
+											1, &gl);
+		JSValue m_div = JS_NewCFunctionData(ctx, ext_inst_divisor_w, 2, 0,
+											 1, &gl);
+		JS_FreeValue(ctx, gl);
+
+		JS_DefinePropertyValueStr(ctx, ext, "drawArraysInstancedANGLE",
+								  m_da, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "drawElementsInstancedANGLE",
+								  m_de, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "vertexAttribDivisorANGLE",
+								  m_div, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext,
+								  "VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE",
+								  JS_NewInt32(ctx, 0x88FE), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// OES_standard_derivatives — no instance methods, just the hint pname
+	// constant. Webby pages call getExtension to feature-detect before
+	// using `#extension GL_OES_standard_derivatives : enable` in their
+	// shaders. The bridge's flatShading-fallback path uses derivatives
+	// internally regardless of whether the page opted in.
+	if (strcmp(name, "OES_standard_derivatives") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext))
+			return ext;
+		JS_DefinePropertyValueStr(ctx, ext,
+								  "FRAGMENT_SHADER_DERIVATIVE_HINT_OES",
+								  JS_NewInt32(ctx, 0x8B8B), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_depth_texture (and the older OES_depth_texture alias). The
+	// extension's only client-visible surface is the UNSIGNED_INT_24_8_WEBGL
+	// constant used as the `type` argument of `gl.texImage2D` for
+	// DEPTH_STENCIL depth+stencil textures (the 24-bit-depth + 8-bit-stencil
+	// packed format). DEPTH_COMPONENT alone with UNSIGNED_SHORT or
+	// UNSIGNED_INT doesn't need the constant; the format/type accept-list
+	// is widened unconditionally once `texImage2D` is asked for them. See
+	// [[bridge-depth-texture-support]].
+	if (strcmp(name, "WEBGL_depth_texture") == 0 ||
+	    strcmp(name, "OES_depth_texture") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext))
+			return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "UNSIGNED_INT_24_8_WEBGL",
+								  JS_NewInt32(ctx, 0x84FA), JS_PROP_C_W_E);
+		return ext;
+	}
+
 	JS_FreeCString(ctx, name);
 	return JS_NULL;
 }
@@ -964,15 +1442,23 @@ static void flush_pending_bridge_clear_to_software(nx_webgl_context_t *context) 
 		return;
 	// If the GLES bridge accumulated draws this frame, flush them to the
 	// canvas first so software fallbacks can compose on top instead of
-	// clobbering bridge content.
+	// clobbering bridge content. Gated on `auto_flush_enabled` — clients
+	// driving their own readback (inline-canvas WebGL via
+	// `gl.setBridgeAutoFlush(false)` + `gl.copyBridgeToCanvas`) DON'T
+	// want the bridge to flush its FBO across the full screen canvas
+	// here; that would smear bridge content over the page chrome that
+	// sits outside the inline canvas's layout slot. When auto-flush is
+	// off, we just clear the pending flag and let the client's own
+	// readback handle presentation.
 	if (context->egl && nx_webgl_egl_has_pending_readback(context->egl)) {
 		nx_canvas_t *canvas = context->canvas;
-		if (canvas) {
+		if (canvas && nx_webgl_egl_get_auto_flush(context->egl)) {
 			nx_webgl_egl_flush_bridge_present(context->egl, canvas);
 		}
-		// Once the bridge content is on the canvas, treat the canvas as
-		// already-cleared-and-drawn so the upcoming software draw does not
-		// erase what the bridge just produced.
+		// Once the bridge content is on the canvas (or the client has
+		// opted out of the flush), treat the canvas as already-cleared-
+		// and-drawn so the upcoming software draw does not erase what
+		// the bridge just produced.
 		context->bridge_clear_pending = false;
 		return;
 	}
@@ -998,7 +1484,7 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_UNDEFINED;
 	}
 
-	if ((mask & GL_COLOR_BUFFER_BIT) == 0)
+	if (mask == 0)
 		return JS_UNDEFINED;
 
 	nx_canvas_t *canvas = context->canvas;
@@ -1006,26 +1492,45 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_UNDEFINED;
 
 	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		// Reset per-frame dispatch-debug log. Each draw will append a
+		// tag indicating which path it took (bridge success vs failure
+		// with reason). Status canvas picks this up via getBackendInfo.
+		nx_webgl_egl_reset_dispatch_debug(context->egl);
 		// Flush any accumulated bridge draws from the previous frame so the
 		// presented canvas shows their pixels (one readback per frame instead
-		// of one per draw call).
-		if (nx_webgl_egl_has_pending_readback(context->egl)) {
+		// of one per draw call). Skipped when the client opted out via
+		// `gl.setBridgeAutoFlush(false)` — clients driving their own
+		// readback don't need it and the extra 1280×720 glReadPixels +
+		// canvas->data write is a per-frame stall plus a visible flash on
+		// the first auto-flush before the page paint covers it.
+		if (nx_webgl_egl_has_pending_readback(context->egl) &&
+		    nx_webgl_egl_get_auto_flush(context->egl)) {
 			nx_webgl_egl_flush_bridge_present(context->egl, canvas);
 		}
 		// Actually clear the GLES FBO so the new frame starts on a clean
-		// surface, honoring the user's clearColor + scissor state.
+		// surface, honoring the user's clearColor + clearDepth +
+		// clearStencil + bit-mask state. Pre-#19.5 this hardcoded
+		// glClearDepthf(1.0) and always cleared both color+depth —
+		// surfaced as a real bug in webgl_depth_texture hw bring-up
+		// where `gl.clearDepth(0.5)` had no effect.
 		nx_webgl_egl_clear_bridge_with_state(
 			context->egl, canvas,
+			mask,
+			(float)context->clear_depth,
+			(int32_t)context->clear_stencil,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 			context->scissor_box,
 			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
 		// Mark canvas as still needing a software clear in case a software
 		// fallback draw happens before any bridge draw this frame; the canvas
 		// currently holds the previous frame's bridge readback.
-		context->bridge_clear_pending = true;
+		if (mask & GL_COLOR_BUFFER_BIT)
+			context->bridge_clear_pending = true;
 		return JS_UNDEFINED;
 	}
 
+	if ((mask & GL_COLOR_BUFFER_BIT) == 0)
+		return JS_UNDEFINED;
 	context->bridge_clear_pending = false;
 	clear_canvas_software(context);
 
@@ -1154,6 +1659,27 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// Scan for opt-in markers that promote this shader's program to the
+	// raw-shader passthrough path (see nx_webgl_program_t.raw_passthrough).
+	// A simple strstr is enough — GLSL ES doesn't have macros that could
+	// rewrite the literal text, so any occurrence in the source is real.
+	//
+	//   - `#pragma raw_passthrough` — explicit opt-in (milestone #14, the
+	//     original passthrough path for ShaderMaterial demos).
+	//   - `#define USE_SHADOWMAP` — emitted by Three.js into shadow-receive
+	//     materials' shader prefixes when `renderer.shadowMap.enabled &&
+	//     shadows.length > 0`. The receive shaders pull in
+	//     shadowmap_pars_fragment with `directionalShadowMap[]` samplers,
+	//     `getShadow()` PCF kernel, `unpackRGBAToDepth()` — none of which
+	//     the bridge's hardcoded programs know. See [[swb-threejs-webgl-shadowmap]].
+	//   - `#define DEPTH_PACKING` — exclusive to MeshDepthMaterial's
+	//     auto-shader (the shadow-cast pass writes RGBA-packed depth via
+	//     `packDepthToRGBA(fragCoordZ)`).
+	shader->raw_passthrough =
+		strstr(shader->source, "#pragma raw_passthrough") != NULL ||
+		strstr(shader->source, "#define USE_SHADOWMAP") != NULL ||
+		strstr(shader->source, "#define DEPTH_PACKING") != NULL;
+
 	char gles_log[2048];
 	bool gles_status = false;
 	if (nx_webgl_egl_compile_shader(context->egl, context->canvas, shader->type,
@@ -1269,10 +1795,53 @@ static JSValue nx_webgl_create_program(JSContext *ctx, JSValueConst this_val,
 	program->line_scale = 1.f;
 	program->line_dash_size = 1.f;
 	program->line_total_size = 2.f;
+	program->fog_color[0] = 0.f;
+	program->fog_color[1] = 0.f;
+	program->fog_color[2] = 0.f;
+	program->fog_near = 1.f;
+	program->fog_far = 1000.f;
+	program->light_direction[0] = 0.f;
+	program->light_direction[1] = 0.f;
+	program->light_direction[2] = 1.f;
+	program->light_color[0] = 1.f;
+	program->light_color[1] = 1.f;
+	program->light_color[2] = 1.f;
+	program->ambient_light_color[0] = 0.f;
+	program->ambient_light_color[1] = 0.f;
+	program->ambient_light_color[2] = 0.f;
+	program->point_light_position[0] = 0.f;
+	program->point_light_position[1] = 0.f;
+	program->point_light_position[2] = 0.f;
+	program->point_light_color[0] = 0.f;
+	program->point_light_color[1] = 0.f;
+	program->point_light_color[2] = 0.f;
+	program->point_light_distance = 0.f;
+	program->point_light_decay = 0.f;
+	program->light_direction2[0] = 0.f;
+	program->light_direction2[1] = 0.f;
+	program->light_direction2[2] = 1.f;
+	program->light_color2[0] = 0.f;
+	program->light_color2[1] = 0.f;
+	program->light_color2[2] = 0.f;
+	program->fog_density = 0.f;
+	// Default mapTransform = identity mat3 (column-major). Used as the
+	// fallback when Three.js doesn't bind a texture transform — UVs flow
+	// through unchanged so `texture.repeat`-less materials are unaffected.
+	program->map_transform[0] = 1.f; program->map_transform[1] = 0.f; program->map_transform[2] = 0.f;
+	program->map_transform[3] = 0.f; program->map_transform[4] = 1.f; program->map_transform[5] = 0.f;
+	program->map_transform[6] = 0.f; program->map_transform[7] = 0.f; program->map_transform[8] = 1.f;
+	// Sprite defaults — center at quad midpoint, no rotation, identity
+	// model matrix. None of the `has_sprite_*` flags are set, so the bridge
+	// only takes the sprite path when Three.js actually uploads these.
+	for (int i = 0; i < 16; i++) program->model_matrix[i] = (i % 5 == 0) ? 1.f : 0.f;
+	program->sprite_center[0] = 0.5f;
+	program->sprite_center[1] = 0.5f;
+	program->sprite_rotation = 0.f;
 	program->line_distance_attrib_index = -1;
 	program->color_attrib_index = -1;
 	program->position_attrib_index = -1;
 	program->uv_attrib_index = -1;
+	program->normal_attrib_index = -1;
 	JS_SetOpaque(obj, program);
 	return obj;
 }
@@ -1297,6 +1866,49 @@ static JSValue nx_webgl_attach_shader(JSContext *ctx, JSValueConst this_val,
 	*target = JS_DupValue(ctx, argv[1]);
 	program->link_status = false;
 	replace_string(ctx, &program->info_log, "");
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_bind_attrib_location(JSContext *ctx,
+											  JSValueConst this_val, int argc,
+											  JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || program->deleted) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	int32_t location;
+	if (JS_ToInt32(ctx, &location, argv[1]))
+		return JS_EXCEPTION;
+	if (location < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	const char *name = JS_ToCString(ctx, argv[2]);
+	if (!name)
+		return JS_EXCEPTION;
+	// WebGL spec: rebinding the SAME name overwrites the old location.
+	for (int i = 0; i < program->attrib_binding_count; i++) {
+		if (strcmp(program->attrib_bindings[i].name, name) == 0) {
+			program->attrib_bindings[i].location = location;
+			JS_FreeCString(ctx, name);
+			return JS_UNDEFINED;
+		}
+	}
+	if (program->attrib_binding_count >= NX_WEBGL_MAX_ATTRIB_BINDINGS) {
+		// No matching WebGL error for "too many bindings"; INVALID_VALUE
+		// is the closest spec-defined option.
+		context->error = GL_INVALID_VALUE;
+		JS_FreeCString(ctx, name);
+		return JS_UNDEFINED;
+	}
+	int i = program->attrib_binding_count++;
+	program->attrib_bindings[i].location = location;
+	program->attrib_bindings[i].name = js_strdup(ctx, name);
+	JS_FreeCString(ctx, name);
 	return JS_UNDEFINED;
 }
 
@@ -1328,12 +1940,27 @@ static JSValue nx_webgl_link_program(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// Propagate the `#pragma raw_passthrough` opt-in from either shader to
+	// the program. Either side flipping it on is sufficient — Three.js
+	// typically injects the pragma into both vertex and fragment sources,
+	// but a vertex-only or fragment-only opt-in still asks for the
+	// passthrough path. See [[bridge-raw-shader-passthrough]].
+	program->raw_passthrough =
+		vertex->raw_passthrough || fragment->raw_passthrough;
+
 	if (vertex->gles_handle && fragment->gles_handle) {
 		char gles_log[2048];
 		bool gles_status = false;
+		nx_webgl_attrib_binding_t bindings[NX_WEBGL_MAX_ATTRIB_BINDINGS];
+		for (int i = 0; i < program->attrib_binding_count; i++) {
+			bindings[i].location = program->attrib_bindings[i].location;
+			bindings[i].name = program->attrib_bindings[i].name;
+		}
 		if (nx_webgl_egl_link_program(context->egl, context->canvas,
 									  vertex->gles_handle,
 									  fragment->gles_handle,
+									  bindings,
+									  program->attrib_binding_count,
 									  &program->gles_handle, &gles_status,
 									  gles_log, sizeof(gles_log))) {
 			program->gles_link_attempted = true;
@@ -1357,6 +1984,9 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 	if (JS_IsNull(argv[0])) {
 		JS_FreeValue(ctx, context->current_program);
 		context->current_program = JS_UNDEFINED;
+		if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl)) {
+			nx_webgl_egl_use_native_program(context->egl, 0);
+		}
 		return JS_UNDEFINED;
 	}
 
@@ -1372,6 +2002,18 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 
 	JS_FreeValue(ctx, context->current_program);
 	context->current_program = JS_DupValue(ctx, argv[0]);
+	// Bind the linked GLES program on the native side so subsequent
+	// glUniform* calls (which operate on the currently-bound program)
+	// land on the right program. Bridge dispatch internally re-binds its
+	// own program around its draws, but at the end of each user-visible
+	// gl.useProgram boundary the user's program is what we want bound.
+	// For passthrough programs this is the actual draw-time program; for
+	// bridge-mode programs the uniform location values still map to the
+	// user program's uniform table.
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle) {
+		nx_webgl_egl_use_native_program(context->egl, program->gles_handle);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -1406,8 +2048,29 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 		return JS_NewUint32(ctx, count);
 	}
 	case GL_ACTIVE_UNIFORMS:
+		// Forward to native GLES when we have a real linked program — Three.js
+		// uses this count to iterate the actual shader's uniforms, which
+		// dynamically reflects scene state (number of lights, fog mode, etc).
+		// Hardcoded `active_uniforms` is a stale snapshot that doesn't match
+		// any real shader and causes Three.js to crash when it iterates
+		// uniforms with no corresponding state (e.g. pointLights[0] when
+		// scene has no point lights). See `nxjs-active-uniforms-attribs-lists`.
+		if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+			program->gles_handle) {
+			int n = 0;
+			if (nx_webgl_egl_get_program_iv(context->egl, program->gles_handle,
+											GL_ACTIVE_UNIFORMS, &n))
+				return JS_NewUint32(ctx, (uint32_t)n);
+		}
 		return JS_NewUint32(ctx, countof(active_uniforms));
 	case GL_ACTIVE_ATTRIBUTES:
+		if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+			program->gles_handle) {
+			int n = 0;
+			if (nx_webgl_egl_get_program_iv(context->egl, program->gles_handle,
+											GL_ACTIVE_ATTRIBUTES, &n))
+				return JS_NewUint32(ctx, (uint32_t)n);
+		}
 		return JS_NewUint32(ctx, countof(active_attributes));
 	default:
 		context->error = GL_INVALID_ENUM;
@@ -1451,6 +2114,21 @@ static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
 	uint32_t index;
 	if (JS_ToUint32(ctx, &index, argv[1]))
 		return JS_EXCEPTION;
+	// Forward to native GLES when a real program is linked — see
+	// getProgramParameter for the rationale.
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle) {
+		char name[256];
+		int size = 0;
+		uint32_t type = 0;
+		if (nx_webgl_egl_get_active_attrib(context->egl, program->gles_handle,
+										   index, name, sizeof(name), &size,
+										   &type)) {
+			nx_webgl_active_info_t info = {name, size, type};
+			return new_active_info(ctx, &info);
+		}
+		return JS_NULL;
+	}
 	if (index >= countof(active_attributes))
 		return JS_NULL;
 	return new_active_info(ctx, &active_attributes[index]);
@@ -1476,6 +2154,19 @@ static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
 	uint32_t index;
 	if (JS_ToUint32(ctx, &index, argv[1]))
 		return JS_EXCEPTION;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle) {
+		char name[256];
+		int size = 0;
+		uint32_t type = 0;
+		if (nx_webgl_egl_get_active_uniform(context->egl, program->gles_handle,
+											index, name, sizeof(name), &size,
+											&type)) {
+			nx_webgl_active_info_t info = {name, size, type};
+			return new_active_info(ctx, &info);
+		}
+		return JS_NULL;
+	}
 	if (index >= countof(active_uniforms))
 		return JS_NULL;
 	return new_active_info(ctx, &active_uniforms[index]);
@@ -1566,6 +2257,7 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+
 static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 									int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -1594,19 +2286,40 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// WebIDL overload resolution for `bufferData(GLenum target,
+	// [BufferDataSource? data | GLsizeiptr size], GLenum usage)`:
+	//
+	//   - null / undefined  -> BufferDataSource overload (nullable);
+	//     WebGL spec override flags INVALID_VALUE.
+	//   - ArrayBuffer / ArrayBufferView -> BufferDataSource overload.
+	//   - Anything else -> GLsizeiptr overload: ToNumber-coerce per
+	//     ECMAScript, truncate toward zero, reject negative as
+	//     INVALID_VALUE, reject > 4GB as OUT_OF_MEMORY.
+	//
+	// JS_ToInt64 handles ToNumber for strings (numeric parse), arrays
+	// (toString -> single-element parses, multi-element -> NaN -> 0),
+	// and plain objects (ToPrimitive -> NaN -> 0). Matches Khronos's
+	// buffer-data-and-buffer-sub-data WebIDL overload assertions.
 	size_t size = 0;
 	uint8_t *source = NULL;
-	if (JS_IsNumber(argv[1])) {
-		uint32_t requested_size;
-		if (JS_ToUint32(ctx, &requested_size, argv[1]))
+	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	source = NX_GetBufferSource(ctx, &size, argv[1]);
+	if (!source) {
+		int64_t requested_signed;
+		if (JS_ToInt64(ctx, &requested_signed, argv[1]))
 			return JS_EXCEPTION;
-		size = requested_size;
-	} else {
-		source = NX_GetBufferSource(ctx, &size, argv[1]);
-		if (!source) {
+		if (requested_signed < 0) {
 			context->error = GL_INVALID_VALUE;
 			return JS_UNDEFINED;
 		}
+		if ((uint64_t)requested_signed > 0xFFFFFFFFu) {
+			context->error = GL_OUT_OF_MEMORY;
+			return JS_UNDEFINED;
+		}
+		size = (size_t)requested_signed;
 	}
 
 	if (size == 0) {
@@ -1632,6 +2345,26 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 	buffer->size = size;
 	buffer->usage = usage;
 	buffer->target = target;
+
+	// Also mirror the upload to a native GLES buffer so the raw-shader
+	// passthrough draw path can bind it directly. Bridge-mode draws still
+	// read from `buffer->data` and ignore the native handle. Lazy-create
+	// on first upload; reuse the handle on subsequent bufferData calls.
+	// We intentionally do this AFTER the CPU copy so bridge-mode behavior
+	// is unaffected if the native upload fails or the EGL backend isn't
+	// available.
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		if (!buffer->gles_handle) {
+			buffer->gles_handle =
+				nx_webgl_egl_create_native_buffer(context->egl, context->canvas);
+		}
+		if (buffer->gles_handle) {
+			nx_webgl_egl_native_buffer_data(context->egl, buffer->gles_handle,
+											target, size,
+											size > 0 ? buffer->data : NULL,
+											usage);
+		}
+	}
 	return JS_UNDEFINED;
 }
 
@@ -1663,11 +2396,23 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// Per the WebGL/WebIDL spec, `bufferSubData(target, offset, data)`'s
+	// `data` argument is a non-nullable `BufferSource`. WebIDL type
+	// conversion fails synchronously with TypeError if `data` is null,
+	// undefined, or any other non-BufferSource value. We reproduce that
+	// behavior here so callers can rely on try/catch instead of needing
+	// to poll getError(), and so we don't leak INVALID_VALUE into the
+	// subsequent error queue from a programmer-error call site.
 	size_t byte_length = 0;
+	if (JS_IsNull(argv[2]) || JS_IsUndefined(argv[2])) {
+		return JS_ThrowTypeError(ctx,
+			"bufferSubData: 'data' argument must be a BufferSource (got %s)",
+			JS_IsNull(argv[2]) ? "null" : "undefined");
+	}
 	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[2]);
 	if (!source) {
-		context->error = GL_INVALID_VALUE;
-		return JS_UNDEFINED;
+		return JS_ThrowTypeError(ctx,
+			"bufferSubData: 'data' argument must be an ArrayBuffer or ArrayBufferView");
 	}
 
 	size_t byte_offset = (size_t)offset;
@@ -1681,6 +2426,19 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 			return JS_UNDEFINED;
 		}
 		memcpy(buffer->data + byte_offset, source, byte_length);
+
+		// Mirror to the native GL buffer for the passthrough path. Same
+		// rationale as bufferData. No-op when no handle was allocated yet
+		// (the buffer was never bufferData'd, which is a programmer error
+		// already caught by the !data check above).
+		if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+			buffer->gles_handle) {
+			nx_webgl_egl_native_buffer_sub_data(context->egl,
+												buffer->gles_handle,
+												target,
+												byte_offset, byte_length,
+												source);
+		}
 	}
 	return JS_UNDEFINED;
 }
@@ -1701,6 +2459,10 @@ static JSValue nx_webgl_delete_buffer(JSContext *ctx, JSValueConst this_val,
 	}
 
 	buffer->deleted = true;
+	if (buffer->gles_handle && context->egl) {
+		nx_webgl_egl_delete_native_buffer(context->egl, buffer->gles_handle);
+		buffer->gles_handle = 0;
+	}
 	if (nx_get_webgl_buffer(context->array_buffer_binding) == buffer) {
 		JS_FreeValue(ctx, context->array_buffer_binding);
 		context->array_buffer_binding = JS_UNDEFINED;
@@ -1710,6 +2472,39 @@ static JSValue nx_webgl_delete_buffer(JSContext *ctx, JSValueConst this_val,
 		context->element_array_buffer_binding = JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_buffer_parameter(JSContext *ctx,
+											  JSValueConst this_val, int argc,
+											  JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t target;
+	uint32_t pname;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &pname, argv[1]))
+		return JS_EXCEPTION;
+	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_NULL;
+	}
+	if (pname != GL_BUFFER_SIZE && pname != GL_BUFFER_USAGE) {
+		context->error = GL_INVALID_ENUM;
+		return JS_NULL;
+	}
+	nx_webgl_buffer_t *buffer =
+		nx_get_webgl_buffer(target == GL_ARRAY_BUFFER
+								? context->array_buffer_binding
+								: context->element_array_buffer_binding);
+	if (!buffer || buffer->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	if (pname == GL_BUFFER_SIZE)
+		return JS_NewInt64(ctx, (int64_t)buffer->size);
+	return JS_NewUint32(ctx, buffer->usage);
 }
 
 static JSValue nx_webgl_create_texture(JSContext *ctx, JSValueConst this_val,
@@ -1753,6 +2548,14 @@ static JSValue nx_webgl_active_texture(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 	context->active_texture = texture;
+	// Mirror to native GL so that subsequent gl.bindTexture calls (also
+	// forwarded) land on the right unit when the raw-shader passthrough
+	// path samples a user-bound texture. Bridge-mode dispatch resets the
+	// active unit to GL_TEXTURE0 for its own sampling, so this forwarding
+	// is purely about keeping native state aligned with user state at
+	// passthrough-dispatch time. See [[bridge-fbo-support]] +
+	// [[bridge-raw-shader-passthrough]].
+	nx_webgl_egl_forward_active_texture(context->egl, texture);
 	return JS_UNDEFINED;
 }
 
@@ -1774,6 +2577,8 @@ static JSValue nx_webgl_bind_texture(JSContext *ctx, JSValueConst this_val,
 	if (JS_IsNull(argv[1])) {
 		JS_FreeValue(ctx, *binding);
 		*binding = JS_UNDEFINED;
+		// Mirror unbind to native so passthrough doesn't see a stale binding.
+		nx_webgl_egl_forward_bind_texture(context->egl, target, 0);
 		return JS_UNDEFINED;
 	}
 
@@ -1789,6 +2594,14 @@ static JSValue nx_webgl_bind_texture(JSContext *ctx, JSValueConst this_val,
 	texture->target = target;
 	JS_FreeValue(ctx, *binding);
 	*binding = JS_DupValue(ctx, argv[1]);
+	// Forward to native GL when the texture has a persistent handle (FBO
+	// color attachment or any texImage2D-allocated texture), so the
+	// raw-shader passthrough path samples the right texture. Textures
+	// without a persistent handle (legacy cache-only path) don't have a
+	// native handle to bind — bridge dispatch manages those internally.
+	if (texture->gles_handle)
+		nx_webgl_egl_forward_bind_texture(context->egl, target,
+		                                   texture->gles_handle);
 	return JS_UNDEFINED;
 }
 
@@ -1893,8 +2706,38 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &type, argv[7]))
 		return JS_EXCEPTION;
 
-	if (!is_texture_image_target(target) || internal_format != GL_RGBA ||
-		format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+	if (!is_texture_image_target(target)) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	// Accept-list for (internalformat, format, type) tuples. WebGL 1 spec
+	// requires internalformat == format for unsized formats. Milestone #19.5
+	// widens this beyond the original RGBA+UNSIGNED_BYTE to also accept the
+	// depth-texture combos that WEBGL_depth_texture / OES_depth_texture
+	// enable. The dispatch path forwards (format, type) straight to native
+	// glTexImage2D via persistent_texture_image_2d for the NULL-source case
+	// (the FBO-attachment pattern Three.js's DepthTexture uses).
+	bool is_rgba_unorm = (internal_format == GL_RGBA &&
+	                      format == GL_RGBA && type == GL_UNSIGNED_BYTE);
+	// Accept both unsized (GL_DEPTH_COMPONENT) and sized
+	// (GL_DEPTH_COMPONENT16/24/32F) internalformats with format =
+	// GL_DEPTH_COMPONENT. Three.js's WebGLTextures always passes the
+	// SIZED form (`_gl.DEPTH_COMPONENT16` for WebGL 1, `_gl.DEPTH_COMPONENT24`
+	// for WebGL 2), so rejecting that case was the bug behind the
+	// "white canvas" / unwritten-depth-attachment symptom in milestone
+	// #19.5 hw bring-up.
+	bool is_depth_internal = (internal_format == GL_DEPTH_COMPONENT ||
+	                          internal_format == GL_DEPTH_COMPONENT16 ||
+	                          internal_format == GL_DEPTH_COMPONENT24 ||
+	                          internal_format == GL_DEPTH_COMPONENT32F);
+	bool is_depth = (is_depth_internal && format == GL_DEPTH_COMPONENT &&
+	                 (type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT));
+	bool is_depth_stencil_internal = (internal_format == GL_DEPTH_STENCIL ||
+	                                   internal_format == GL_DEPTH24_STENCIL8);
+	bool is_depth_stencil = (is_depth_stencil_internal &&
+	                         format == GL_DEPTH_STENCIL &&
+	                         type == GL_UNSIGNED_INT_24_8_WEBGL);
+	if (!is_rgba_unorm && !is_depth && !is_depth_stencil) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -1917,10 +2760,19 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 
 	size_t byte_length = 0;
 	uint8_t *source = NULL;
-	if (!JS_IsNull(argv[8]))
+	bool null_source = JS_IsNull(argv[8]) || JS_IsUndefined(argv[8]);
+	if (!null_source)
 		source = NX_GetBufferSource(ctx, &byte_length, argv[8]);
 	size_t expected = (size_t)width * (size_t)height * 4;
-	if (!source || byte_length < expected) {
+	// Depth and depth-stencil textures may only be allocated with NULL data
+	// per the WEBGL_depth_texture spec (no client-side pixel upload). Reject
+	// non-null with INVALID_OPERATION to match the Khronos conformance
+	// behavior; Three.js's DepthTexture path always passes NULL anyway.
+	if (!null_source && (is_depth || is_depth_stencil)) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (!null_source && (!source || byte_length < expected)) {
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
@@ -1928,6 +2780,43 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	if (texture_target == GL_TEXTURE_CUBE_MAP) {
 		texture->width = width;
 		texture->height = height;
+		texture->revision++;
+		if (texture->revision == 0)
+			texture->revision = 1;
+		return JS_UNDEFINED;
+	}
+
+	// NULL-source path (the FBO color-attachment init pattern Three.js's
+	// WebGLRenderTarget uses). Allocate or refresh a persistent native GLES
+	// texture so subsequent framebufferTexture2D can attach it AND the
+	// bridge can sample it (after pass-1 writes pixels into it). No CPU-side
+	// data buffer needed — sampling goes through `gles_handle` per
+	// [[bridge-fbo-support]].
+	if (null_source) {
+		js_free(ctx, texture->data);
+		js_free(ctx, texture->alpha_min_x);
+		js_free(ctx, texture->alpha_max_x);
+		texture->data = NULL;
+		texture->alpha_min_x = NULL;
+		texture->alpha_max_x = NULL;
+		texture->width = width;
+		texture->height = height;
+		texture->target = target;
+		if (texture->gles_handle == 0)
+			texture->gles_handle = nx_webgl_egl_create_persistent_texture(
+				context->egl, context->canvas);
+		if (texture->gles_handle == 0) {
+			context->error = GL_OUT_OF_MEMORY;
+			return JS_UNDEFINED;
+		}
+		if (!nx_webgl_egl_persistent_texture_image_2d(
+		        context->egl, texture->gles_handle, width, height,
+		        internal_format, format, type, NULL,
+		        texture->min_filter, texture->mag_filter,
+		        texture->wrap_s, texture->wrap_t)) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
 		texture->revision++;
 		if (texture->revision == 0)
 			texture->revision = 1;
@@ -1961,6 +2850,18 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	texture->revision++;
 	if (texture->revision == 0)
 		texture->revision = 1;
+	// If the texture already has a persistent GLES handle (it was used as
+	// an FBO attachment before, or NULL-source'd earlier), keep it in sync
+	// with this CPU upload so subsequent FBO renders into it would see the
+	// new texels — also the case where Three.js re-uploads texture data
+	// after the WebGLRenderTarget has been created.
+	if (texture->gles_handle != 0) {
+		(void)nx_webgl_egl_persistent_texture_image_2d(
+		    context->egl, texture->gles_handle, width, height,
+		    internal_format, format, type, copy,
+		    texture->min_filter, texture->mag_filter,
+		    texture->wrap_s, texture->wrap_t);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2098,6 +2999,11 @@ static JSValue nx_webgl_delete_texture(JSContext *ctx, JSValueConst this_val,
 	}
 	texture->deleted = true;
 	nx_webgl_egl_delete_cached_texture(context->egl, texture->bridge_id);
+	if (texture->gles_handle) {
+		nx_webgl_egl_delete_persistent_texture(context->egl,
+		                                        texture->gles_handle);
+		texture->gles_handle = 0;
+	}
 	if (nx_get_webgl_texture(context->texture_2d_binding) == texture) {
 		JS_FreeValue(ctx, context->texture_2d_binding);
 		context->texture_2d_binding = JS_UNDEFINED;
@@ -2131,7 +3037,30 @@ static JSValue nx_webgl_get_uniform_location(JSContext *ctx,
 		return JS_EXCEPTION;
 
 	nx_webgl_uniform_kind_t kind = uniform_kind_for_name(name);
-	if (kind == NX_WEBGL_UNIFORM_UNKNOWN) {
+
+	// Always try to populate the native GLES location when bridge is
+	// active and the program has a real linked handle. Previously
+	// `location->location` was left as the js_mallocz default (0) which
+	// is wrong for any uniform not actually at GLES slot 0 — but the
+	// bridge demos didn't notice because they use bridge-side state
+	// stashing for rendering and the per-Three.js-program uniform
+	// uploads are dead writes anyway.
+	//
+	// For tests with custom shader uniforms (no allowlist entry,
+	// kind=UNKNOWN), we MUST forward to native GLES so the location is
+	// addressable; otherwise getUniformLocation returns null and the
+	// test can't proceed. Without this, raw WebGL conformance tests
+	// using their own shader uniforms always fail at lookup time.
+	int native_location = -1;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle) {
+		native_location = nx_webgl_egl_get_uniform_location(
+			context->egl, program->gles_handle, name);
+	}
+
+	// If neither the allowlist nor native GLES knows the name, return
+	// null per WebGL spec for an absent uniform.
+	if (kind == NX_WEBGL_UNIFORM_UNKNOWN && native_location < 0) {
 		JS_FreeCString(ctx, name);
 		return JS_NULL;
 	}
@@ -2153,6 +3082,7 @@ static JSValue nx_webgl_get_uniform_location(JSContext *ctx,
 	location->program = JS_DupValue(ctx, argv[0]);
 	location->name = js_strdup(ctx, name);
 	location->kind = kind;
+	location->location = native_location;  // -1 when not in native program
 	JS_SetOpaque(obj, location);
 	JS_FreeCString(ctx, name);
 	return obj;
@@ -2165,6 +3095,14 @@ static bool get_uniform_program(nx_webgl_context_t *context,
 		return false;
 	nx_webgl_program_t *program = nx_get_webgl_program(location->program);
 	if (!program || program->deleted || !program->link_status)
+		return false;
+	// WebGL spec: setting a uniform requires the location's program to
+	// match the currently-bound program (gl.useProgram). Otherwise
+	// INVALID_OPERATION. Callers treat a `false` return as "set the
+	// error and abort"; signal cross-program-mismatch the same way.
+	nx_webgl_program_t *current =
+		nx_get_webgl_program(context->current_program);
+	if (current != program)
 		return false;
 	*out_program = program;
 	return true;
@@ -2199,6 +3137,10 @@ static JSValue nx_webgl_uniform2f(JSContext *ctx, JSValueConst this_val,
 		program->offset[0] = (float)x;
 		program->offset[1] = (float)y;
 		program->has_offset = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPRITE_CENTER) {
+		program->sprite_center[0] = (float)x;
+		program->sprite_center[1] = (float)y;
+		program->has_sprite_center = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -2239,6 +3181,30 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 	} else if (location->kind == NX_WEBGL_UNIFORM_LINE_TOTAL_SIZE) {
 		program->line_total_size = (float)value;
 		program->has_line_total_size = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_FOG_NEAR) {
+		program->fog_near = (float)value;
+		program->has_fog_near = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_FOG_FAR) {
+		program->fog_far = (float)value;
+		program->has_fog_far = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_DISTANCE) {
+		program->point_light_distance = (float)value;
+		program->has_point_light_distance = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_DECAY) {
+		program->point_light_decay = (float)value;
+		program->has_point_light_decay = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_FOG_DENSITY) {
+		program->fog_density = (float)value;
+		program->has_fog_density = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPRITE_ROTATION) {
+		program->sprite_rotation = (float)value;
+		program->has_sprite_rotation = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_SIZE) {
+		program->point_size = (float)value;
+		program->has_point_size = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SHININESS) {
+		program->shininess = (float)value;
+		program->has_shininess = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -2278,9 +3244,76 @@ static JSValue nx_webgl_uniform3f(JSContext *ctx, JSValueConst this_val,
 		if (!program->has_color)
 			program->color[3] = 1.f;
 		program->has_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_FOG_COLOR) {
+		program->fog_color[0] = clamp01(values[0]);
+		program->fog_color[1] = clamp01(values[1]);
+		program->fog_color[2] = clamp01(values[2]);
+		program->has_fog_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_DIRECTION) {
+		// Three.js sends the view-space direction already; no clamp here
+		// since direction components are signed unit-vector axes.
+		program->light_direction[0] = values[0];
+		program->light_direction[1] = values[1];
+		program->light_direction[2] = values[2];
+		program->has_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_COLOR) {
+		// Light color = baseColor × intensity from Three.js, in linear
+		// space. Intensity values like `new DirectionalLight(0xfff, 3)`
+		// yield channel values > 1 so we don't clamp here either.
+		program->light_color[0] = values[0];
+		program->light_color[1] = values[1];
+		program->light_color[2] = values[2];
+		program->has_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_AMBIENT_LIGHT_COLOR) {
+		program->ambient_light_color[0] = values[0];
+		program->ambient_light_color[1] = values[1];
+		program->ambient_light_color[2] = values[2];
+		program->has_ambient_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_POSITION) {
+		// View-space position (Three.js does the world→view conversion
+		// before upload). No clamp — positions are signed and can be any
+		// magnitude.
+		program->point_light_position[0] = values[0];
+		program->point_light_position[1] = values[1];
+		program->point_light_position[2] = values[2];
+		program->has_point_light_position = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_COLOR) {
+		program->point_light_color[0] = values[0];
+		program->point_light_color[1] = values[1];
+		program->point_light_color[2] = values[2];
+		program->has_point_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_DIRECTION_1) {
+		program->light_direction2[0] = values[0];
+		program->light_direction2[1] = values[1];
+		program->light_direction2[2] = values[2];
+		program->has_light_direction2 = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_COLOR_1) {
+		program->light_color2[0] = values[0];
+		program->light_color2[1] = values[1];
+		program->light_color2[2] = values[2];
+		program->has_light_color2 = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPECULAR) {
+		program->specular[0] = (float)clamp01(values[0]);
+		program->specular[1] = (float)clamp01(values[1]);
+		program->specular[2] = (float)clamp01(values[2]);
+		program->has_specular = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_EMISSIVE) {
+		program->emissive[0] = (float)clamp01(values[0]);
+		program->emissive[1] = (float)clamp01(values[1]);
+		program->emissive[2] = (float)clamp01(values[2]);
+		program->has_emissive = true;
 	}
 	return JS_UNDEFINED;
 }
+
+// Forward declarations — definitions live further down with the other
+// uniform-setter helpers.
+static const float *uniform_array_or_buffer_floats(
+	JSContext *ctx, JSValueConst obj, int min_elements, float *fallback,
+	int fallback_capacity, int *out_count);
+static const int32_t *uniform_array_or_buffer_ints(
+	JSContext *ctx, JSValueConst obj, int min_elements, int32_t *fallback,
+	int fallback_capacity, int *out_count);
 
 static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 								   int argc, JSValueConst *argv) {
@@ -2297,21 +3330,68 @@ static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_COLOR) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
-
-	size_t byte_length = 0;
-	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[1]);
-	if (!source || byte_length < sizeof(float) * 3) {
+	// Accept either TypedArray/ArrayBuffer (the common case) OR a plain
+	// JS Array — Three.js's WebGLLights uses `[r, g, b]` arrays for
+	// `state.ambient` (`uniforms.ambientLightColor.value`), so without
+	// the Array fallback ambient never reaches the bridge (and the call
+	// silently sets GL_INVALID_VALUE = 0x501).
+	float scratch[16];
+	int count = 0;
+	const float *source = uniform_array_or_buffer_floats(
+		ctx, argv[1], 3, scratch, (int)(sizeof(scratch) / sizeof(scratch[0])),
+		&count);
+	if (!source || count <= 0 || count % 3 != 0) {
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
-	memcpy(program->color, source, sizeof(float) * 3);
-	if (!program->has_color)
-		program->color[3] = 1.f;
-	program->has_color = true;
+	// Forward to native GLES when bridge is active and the program has a
+	// real linked program — needed for tests using custom shader
+	// uniforms (unknown kind) to not silently drop their data.
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform3fv(context->egl, location->location,
+								count / 3, source);
+	}
+	if (location->kind == NX_WEBGL_UNIFORM_COLOR) {
+		memcpy(program->color, source, sizeof(float) * 3);
+		if (!program->has_color)
+			program->color[3] = 1.f;
+		program->has_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_FOG_COLOR) {
+		memcpy(program->fog_color, source, sizeof(float) * 3);
+		program->has_fog_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_DIRECTION) {
+		memcpy(program->light_direction, source, sizeof(float) * 3);
+		program->has_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_COLOR) {
+		memcpy(program->light_color, source, sizeof(float) * 3);
+		program->has_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_AMBIENT_LIGHT_COLOR) {
+		memcpy(program->ambient_light_color, source, sizeof(float) * 3);
+		program->has_ambient_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_POSITION) {
+		memcpy(program->point_light_position, source, sizeof(float) * 3);
+		program->has_point_light_position = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_POINT_LIGHT_COLOR) {
+		memcpy(program->point_light_color, source, sizeof(float) * 3);
+		program->has_point_light_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_DIRECTION_1) {
+		memcpy(program->light_direction2, source, sizeof(float) * 3);
+		program->has_light_direction2 = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_LIGHT_COLOR_1) {
+		memcpy(program->light_color2, source, sizeof(float) * 3);
+		program->has_light_color2 = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPECULAR) {
+		program->specular[0] = (float)clamp01(source[0]);
+		program->specular[1] = (float)clamp01(source[1]);
+		program->specular[2] = (float)clamp01(source[2]);
+		program->has_specular = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_EMISSIVE) {
+		program->emissive[0] = (float)clamp01(source[0]);
+		program->emissive[1] = (float)clamp01(source[1]);
+		program->emissive[2] = (float)clamp01(source[2]);
+		program->has_emissive = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2367,21 +3447,29 @@ static JSValue nx_webgl_uniform1i(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if (location->kind != NX_WEBGL_UNIFORM_SAMPLER) {
-		context->error = GL_INVALID_OPERATION;
-		return JS_UNDEFINED;
-	}
 
 	int32_t value;
 	if (JS_ToInt32(ctx, &value, argv[1]))
 		return JS_EXCEPTION;
-	if (value != 0) {
-		context->error = GL_INVALID_VALUE;
-		return JS_UNDEFINED;
+
+	// Forward to native GLES whenever the bridge has a real linked program
+	// and the uniform has a valid native location. Required for
+	// raw-shader passthrough programs (Three.js's auto-shaders) which
+	// have many int/bool/sampler uniforms (e.g. `bool receiveShadow`,
+	// `directionalShadowMap[N]` samplers bound to non-zero slots).
+	// See [[nxjs-uniform1i-fix]] memory for the milestone-#20 backstory.
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform1i(context->egl, location->location, value);
 	}
 
-	program->sampler0 = value;
-	program->has_sampler0 = true;
+	// Bridge-mode legacy stashing: only the bridge's hardcoded sampler at
+	// texture unit 0 is honored. Non-zero sampler slots reach native via
+	// the forward above; the bridge dispatch's texture binding ignores them.
+	if (location->kind == NX_WEBGL_UNIFORM_SAMPLER && value == 0) {
+		program->sampler0 = value;
+		program->has_sampler0 = true;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2398,6 +3486,7 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 	if (transpose < 0)
 		return JS_EXCEPTION;
 	if (transpose) {
+		// WebGL 1: transpose must be false.
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
@@ -2410,16 +3499,22 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		return JS_UNDEFINED;
 	}
 
-	size_t byte_length = 0;
-	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[2]);
-	if (!source || byte_length < sizeof(float) * 16) {
+	// Accept TypedArray/ArrayBuffer OR plain JS Array (Three.js's
+	// `state.ambient` pattern); reject sizes that aren't a positive
+	// multiple of 16 (the spec requires an integer number of mat4s).
+	float scratch[16];
+	int count = 0;
+	const float *source = uniform_array_or_buffer_floats(
+		ctx, argv[2], 16, scratch,
+		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
+	if (!source || count <= 0 || count % 16 != 0) {
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
 
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle && location->location >= 0) {
-		nx_webgl_egl_uniform_matrix4fv(context->egl, location->location, transpose, (const float *)source);
+		nx_webgl_egl_uniform_matrix4fv(context->egl, location->location, false, source);
 	}
 	if (location->kind == NX_WEBGL_UNIFORM_MATRIX4 ||
 		location->kind == NX_WEBGL_UNIFORM_PROJECTION_MATRIX ||
@@ -2434,8 +3529,347 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 			memcpy(program->matrix4, source, sizeof(float) * 16);
 			program->has_matrix4 = true;
 		}
+	} else if (location->kind == NX_WEBGL_UNIFORM_MODEL_MATRIX) {
+		memcpy(program->model_matrix, source, sizeof(float) * 16);
+		program->has_model_matrix = true;
 	}
 	return JS_UNDEFINED;
+}
+
+// Extract a float buffer from either a TypedArray/ArrayBuffer (preferred)
+// or a plain JS Array. Three.js's WebGLLights stores some uniform values
+// as plain `[r, g, b]` arrays (e.g. `state.ambient`), so uniform*v setters
+// that only accept buffer sources silently fail with GL_INVALID_VALUE and
+// the value never reaches the bridge. Returns the buffer pointer or NULL
+// on failure; on success writes the element count to *out_count.
+//
+// `fallback` is scratch storage for the Array path. `fallback_capacity`
+// is its element capacity. If the Array has more elements than capacity,
+// returns NULL (caller should size scratch for the worst case).
+static const float *uniform_array_or_buffer_floats(
+	JSContext *ctx, JSValueConst obj, int min_elements, float *fallback,
+	int fallback_capacity, int *out_count) {
+	size_t byte_length = 0;
+	uint8_t *src = NX_GetBufferSource(ctx, &byte_length, obj);
+	if (src && byte_length >= (size_t)min_elements * sizeof(float)) {
+		*out_count = (int)(byte_length / sizeof(float));
+		return (const float *)src;
+	}
+	if (!JS_IsObject(obj))
+		return NULL;
+	JSValue len_val = JS_GetPropertyStr(ctx, obj, "length");
+	uint32_t len = 0;
+	int ok = !JS_ToUint32(ctx, &len, len_val);
+	JS_FreeValue(ctx, len_val);
+	if (!ok || (int)len < min_elements || (int)len > fallback_capacity)
+		return NULL;
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue elem = JS_GetPropertyUint32(ctx, obj, i);
+		double v = 0.0;
+		int conv_failed = JS_ToFloat64(ctx, &v, elem);
+		JS_FreeValue(ctx, elem);
+		if (conv_failed)
+			return NULL;
+		fallback[i] = (float)v;
+	}
+	*out_count = (int)len;
+	return fallback;
+}
+
+// Same as above but for int32 uniform-array setters (uniform*iv family).
+static const int32_t *uniform_array_or_buffer_ints(
+	JSContext *ctx, JSValueConst obj, int min_elements, int32_t *fallback,
+	int fallback_capacity, int *out_count) {
+	size_t byte_length = 0;
+	uint8_t *src = NX_GetBufferSource(ctx, &byte_length, obj);
+	if (src && byte_length >= (size_t)min_elements * sizeof(int32_t)) {
+		*out_count = (int)(byte_length / sizeof(int32_t));
+		return (const int32_t *)src;
+	}
+	if (!JS_IsObject(obj))
+		return NULL;
+	JSValue len_val = JS_GetPropertyStr(ctx, obj, "length");
+	uint32_t len = 0;
+	int ok = !JS_ToUint32(ctx, &len, len_val);
+	JS_FreeValue(ctx, len_val);
+	if (!ok || (int)len < min_elements || (int)len > fallback_capacity)
+		return NULL;
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue elem = JS_GetPropertyUint32(ctx, obj, i);
+		int32_t v = 0;
+		int conv_failed = JS_ToInt32(ctx, &v, elem);
+		JS_FreeValue(ctx, elem);
+		if (conv_failed)
+			return NULL;
+		fallback[i] = v;
+	}
+	*out_count = (int)len;
+	return fallback;
+}
+
+// Forwarders for the rest of the WebGL1 uniform-setter family. Three.js's
+// WebGLUniforms.upload() picks a setter per uniform TYPE returned by
+// gl.getActiveUniform — now that getActiveUniform forwards to native GLES
+// (see nxjs-active-uniforms-attribs-lists memory), Three.js sees every
+// uniform the linked shader declares and calls the matching setter. Any
+// setter we don't expose throws "not a function" mid-render. These
+// forwarders cover the common Phong/Lambert uniform types (mat3 for
+// normalMatrix, ivec/float-array variants for misc uniforms).
+//
+// None of the names that currently land on these setters are in
+// uniform_kind_for_name's allowlist, so getUniformLocation returns null
+// and the early-null-check usually short-circuits. The native-GLES
+// forward branch is kept for future demos that legitimately upload to
+// an allowlisted uniform via these methods.
+
+static bool uniform_setter_common(JSContext *ctx, JSValueConst this_val,
+								  JSValueConst location_arg,
+								  nx_webgl_context_t **out_context,
+								  nx_webgl_uniform_location_t **out_location,
+								  nx_webgl_program_t **out_program) {
+	*out_context = nx_get_webgl_context(ctx, this_val);
+	if (!*out_context)
+		return false;
+	if (JS_IsNull(location_arg)) {
+		*out_location = NULL;
+		*out_program = NULL;
+		return true;
+	}
+	*out_location = nx_get_webgl_uniform_location(location_arg);
+	if (!get_uniform_program(*out_context, *out_location, out_program)) {
+		(*out_context)->error = GL_INVALID_OPERATION;
+		return false;
+	}
+	return true;
+}
+
+// Shared body for the three uniformMatrix*fv setters. Validates:
+//   - transpose flag (WebGL 1 rejects transpose=true with INVALID_VALUE)
+//   - array source is a TypedArray/ArrayBuffer OR a plain JS Array
+//   - element count is a positive multiple of `components` (e.g. 9 for mat3)
+// Then forwards to native GLES through `backend_call`. Returns JS_UNDEFINED.
+static JSValue uniform_matrix_fv_common(
+	JSContext *ctx, JSValueConst this_val, JSValueConst *argv, int components,
+	void (*backend_call)(nx_webgl_egl_t *, int, bool, const float *)) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	int transpose = JS_ToBool(ctx, argv[1]);
+	if (transpose < 0)
+		return JS_EXCEPTION;
+	if (transpose) {
+		// WebGL 1: transpose must be false. WebGL 2 allows true but the
+		// nx.js bridge is WebGL-1-only today.
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!location)
+		return JS_UNDEFINED;
+	float scratch[16];
+	int count = 0;
+	const float *source = uniform_array_or_buffer_floats(
+		ctx, argv[2], components, scratch,
+		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
+	if (!source) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	// WebGL spec: length must be a positive multiple of `components`
+	// (i.e. an integer number of matrices).
+	if (count <= 0 || count % components != 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		backend_call(context->egl, location->location, false, source);
+	}
+	// Bridge-side stash for known mat3 uniform kinds. Mirrors the mat4
+	// stashing in nx_webgl_uniform_matrix4fv for projection/modelView/u_matrix.
+	if (components == 9 &&
+		location->kind == NX_WEBGL_UNIFORM_MAP_TRANSFORM) {
+		memcpy(program->map_transform, source, sizeof(float) * 9);
+		program->has_map_transform = true;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_uniform_matrix3fv(JSContext *ctx,
+										  JSValueConst this_val, int argc,
+										  JSValueConst *argv) {
+	return uniform_matrix_fv_common(ctx, this_val, argv, 9,
+									nx_webgl_egl_uniform_matrix3fv);
+}
+
+static JSValue nx_webgl_uniform_matrix2fv(JSContext *ctx,
+										  JSValueConst this_val, int argc,
+										  JSValueConst *argv) {
+	return uniform_matrix_fv_common(ctx, this_val, argv, 4,
+									nx_webgl_egl_uniform_matrix2fv);
+}
+
+static JSValue uniform_fv_common(JSContext *ctx, JSValueConst this_val, int argc,
+								 JSValueConst *argv, int components,
+								 void (*backend_call)(nx_webgl_egl_t *, int,
+													  int, const float *)) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	if (!location)
+		return JS_UNDEFINED;
+	// Bound the on-stack scratch buffer. 64 floats covers vec4 arrays of
+	// length 16 (e.g. lightProbe SH coefficients are 9 vec3s = 27 floats);
+	// callers passing larger arrays must use a TypedArray, not a JS Array.
+	float scratch[64];
+	int count = 0;
+	const float *source = uniform_array_or_buffer_floats(
+		ctx, argv[1], components, scratch,
+		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
+	if (!source) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	int element_count = count / components;
+	if (element_count <= 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		backend_call(context->egl, location->location, element_count, source);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_uniform1fv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_fv_common(ctx, this_val, argc, argv, 1, nx_webgl_egl_uniform1fv);
+}
+
+static JSValue nx_webgl_uniform2fv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_fv_common(ctx, this_val, argc, argv, 2, nx_webgl_egl_uniform2fv);
+}
+
+static JSValue nx_webgl_uniform4fv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_fv_common(ctx, this_val, argc, argv, 4, nx_webgl_egl_uniform4fv);
+}
+
+static JSValue nx_webgl_uniform2i(JSContext *ctx, JSValueConst this_val,
+								  int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	int32_t x, y;
+	if (JS_ToInt32(ctx, &x, argv[1]) || JS_ToInt32(ctx, &y, argv[2]))
+		return JS_EXCEPTION;
+	if (!location)
+		return JS_UNDEFINED;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform2i(context->egl, location->location, x, y);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_uniform3i(JSContext *ctx, JSValueConst this_val,
+								  int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	int32_t x, y, z;
+	if (JS_ToInt32(ctx, &x, argv[1]) || JS_ToInt32(ctx, &y, argv[2]) ||
+		JS_ToInt32(ctx, &z, argv[3]))
+		return JS_EXCEPTION;
+	if (!location)
+		return JS_UNDEFINED;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform3i(context->egl, location->location, x, y, z);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_uniform4i(JSContext *ctx, JSValueConst this_val,
+								  int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	int32_t x, y, z, w;
+	if (JS_ToInt32(ctx, &x, argv[1]) || JS_ToInt32(ctx, &y, argv[2]) ||
+		JS_ToInt32(ctx, &z, argv[3]) || JS_ToInt32(ctx, &w, argv[4]))
+		return JS_EXCEPTION;
+	if (!location)
+		return JS_UNDEFINED;
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		nx_webgl_egl_uniform4i(context->egl, location->location, x, y, z, w);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue uniform_iv_common(JSContext *ctx, JSValueConst this_val, int argc,
+								 JSValueConst *argv, int components,
+								 void (*backend_call)(nx_webgl_egl_t *, int,
+													  int, const int *)) {
+	nx_webgl_context_t *context;
+	nx_webgl_uniform_location_t *location;
+	nx_webgl_program_t *program;
+	if (!uniform_setter_common(ctx, this_val, argv[0], &context, &location, &program))
+		return context ? JS_UNDEFINED : JS_EXCEPTION;
+	if (!location)
+		return JS_UNDEFINED;
+	int32_t scratch[64];
+	int count = 0;
+	const int32_t *source = uniform_array_or_buffer_ints(
+		ctx, argv[1], components, scratch,
+		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
+	if (!source) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	int element_count = count / components;
+	if (element_count <= 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+		program->gles_handle && location->location >= 0) {
+		backend_call(context->egl, location->location, element_count,
+					 (const int *)source);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_uniform1iv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_iv_common(ctx, this_val, argc, argv, 1, nx_webgl_egl_uniform1iv);
+}
+
+static JSValue nx_webgl_uniform2iv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_iv_common(ctx, this_val, argc, argv, 2, nx_webgl_egl_uniform2iv);
+}
+
+static JSValue nx_webgl_uniform3iv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_iv_common(ctx, this_val, argc, argv, 3, nx_webgl_egl_uniform3iv);
+}
+
+static JSValue nx_webgl_uniform4iv(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	return uniform_iv_common(ctx, this_val, argc, argv, 4, nx_webgl_egl_uniform4iv);
 }
 
 static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
@@ -2475,6 +3909,8 @@ static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
 		else if (strcmp(name, "lineDistance") == 0 ||
 				 strcmp(name, "a_lineDistance") == 0)
 			location = 3;
+		else if (strcmp(name, "normal") == 0 || strcmp(name, "a_normal") == 0)
+			location = 4;
 	}
 
 	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
@@ -2498,6 +3934,11 @@ static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
 		 strcmp(name, "texcoord") == 0 || strcmp(name, "texCoord") == 0)) {
 		program->uv_attrib_index = location;
 		program->has_uv_attrib_index = true;
+	}
+	if (location >= 0 && location < NX_WEBGL_MAX_VERTEX_ATTRIBS &&
+		(strcmp(name, "normal") == 0 || strcmp(name, "a_normal") == 0)) {
+		program->normal_attrib_index = location;
+		program->has_normal_attrib_index = true;
 	}
 
 	JS_FreeCString(ctx, name);
@@ -2710,6 +4151,75 @@ static nx_webgl_vec3_t transform_position3_depth(nx_webgl_program_t *program,
 		out.y += program->offset[1];
 	}
 	return out;
+}
+
+// Computes view-space normal for a single vertex by multiplying the input
+// normal by Three.js's `normalMatrix` = transpose(inverse(upper-left 3x3
+// of modelView)). Uses the cofactor identity (cofactor = inverseTranspose
+// × det) and skips the determinant divide because the bridge fragment
+// shader normalizes the result anyway. Returns the input normal unchanged
+// when no model-view matrix is present (e.g. matrix4-only fixed-pipeline
+// path), which is fine for any demo that doesn't use lighting.
+static nx_webgl_vec3_t compute_view_space_normal(nx_webgl_program_t *program,
+												  nx_webgl_vec3_t normal) {
+	if (!program->has_model_view_matrix)
+		return normal;
+	const float *mv = program->model_view_matrix;
+	// Upper-left 3x3 of the column-major modelView. Elements mv[3], mv[7],
+	// mv[11] (the translation row of column-major) are ignored.
+	float a = mv[0], b = mv[4], c = mv[8];
+	float d = mv[1], e = mv[5], f = mv[9];
+	float g = mv[2], h = mv[6], k = mv[10];
+	// Cofactor matrix entries (signed minors).
+	float c00 = e * k - f * h;
+	float c01 = -(d * k - f * g);
+	float c02 = d * h - e * g;
+	float c10 = -(b * k - c * h);
+	float c11 = a * k - c * g;
+	float c12 = -(a * h - b * g);
+	float c20 = b * f - c * e;
+	float c21 = -(a * f - c * d);
+	float c22 = a * e - b * d;
+	nx_webgl_vec3_t out;
+	out.x = c00 * normal.x + c01 * normal.y + c02 * normal.z;
+	out.y = c10 * normal.x + c11 * normal.y + c12 * normal.z;
+	out.z = c20 * normal.x + c21 * normal.y + c22 * normal.z;
+	return out;
+}
+
+// Computes view-space position for a single vertex via `mvPosition.xyz`.
+// Used by point-light dispatch to feed per-fragment light direction
+// (`pointLightPosition - vViewPosition` in view space). For the matrix4-
+// only branch we don't have a separate modelView matrix — return the
+// input position as a best-effort fallback (point lighting will be
+// approximate or off).
+static nx_webgl_vec3_t compute_view_space_position(
+	nx_webgl_program_t *program, nx_webgl_vec3_t position) {
+	if (!program->has_model_view_matrix)
+		return position;
+	const float *mv = program->model_view_matrix;
+	nx_webgl_vec3_t out;
+	out.x = mv[0] * position.x + mv[4] * position.y + mv[8] * position.z + mv[12];
+	out.y = mv[1] * position.x + mv[5] * position.y + mv[9] * position.z + mv[13];
+	out.z = mv[2] * position.x + mv[6] * position.y + mv[10] * position.z + mv[14];
+	return out;
+}
+
+// Computes view-space fog depth (Three.js's `vFogDepth = -mvPosition.z`) for
+// a single vertex. Used by the bridge dispatch sites to feed fog data per
+// vertex to the bridge programs (which mix in `u_fogColor` per the
+// scene.fog uniforms). For the `has_matrix4` branch we don't have a
+// separate modelView matrix, so fog depth is undefined — return 0 which
+// will saturate to no-fog with sensible near/far values.
+static float compute_fog_depth(nx_webgl_program_t *program,
+							   nx_webgl_vec3_t position) {
+	if (program->has_projection_matrix && program->has_model_view_matrix) {
+		float *mv = program->model_view_matrix;
+		float mz = mv[2] * position.x + mv[6] * position.y +
+				   mv[10] * position.z + mv[14];
+		return -mz;
+	}
+	return 0.f;
 }
 
 static nx_webgl_vec2_t transform_position3(nx_webgl_program_t *program,
@@ -3137,6 +4647,119 @@ static bool draw_axis_aligned_textured_quads(
 	return true;
 }
 
+// Three.js's SpriteMaterial vertex shader does view-aligned-quad expansion
+// per sprite — pulls modelView origin to view space, extracts world scale
+// from modelMatrix column lengths, adds a rotated/scaled quad-corner offset,
+// then projects. Our bridge_texture_program just expects pre-projected NDC
+// vertices, so this helper does the sprite math CPU-side and routes through
+// the existing textured-triangle bridge. Triggered by Three.js uploading the
+// `center` + `rotation` uniforms — see uniform_kind_for_name.
+static bool draw_sprite_bridge(JSContext *ctx, nx_webgl_context_t *context,
+							   nx_webgl_program_t *program,
+							   nx_webgl_vertex_attrib_t *position,
+							   nx_webgl_vertex_attrib_t *texcoord,
+							   nx_webgl_texture_t *texture,
+							   uint16_t *indices, int count, bool blend) {
+	if (!nx_webgl_egl_is_bridge_enabled(context->egl) || !texture ||
+		!texture->data || texture->deleted || texture->revision == 0 ||
+		texture->bridge_id == 0 || count <= 0 || count % 3 != 0)
+		return false;
+	if (!program->has_model_view_matrix || !program->has_projection_matrix)
+		return false;
+
+	int vertex_count = count;
+	// Sprites draw a single quad (6 indices). Bound at 12 vertices (2
+	// quads worth) so the stack buffer covers everything Three.js ever
+	// sends through this path. Skip js_malloc per draw — there are
+	// 200+ sprite draws per frame and the alloc overhead adds up.
+	float clip_xyzuv_stack[12 * 5];
+	if (vertex_count > 12) return false;
+	float *clip_xyzuv = clip_xyzuv_stack;
+	(void)ctx;
+
+	const float *mv = program->model_view_matrix;
+	const float *mm = program->has_model_matrix ? program->model_matrix : NULL;
+	const float *pm = program->projection_matrix;
+	// Sprite center in view space = modelViewMatrix * (0, 0, 0, 1) = the
+	// translation column of the column-major matrix.
+	float mvX = mv[12];
+	float mvY = mv[13];
+	float mvZ = mv[14];
+	// World-space scale from modelMatrix columns 0 and 1 (the X and Y axes).
+	// Fall back to (1, 1) when modelMatrix wasn't uploaded.
+	float scaleX = 1.f;
+	float scaleY = 1.f;
+	if (mm) {
+		scaleX = sqrtf(mm[0] * mm[0] + mm[1] * mm[1] + mm[2] * mm[2]);
+		scaleY = sqrtf(mm[4] * mm[4] + mm[5] * mm[5] + mm[6] * mm[6]);
+	}
+	float cx = program->has_sprite_center ? program->sprite_center[0] : 0.5f;
+	float cy = program->has_sprite_center ? program->sprite_center[1] : 0.5f;
+	float rot = program->has_sprite_rotation ? program->sprite_rotation : 0.f;
+	float cosR = cosf(rot);
+	float sinR = sinf(rot);
+
+	bool loaded = true;
+	for (int i = 0; i < vertex_count; i++) {
+		int idx = indices[i];
+		nx_webgl_vec3_t pos3;
+		nx_webgl_vec2_t uv;
+		if (!read_attrib_vec3(context, position, idx, &pos3) ||
+			!read_attrib_vec2(context, texcoord, idx, &uv)) {
+			loaded = false;
+			break;
+		}
+		float alignedX = (pos3.x - (cx - 0.5f)) * scaleX;
+		float alignedY = (pos3.y - (cy - 0.5f)) * scaleY;
+		float rotX = cosR * alignedX - sinR * alignedY;
+		float rotY = sinR * alignedX + cosR * alignedY;
+		float vx = mvX + rotX;
+		float vy = mvY + rotY;
+		float vz = mvZ;
+		float cxw = pm[0] * vx + pm[4] * vy + pm[8] * vz + pm[12];
+		float cyw = pm[1] * vx + pm[5] * vy + pm[9] * vz + pm[13];
+		float czw = pm[2] * vx + pm[6] * vy + pm[10] * vz + pm[14];
+		float cww = pm[3] * vx + pm[7] * vy + pm[11] * vz + pm[15];
+		if (cww != 0.f) {
+			cxw /= cww;
+			cyw /= cww;
+			czw /= cww;
+		}
+		int out = i * 5;
+		clip_xyzuv[out + 0] = cxw;
+		clip_xyzuv[out + 1] = cyw;
+		clip_xyzuv[out + 2] = czw;
+		clip_xyzuv[out + 3] = uv.x;
+		clip_xyzuv[out + 4] = uv.y;
+	}
+
+	bool drew = false;
+	if (loaded) {
+		float zero3[3] = {0.f, 0.f, 0.f};
+		drew = nx_webgl_egl_draw_textured_triangles_bridge(
+			context->egl, context->canvas, clip_xyzuv, vertex_count,
+			texture->bridge_id, texture->revision, (int)texture->width,
+			(int)texture->height, texture->data, texture->gles_handle,
+			texture->min_filter,
+			texture->mag_filter, texture->wrap_s, texture->wrap_t, blend,
+			context->blend_src, context->blend_dst, context->blend_src_alpha, context->blend_dst_alpha, context->viewport,
+			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+			context->scissor_box,
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+			NULL, false, zero3, 0.f, 0.f,  // fog disabled — sprites usually transparent
+			NULL, false, zero3, zero3, zero3,
+			NULL, false, zero3, zero3, 0.f, 0.f,
+			false, zero3, zero3,
+			false, 0.f,
+			program->map_transform, program->has_map_transform,
+			false, 0u,  // cull face DISABLED for sprites — sprite quads are always camera-facing, no winding concerns
+			program->has_color ? program->color : NULL,
+			false, NULL, 0.f, NULL,
+			false);  // specular + emissive + derivative-normals DISABLED for sprites
+	}
+	return drew;
+}
+
 static bool draw_indexed_textured_triangles_bridge(
 	JSContext *ctx, nx_webgl_context_t *context, nx_webgl_program_t *program,
 	nx_webgl_vertex_attrib_t *position, nx_webgl_vertex_attrib_t *texcoord,
@@ -3147,11 +4770,101 @@ static bool draw_indexed_textured_triangles_bridge(
 		return false;
 
 	int vertex_count = count;
+	bool fog_enabled = program->has_fog_color &&
+					   ((program->has_fog_near && program->has_fog_far) ||
+						program->has_fog_density);
+	int normal_index = program->has_normal_attrib_index
+						   ? program->normal_attrib_index
+						   : 4;
+	if (normal_index < 0 || normal_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		normal_index = 4;
+	nx_webgl_vertex_attrib_t *normal_attr =
+		&context->vertex_attribs[normal_index];
+	bool has_normals = normal_attr->enabled &&
+					   normal_attr->type == GL_FLOAT &&
+					   normal_attr->size >= 3;
+	bool has_directional = program->has_light_direction &&
+						   program->has_light_color;
+	bool has_point_light = program->has_point_light_position &&
+						   program->has_point_light_color;
+	// Lighting wants per-fragment normals; sourced from either the
+	// per-vertex `a_normal` buffer OR (milestone #16) the bridge fragment
+	// shader's view-position derivatives via OES_standard_derivatives.
+	// The derivative path activates when lighting uniforms are bound but
+	// the program has no `normal` attribute (Three.js's `flatShading: true`
+	// optimizer drops it — [[bridge-flatshading-gap]]).
+	bool has_lighting_uniforms = has_directional || has_point_light;
+	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
+	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyzuv =
 		js_malloc(ctx, (size_t)vertex_count * 5 * sizeof(float));
 	if (!clip_xyzuv)
 		return false;
+	float *fog_depth_data = NULL;
+	if (fog_enabled) {
+		fog_depth_data =
+			js_malloc(ctx, (size_t)vertex_count * sizeof(float));
+		if (!fog_depth_data) {
+			js_free(ctx, clip_xyzuv);
+			return false;
+		}
+	}
+	float *normal_data = NULL;
+	float *view_position_data = NULL;
+	if (lighting_enabled) {
+		// Only allocate the per-vertex normal buffer when we actually have
+		// `a_normal` to read from; derivative-normals computes N entirely
+		// from `v_viewPosition` in the fragment shader.
+		if (has_normals) {
+			normal_data =
+				js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+			if (!normal_data) {
+				js_free(ctx, clip_xyzuv);
+				js_free(ctx, fog_depth_data);
+				return false;
+			}
+		}
+		// Always populate view-position when lit. Point-light dispatch
+		// needs it; specular (post-#11) needs it; derivative-normals
+		// (milestone #16) needs it; and the bridge fragment shader's
+		// `V = normalize(-v_viewPosition)` would otherwise pick up
+		// garbage when light is on but no point light is in scene.
+		view_position_data =
+			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+		if (!view_position_data) {
+			js_free(ctx, clip_xyzuv);
+			js_free(ctx, fog_depth_data);
+			js_free(ctx, normal_data);
+			return false;
+		}
+	}
 
+	// Per-vertex "behind camera" flag. The bridge has no GPU near-plane
+	// clipping (Three.js / GLES rely on GL's clip-space machinery, which
+	// our CPU-side perspective divide bypasses). Vertices with pre-divide
+	// `tw <= eps` lie at-or-behind the near plane; after the divide their
+	// NDC values are reflected through the origin and the rasterizer
+	// connects them to in-frustum vertices producing huge stretched
+	// triangles — exactly the [[bridge-no-near-clip]] failure mode.
+	// We compute tw inline (one extra dot product of the projection
+	// matrix's row 3 with the model-view-transformed position), flag the
+	// vertex, and post-process triangles to collapse any triangle touching
+	// a behind-camera vertex to zero area. Costs ~7 muls/vertex for the
+	// extra `tw` calc + an O(N) sweep at the end; small relative to the
+	// dispatch.
+	uint8_t *vertex_behind = NULL;
+	bool have_clip_check = program->has_projection_matrix &&
+						   program->has_model_view_matrix;
+	if (have_clip_check) {
+		vertex_behind = js_malloc(ctx, (size_t)vertex_count);
+		if (!vertex_behind) {
+			js_free(ctx, clip_xyzuv);
+			js_free(ctx, fog_depth_data);
+			js_free(ctx, normal_data);
+			js_free(ctx, view_position_data);
+			return false;
+		}
+	}
 	bool loaded = true;
 	for (int i = 0; i < vertex_count; i++) {
 		nx_webgl_vec3_t position3;
@@ -3168,21 +4881,104 @@ static bool draw_indexed_textured_triangles_bridge(
 		clip_xyzuv[out + 2] = clip.z;
 		clip_xyzuv[out + 3] = uv.x;
 		clip_xyzuv[out + 4] = uv.y;
+		if (vertex_behind) {
+			const float *mv = program->model_view_matrix;
+			const float *p = program->projection_matrix;
+			float mx = mv[0] * position3.x + mv[4] * position3.y +
+					   mv[8] * position3.z + mv[12];
+			float my = mv[1] * position3.x + mv[5] * position3.y +
+					   mv[9] * position3.z + mv[13];
+			float mz = mv[2] * position3.x + mv[6] * position3.y +
+					   mv[10] * position3.z + mv[14];
+			float mw = mv[3] * position3.x + mv[7] * position3.y +
+					   mv[11] * position3.z + mv[15];
+			float tw = p[3] * mx + p[7] * my + p[11] * mz + p[15] * mw;
+			vertex_behind[i] = (tw <= 1e-4f) ? 1 : 0;
+		}
+		if (fog_depth_data)
+			fog_depth_data[i] = compute_fog_depth(program, position3);
+		if (normal_data) {
+			nx_webgl_vec3_t n;
+			if (!read_attrib_vec3(context, normal_attr, indices[i], &n)) {
+				loaded = false;
+				break;
+			}
+			nx_webgl_vec3_t vn = compute_view_space_normal(program, n);
+			normal_data[i * 3 + 0] = vn.x;
+			normal_data[i * 3 + 1] = vn.y;
+			normal_data[i * 3 + 2] = vn.z;
+		}
+		if (view_position_data) {
+			nx_webgl_vec3_t vp =
+				compute_view_space_position(program, position3);
+			view_position_data[i * 3 + 0] = vp.x;
+			view_position_data[i * 3 + 1] = vp.y;
+			view_position_data[i * 3 + 2] = vp.z;
+		}
+	}
+	// Collapse triangles that touch any at-or-behind-near-plane vertex.
+	if (loaded && vertex_behind) {
+		for (int tri = 0; tri + 2 < vertex_count; tri += 3) {
+			if (vertex_behind[tri] || vertex_behind[tri + 1] ||
+				vertex_behind[tri + 2]) {
+				for (int k = 0; k < 3; k++) {
+					int out = (tri + k) * 5;
+					clip_xyzuv[out + 0] = 0.f;
+					clip_xyzuv[out + 1] = 0.f;
+					clip_xyzuv[out + 2] = 0.f;
+				}
+			}
+		}
 	}
 
 	bool drew = false;
 	if (loaded) {
+		float zero3[3] = {0.f, 0.f, 0.f};
+		bool has_directional2 = program->has_light_direction2 &&
+								program->has_light_color2;
 		drew = nx_webgl_egl_draw_textured_triangles_bridge(
 			context->egl, context->canvas, clip_xyzuv, vertex_count,
 			texture->bridge_id, texture->revision, (int)texture->width,
-			(int)texture->height, texture->data, texture->min_filter,
+			(int)texture->height, texture->data, texture->gles_handle,
+			texture->min_filter,
 			texture->mag_filter, texture->wrap_s, texture->wrap_t, blend,
-			context->blend_src, context->blend_dst, context->viewport,
+			context->blend_src, context->blend_dst, context->blend_src_alpha, context->blend_dst_alpha, context->viewport,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 			context->scissor_box,
-			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+			fog_enabled ? fog_depth_data : NULL,
+			fog_enabled, program->fog_color, program->fog_near,
+			program->fog_far,
+			(lighting_enabled && has_normals) ? normal_data : NULL,
+			lighting_enabled,
+			has_directional ? program->light_direction : zero3,
+			has_directional ? program->light_color : zero3,
+			program->has_ambient_light_color
+				? program->ambient_light_color
+				: zero3,
+			lighting_enabled ? view_position_data : NULL,
+			has_point_light, program->point_light_position,
+			program->point_light_color, program->point_light_distance,
+			program->point_light_decay,
+			has_directional2,
+			has_directional2 ? program->light_direction2 : zero3,
+			has_directional2 ? program->light_color2 : zero3,
+			program->has_fog_density, program->fog_density,
+			program->map_transform, program->has_map_transform,
+			(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
+			context->cull_face,
+			program->has_color ? program->color : NULL,
+			program->has_specular && program->has_shininess,
+			program->has_specular ? program->specular : NULL,
+			program->has_shininess ? program->shininess : 30.f,
+			program->has_emissive ? program->emissive : NULL,
+			use_derivative_normals);
 	}
 	js_free(ctx, clip_xyzuv);
+	js_free(ctx, fog_depth_data);
+	js_free(ctx, normal_data);
+	js_free(ctx, view_position_data);
+	js_free(ctx, vertex_behind);
 	return drew;
 }
 
@@ -3206,6 +5002,28 @@ static bool draw_indexed_triangles_bridge(
 							color_attr->type == GL_FLOAT &&
 							color_attr->size >= 3;
 
+	bool fog_enabled = program->has_fog_color &&
+					   ((program->has_fog_near && program->has_fog_far) ||
+						program->has_fog_density);
+	int normal_index = program->has_normal_attrib_index
+						   ? program->normal_attrib_index
+						   : 4;
+	if (normal_index < 0 || normal_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		normal_index = 4;
+	nx_webgl_vertex_attrib_t *normal_attr =
+		&context->vertex_attribs[normal_index];
+	bool has_normals = normal_attr->enabled &&
+					   normal_attr->type == GL_FLOAT &&
+					   normal_attr->size >= 3;
+	bool has_directional = program->has_light_direction &&
+						   program->has_light_color;
+	bool has_point_light = program->has_point_light_position &&
+						   program->has_point_light_color;
+	// See draw_indexed_textured_triangles_bridge for the derivative-normals
+	// gating rationale (milestone #16).
+	bool has_lighting_uniforms = has_directional || has_point_light;
+	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
+	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyz =
 		js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
 	if (!clip_xyz)
@@ -3216,6 +5034,41 @@ static bool draw_indexed_triangles_bridge(
 			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
 		if (!vertex_color_data) {
 			js_free(ctx, clip_xyz);
+			return false;
+		}
+	}
+	float *fog_depth_data = NULL;
+	if (fog_enabled) {
+		fog_depth_data =
+			js_malloc(ctx, (size_t)vertex_count * sizeof(float));
+		if (!fog_depth_data) {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, vertex_color_data);
+			return false;
+		}
+	}
+	float *normal_data = NULL;
+	float *view_position_data = NULL;
+	if (lighting_enabled) {
+		if (has_normals) {
+			normal_data =
+				js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+			if (!normal_data) {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
+				return false;
+			}
+		}
+		// Always populate view-position when lit (point-light, specular,
+		// derivative-normals all need it).
+		view_position_data =
+			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+		if (!view_position_data) {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
+			js_free(ctx, normal_data);
 			return false;
 		}
 	}
@@ -3231,6 +5084,8 @@ static bool draw_indexed_triangles_bridge(
 		clip_xyz[i * 3 + 0] = clip.x;
 		clip_xyz[i * 3 + 1] = clip.y;
 		clip_xyz[i * 3 + 2] = clip.z;
+		if (fog_depth_data)
+			fog_depth_data[i] = compute_fog_depth(program, position3);
 		if (has_vertex_color) {
 			nx_webgl_vec3_t col;
 			if (!read_attrib_vec3(context, color_attr, indices[i], &col)) {
@@ -3240,6 +5095,24 @@ static bool draw_indexed_triangles_bridge(
 			vertex_color_data[i * 3 + 0] = col.x;
 			vertex_color_data[i * 3 + 1] = col.y;
 			vertex_color_data[i * 3 + 2] = col.z;
+		}
+		if (normal_data) {
+			nx_webgl_vec3_t n;
+			if (!read_attrib_vec3(context, normal_attr, indices[i], &n)) {
+				loaded = false;
+				break;
+			}
+			nx_webgl_vec3_t vn = compute_view_space_normal(program, n);
+			normal_data[i * 3 + 0] = vn.x;
+			normal_data[i * 3 + 1] = vn.y;
+			normal_data[i * 3 + 2] = vn.z;
+		}
+		if (view_position_data) {
+			nx_webgl_vec3_t vp =
+				compute_view_space_position(program, position3);
+			view_position_data[i * 3 + 0] = vp.x;
+			view_position_data[i * 3 + 1] = vp.y;
+			view_position_data[i * 3 + 2] = vp.z;
 		}
 	}
 
@@ -3251,17 +5124,81 @@ static bool draw_indexed_triangles_bridge(
 			(float)(color & 0xff) / 255.f,
 			(float)((color >> 24) & 0xff) / 255.f,
 		};
+		float zero3[3] = {0.f, 0.f, 0.f};
+		bool has_directional2 = program->has_light_direction2 &&
+								program->has_light_color2;
+		{
+			// DIAGNOSTIC: dump dispatch state so JS can read via
+			// gl.getBackendInfo().debugDispatchState.
+			char dbg[512];
+			snprintf(dbg, sizeof(dbg),
+					 "hLD=%d hLC=%d hAL=%d hLD2=%d hLC2=%d hC=%d | "
+					 "C=%.2f,%.2f,%.2f,%.2f | "
+					 "L1=%.2f,%.2f,%.2f | L2=%.2f,%.2f,%.2f | "
+					 "A=%.2f,%.2f,%.2f | LD1=%.2f,%.2f,%.2f | "
+					 "LD2=%.2f,%.2f,%.2f | hd2=%d gpu=%02x%02x%02x%02x",
+					 program->has_light_direction, program->has_light_color,
+					 program->has_ambient_light_color,
+					 program->has_light_direction2, program->has_light_color2,
+					 program->has_color,
+					 program->color[0], program->color[1],
+					 program->color[2], program->color[3],
+					 program->light_color[0], program->light_color[1],
+					 program->light_color[2],
+					 program->light_color2[0], program->light_color2[1],
+					 program->light_color2[2],
+					 program->ambient_light_color[0],
+					 program->ambient_light_color[1],
+					 program->ambient_light_color[2],
+					 program->light_direction[0], program->light_direction[1],
+					 program->light_direction[2],
+					 program->light_direction2[0], program->light_direction2[1],
+					 program->light_direction2[2],
+					 has_directional2,
+					 (color >> 16) & 0xff, (color >> 8) & 0xff,
+					 color & 0xff, (color >> 24) & 0xff);
+			nx_webgl_egl_set_dispatch_debug(context->egl, dbg);
+		}
 		drew = nx_webgl_egl_draw_triangles_bridge(
 			context->egl, context->canvas, clip_xyz,
 			has_vertex_color ? vertex_color_data : NULL, vertex_count,
 			gpu_color, blend, context->blend_src, context->blend_dst,
+			context->blend_src_alpha, context->blend_dst_alpha,
 			context->viewport,
 			(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 			context->scissor_box,
-			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+			(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+			fog_enabled ? fog_depth_data : NULL,
+			fog_enabled, program->fog_color, program->fog_near,
+			program->fog_far,
+			(lighting_enabled && has_normals) ? normal_data : NULL,
+			lighting_enabled,
+			has_directional ? program->light_direction : zero3,
+			has_directional ? program->light_color : zero3,
+			program->has_ambient_light_color
+				? program->ambient_light_color
+				: zero3,
+			lighting_enabled ? view_position_data : NULL,
+			has_point_light, program->point_light_position,
+			program->point_light_color, program->point_light_distance,
+			program->point_light_decay,
+			has_directional2,
+			has_directional2 ? program->light_direction2 : zero3,
+			has_directional2 ? program->light_color2 : zero3,
+			program->has_fog_density, program->fog_density,
+			(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
+			context->cull_face,
+			program->has_specular && program->has_shininess,
+			program->has_specular ? program->specular : NULL,
+			program->has_shininess ? program->shininess : 30.f,
+			program->has_emissive ? program->emissive : NULL,
+			use_derivative_normals);
 	}
 	js_free(ctx, clip_xyz);
 	js_free(ctx, vertex_color_data);
+	js_free(ctx, fog_depth_data);
+	js_free(ctx, normal_data);
+	js_free(ctx, view_position_data);
 	return drew;
 }
 
@@ -3546,7 +5483,8 @@ static int expand_lines_to_pairs(nx_webgl_context_t *context,
 								 bool has_vertex_color, uint32_t mode,
 								 int32_t first, int32_t count,
 								 const uint16_t *indices, float *clip_xyz,
-								 float *line_distance, float *vertex_colors) {
+								 float *line_distance, float *vertex_colors,
+								 float *fog_depth) {
 	int segment_count = 0;
 	if (mode == GL_LINES)
 		segment_count = count / 2;
@@ -3595,6 +5533,10 @@ static int expand_lines_to_pairs(nx_webgl_context_t *context,
 		clip_xyz[(out_vertex + 1) * 3 + 0] = c1.x;
 		clip_xyz[(out_vertex + 1) * 3 + 1] = c1.y;
 		clip_xyz[(out_vertex + 1) * 3 + 2] = c1.z;
+		if (fog_depth) {
+			fog_depth[out_vertex] = compute_fog_depth(program, pos0);
+			fog_depth[out_vertex + 1] = compute_fog_depth(program, pos1);
+		}
 		if (has_line_distance && line_distance) {
 			float d0 = 0.f;
 			float d1 = 0.f;
@@ -3687,12 +5629,19 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 
 	int max_vertex_count = max_segment_count * 2;
 
+	// Lines path supports linear Fog only (no exp2 — bridge_line_program
+	// hasn't been extended for it). FogExp2 scenes will render lines
+	// without fog rather than with wrong defaults.
+	bool fog_enabled = program->has_fog_color && program->has_fog_near &&
+					   program->has_fog_far;
+
 	// Try GPU bridge first when enabled.
 	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
 		float *clip_xyz =
 			js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
 		float *line_distance_data = NULL;
 		float *vertex_color_data = NULL;
+		float *fog_depth_data = NULL;
 		if (clip_xyz && has_line_distance) {
 			line_distance_data =
 				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
@@ -3702,16 +5651,23 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_malloc(ctx,
 						  (size_t)max_vertex_count * 3 * sizeof(float));
 		}
+		if (clip_xyz && fog_enabled) {
+			fog_depth_data =
+				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
+		}
 		if (clip_xyz && (!has_line_distance || line_distance_data) &&
-			(!has_vertex_color || vertex_color_data)) {
+			(!has_vertex_color || vertex_color_data) &&
+			(!fog_enabled || fog_depth_data)) {
 			int written = expand_lines_to_pairs(
 				context, program, position, line_distance_attr,
 				has_line_distance, color_attr, has_vertex_color, mode, first,
-				count, NULL, clip_xyz, line_distance_data, vertex_color_data);
+				count, NULL, clip_xyz, line_distance_data, vertex_color_data,
+				fog_depth_data);
 			if (written < 0) {
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				context->error = GL_INVALID_OPERATION;
 				return;
 			}
@@ -3721,13 +5677,17 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 					dashed ? line_distance_data : NULL,
 					has_vertex_color ? vertex_color_data : NULL, written,
 					uniform_color, scale, dash_size, total_size, blend,
-					context->blend_src, context->blend_dst, context->viewport,
+					context->blend_src, context->blend_dst, context->blend_src_alpha, context->blend_dst_alpha, context->viewport,
 					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 					context->scissor_box,
-					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+					fog_enabled ? fog_depth_data : NULL,
+					fog_enabled, program->fog_color, program->fog_near,
+					program->fog_far);
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				if (drew) {
 					context->bridge_clear_pending = false;
 					return;
@@ -3736,12 +5696,14 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				return;
 			}
 		} else {
 			js_free(ctx, clip_xyz);
 			js_free(ctx, line_distance_data);
 			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
 		}
 	}
 
@@ -3874,11 +5836,16 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 
 	int max_vertex_count = max_segment_count * 2;
 
+	// See draw_arrays_lines for why this stays linear-only.
+	bool fog_enabled = program->has_fog_color && program->has_fog_near &&
+					   program->has_fog_far;
+
 	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
 		float *clip_xyz =
 			js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
 		float *line_distance_data = NULL;
 		float *vertex_color_data = NULL;
+		float *fog_depth_data = NULL;
 		if (clip_xyz && has_line_distance) {
 			line_distance_data =
 				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
@@ -3888,17 +5855,23 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_malloc(ctx,
 						  (size_t)max_vertex_count * 3 * sizeof(float));
 		}
+		if (clip_xyz && fog_enabled) {
+			fog_depth_data =
+				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
+		}
 		if (clip_xyz && (!has_line_distance || line_distance_data) &&
-			(!has_vertex_color || vertex_color_data)) {
+			(!has_vertex_color || vertex_color_data) &&
+			(!fog_enabled || fog_depth_data)) {
 			int written = expand_lines_to_pairs(
 				context, program, position, line_distance_attr,
 				has_line_distance, color_attr, has_vertex_color, mode,
 				0, count, indices, clip_xyz, line_distance_data,
-				vertex_color_data);
+				vertex_color_data, fog_depth_data);
 			if (written < 0) {
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				context->error = GL_INVALID_OPERATION;
 				return;
 			}
@@ -3908,13 +5881,17 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 					dashed ? line_distance_data : NULL,
 					has_vertex_color ? vertex_color_data : NULL, written,
 					uniform_color, scale, dash_size, total_size, blend,
-					context->blend_src, context->blend_dst, context->viewport,
+					context->blend_src, context->blend_dst, context->blend_src_alpha, context->blend_dst_alpha, context->viewport,
 					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 					context->scissor_box,
-					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+					fog_enabled ? fog_depth_data : NULL,
+					fog_enabled, program->fog_color, program->fog_near,
+					program->fog_far);
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				if (drew) {
 					context->bridge_clear_pending = false;
 					return;
@@ -3923,12 +5900,14 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_free(ctx, clip_xyz);
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
 				return;
 			}
 		} else {
 			js_free(ctx, clip_xyz);
 			js_free(ctx, line_distance_data);
 			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
 		}
 	}
 
@@ -3999,6 +5978,379 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 		cairo_surface_mark_dirty(canvas->surface);
 }
 
+// Expand GL_POINTS to screen-aligned quads in NDC space and dispatch
+// through the bridge triangle path. Each input point becomes 6 vertices
+// (two triangles) sized so the output appears as a small square ~2 pixels
+// wide in the bound viewport. Required because GLES2 GL_POINTS is a
+// separate primitive type the bridge doesn't natively support, and
+// Three.js's PointsMaterial / particle systems issue drawArrays(POINTS,
+// ...). The expanded quads route through bridge_color_program so vertex
+// colors and linear / exp2 fog still work; lighting is N/A since
+// PointsMaterial doesn't ship normals.
+static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
+							   nx_webgl_program_t *program,
+							   int32_t first, int32_t count) {
+	if (count <= 0)
+		return;
+
+	int position_index = program->has_position_attrib_index
+							 ? program->position_attrib_index
+							 : 0;
+	if (position_index < 0 || position_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		position_index = 0;
+	nx_webgl_vertex_attrib_t *position =
+		&context->vertex_attribs[position_index];
+	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
+		context->error = GL_INVALID_OPERATION;
+		return;
+	}
+
+	int color_index = program->has_color_attrib_index
+						  ? program->color_attrib_index
+						  : 1;
+	if (color_index < 0 || color_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+		color_index = 1;
+	nx_webgl_vertex_attrib_t *color_attr =
+		&context->vertex_attribs[color_index];
+	bool has_vertex_color = color_attr->enabled &&
+							color_attr->type == GL_FLOAT &&
+							color_attr->size >= 3;
+
+	nx_canvas_t *canvas = context->canvas;
+	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
+	bool fog_enabled = program->has_fog_color &&
+					   ((program->has_fog_near && program->has_fog_far) ||
+						program->has_fog_density);
+	float fallback_color[4] = {
+		68.f / 255.f,
+		215.f / 255.f,
+		182.f / 255.f,
+		1.f,
+	};
+	float *gpu_color = program->has_color ? program->color : fallback_color;
+
+	// Resolve the bound texture for textured point sprites. NULL when no
+	// texture or no sampler uniform — falls through to the untextured
+	// color path. Three.js's PointsMaterial({map, ...}) sets up `map` →
+	// program->sampler0 which active_texture_for_program then resolves.
+	nx_webgl_texture_t *texture = active_texture_for_program(context, program);
+	bool use_texture = texture != NULL;
+
+	// Quad half-extent in pixels. Three.js's PointsMaterial uploads
+	// `size` (= material.size × pixelRatio) which we recognized as
+	// NX_WEBGL_UNIFORM_POINT_SIZE. When `size` is bound we use it as the
+	// quad full width; otherwise default to 2 px (legacy milestone #6
+	// behavior — small dots for starfields without PointsMaterial.size).
+	float base_size_px = program->has_point_size ? program->point_size : 2.f;
+	float vw = context->viewport[2] > 0 ? (float)context->viewport[2] : 640.f;
+	float vh = context->viewport[3] > 0 ? (float)context->viewport[3] : 360.f;
+	// `size` is the FULL on-screen width of the point quad; half-extent
+	// is therefore size/2 pixels. NDC width = 2; NDC half-extent =
+	// (size_px/2) × (2/vw) = size_px/vw.
+	float base_half_x_ndc = base_size_px / vw;
+	float base_half_y_ndc = base_size_px / vh;
+
+	// Size attenuation: Three.js's PointsMaterial shader does
+	// `gl_PointSize *= (scale / -mvPosition.z)` when sizeAttenuation is
+	// true. `scale` is uploaded as `0.5 × canvas.height` (see Three.js
+	// r162 source ~line 28029). The bridge can't distinguish "attenuation
+	// on" from "attenuation off" via uniform values alone, so we apply
+	// the multiply whenever both `size` AND `scale` are bound — matches
+	// Three.js's default-on behavior. Demos that want fixed-size points
+	// can omit one of the uniforms; the bridge falls back to the base
+	// size.
+	bool size_attenuation = program->has_point_size && program->has_line_scale;
+	float attenuation_scale = program->has_line_scale ? program->line_scale
+													  : 1.f;
+
+	// Two triangles forming a quad. Vertex order: TL, BR, BL, TL, TR, BR.
+	static const float quad_dx[6] = {-1.f, +1.f, -1.f, -1.f, +1.f, +1.f};
+	static const float quad_dy[6] = {+1.f, -1.f, -1.f, +1.f, +1.f, -1.f};
+	// Matching UV layout for textured points. (u, v) = ((dx+1)/2, (1-dy)/2)
+	// so TL of quad samples (0, 0), BR samples (1, 1).
+	static const float quad_u[6] = {0.f, 1.f, 0.f, 0.f, 1.f, 1.f};
+	static const float quad_v[6] = {0.f, 1.f, 1.f, 0.f, 0.f, 1.f};
+
+	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
+		int max_vertex_count = count * 6;
+		float *clip_xyz = NULL;
+		float *clip_xyzuv = NULL;
+		if (use_texture)
+			clip_xyzuv =
+				js_malloc(ctx, (size_t)max_vertex_count * 5 * sizeof(float));
+		else
+			clip_xyz =
+				js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
+		float *vertex_color_data = NULL;
+		float *fog_depth_data = NULL;
+		if ((clip_xyz || clip_xyzuv) && has_vertex_color && !use_texture) {
+			// Per-vertex color only flows through the untextured triangle
+			// bridge. The textured path takes a single diffuse uniform.
+			vertex_color_data =
+				js_malloc(ctx, (size_t)max_vertex_count * 3 * sizeof(float));
+		}
+		if ((clip_xyz || clip_xyzuv) && fog_enabled) {
+			fog_depth_data =
+				js_malloc(ctx, (size_t)max_vertex_count * sizeof(float));
+		}
+		bool buffers_ok = (use_texture ? (clip_xyzuv != NULL)
+									   : (clip_xyz != NULL)) &&
+						  (!has_vertex_color || use_texture ||
+						   vertex_color_data) &&
+						  (!fog_enabled || fog_depth_data);
+		if (buffers_ok) {
+			bool loaded = true;
+			int written_points = 0;
+			for (int p = 0; p < count; p++) {
+				int vertex_index = first + p;
+				nx_webgl_vec3_t pos;
+				if (!read_attrib_vec3(context, position, vertex_index, &pos)) {
+					loaded = false;
+					break;
+				}
+				nx_webgl_vec3_t ndc = transform_position3_depth(program, pos);
+				// Per-point half-extent in NDC. For size attenuation we
+				// scale by `scale / -mv_z` — Three.js's exact formula.
+				// Mirror compute_view_space_position to get mv_z, then
+				// apply.
+				float half_x = base_half_x_ndc;
+				float half_y = base_half_y_ndc;
+				if (size_attenuation && program->has_model_view_matrix) {
+					const float *mv = program->model_view_matrix;
+					float mv_z = mv[2] * pos.x + mv[6] * pos.y +
+								 mv[10] * pos.z + mv[14];
+					if (mv_z < -0.0001f) {
+						float k = attenuation_scale / -mv_z;
+						half_x *= k;
+						half_y *= k;
+					}
+				}
+				// Cull points fully outside the NDC cube (with the per-
+				// point margin for the quad expansion). Off-screen points
+				// pay no bandwidth + bridge upload cost.
+				if (ndc.z < -1.f || ndc.z > 1.f)
+					continue;
+				if (ndc.x < -1.f - half_x || ndc.x > 1.f + half_x)
+					continue;
+				if (ndc.y < -1.f - half_y || ndc.y > 1.f + half_y)
+					continue;
+
+				nx_webgl_vec3_t col = {1.f, 1.f, 1.f};
+				if (has_vertex_color && !use_texture) {
+					if (!read_attrib_vec3(context, color_attr, vertex_index,
+										  &col)) {
+						loaded = false;
+						break;
+					}
+				}
+				float fog_depth = fog_enabled ? compute_fog_depth(program, pos)
+											  : 0.f;
+				int base = written_points * 6;
+				for (int v = 0; v < 6; v++) {
+					float vx = ndc.x + quad_dx[v] * half_x;
+					float vy = ndc.y + quad_dy[v] * half_y;
+					if (use_texture) {
+						clip_xyzuv[(base + v) * 5 + 0] = vx;
+						clip_xyzuv[(base + v) * 5 + 1] = vy;
+						clip_xyzuv[(base + v) * 5 + 2] = ndc.z;
+						clip_xyzuv[(base + v) * 5 + 3] = quad_u[v];
+						clip_xyzuv[(base + v) * 5 + 4] = quad_v[v];
+					} else {
+						clip_xyz[(base + v) * 3 + 0] = vx;
+						clip_xyz[(base + v) * 3 + 1] = vy;
+						clip_xyz[(base + v) * 3 + 2] = ndc.z;
+						if (vertex_color_data) {
+							vertex_color_data[(base + v) * 3 + 0] = col.x;
+							vertex_color_data[(base + v) * 3 + 1] = col.y;
+							vertex_color_data[(base + v) * 3 + 2] = col.z;
+						}
+					}
+					if (fog_depth_data)
+						fog_depth_data[base + v] = fog_depth;
+				}
+				written_points++;
+			}
+			if (!loaded) {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, clip_xyzuv);
+				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
+				context->error = GL_INVALID_OPERATION;
+				return;
+			}
+			int vertex_count_out = written_points * 6;
+			if (vertex_count_out == 0) {
+				js_free(ctx, clip_xyz);
+				js_free(ctx, clip_xyzuv);
+				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
+				return;
+			}
+			float zero3[3] = {0.f, 0.f, 0.f};
+			bool drew = false;
+			if (use_texture) {
+				drew = nx_webgl_egl_draw_textured_triangles_bridge(
+					context->egl, canvas, clip_xyzuv, vertex_count_out,
+					texture->bridge_id, texture->revision,
+					(int)texture->width, (int)texture->height, texture->data,
+					texture->gles_handle,
+					texture->min_filter, texture->mag_filter, texture->wrap_s,
+					texture->wrap_t, blend, context->blend_src,
+					context->blend_dst, context->blend_src_alpha,
+					context->blend_dst_alpha, context->viewport,
+					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+					context->scissor_box,
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+					fog_enabled ? fog_depth_data : NULL,
+					fog_enabled, program->fog_color, program->fog_near,
+					program->fog_far,
+					NULL, false, zero3, zero3, zero3,
+					NULL, false, zero3, zero3, 0.f, 0.f,
+					false, zero3, zero3,
+					program->has_fog_density, program->fog_density,
+					NULL, false,  // map_transform — points don't use it
+					false, 0u,    // cull face — N/A for screen-aligned points
+					program->has_color ? program->color : NULL,
+					false, NULL, 0.f, NULL, false);  // specular + emissive + derivative-normals DISABLED for points
+			} else {
+				drew = nx_webgl_egl_draw_triangles_bridge(
+					context->egl, canvas, clip_xyz,
+					has_vertex_color ? vertex_color_data : NULL,
+					vertex_count_out, gpu_color, blend, context->blend_src,
+					context->blend_dst, context->blend_src_alpha,
+					context->blend_dst_alpha, context->viewport,
+					(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
+					context->scissor_box,
+					(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+					fog_enabled ? fog_depth_data : NULL,
+					fog_enabled, program->fog_color, program->fog_near,
+					program->fog_far,
+					NULL, false, zero3, zero3, zero3,
+					NULL, false, zero3, zero3, 0.f, 0.f,
+					false, zero3, zero3,
+					program->has_fog_density, program->fog_density,
+					(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
+					context->cull_face,
+					false, NULL, 0.f, NULL, false);  // specular + emissive + derivative-normals DISABLED for points
+			}
+			js_free(ctx, clip_xyz);
+			js_free(ctx, clip_xyzuv);
+			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
+			if (drew) {
+				context->bridge_clear_pending = false;
+				return;
+			}
+		} else {
+			js_free(ctx, clip_xyz);
+			js_free(ctx, clip_xyzuv);
+			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
+		}
+	}
+
+	// Software fallback: plot a single pixel per point. Adequate for
+	// debug builds where the bridge is disabled; the bridge path above
+	// is the production path.
+	flush_pending_bridge_clear_to_software(context);
+	uint32_t color_u32 = program_color(program);
+	uint32_t *pixels = (uint32_t *)canvas->data;
+	for (int p = 0; p < count; p++) {
+		nx_webgl_vec3_t pos;
+		if (!read_attrib_vec3(context, position, first + p, &pos)) {
+			context->error = GL_INVALID_OPERATION;
+			return;
+		}
+		nx_webgl_vec3_t ndc = transform_position3_depth(program, pos);
+		if (ndc.z < -1.f || ndc.z > 1.f)
+			continue;
+		nx_webgl_vec2_t px =
+			clip_to_pixel(context, (nx_webgl_vec2_t){ndc.x, ndc.y});
+		int ix = (int)px.x;
+		int iy = (int)px.y;
+		if (ix < 0 || ix >= canvas->width || iy < 0 || iy >= canvas->height)
+			continue;
+		pixels[iy * canvas->width + ix] = color_u32;
+	}
+	if (canvas->surface)
+		cairo_surface_mark_dirty(canvas->surface);
+}
+
+// Dispatch a draw through the raw-shader passthrough path when one of three
+// gates fires: (1) the bound program was marked via `#pragma raw_passthrough`,
+// (2) `instance_count > 0` was supplied via an `ANGLE_instanced_arrays`
+// draw call (instancing always needs the native program), or (3) any enabled
+// attrib has divisor > 0 (the program is mid-instancing — Three.js's pattern
+// is to set divisors once and leave them between draws). Bypasses the
+// bridge's hardcoded-program swap and runs the user's linked GLES program
+// directly. Returns true if the draw was dispatched (success or GL error
+// inside the passthrough path); false to fall through to bridge-mode
+// dispatch. See [[bridge-raw-shader-passthrough]].
+static bool try_draw_passthrough(nx_webgl_context_t *context,
+								  nx_webgl_program_t *program,
+								  uint32_t mode, bool indexed,
+								  int32_t first, int32_t count,
+								  uint32_t element_type,
+								  uint32_t element_offset,
+								  uint32_t element_buffer_handle,
+								  int32_t instance_count) {
+	if (!program || !program->gles_handle)
+		return false;
+	if (!context->egl || !nx_webgl_egl_is_bridge_enabled(context->egl))
+		return false;
+
+	bool any_divisor = false;
+	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+		if (context->vertex_attribs[i].enabled &&
+			context->vertex_attribs[i].divisor > 0u) {
+			any_divisor = true;
+			break;
+		}
+	}
+	// Gate: explicit pragma, explicit instanced draw, or sticky divisor on
+	// any enabled attrib (Three.js's instancing pattern).
+	if (!program->raw_passthrough && instance_count <= 0 && !any_divisor)
+		return false;
+
+	nx_webgl_egl_passthrough_attrib_t attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
+	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+		nx_webgl_vertex_attrib_t *src = &context->vertex_attribs[i];
+		attribs[i].enabled = src->enabled;
+		nx_webgl_buffer_t *buf = nx_get_webgl_buffer(src->buffer);
+		attribs[i].buffer_handle =
+			(buf && !buf->deleted) ? buf->gles_handle : 0u;
+		attribs[i].size = src->size;
+		attribs[i].type = src->type;
+		attribs[i].normalized = src->normalized;
+		attribs[i].stride = src->stride;
+		attribs[i].offset = src->offset;
+		attribs[i].divisor = src->divisor;
+	}
+
+	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
+	bool scissor_enabled = (context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0;
+	bool depth_enabled = (context->enabled_caps & GL_CAP_DEPTH_TEST) != 0;
+	bool cull_enabled = (context->enabled_caps & GL_CAP_CULL_FACE) != 0;
+
+	bool ok = nx_webgl_egl_draw_passthrough(
+		context->egl, context->canvas, program->gles_handle, mode,
+		indexed, first, count, element_type, element_offset,
+		element_buffer_handle, attribs, NX_WEBGL_MAX_VERTEX_ATTRIBS,
+		instance_count, context->viewport, blend,
+		context->blend_src, context->blend_dst,
+		context->blend_src_alpha, context->blend_dst_alpha,
+		scissor_enabled, context->scissor_box, depth_enabled,
+		cull_enabled, context->cull_face, context->front_face);
+	// An instanced draw that failed setup (e.g. missing native instancing
+	// fn pointers) should propagate up so the JS caller can set INVALID_OP.
+	// The non-instanced fallback case still returns "dispatched" because the
+	// raw_passthrough / divisor gate already committed us to native dispatch.
+	if (!ok && instance_count > 0)
+		return false;
+	context->bridge_clear_pending = false;
+	return true;
+}
+
 static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 									int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -4013,7 +6365,7 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 
 	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
-		mode != GL_LINE_LOOP) {
+		mode != GL_LINE_LOOP && mode != GL_POINTS) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -4046,8 +6398,22 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
+	// Raw-shader passthrough opt-in via `#pragma raw_passthrough` in either
+	// attached shader. Runs the user's linked program directly; bridge swap
+	// and CPU-side transformation are skipped. See [[nxjs-no-custom-fragment-shader]]
+	// for what this unblocks.
+	if (try_draw_passthrough(context, program, mode, false, first, count,
+							  0, 0, 0, 0)) {
+		return JS_UNDEFINED;
+	}
+
 	if (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) {
 		draw_arrays_lines(ctx, context, program, mode, first, count);
+		return JS_UNDEFINED;
+	}
+
+	if (mode == GL_POINTS) {
+		draw_arrays_points(ctx, context, program, first, count);
 		return JS_UNDEFINED;
 	}
 
@@ -4064,6 +6430,47 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	if (triangle_count == 0)
 		return JS_UNDEFINED;
 
+	// Textured drawArrays: synthesize sequential indices and route
+	// through the existing indexed-textured bridge dispatch. Required
+	// for Three.js's PolyhedronGeometry-derived shapes (Tetra/Octa/Icos)
+	// which Three.js builds as non-indexed (each face copies vertices so
+	// UVs and normals can differ at face boundaries). Without this,
+	// such shapes with MeshPhongMaterial({map: tex}) hit the software
+	// fallback and leak pixels onto canvas->data at canvas-space coords.
+	if (nx_webgl_egl_is_bridge_enabled(context->egl) && use_texture) {
+		int vertex_count = triangle_count * 3;
+		uint16_t *fake_indices =
+			js_malloc(ctx, (size_t)vertex_count * sizeof(uint16_t));
+		if (fake_indices) {
+			int first_clamped = first < 0 ? 0 : first;
+			bool indices_fit = true;
+			for (int i = 0; i < vertex_count; i++) {
+				int idx = first_clamped + i;
+				if (idx < 0 || idx > 0xFFFF) {
+					indices_fit = false;
+					break;
+				}
+				fake_indices[i] = (uint16_t)idx;
+			}
+			if (indices_fit &&
+				draw_indexed_textured_triangles_bridge(
+					ctx, context, program, position, texcoord, texture,
+					fake_indices, vertex_count, blend)) {
+				js_free(ctx, fake_indices);
+				context->bridge_clear_pending = false;
+				return JS_UNDEFINED;
+			}
+			js_free(ctx, fake_indices);
+		}
+		// Bridge failed — when client manages its own readback,
+		// don't fall through to software (see nx_webgl_draw_elements
+		// gate). Matches the textured drawElements failure path.
+		if (!nx_webgl_egl_get_auto_flush(context->egl)) {
+			nx_webgl_egl_append_dispatch_debug(context->egl, "AT-BAIL");
+			return JS_UNDEFINED;
+		}
+	}
+
 	if (nx_webgl_egl_is_bridge_enabled(context->egl) && !use_texture) {
 		int vertex_count = triangle_count * 3;
 		int color_index = program->has_color_attrib_index
@@ -4076,15 +6483,60 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		bool has_vertex_color = color_attr->enabled &&
 								color_attr->type == GL_FLOAT &&
 								color_attr->size >= 3;
+		bool fog_enabled = program->has_fog_color &&
+						   ((program->has_fog_near && program->has_fog_far) ||
+							program->has_fog_density);
+		int normal_index = program->has_normal_attrib_index
+							   ? program->normal_attrib_index
+							   : 4;
+		if (normal_index < 0 || normal_index >= NX_WEBGL_MAX_VERTEX_ATTRIBS)
+			normal_index = 4;
+		nx_webgl_vertex_attrib_t *normal_attr =
+			&context->vertex_attribs[normal_index];
+		bool has_normals = normal_attr->enabled &&
+						   normal_attr->type == GL_FLOAT &&
+						   normal_attr->size >= 3;
+		bool has_directional = program->has_light_direction &&
+							   program->has_light_color;
+		bool has_point_light = program->has_point_light_position &&
+							   program->has_point_light_color;
+		// See draw_indexed_textured_triangles_bridge for derivative-normals
+		// (milestone #16) gating rationale.
+		bool has_lighting_uniforms = has_directional || has_point_light;
+		bool use_derivative_normals = has_lighting_uniforms && !has_normals;
+		bool lighting_enabled = has_lighting_uniforms;
 
 		float *clip_xyz =
 			js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
 		float *vertex_color_data = NULL;
+		float *fog_depth_data = NULL;
+		float *normal_data = NULL;
+		float *view_position_data = NULL;
 		if (clip_xyz && has_vertex_color) {
 			vertex_color_data =
 				js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
 		}
-		if (clip_xyz && (!has_vertex_color || vertex_color_data)) {
+		if (clip_xyz && fog_enabled) {
+			fog_depth_data =
+				js_malloc(ctx, (size_t)vertex_count * sizeof(float));
+		}
+		if (clip_xyz && lighting_enabled) {
+			if (has_normals) {
+				normal_data =
+					js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+			}
+			// Always allocate view-position when lit — needed by both the
+			// point-light dispatch and the Blinn-Phong specular / derivative-
+			// normals paths.
+			if (!has_normals || normal_data) {
+				view_position_data =
+					js_malloc(ctx, (size_t)vertex_count * 3 * sizeof(float));
+			}
+		}
+		if (clip_xyz && (!has_vertex_color || vertex_color_data) &&
+			(!fog_enabled || fog_depth_data) &&
+			(!(lighting_enabled && has_normals) || normal_data) &&
+			(!lighting_enabled || view_position_data)) {
 			bool loaded = true;
 			for (int i = 0; i < vertex_count; i++) {
 				int vertex_index = first + i;
@@ -4099,6 +6551,8 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 				clip_xyz[i * 3 + 0] = clip.x;
 				clip_xyz[i * 3 + 1] = clip.y;
 				clip_xyz[i * 3 + 2] = clip.z;
+				if (fog_depth_data)
+					fog_depth_data[i] = compute_fog_depth(program, position3);
 				if (has_vertex_color) {
 					nx_webgl_vec3_t col;
 					if (!read_attrib_vec3(context, color_attr, vertex_index,
@@ -4110,10 +6564,32 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 					vertex_color_data[i * 3 + 1] = col.y;
 					vertex_color_data[i * 3 + 2] = col.z;
 				}
+				if (normal_data) {
+					nx_webgl_vec3_t n;
+					if (!read_attrib_vec3(context, normal_attr, vertex_index,
+										  &n)) {
+						loaded = false;
+						break;
+					}
+					nx_webgl_vec3_t vn = compute_view_space_normal(program, n);
+					normal_data[i * 3 + 0] = vn.x;
+					normal_data[i * 3 + 1] = vn.y;
+					normal_data[i * 3 + 2] = vn.z;
+				}
+				if (view_position_data) {
+					nx_webgl_vec3_t vp =
+						compute_view_space_position(program, position3);
+					view_position_data[i * 3 + 0] = vp.x;
+					view_position_data[i * 3 + 1] = vp.y;
+					view_position_data[i * 3 + 2] = vp.z;
+				}
 			}
 			if (!loaded) {
 				js_free(ctx, clip_xyz);
 				js_free(ctx, vertex_color_data);
+				js_free(ctx, fog_depth_data);
+				js_free(ctx, normal_data);
+				js_free(ctx, view_position_data);
 				context->error = GL_INVALID_OPERATION;
 				return JS_UNDEFINED;
 			}
@@ -4125,16 +6601,48 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			};
 			float *gpu_color = program->has_color ? program->color
 												  : fallback_color;
+			float zero3[3] = {0.f, 0.f, 0.f};
+			bool has_directional2 = program->has_light_direction2 &&
+									program->has_light_color2;
 			bool drew = nx_webgl_egl_draw_triangles_bridge(
 				context->egl, canvas, clip_xyz,
 				has_vertex_color ? vertex_color_data : NULL, vertex_count,
 				gpu_color, blend, context->blend_src, context->blend_dst,
+				context->blend_src_alpha, context->blend_dst_alpha,
 				context->viewport,
 				(context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0,
 				context->scissor_box,
-				(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0);
+				(context->enabled_caps & GL_CAP_DEPTH_TEST) != 0,
+				fog_enabled ? fog_depth_data : NULL,
+				fog_enabled, program->fog_color, program->fog_near,
+				program->fog_far,
+				(lighting_enabled && has_normals) ? normal_data : NULL,
+				lighting_enabled,
+				has_directional ? program->light_direction : zero3,
+				has_directional ? program->light_color : zero3,
+				program->has_ambient_light_color
+					? program->ambient_light_color
+					: zero3,
+				lighting_enabled ? view_position_data : NULL,
+				has_point_light, program->point_light_position,
+				program->point_light_color, program->point_light_distance,
+				program->point_light_decay,
+				has_directional2,
+				has_directional2 ? program->light_direction2 : zero3,
+				has_directional2 ? program->light_color2 : zero3,
+				program->has_fog_density, program->fog_density,
+			(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
+			context->cull_face,
+			program->has_specular && program->has_shininess,
+			program->has_specular ? program->specular : NULL,
+			program->has_shininess ? program->shininess : 30.f,
+			program->has_emissive ? program->emissive : NULL,
+			use_derivative_normals);
 			js_free(ctx, clip_xyz);
 			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
+			js_free(ctx, normal_data);
+			js_free(ctx, view_position_data);
 			if (drew) {
 				context->bridge_clear_pending = false;
 				return JS_UNDEFINED;
@@ -4142,6 +6650,9 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		} else {
 			js_free(ctx, clip_xyz);
 			js_free(ctx, vertex_color_data);
+			js_free(ctx, fog_depth_data);
+			js_free(ctx, normal_data);
+			js_free(ctx, view_position_data);
 		}
 	}
 
@@ -4204,12 +6715,19 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
-	if (type != GL_UNSIGNED_SHORT) {
+	if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
-	if (count < 0 || offset < 0 || offset % (int)sizeof(uint16_t) != 0) {
+	size_t index_size = (type == GL_UNSIGNED_BYTE) ? 1 : 2;
+	if (count < 0 || offset < 0) {
 		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	// WebGL 1.0 spec 6.4: offset not aligned to index size returns
+	// INVALID_OPERATION (not INVALID_VALUE).
+	if ((size_t)offset % index_size != 0) {
+		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 	if (count == 0)
@@ -4239,7 +6757,7 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
-	if ((size_t)offset + (size_t)count * sizeof(uint16_t) >
+	if ((size_t)offset + (size_t)count * index_size >
 		element_buffer->size) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
@@ -4249,11 +6767,38 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
 
-	uint16_t *indices = (uint16_t *)(element_buffer->data + offset);
+	// Raw-shader passthrough opt-in via `#pragma raw_passthrough` in either
+	// attached shader. Native glDrawElements reads the user's element
+	// buffer directly (no JS-side index extraction). See
+	// [[bridge-raw-shader-passthrough]].
+	if (try_draw_passthrough(context, program, mode, true, 0, count,
+							  type, (uint32_t)offset,
+							  element_buffer->gles_handle, 0)) {
+		return JS_UNDEFINED;
+	}
+
+	// All downstream dispatch paths take `uint16_t *indices`. When the
+	// caller used `gl.UNSIGNED_BYTE`, upconvert the uint8 indices into
+	// a temporary uint16 buffer first; free at every exit path below.
+	uint16_t *indices;
+	uint16_t *owned_indices = NULL;
+	if (type == GL_UNSIGNED_BYTE) {
+		owned_indices = js_malloc(ctx, (size_t)count * sizeof(uint16_t));
+		if (!owned_indices)
+			return JS_EXCEPTION;
+		const uint8_t *src = element_buffer->data + offset;
+		for (int i = 0; i < count; i++)
+			owned_indices[i] = (uint16_t)src[i];
+		indices = owned_indices;
+	} else {
+		indices = (uint16_t *)(element_buffer->data + offset);
+	}
 
 	if (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) {
 		draw_elements_lines(ctx, context, program, position, mode, indices,
 							count);
+		if (owned_indices)
+			js_free(ctx, owned_indices);
 		return JS_UNDEFINED;
 	}
 
@@ -4270,6 +6815,24 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		draw_indexed_triangles_bridge(ctx, context, program, position, indices,
 									  count, color, blend)) {
 		context->bridge_clear_pending = false;
+		if (owned_indices)
+			js_free(ctx, owned_indices);
+		return JS_UNDEFINED;
+	}
+	// Sprite detection: Three.js's SpriteMaterial uploads `center` (vec2)
+	// and `rotation` (float) — uniforms no other material uses. When both
+	// are present, the bridge can't use its generic CPU-side MVP path
+	// (sprite vertices are screen-aligned around the sprite's view-space
+	// origin, not Three.js's standard MVP transform). Route to the
+	// dedicated sprite math path instead. Falls through to the generic
+	// textured path if the sprite path declines (e.g. no modelMatrix).
+	if (use_texture && program->has_sprite_center &&
+		program->has_sprite_rotation &&
+		draw_sprite_bridge(ctx, context, program, position, texcoord,
+						   texture, indices, count, blend)) {
+		context->bridge_clear_pending = false;
+		if (owned_indices)
+			js_free(ctx, owned_indices);
 		return JS_UNDEFINED;
 	}
 	if (use_texture &&
@@ -4277,6 +6840,26 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 											   texcoord, texture, indices,
 											   count, blend)) {
 		context->bridge_clear_pending = false;
+		if (owned_indices)
+			js_free(ctx, owned_indices);
+		return JS_UNDEFINED;
+	}
+	if (!use_texture)
+		nx_webgl_egl_append_dispatch_debug(context->egl, "noTex");
+	// Bridge dispatch failed (or wasn't applicable). When the client has
+	// opted out of bridge auto-flush (inline-canvas WebGL via
+	// `gl.setBridgeAutoFlush(false)`), it expects the bridge to manage
+	// the FBO and the client to handle screen presentation via
+	// `gl.copyBridgeToCanvas`. The software fallback below writes to
+	// `canvas->data` — which IS the screen canvas backing buffer in
+	// that mode, NOT the inline canvas slot. Those pixels land at
+	// (0,0) of the screen and visually leak as "shapes outside the
+	// canvas" overlapping the page chrome. Bail out instead so the
+	// draw is lost-but-clean for the frame.
+	if (context->egl && !nx_webgl_egl_get_auto_flush(context->egl)) {
+		nx_webgl_egl_append_dispatch_debug(context->egl, "BAIL");
+		if (owned_indices)
+			js_free(ctx, owned_indices);
 		return JS_UNDEFINED;
 	}
 	flush_pending_bridge_clear_to_software(context);
@@ -4285,6 +6868,8 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 										 texture, indices, count, blend)) {
 		if (canvas->surface)
 			cairo_surface_mark_dirty(canvas->surface);
+		if (owned_indices)
+			js_free(ctx, owned_indices);
 		return JS_UNDEFINED;
 	}
 
@@ -4296,8 +6881,11 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	if (sort_depth && triangle_count > (int)countof(stack_triangles)) {
 		triangles = js_malloc(ctx, (size_t)triangle_count *
 									   sizeof(nx_webgl_triangle_t));
-		if (!triangles)
+		if (!triangles) {
+			if (owned_indices)
+				js_free(ctx, owned_indices);
 			return JS_EXCEPTION;
+		}
 	}
 
 	for (int triangle = 0; triangle < triangle_count; triangle++) {
@@ -4309,6 +6897,8 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 								  &position3)) {
 				if (triangles != stack_triangles)
 					js_free(ctx, triangles);
+				if (owned_indices)
+					js_free(ctx, owned_indices);
 				context->error = GL_INVALID_OPERATION;
 				return JS_UNDEFINED;
 			}
@@ -4317,6 +6907,8 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 								  &local_triangle.uv[i])) {
 				if (triangles != stack_triangles)
 					js_free(ctx, triangles);
+				if (owned_indices)
+					js_free(ctx, owned_indices);
 				context->error = GL_INVALID_OPERATION;
 				return JS_UNDEFINED;
 			}
@@ -4366,10 +6958,165 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	}
 	if (triangles != stack_triangles)
 		js_free(ctx, triangles);
+	if (owned_indices)
+		js_free(ctx, owned_indices);
 
 	if (canvas->surface)
 		cairo_surface_mark_dirty(canvas->surface);
 
+	return JS_UNDEFINED;
+}
+
+// ANGLE_instanced_arrays — vertexAttribDivisorANGLE(index, divisor).
+// Stores per-attrib divisor in `context->vertex_attribs[index].divisor`;
+// the passthrough dispatch consumes it at draw time via the native
+// `glVertexAttribDivisor*` entry point resolved at backend init.
+static JSValue nx_webgl_vertex_attrib_divisor(JSContext *ctx,
+											   JSValueConst this_val, int argc,
+											   JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t index;
+	uint32_t divisor;
+	if (JS_ToUint32(ctx, &index, argv[0]) ||
+		JS_ToUint32(ctx, &divisor, argv[1]))
+		return JS_EXCEPTION;
+	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	context->vertex_attribs[index].divisor = divisor;
+	return JS_UNDEFINED;
+}
+
+// ANGLE_instanced_arrays — drawArraysInstancedANGLE(mode, first, count, instanceCount).
+// Always dispatches via the passthrough path; instancing is not supported on
+// the bridge's hardcoded programs. Returns INVALID_OPERATION if native
+// instancing entry points aren't loaded (probe at backend init).
+static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
+											   JSValueConst this_val, int argc,
+											   JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t mode;
+	int32_t first;
+	int32_t count;
+	int32_t instance_count;
+	if (JS_ToUint32(ctx, &mode, argv[0]) || JS_ToInt32(ctx, &first, argv[1]) ||
+		JS_ToInt32(ctx, &count, argv[2]) ||
+		JS_ToInt32(ctx, &instance_count, argv[3]))
+		return JS_EXCEPTION;
+
+	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
+		mode != GL_LINE_LOOP && mode != GL_POINTS) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (first < 0 || count < 0 || instance_count < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (count == 0 || instance_count == 0)
+		return JS_UNDEFINED;
+
+	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
+	if (!program || !program->link_status || program->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	nx_canvas_t *canvas = context->canvas;
+	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
+		return JS_UNDEFINED;
+
+	if (!try_draw_passthrough(context, program, mode, false, first, count,
+							  0, 0, 0, instance_count)) {
+		// Native instancing not available — bridge can't emulate.
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	return JS_UNDEFINED;
+}
+
+// ANGLE_instanced_arrays — drawElementsInstancedANGLE(mode, count, type, offset, instanceCount).
+// Same dispatch rules as drawArraysInstancedANGLE.
+static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
+												 JSValueConst this_val,
+												 int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	uint32_t mode;
+	int32_t count;
+	uint32_t type;
+	int32_t offset;
+	int32_t instance_count;
+	if (JS_ToUint32(ctx, &mode, argv[0]) || JS_ToInt32(ctx, &count, argv[1]) ||
+		JS_ToUint32(ctx, &type, argv[2]) || JS_ToInt32(ctx, &offset, argv[3]) ||
+		JS_ToInt32(ctx, &instance_count, argv[4]))
+		return JS_EXCEPTION;
+
+	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
+		mode != GL_LINE_LOOP) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE &&
+		type != GL_UNSIGNED_INT) {
+		// Native GL3 supports UNSIGNED_INT directly; nx.js doesn't expose
+		// the OES_element_index_uint extension, but accept it here in case
+		// Three.js feature-detects via getExtension first.
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	size_t index_size = (type == GL_UNSIGNED_BYTE) ? 1
+						: (type == GL_UNSIGNED_INT) ? 4
+													: 2;
+	if (count < 0 || offset < 0 || instance_count < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if ((size_t)offset % index_size != 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (count == 0 || instance_count == 0)
+		return JS_UNDEFINED;
+
+	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
+	if (!program || !program->link_status || program->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	nx_webgl_buffer_t *element_buffer =
+		nx_get_webgl_buffer(context->element_array_buffer_binding);
+	if (!element_buffer || element_buffer->deleted || !element_buffer->data) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if ((size_t)offset + (size_t)count * index_size > element_buffer->size) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	nx_canvas_t *canvas = context->canvas;
+	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
+		return JS_UNDEFINED;
+
+	if (!try_draw_passthrough(context, program, mode, true, 0, count,
+							  type, (uint32_t)offset,
+							  element_buffer->gles_handle,
+							  instance_count)) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -4405,6 +7152,22 @@ static JSValue nx_webgl_enable(JSContext *ctx, JSValueConst this_val, int argc,
 static JSValue nx_webgl_disable(JSContext *ctx, JSValueConst this_val, int argc,
 								JSValueConst *argv) {
 	return nx_webgl_enable_disable(ctx, this_val, argc, argv, false);
+}
+
+static JSValue nx_webgl_is_enabled(JSContext *ctx, JSValueConst this_val,
+								   int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t cap;
+	if (JS_ToUint32(ctx, &cap, argv[0]))
+		return JS_EXCEPTION;
+	uint32_t flag = cap_to_flag(cap);
+	if (flag == 0) {
+		context->error = GL_INVALID_ENUM;
+		return JS_NewBool(ctx, false);
+	}
+	return JS_NewBool(ctx, (context->enabled_caps & flag) != 0);
 }
 
 static JSValue nx_webgl_depth_func(JSContext *ctx, JSValueConst this_val,
@@ -4602,6 +7365,72 @@ static JSValue nx_webgl_stencil_op(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static JSValue nx_webgl_create_framebuffer(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_framebuffer_t *fb = js_mallocz(ctx, sizeof(*fb));
+	if (!fb)
+		return JS_EXCEPTION;
+	JSValue obj = JS_NewObjectClass(ctx, nx_webgl_framebuffer_class_id);
+	if (JS_IsException(obj)) {
+		js_free(ctx, fb);
+		return obj;
+	}
+	fb->color_attachment = JS_UNDEFINED;
+	fb->depth_attachment = JS_UNDEFINED;
+	fb->stencil_attachment = JS_UNDEFINED;
+	fb->handle = nx_webgl_egl_create_native_framebuffer(context->egl,
+	                                                    context->canvas);
+	if (fb->handle == 0) {
+		js_free(ctx, fb);
+		JS_FreeValue(ctx, obj);
+		context->error = GL_OUT_OF_MEMORY;
+		return JS_NULL;
+	}
+	JS_SetOpaque(obj, fb);
+	return obj;
+}
+
+static JSValue nx_webgl_delete_framebuffer(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))
+		return JS_UNDEFINED;
+	nx_webgl_framebuffer_t *fb = nx_get_webgl_framebuffer(argv[0]);
+	if (!fb || fb->deleted)
+		return JS_UNDEFINED;
+	if (nx_get_webgl_framebuffer(context->framebuffer_binding) == fb) {
+		JS_FreeValue(ctx, context->framebuffer_binding);
+		context->framebuffer_binding = JS_UNDEFINED;
+		// Bridge also clears its mirrored binding so subsequent draws
+		// don't target a deleted FBO.
+		nx_webgl_egl_set_user_framebuffer(context->egl, 0, 0, 0);
+	}
+	if (fb->handle) {
+		nx_webgl_egl_delete_native_framebuffer(context->egl, fb->handle);
+		fb->handle = 0;
+	}
+	fb->deleted = true;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_is_framebuffer(JSContext *ctx,
+                                        JSValueConst this_val, int argc,
+                                        JSValueConst *argv) {
+	(void)ctx;
+	(void)this_val;
+	if (argc < 1)
+		return JS_NewBool(ctx, false);
+	nx_webgl_framebuffer_t *fb = nx_get_webgl_framebuffer(argv[0]);
+	return JS_NewBool(ctx, fb && !fb->deleted && fb->handle != 0);
+}
+
 static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 										 int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -4614,7 +7443,422 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
-	if (!JS_IsNull(argv[1])) {
+	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+		JS_FreeValue(ctx, context->framebuffer_binding);
+		context->framebuffer_binding = JS_UNDEFINED;
+		nx_webgl_egl_set_user_framebuffer(context->egl, 0, 0, 0);
+		return JS_UNDEFINED;
+	}
+	nx_webgl_framebuffer_t *fb = nx_get_webgl_framebuffer(argv[1]);
+	if (!fb || fb->deleted || fb->handle == 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	JS_FreeValue(ctx, context->framebuffer_binding);
+	context->framebuffer_binding = JS_DupValue(ctx, argv[1]);
+	nx_webgl_egl_set_user_framebuffer(context->egl, fb->handle, fb->width,
+	                                   fb->height);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_check_framebuffer_status(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	if (target != GL_FRAMEBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_NewUint32(ctx, 0);
+	}
+	nx_webgl_framebuffer_t *fb =
+		nx_get_webgl_framebuffer(context->framebuffer_binding);
+	if (!fb || fb->handle == 0) {
+		// Default framebuffer (bridge_framebuffer) is always complete.
+		return JS_NewUint32(ctx, GL_FRAMEBUFFER_COMPLETE);
+	}
+	uint32_t status = nx_webgl_egl_check_framebuffer_status(context->egl,
+	                                                         fb->handle);
+	return JS_NewUint32(ctx, status);
+}
+
+static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc,
+                                                JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, attachment, textarget;
+	int32_t level;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+	    JS_ToUint32(ctx, &attachment, argv[1]) ||
+	    JS_ToUint32(ctx, &textarget, argv[2]) ||
+	    JS_ToInt32(ctx, &level, argv[4]))
+		return JS_EXCEPTION;
+	if (target != GL_FRAMEBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (textarget != GL_TEXTURE_2D) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (level != 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_framebuffer_t *fb =
+		nx_get_webgl_framebuffer(context->framebuffer_binding);
+	if (!fb || fb->handle == 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	uint32_t tex_handle = 0;
+	JSValue *slot = NULL;
+	if (attachment == GL_COLOR_ATTACHMENT0)
+		slot = &fb->color_attachment;
+	else if (attachment == GL_DEPTH_ATTACHMENT)
+		slot = &fb->depth_attachment;
+	else if (attachment == GL_STENCIL_ATTACHMENT)
+		slot = &fb->stencil_attachment;
+	else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+		// Combined depth+stencil attachment — Three.js's DepthStencilFormat
+		// path uses this. Store in depth slot (the stencil slot stays
+		// available for stencil-only configs); both halves of the
+		// underlying texture come from the single binding.
+		slot = &fb->depth_attachment;
+	else {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+
+	if (JS_IsNull(argv[3]) || JS_IsUndefined(argv[3])) {
+		// Detach.
+		if (slot) {
+			JS_FreeValue(ctx, *slot);
+			*slot = JS_UNDEFINED;
+		}
+	} else {
+		nx_webgl_texture_t *texture = nx_get_webgl_texture(argv[3]);
+		if (!texture || texture->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		// Ensure the texture has a persistent native handle. Three.js
+		// usually calls texImage2D(NULL) before framebufferTexture2D, which
+		// allocates the handle; this is a safety net for the reverse order.
+		if (texture->gles_handle == 0) {
+			texture->gles_handle =
+				nx_webgl_egl_create_persistent_texture(context->egl,
+				                                        context->canvas);
+			if (texture->gles_handle == 0) {
+				context->error = GL_OUT_OF_MEMORY;
+				return JS_UNDEFINED;
+			}
+			// Allocate empty storage at the recorded dims (or 1×1 if none).
+			int w = texture->width > 0 ? (int)texture->width : 1;
+			int h = texture->height > 0 ? (int)texture->height : 1;
+			(void)nx_webgl_egl_persistent_texture_image_2d(
+			    context->egl, texture->gles_handle, w, h, GL_RGBA,
+			    GL_RGBA, GL_UNSIGNED_BYTE, NULL, texture->min_filter,
+			    texture->mag_filter, texture->wrap_s, texture->wrap_t);
+			texture->width = w;
+			texture->height = h;
+		}
+		tex_handle = texture->gles_handle;
+		if (slot) {
+			JS_FreeValue(ctx, *slot);
+			*slot = JS_DupValue(ctx, argv[3]);
+		}
+		// Update the FBO's dims from the color attachment's dims. Three.js
+		// asks for matching color/depth dims, so updating from color is
+		// sufficient for the bridge's viewport scaling.
+		if (attachment == GL_COLOR_ATTACHMENT0) {
+			fb->width = (int)texture->width;
+			fb->height = (int)texture->height;
+			// If this FBO is currently bound, push the new dims to the
+			// bridge so the next dispatch's viewport scales right.
+			if (nx_get_webgl_framebuffer(context->framebuffer_binding) == fb)
+				nx_webgl_egl_set_user_framebuffer(context->egl, fb->handle,
+				                                   fb->width, fb->height);
+		}
+	}
+
+	if (!nx_webgl_egl_framebuffer_texture_2d(context->egl, fb->handle,
+	                                          attachment, tex_handle)) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, attachment, rbtarget;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+	    JS_ToUint32(ctx, &attachment, argv[1]) ||
+	    JS_ToUint32(ctx, &rbtarget, argv[2]))
+		return JS_EXCEPTION;
+	if (target != GL_FRAMEBUFFER || rbtarget != GL_RENDERBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_framebuffer_t *fb =
+		nx_get_webgl_framebuffer(context->framebuffer_binding);
+	if (!fb || fb->handle == 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	uint32_t rb_handle = 0;
+	JSValue *slot = NULL;
+	if (attachment == GL_COLOR_ATTACHMENT0)
+		slot = &fb->color_attachment;
+	else if (attachment == GL_DEPTH_ATTACHMENT)
+		slot = &fb->depth_attachment;
+	else if (attachment == GL_STENCIL_ATTACHMENT)
+		slot = &fb->stencil_attachment;
+	else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+		slot = &fb->depth_attachment;
+	else {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+
+	if (JS_IsNull(argv[3]) || JS_IsUndefined(argv[3])) {
+		if (slot) {
+			JS_FreeValue(ctx, *slot);
+			*slot = JS_UNDEFINED;
+		}
+	} else {
+		nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[3]);
+		if (!rb || rb->deleted || rb->handle == 0) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		rb_handle = rb->handle;
+		if (slot) {
+			JS_FreeValue(ctx, *slot);
+			*slot = JS_DupValue(ctx, argv[3]);
+		}
+	}
+
+	if (!nx_webgl_egl_framebuffer_renderbuffer(context->egl, fb->handle,
+	                                            attachment, rb_handle)) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_create_renderbuffer(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_renderbuffer_t *rb = js_mallocz(ctx, sizeof(*rb));
+	if (!rb)
+		return JS_EXCEPTION;
+	JSValue obj = JS_NewObjectClass(ctx, nx_webgl_renderbuffer_class_id);
+	if (JS_IsException(obj)) {
+		js_free(ctx, rb);
+		return obj;
+	}
+	rb->handle = nx_webgl_egl_create_native_renderbuffer(context->egl,
+	                                                     context->canvas);
+	if (rb->handle == 0) {
+		js_free(ctx, rb);
+		JS_FreeValue(ctx, obj);
+		context->error = GL_OUT_OF_MEMORY;
+		return JS_NULL;
+	}
+	JS_SetOpaque(obj, rb);
+	return obj;
+}
+
+static JSValue nx_webgl_delete_renderbuffer(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))
+		return JS_UNDEFINED;
+	nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[0]);
+	if (!rb || rb->deleted)
+		return JS_UNDEFINED;
+	if (nx_get_webgl_renderbuffer(context->renderbuffer_binding) == rb) {
+		JS_FreeValue(ctx, context->renderbuffer_binding);
+		context->renderbuffer_binding = JS_UNDEFINED;
+	}
+	if (rb->handle) {
+		nx_webgl_egl_delete_native_renderbuffer(context->egl, rb->handle);
+		rb->handle = 0;
+	}
+	rb->deleted = true;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_is_renderbuffer(JSContext *ctx,
+                                         JSValueConst this_val, int argc,
+                                         JSValueConst *argv) {
+	(void)ctx;
+	(void)this_val;
+	if (argc < 1)
+		return JS_NewBool(ctx, false);
+	nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[0]);
+	return JS_NewBool(ctx, rb && !rb->deleted && rb->handle != 0);
+}
+
+static JSValue nx_webgl_bind_renderbuffer(JSContext *ctx,
+                                           JSValueConst this_val, int argc,
+                                           JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	if (target != GL_RENDERBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+		JS_FreeValue(ctx, context->renderbuffer_binding);
+		context->renderbuffer_binding = JS_UNDEFINED;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[1]);
+	if (!rb || rb->deleted || rb->handle == 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	JS_FreeValue(ctx, context->renderbuffer_binding);
+	context->renderbuffer_binding = JS_DupValue(ctx, argv[1]);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_renderbuffer_storage(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t width, height;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+	    JS_ToUint32(ctx, &internalformat, argv[1]) ||
+	    JS_ToInt32(ctx, &width, argv[2]) ||
+	    JS_ToInt32(ctx, &height, argv[3]))
+		return JS_EXCEPTION;
+	if (target != GL_RENDERBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (width <= 0 || height <= 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_renderbuffer_t *rb =
+		nx_get_webgl_renderbuffer(context->renderbuffer_binding);
+	if (!rb || rb->handle == 0) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_renderbuffer_storage(context->egl, rb->handle,
+	                                        internalformat, width, height)) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	rb->internal_format = internalformat;
+	rb->width = width;
+	rb->height = height;
+	return JS_UNDEFINED;
+}
+
+// gl.readPixels(x, y, width, height, format, type, pixels)
+// Reads from the currently-bound framebuffer (the bridge FBO when the
+// GPU bridge is enabled) into a JS-side typed array. Only RGBA + UNSIGNED_BYTE
+// is supported — the only format/type pair WebGL 1 mandates and the one the
+// bridge FBO uses natively. The destination buffer must be at least
+// width * height * 4 bytes.
+//
+// Y coordinate convention: canvas-y top-down (matches nx.js's bridge
+// `gl.viewport` and `gl.scissor` quirk — see `bridge_scale_rect` in
+// `webgl_egl.c`). The internal translation to GL's bottom-up
+// `glReadPixels` is done here so that a script that calls
+// `gl.viewport(0, 0, w, h); gl.drawArrays(...); gl.readPixels(x, y, 1, 1, ...)`
+// reads from the same pixel it would on a real WebGL canvas where
+// the canvas IS the framebuffer.
+//
+// Returned bytes are still in GL row order (bottom row of the read
+// rect comes first). Callers that need top-down rows must Y-flip
+// while copying.
+static JSValue nx_webgl_read_pixels(JSContext *ctx, JSValueConst this_val,
+									int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	int32_t x, y, width, height;
+	uint32_t format, type;
+	if (JS_ToInt32(ctx, &x, argv[0]) ||
+		JS_ToInt32(ctx, &y, argv[1]) ||
+		JS_ToInt32(ctx, &width, argv[2]) ||
+		JS_ToInt32(ctx, &height, argv[3]) ||
+		JS_ToUint32(ctx, &format, argv[4]) ||
+		JS_ToUint32(ctx, &type, argv[5]))
+		return JS_EXCEPTION;
+	if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (width <= 0 || height <= 0)
+		return JS_UNDEFINED;
+	size_t buffer_size = 0;
+	uint8_t *dst = NX_GetBufferSource(ctx, &buffer_size, argv[6]);
+	if (!dst) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	size_t needed = (size_t)width * (size_t)height * 4;
+	if (buffer_size < needed) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	// User-FBO path (milestone #19): when the user has bound a non-null
+	// framebuffer via gl.bindFramebuffer, read directly from it using
+	// STANDARD GL convention (origin bottom-left, y not translated). The
+	// canvas-y top-down quirk applies only to the bridge's own FBO, where
+	// canvas-y inputs need flipping to GL-y for glReadPixels.
+	nx_webgl_framebuffer_t *bound_fb =
+		nx_get_webgl_framebuffer(context->framebuffer_binding);
+	if (bound_fb && !bound_fb->deleted && bound_fb->handle != 0) {
+		if (!nx_webgl_egl_read_user_fbo_pixels(context->egl, bound_fb->handle,
+		                                        x, y, width, height,
+		                                        format, type, dst)) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		return JS_UNDEFINED;
+	}
+	// Default-FBO (bridge_framebuffer) path: keep canvas-y top-down convention.
+	int32_t canvas_height = (int32_t)context->canvas->height;
+	int32_t gl_y = canvas_height - y - height;
+	if (!nx_webgl_egl_read_bridge_pixels(context->egl, context->canvas,
+										  x, gl_y, width, height,
+										  format, type, dst)) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
@@ -4635,6 +7879,39 @@ static JSValue nx_webgl_line_width(JSContext *ctx, JSValueConst this_val,
 	}
 	context->line_width = width;
 	return JS_UNDEFINED;
+}
+
+// WebGL 1 `gl.hint(target, mode)`. Accepts GENERATE_MIPMAP_HINT (always
+// present) and FRAGMENT_SHADER_DERIVATIVE_HINT_OES (only when
+// OES_standard_derivatives is exposed via getExtension). Mode must be
+// FASTEST, NICEST, or DONT_CARE. The stored value is the bridge's
+// preference — the actual native GLES hint isn't forwarded (Tegra ignores
+// it for the bridge's fragment shaders) but it's queryable via
+// getParameter so Khronos conformance tests pass.
+static JSValue nx_webgl_hint(JSContext *ctx, JSValueConst this_val,
+							  int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, mode;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &mode, argv[1]))
+		return JS_EXCEPTION;
+	if (mode != GL_FASTEST && mode != GL_NICEST && mode != GL_DONT_CARE) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	switch (target) {
+	case GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES:
+		context->hint_fragment_shader_derivative = mode;
+		return JS_UNDEFINED;
+	case GL_GENERATE_MIPMAP_HINT:
+		context->hint_generate_mipmap = mode;
+		return JS_UNDEFINED;
+	default:
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
 }
 
 static JSValue nx_webgl_viewport(JSContext *ctx, JSValueConst this_val,
@@ -4825,6 +8102,10 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		return JS_NewUint32(ctx, 224);
 	case GL_MAX_VARYING_VECTORS:
 		return JS_NewUint32(ctx, 8);
+	case GL_GENERATE_MIPMAP_HINT:
+		return JS_NewUint32(ctx, context->hint_generate_mipmap);
+	case GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES:
+		return JS_NewUint32(ctx, context->hint_fragment_shader_derivative);
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
@@ -4931,6 +8212,111 @@ static JSValue nx_webgl_enable_gpu_bridge_prototype(JSContext *ctx,
 	return JS_NewBool(ctx, nx_webgl_egl_is_bridge_enabled(context->egl));
 }
 
+// gl.setBridgeAutoFlush(bool) — disable the automatic bridge→canvas
+// readback that fires on `gl.clear` when there's a pending bridge draw.
+// Clients that drive readback themselves via `gl.readPixels` (e.g.
+// switch-web-browser's inline-canvas WebGL canvas-runner) should call
+// this with `false` once after enabling the bridge — saves a 1280×720
+// glReadPixels per frame and avoids a visible flash on the first
+// auto-flush.
+static JSValue nx_webgl_set_bridge_auto_flush(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc,
+                                              JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	bool enabled = true;
+	if (argc > 0 && !JS_IsUndefined(argv[0]))
+		enabled = JS_ToBool(ctx, argv[0]);
+	nx_webgl_egl_set_auto_flush(context->egl, enabled);
+	return JS_NewBool(ctx, enabled);
+}
+
+// gl.setTessellationFix(bool) — toggle bridge-side midpoint
+// subdivision of large screen-space triangles. Off by default.
+//
+// Intended as a workaround for the Tegra X1 TBR per-tile UV-
+// interpolator coherency bug ([[threejs-cube-white-face]]) — but the
+// current implementation does NOT actually fix the bug because
+// midpoint-in-NDC subdivision produces uniform sub-triangle patterns
+// the rasterizer still trips on. switch-web-browser does NOT call
+// this; it uses JS-side `BoxGeometry(w,h,d,8,8,8)` tessellation
+// instead, which is the only working approach today. The API and
+// underlying scaffolding (recursion helper, scratch buffer, hooks in
+// both bridge draw paths) are kept dormant in case someone returns
+// to do the clip-space-correct version. See the big STATE comment
+// in `nxjs-source/source/webgl_egl.c` (above
+// `tessellate_one_triangle`) for the investigation and the refactor
+// that would actually fix things.
+static JSValue nx_webgl_set_tessellation_fix(JSContext *ctx,
+                                             JSValueConst this_val,
+                                             int argc,
+                                             JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	bool enabled = false;
+	if (argc > 0 && !JS_IsUndefined(argv[0]))
+		enabled = JS_ToBool(ctx, argv[0]);
+	nx_webgl_egl_set_tessellation_fix(context->egl, enabled);
+	return JS_NewBool(ctx, nx_webgl_egl_get_tessellation_fix(context->egl));
+}
+
+// gl.copyBridgeToCanvas(srcX, srcY, srcW, srcH, dstCanvas, dstX, dstY)
+// Reads a sub-rect of the bridge FBO directly into `dstCanvas` (a
+// `Screen` or `OffscreenCanvas`) at (dstX, dstY) with Y-flip + premul
+// swizzle, in one C-level row copy. Skips the JS-visible buffer +
+// putImageData + drawImage(offscreen) sequence — for animated inline-
+// canvas WebGL (Three.js cube etc.), this is ~7 ms/frame faster than
+// the explicit-readback+overlay path.
+//
+// Takes the canvas directly (not a 2D context) because 2D contexts are
+// commonly Proxy-wrapped (e.g. by `installBrowserShim` in
+// `switch-web-runtime` for CSS color normalisation) and the Proxy's
+// class id no longer matches nx.js's canvas-context class id, so
+// `JS_GetOpaque` can't reach the underlying C struct. Canvas objects
+// aren't wrapped — `nxScreen()` returns the raw Screen.
+//
+// `srcX`/`srcY` follow nxjs's canvas-y top-down convention (matching
+// `gl.viewport` / `gl.scissor` x/y inputs). Returns `true` on success.
+static JSValue nx_webgl_copy_bridge_to_canvas(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc,
+                                              JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (argc < 7)
+		return JS_NewBool(ctx, false);
+	int32_t src_x, src_y, src_w, src_h, dst_x, dst_y;
+	if (JS_ToInt32(ctx, &src_x, argv[0]) ||
+	    JS_ToInt32(ctx, &src_y, argv[1]) ||
+	    JS_ToInt32(ctx, &src_w, argv[2]) ||
+	    JS_ToInt32(ctx, &src_h, argv[3]) ||
+	    JS_ToInt32(ctx, &dst_x, argv[5]) ||
+	    JS_ToInt32(ctx, &dst_y, argv[6]))
+		return JS_EXCEPTION;
+	nx_canvas_t *dst_canvas = nx_get_canvas(ctx, argv[4]);
+	if (!dst_canvas) {
+		// Clear any TypeError from JS_GetOpaque2 — we treat type
+		// mismatch as a soft fail.
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return JS_NewBool(ctx, false);
+	}
+	// Translate canvas-y top src origin to GL bottom-up. The bridge
+	// FBO height matches `context->canvas->height` (the canvas the
+	// WebGL context is bound to — i.e., the screen canvas).
+	int32_t bridge_h = (int32_t)context->canvas->height;
+	int32_t gl_y = bridge_h - src_y - src_h;
+	bool ok = nx_webgl_egl_read_bridge_to_canvas_data(context->egl,
+	                                                   src_x, gl_y,
+	                                                   src_w, src_h,
+	                                                   dst_canvas,
+	                                                   dst_x, dst_y);
+	return JS_NewBool(ctx, ok);
+}
+
 static JSValue nx_webgl_set_gpu_bridge_resolution_prototype(
 	JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -4984,6 +8370,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "deleteShader", nx_webgl_delete_shader, 1);
 	NX_DEF_FUNC(proto, "createProgram", nx_webgl_create_program, 0);
 	NX_DEF_FUNC(proto, "attachShader", nx_webgl_attach_shader, 2);
+	NX_DEF_FUNC(proto, "bindAttribLocation", nx_webgl_bind_attrib_location, 3);
 	NX_DEF_FUNC(proto, "linkProgram", nx_webgl_link_program, 1);
 	NX_DEF_FUNC(proto, "useProgram", nx_webgl_use_program, 1);
 	NX_DEF_FUNC(proto, "getProgramParameter", nx_webgl_get_program_parameter,
@@ -4996,6 +8383,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "bindBuffer", nx_webgl_bind_buffer, 2);
 	NX_DEF_FUNC(proto, "bufferData", nx_webgl_buffer_data, 3);
 	NX_DEF_FUNC(proto, "bufferSubData", nx_webgl_buffer_sub_data, 3);
+	NX_DEF_FUNC(proto, "getBufferParameter", nx_webgl_get_buffer_parameter, 2);
 	NX_DEF_FUNC(proto, "deleteBuffer", nx_webgl_delete_buffer, 1);
 	NX_DEF_FUNC(proto, "createTexture", nx_webgl_create_texture, 0);
 	NX_DEF_FUNC(proto, "activeTexture", nx_webgl_active_texture, 1);
@@ -5014,6 +8402,18 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "uniform4f", nx_webgl_uniform4f, 5);
 	NX_DEF_FUNC(proto, "uniform1i", nx_webgl_uniform1i, 2);
 	NX_DEF_FUNC(proto, "uniformMatrix4fv", nx_webgl_uniform_matrix4fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix3fv", nx_webgl_uniform_matrix3fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix2fv", nx_webgl_uniform_matrix2fv, 3);
+	NX_DEF_FUNC(proto, "uniform1fv", nx_webgl_uniform1fv, 2);
+	NX_DEF_FUNC(proto, "uniform2fv", nx_webgl_uniform2fv, 2);
+	NX_DEF_FUNC(proto, "uniform4fv", nx_webgl_uniform4fv, 2);
+	NX_DEF_FUNC(proto, "uniform2i", nx_webgl_uniform2i, 3);
+	NX_DEF_FUNC(proto, "uniform3i", nx_webgl_uniform3i, 4);
+	NX_DEF_FUNC(proto, "uniform4i", nx_webgl_uniform4i, 5);
+	NX_DEF_FUNC(proto, "uniform1iv", nx_webgl_uniform1iv, 2);
+	NX_DEF_FUNC(proto, "uniform2iv", nx_webgl_uniform2iv, 2);
+	NX_DEF_FUNC(proto, "uniform3iv", nx_webgl_uniform3iv, 2);
+	NX_DEF_FUNC(proto, "uniform4iv", nx_webgl_uniform4iv, 2);
 	NX_DEF_FUNC(proto, "getAttribLocation", nx_webgl_get_attrib_location, 2);
 	NX_DEF_FUNC(proto, "enableVertexAttribArray",
 				nx_webgl_enable_vertex_attrib_array, 1);
@@ -5024,6 +8424,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "drawArrays", nx_webgl_draw_arrays, 3);
 	NX_DEF_FUNC(proto, "drawElements", nx_webgl_draw_elements, 4);
 	NX_DEF_FUNC(proto, "enable", nx_webgl_enable, 1);
+	NX_DEF_FUNC(proto, "isEnabled", nx_webgl_is_enabled, 1);
 	NX_DEF_FUNC(proto, "disable", nx_webgl_disable, 1);
 	NX_DEF_FUNC(proto, "depthFunc", nx_webgl_depth_func, 1);
 	NX_DEF_FUNC(proto, "depthMask", nx_webgl_depth_mask, 1);
@@ -5039,7 +8440,24 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "stencilFunc", nx_webgl_stencil_func, 3);
 	NX_DEF_FUNC(proto, "stencilOp", nx_webgl_stencil_op, 3);
 	NX_DEF_FUNC(proto, "bindFramebuffer", nx_webgl_bind_framebuffer, 2);
+	NX_DEF_FUNC(proto, "createFramebuffer", nx_webgl_create_framebuffer, 0);
+	NX_DEF_FUNC(proto, "deleteFramebuffer", nx_webgl_delete_framebuffer, 1);
+	NX_DEF_FUNC(proto, "isFramebuffer", nx_webgl_is_framebuffer, 1);
+	NX_DEF_FUNC(proto, "checkFramebufferStatus",
+	            nx_webgl_check_framebuffer_status, 1);
+	NX_DEF_FUNC(proto, "framebufferTexture2D",
+	            nx_webgl_framebuffer_texture_2d, 5);
+	NX_DEF_FUNC(proto, "framebufferRenderbuffer",
+	            nx_webgl_framebuffer_renderbuffer, 4);
+	NX_DEF_FUNC(proto, "createRenderbuffer", nx_webgl_create_renderbuffer, 0);
+	NX_DEF_FUNC(proto, "deleteRenderbuffer", nx_webgl_delete_renderbuffer, 1);
+	NX_DEF_FUNC(proto, "isRenderbuffer", nx_webgl_is_renderbuffer, 1);
+	NX_DEF_FUNC(proto, "bindRenderbuffer", nx_webgl_bind_renderbuffer, 2);
+	NX_DEF_FUNC(proto, "renderbufferStorage",
+	            nx_webgl_renderbuffer_storage, 4);
+	NX_DEF_FUNC(proto, "readPixels", nx_webgl_read_pixels, 7);
 	NX_DEF_FUNC(proto, "lineWidth", nx_webgl_line_width, 1);
+	NX_DEF_FUNC(proto, "hint", nx_webgl_hint, 2);
 	NX_DEF_FUNC(proto, "viewport", nx_webgl_viewport, 4);
 	NX_DEF_FUNC(proto, "scissor", nx_webgl_scissor, 4);
 	NX_DEF_FUNC(proto, "getParameter", nx_webgl_get_parameter, 1);
@@ -5056,6 +8474,12 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 				nx_webgl_bridge_gpu_benchmark_prototype, 3);
 	NX_DEF_FUNC(proto, "enableGpuBridgePrototype",
 				nx_webgl_enable_gpu_bridge_prototype, 1);
+	NX_DEF_FUNC(proto, "setBridgeAutoFlush",
+				nx_webgl_set_bridge_auto_flush, 1);
+	NX_DEF_FUNC(proto, "setTessellationFix",
+				nx_webgl_set_tessellation_fix, 1);
+	NX_DEF_FUNC(proto, "copyBridgeToCanvas",
+				nx_webgl_copy_bridge_to_canvas, 7);
 	NX_DEF_FUNC(proto, "setGpuBridgeResolutionPrototype",
 				nx_webgl_set_gpu_bridge_resolution_prototype, 2);
 
@@ -5150,6 +8574,13 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "VENDOR", GL_VENDOR);
 	define_constant(ctx, proto, "RENDERER", GL_RENDERER);
 	define_constant(ctx, proto, "VERSION", GL_VERSION);
+	// gl.hint() (milestone #16).
+	define_constant(ctx, proto, "DONT_CARE", GL_DONT_CARE);
+	define_constant(ctx, proto, "FASTEST", GL_FASTEST);
+	define_constant(ctx, proto, "NICEST", GL_NICEST);
+	define_constant(ctx, proto, "GENERATE_MIPMAP_HINT", GL_GENERATE_MIPMAP_HINT);
+	define_constant(ctx, proto, "FRAGMENT_SHADER_DERIVATIVE_HINT_OES",
+					GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES);
 	define_constant(ctx, proto, "VERTEX_SHADER", GL_VERTEX_SHADER);
 	define_constant(ctx, proto, "FRAGMENT_SHADER", GL_FRAGMENT_SHADER);
 	define_constant(ctx, proto, "LOW_FLOAT", GL_LOW_FLOAT);
@@ -5176,8 +8607,18 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "FLOAT_VEC2", GL_FLOAT_VEC2);
 	define_constant(ctx, proto, "FLOAT_VEC3", GL_FLOAT_VEC3);
 	define_constant(ctx, proto, "FLOAT_VEC4", GL_FLOAT_VEC4);
+	define_constant(ctx, proto, "FLOAT_MAT2", GL_FLOAT_MAT2);
+	define_constant(ctx, proto, "FLOAT_MAT3", GL_FLOAT_MAT3);
 	define_constant(ctx, proto, "FLOAT_MAT4", GL_FLOAT_MAT4);
+	define_constant(ctx, proto, "INT_VEC2", GL_INT_VEC2);
+	define_constant(ctx, proto, "INT_VEC3", GL_INT_VEC3);
+	define_constant(ctx, proto, "INT_VEC4", GL_INT_VEC4);
+	define_constant(ctx, proto, "BOOL", GL_BOOL);
+	define_constant(ctx, proto, "BOOL_VEC2", GL_BOOL_VEC2);
+	define_constant(ctx, proto, "BOOL_VEC3", GL_BOOL_VEC3);
+	define_constant(ctx, proto, "BOOL_VEC4", GL_BOOL_VEC4);
 	define_constant(ctx, proto, "SAMPLER_2D", GL_SAMPLER_2D);
+	define_constant(ctx, proto, "SAMPLER_CUBE", GL_SAMPLER_CUBE);
 	define_constant(ctx, proto, "ARRAY_BUFFER", GL_ARRAY_BUFFER);
 	define_constant(ctx, proto, "ARRAY_BUFFER_BINDING", GL_ARRAY_BUFFER_BINDING);
 	define_constant(ctx, proto, "ELEMENT_ARRAY_BUFFER", GL_ELEMENT_ARRAY_BUFFER);
@@ -5185,8 +8626,36 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 					GL_ELEMENT_ARRAY_BUFFER_BINDING);
 	define_constant(ctx, proto, "FRAMEBUFFER", GL_FRAMEBUFFER);
 	define_constant(ctx, proto, "FRAMEBUFFER_BINDING", GL_FRAMEBUFFER_BINDING);
+	define_constant(ctx, proto, "RENDERBUFFER", GL_RENDERBUFFER);
 	define_constant(ctx, proto, "RENDERBUFFER_BINDING",
 					GL_RENDERBUFFER_BINDING);
+	define_constant(ctx, proto, "COLOR_ATTACHMENT0", GL_COLOR_ATTACHMENT0);
+	define_constant(ctx, proto, "DEPTH_ATTACHMENT", GL_DEPTH_ATTACHMENT);
+	define_constant(ctx, proto, "STENCIL_ATTACHMENT", GL_STENCIL_ATTACHMENT);
+	define_constant(ctx, proto, "DEPTH_STENCIL_ATTACHMENT",
+					GL_DEPTH_STENCIL_ATTACHMENT);
+	define_constant(ctx, proto, "FRAMEBUFFER_COMPLETE",
+					GL_FRAMEBUFFER_COMPLETE);
+	define_constant(ctx, proto, "FRAMEBUFFER_INCOMPLETE_ATTACHMENT",
+					GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT);
+	define_constant(ctx, proto, "FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT",
+					GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT);
+	define_constant(ctx, proto, "FRAMEBUFFER_INCOMPLETE_DIMENSIONS",
+					GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS);
+	define_constant(ctx, proto, "FRAMEBUFFER_UNSUPPORTED",
+					GL_FRAMEBUFFER_UNSUPPORTED);
+	define_constant(ctx, proto, "DEPTH_COMPONENT", GL_DEPTH_COMPONENT);
+	define_constant(ctx, proto, "DEPTH_COMPONENT16", GL_DEPTH_COMPONENT16);
+	define_constant(ctx, proto, "DEPTH_COMPONENT24", GL_DEPTH_COMPONENT24);
+	define_constant(ctx, proto, "DEPTH_STENCIL", GL_DEPTH_STENCIL);
+	define_constant(ctx, proto, "DEPTH24_STENCIL8", GL_DEPTH24_STENCIL8);
+	define_constant(ctx, proto, "UNSIGNED_INT_24_8_WEBGL",
+					GL_UNSIGNED_INT_24_8_WEBGL);
+	define_constant(ctx, proto, "STENCIL_INDEX8", GL_STENCIL_INDEX8);
+	define_constant(ctx, proto, "RGB", GL_RGB);
+	define_constant(ctx, proto, "RGB565", GL_RGB565);
+	define_constant(ctx, proto, "RGBA4", GL_RGBA4);
+	define_constant(ctx, proto, "RGB5_A1", GL_RGB5_A1);
 	define_constant(ctx, proto, "BUFFER_SIZE", GL_BUFFER_SIZE);
 	define_constant(ctx, proto, "BUFFER_USAGE", GL_BUFFER_USAGE);
 	define_constant(ctx, proto, "STREAM_DRAW", GL_STREAM_DRAW);
@@ -5310,6 +8779,20 @@ void nx_init_webgl(JSContext *ctx, JSValueConst init_obj) {
 		.finalizer = finalizer_webgl_texture,
 	};
 	JS_NewClass(rt, nx_webgl_texture_class_id, &webgl_texture_class);
+
+	JS_NewClassID(rt, &nx_webgl_framebuffer_class_id);
+	JSClassDef webgl_framebuffer_class = {
+		"nx_webgl_framebuffer_t",
+		.finalizer = finalizer_webgl_framebuffer,
+	};
+	JS_NewClass(rt, nx_webgl_framebuffer_class_id, &webgl_framebuffer_class);
+
+	JS_NewClassID(rt, &nx_webgl_renderbuffer_class_id);
+	JSClassDef webgl_renderbuffer_class = {
+		"nx_webgl_renderbuffer_t",
+		.finalizer = finalizer_webgl_renderbuffer,
+	};
+	JS_NewClass(rt, nx_webgl_renderbuffer_class_id, &webgl_renderbuffer_class);
 
 	JS_SetPropertyFunctionList(ctx, init_obj, init_function_list,
 							   countof(init_function_list));
