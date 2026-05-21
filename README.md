@@ -7,9 +7,56 @@
 - GL vendor: nouveau
 - GL renderer: NV120
 - GL version: OpenGL ES 3.2 Mesa 20.1.0-rc3
-- Bridge benchmark 120 frames 256x144: 1.47ms/f 679.1fps
-- Bridge benchmark 120 frames 640x360: 4.28ms/f 233.5fps
-- Bridge benchmark 120 frames 1280x720: 14.15ms/f 70.7fps
+
+### Supported features
+
+A pragmatic subset of WebGL 1 runs end-to-end on the Switch's native
+GLES driver through a bridge layer that handles state translation and
+dispatch. Currently working:
+
+- **Full dispatch surface**: `drawArrays` and `drawElements` across all
+  seven GLES2 primitive modes (TRIANGLES, TRIANGLE_STRIP, TRIANGLE_FAN,
+  LINES, LINE_STRIP, LINE_LOOP, POINTS) on indexed and non-indexed
+  geometry, with `UNSIGNED_SHORT` and `UNSIGNED_BYTE` index types
+- **Shaders**: vertex + fragment GLSL compile, link, attach, attribute
+  and uniform introspection, the full scalar / vector / matrix uniform
+  setter family (including int and bool uniforms), multi-unit sampler
+  bindings, and a `#pragma raw_passthrough` opt-in that runs your
+  exact GLSL on native GLES with no rewriting
+- **Buffers and vertex arrays**: native VBOs via `createBuffer` +
+  `bufferData` + `bufferSubData` (full WebIDL overload resolution),
+  `vertexAttribPointer`, `enableVertexAttribArray`, generic attribute
+  fallback values
+- **Textures**: `texImage2D` for RGBA UByte and the depth /
+  depth-stencil formats, `texParameteri`, persistent native handles
+  for textures used as FBO attachments or sampled by passthrough
+  shaders, `activeTexture` + `bindTexture` plumbed to native
+- **Framebuffers**: full `WebGLRenderTarget` management —
+  `createFramebuffer`, `framebufferTexture2D`,
+  `framebufferRenderbuffer`, `checkFramebufferStatus`,
+  `renderbufferStorage` (DEPTH_COMPONENT16, DEPTH24_STENCIL8, color
+  variants), and dispatch retargeting so subsequent draws land in
+  the user FBO with correct viewport handling and `readPixels`
+- **State**: blend (separate src/dst RGB + alpha), depth test,
+  cull face, polygon offset, scissor, viewport, line width, clear
+  color / depth / stencil
+- **Extensions**: `WEBGL_depth_texture` /
+  `OES_depth_texture` (with `UNSIGNED_INT_24_8_WEBGL`),
+  `OES_standard_derivatives` + `gl.hint()`,
+  `ANGLE_instanced_arrays` (instanced drawArrays/drawElements,
+  `vertexAttribDivisor`)
+- **Switch integration**: touch input dispatch on `screen`, gamepad
+  input via `navigator.getGamepads()`, and a single-FBO present
+  pipeline with auto-flush + readback so the WebGL output appears
+  on the visible screen each frame
+
+### Khronos conformance
+
+I am actively targeting full
+[Khronos WebGL 1 conformance](https://www.khronos.org/registry/webgl/conformance-suites/)
+on real hardware. Coverage will continue to grow toward the complete
+suite, with the long-term goal of running every conformance test that
+fits inside the Switch's memory and dispatch budget.
 
 <img align="right" width="200" height="200" src="./assets/logo.png">
 
