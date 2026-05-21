@@ -19,6 +19,8 @@
 #define GL_LINE_LOOP 0x0002
 #define GL_LINE_STRIP 0x0003
 #define GL_TRIANGLES 0x0004
+#define GL_TRIANGLE_STRIP 0x0005
+#define GL_TRIANGLE_FAN 0x0006
 #define GL_ZERO 0
 #define GL_ONE 1
 #define GL_NEVER 0x0200
@@ -6364,8 +6366,18 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		JS_ToInt32(ctx, &count, argv[2]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
-		mode != GL_LINE_LOOP && mode != GL_POINTS) {
+	// Accept all 7 GLES2 primitive modes. The bridge's hardcoded software
+	// paths assume independent triangles (count % 3 == 0), so they'll
+	// silently no-op for TRIANGLE_STRIP/FAN with non-multiple-of-3 counts;
+	// but raw-shader passthrough programs go straight to native
+	// `glDrawArrays(mode, ...)` which handles all modes correctly.
+	// Previously TRIANGLE_STRIP and TRIANGLE_FAN were rejected here with
+	// INVALID_ENUM, which silently broke fullscreen-quad shaders that
+	// use `drawArrays(TRIANGLE_STRIP, 0, 4)` — a common idiom.
+	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
+		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
+		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
+		mode != GL_POINTS) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -6710,8 +6722,11 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &type, argv[2]) || JS_ToInt32(ctx, &offset, argv[3]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
-		mode != GL_LINE_LOOP) {
+	// See nx_webgl_draw_arrays for rationale on the widened mode list.
+	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
+		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
+		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
+		mode != GL_POINTS) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -7012,8 +7027,11 @@ static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
 		JS_ToInt32(ctx, &instance_count, argv[3]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
-		mode != GL_LINE_LOOP && mode != GL_POINTS) {
+	// See nx_webgl_draw_arrays for rationale on the widened mode list.
+	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
+		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
+		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
+		mode != GL_POINTS) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -7062,8 +7080,11 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 		JS_ToInt32(ctx, &instance_count, argv[4]))
 		return JS_EXCEPTION;
 
-	if (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_LINE_STRIP &&
-		mode != GL_LINE_LOOP) {
+	// See nx_webgl_draw_arrays for rationale on the widened mode list.
+	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
+		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
+		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
+		mode != GL_POINTS) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -8492,6 +8513,8 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "LINE_LOOP", GL_LINE_LOOP);
 	define_constant(ctx, proto, "LINE_STRIP", GL_LINE_STRIP);
 	define_constant(ctx, proto, "TRIANGLES", GL_TRIANGLES);
+	define_constant(ctx, proto, "TRIANGLE_STRIP", GL_TRIANGLE_STRIP);
+	define_constant(ctx, proto, "TRIANGLE_FAN", GL_TRIANGLE_FAN);
 	define_constant(ctx, proto, "ZERO", GL_ZERO);
 	define_constant(ctx, proto, "ONE", GL_ONE);
 	define_constant(ctx, proto, "NEVER", GL_NEVER);
