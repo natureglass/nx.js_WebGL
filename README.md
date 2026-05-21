@@ -58,6 +58,8 @@ on real hardware. Coverage will continue to grow toward the complete
 suite, with the long-term goal of running every conformance test that
 fits inside the Switch's memory and dispatch budget.
 
+---
+
 <img align="right" width="200" height="200" src="./assets/logo.png">
 
 **nx.js** is a framework that enables the development of Nintendo Switch
