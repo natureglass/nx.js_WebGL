@@ -1,6 +1,7 @@
 #include "webgl.h"
 #include "webgl_egl.h"
 #include "canvas.h"
+#include "image.h"
 #include "util.h"
 #include <math.h>
 #include <stdint.h>
@@ -170,6 +171,12 @@
 #define GL_RGB565 0x8D62
 #define GL_RGBA4 0x8056
 #define GL_RGB5_A1 0x8057
+// P2 (HDR/PMREM): float and half-float texture formats.
+#define GL_HALF_FLOAT_OES 0x8D61
+#define GL_RGBA16F 0x881A
+#define GL_RGBA32F 0x8814
+#define GL_RGB16F 0x881B
+#define GL_RGB32F 0x8815
 #define GL_BUFFER_SIZE 0x8764
 #define GL_BUFFER_USAGE 0x8765
 #define GL_STREAM_DRAW 0x88E0
@@ -192,6 +199,13 @@
 #define GL_TEXTURE_WRAP_T 0x2803
 #define GL_NEAREST 0x2600
 #define GL_LINEAR 0x2601
+// Mipmap-aware MIN_FILTER variants (GLES 2.0 + WebGL 1). MAG_FILTER
+// only accepts NEAREST or LINEAR per spec. Added 2026-05-22 (milestone
+// #24) — see [[swb-threejs-webgl-materials-texture-filters]].
+#define GL_NEAREST_MIPMAP_NEAREST 0x2700
+#define GL_LINEAR_MIPMAP_NEAREST 0x2701
+#define GL_NEAREST_MIPMAP_LINEAR 0x2702
+#define GL_LINEAR_MIPMAP_LINEAR 0x2703
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_REPEAT 0x2901
 #define GL_RGBA 0x1908
@@ -278,8 +292,23 @@ typedef struct {
 	JSValue current_program;
 	JSValue array_buffer_binding;
 	JSValue element_array_buffer_binding;
+	// WebGL 2-only buffer-target bindings. Per ES3 spec each buffer target
+	// has its own binding slot. Three.js's WebGLUniformsGroups binds UBOs
+	// via bind_buffer(UNIFORM_BUFFER, ...) then bufferData/bufferSubData
+	// against the same target.
+	JSValue uniform_buffer_binding;
+	JSValue copy_read_buffer_binding;
+	JSValue copy_write_buffer_binding;
+	JSValue pixel_pack_buffer_binding;
+	JSValue pixel_unpack_buffer_binding;
+	JSValue transform_feedback_buffer_binding;
 	JSValue texture_2d_binding;
 	JSValue texture_cube_binding;
+	// WebGL 2-only texture targets. The empty-texture pool Three.js creates
+	// at WebGLState construction binds these unconditionally on WebGL 2
+	// contexts ([three.module.js:23058]).
+	JSValue texture_3d_binding;
+	JSValue texture_2d_array_binding;
 	// Currently bound user framebuffer / renderbuffer, JS_UNDEFINED if none
 	// (default-FBO bind = JS_UNDEFINED). Bridge dispatch consults the EGL
 	// backend's mirrored `current_user_framebuffer` field (set via
@@ -299,6 +328,36 @@ typedef struct {
 	// getParameter.
 	uint32_t hint_fragment_shader_derivative;
 	uint32_t hint_generate_mipmap;
+	// WebGL 2 marker. Set on contexts created via `webgl2ContextNew`.
+	// Affects: getParameter(VERSION/SHADING_LANGUAGE_VERSION), what extension
+	// surface getSupportedExtensions returns (e.g. ANGLE_instanced_arrays is
+	// folded into core on a WebGL 2 context), and which constants are
+	// reachable (the v2-only constants are defined on the WebGL2 prototype).
+	bool is_webgl2;
+	// WebGL 2 bound vertex array (`gl.bindVertexArray`). Bridge mode does
+	// not snapshot VAO state; native GLES handles the binding directly.
+	// JS_UNDEFINED if no VAO is bound (i.e. default VAO 0).
+	JSValue vertex_array_binding;
+	// Pixel storage state newly addressable in WebGL 2.
+	int32_t pack_row_length;
+	int32_t pack_skip_rows;
+	int32_t pack_skip_pixels;
+	int32_t unpack_row_length;
+	int32_t unpack_skip_rows;
+	int32_t unpack_skip_pixels;
+	int32_t unpack_image_height;
+	int32_t unpack_skip_images;
+	// WebGL-1+2 image-source unpack flags. Honored when tex*Image*D is
+	// called with an HTMLImageElement / ImageBitmap / canvas-like source:
+	//   - `unpack_flip_y` = true → rows are emitted bottom-to-top into the
+	//     GL texture (the WebGL default is false; Three.js sets it true).
+	//   - `unpack_premultiply_alpha` = true → RGB channels are multiplied
+	//     by alpha during upload (default false; the WebGL convention is
+	//     "store source pixels as-is"). nx.js's image decoders ALREADY
+	//     pre-multiply alpha for cairo's sake, so when this flag is false
+	//     we need to UN-premultiply before uploading.
+	bool unpack_flip_y;
+	bool unpack_premultiply_alpha;
 } nx_webgl_context_t;
 
 typedef struct {
@@ -353,6 +412,9 @@ typedef struct {
 	float specular[3];
 	float shininess;
 	float emissive[3];
+	float hemi_light_direction[3];
+	float hemi_light_sky_color[3];
+	float hemi_light_ground_color[3];
 	int line_distance_attrib_index;
 	int color_attrib_index;
 	int position_attrib_index;
@@ -397,6 +459,9 @@ typedef struct {
 	bool has_specular;
 	bool has_shininess;
 	bool has_emissive;
+	bool has_hemi_light_direction;
+	bool has_hemi_light_sky_color;
+	bool has_hemi_light_ground_color;
 	bool has_line_distance_attrib_index;
 	bool has_color_attrib_index;
 	bool has_position_attrib_index;
@@ -444,6 +509,13 @@ typedef struct {
 	int *alpha_max_x;
 	uint32_t bridge_id;
 	uint32_t revision;
+	// (internalformat, format, type) of the most recent texImage2D upload.
+	// Used by lazy-promote to ALSO upload FLOAT/HALF_FLOAT textures
+	// correctly — without this we'd hardcode RGBA/UBYTE and break HDR.
+	// Defaults to RGBA/RGBA/UNSIGNED_BYTE for legacy callers.
+	uint32_t internal_format;
+	uint32_t format;
+	uint32_t type;
 	// Persistent native GLES texture handle. 0 until the texture is used as
 	// an FBO color attachment (`framebufferTexture2D`) or `texImage2D` is
 	// called with NULL data (storage-only allocation, the FBO-color-init
@@ -459,11 +531,20 @@ typedef struct {
 // so Three.js's `WebGLRenderTarget` can be backed by real native GLES FBOs
 // and the bridge can be retargeted into them via
 // `nx_webgl_egl_set_user_framebuffer`. See [[bridge-fbo-support]].
+// Max color attachments per FBO — sized to cover the COLOR_ATTACHMENT0..15
+// constant range exposed on the WebGL 2 proto. Tegra GLES advertises
+// MAX_COLOR_ATTACHMENTS = 8; reserving 16 slots wastes a few JSValue
+// pointers but keeps the indexing math direct (attachment - COLOR_ATTACHMENT0).
+#define NX_WEBGL_MAX_COLOR_ATTACHMENTS 16
+
 typedef struct {
 	uint32_t handle;          // Native GLES FBO handle (0 = unallocated).
 	int width;                // Derived from color attachment dims.
 	int height;
-	JSValue color_attachment;  // texture JSValue (dup'd) — kept alive while attached.
+	// One JSValue per COLOR_ATTACHMENT0..15 slot — texture or renderbuffer
+	// (dup'd) kept alive while attached. Slot 0 also matches the WebGL 1
+	// single-color-attachment use case.
+	JSValue color_attachments[NX_WEBGL_MAX_COLOR_ATTACHMENTS];
 	JSValue depth_attachment;  // renderbuffer JSValue (dup'd).
 	JSValue stencil_attachment;
 	bool deleted;
@@ -532,6 +613,9 @@ typedef enum {
 	NX_WEBGL_UNIFORM_SPECULAR,
 	NX_WEBGL_UNIFORM_SHININESS,
 	NX_WEBGL_UNIFORM_EMISSIVE,
+	NX_WEBGL_UNIFORM_HEMI_LIGHT_DIRECTION,
+	NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR,
+	NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR,
 } nx_webgl_uniform_kind_t;
 
 typedef struct {
@@ -633,9 +717,52 @@ static bool is_shader_type(uint32_t type) {
 	return type == GL_VERTEX_SHADER || type == GL_FRAGMENT_SHADER;
 }
 
+// WebGL 1 = STATIC/DYNAMIC/STREAM _DRAW only. WebGL 2 also accepts the
+// _READ and _COPY variants (transform feedback + pixel pack/unpack flows).
 static bool is_buffer_usage(uint32_t usage) {
 	return usage == GL_STATIC_DRAW || usage == GL_DYNAMIC_DRAW ||
 		   usage == GL_STREAM_DRAW;
+}
+static bool is_buffer_usage_webgl2(uint32_t usage) {
+	if (is_buffer_usage(usage)) return true;
+	switch (usage) {
+		case 0x88E5: // STATIC_READ
+		case 0x88E9: // DYNAMIC_READ
+		case 0x88E1: // STREAM_READ
+		case 0x88E6: // STATIC_COPY
+		case 0x88EA: // DYNAMIC_COPY
+		case 0x88E2: // STREAM_COPY
+			return true;
+	}
+	return false;
+}
+
+// All WebGL 1 + WebGL 2 buffer targets recognized by bindBuffer /
+// bufferData / bufferSubData. Returns NULL for invalid target; the caller
+// then sets context->error = GL_INVALID_ENUM.
+static JSValue *buffer_binding_for_target(nx_webgl_context_t *context,
+                                          uint32_t target) {
+	switch (target) {
+		case GL_ARRAY_BUFFER:               return &context->array_buffer_binding;
+		case GL_ELEMENT_ARRAY_BUFFER:       return &context->element_array_buffer_binding;
+		// WebGL 2 targets — gated by `context->is_webgl2` at the call site.
+		case 0x8A11 /* UNIFORM_BUFFER         */: return &context->uniform_buffer_binding;
+		case 0x8F36 /* COPY_READ_BUFFER      */: return &context->copy_read_buffer_binding;
+		case 0x8F37 /* COPY_WRITE_BUFFER     */: return &context->copy_write_buffer_binding;
+		case 0x88EB /* PIXEL_PACK_BUFFER     */: return &context->pixel_pack_buffer_binding;
+		case 0x88EC /* PIXEL_UNPACK_BUFFER   */: return &context->pixel_unpack_buffer_binding;
+		case 0x8C8E /* TRANSFORM_FEEDBACK_BUFFER */: return &context->transform_feedback_buffer_binding;
+	}
+	return NULL;
+}
+
+static bool is_webgl2_buffer_target(uint32_t target) {
+	switch (target) {
+		case 0x8A11: case 0x8F36: case 0x8F37:
+		case 0x88EB: case 0x88EC: case 0x8C8E:
+			return true;
+	}
+	return false;
 }
 
 static bool is_vertex_attrib_type(uint32_t type) {
@@ -669,7 +796,9 @@ static bool is_stencil_op(uint32_t op) {
 }
 
 static bool is_texture_binding_target(uint32_t target) {
-	return target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP;
+	return target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP ||
+		   target == 0x806F /* TEXTURE_3D */ ||
+		   target == 0x8C1A /* TEXTURE_2D_ARRAY */;
 }
 
 static bool is_texture_image_target(uint32_t target) {
@@ -686,6 +815,10 @@ static JSValue *texture_binding_for_target(nx_webgl_context_t *context,
 		(target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
 		 target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z))
 		return &context->texture_cube_binding;
+	if (target == 0x806F /* TEXTURE_3D */)
+		return &context->texture_3d_binding;
+	if (target == 0x8C1A /* TEXTURE_2D_ARRAY */)
+		return &context->texture_2d_array_binding;
 	return NULL;
 }
 
@@ -810,6 +943,21 @@ static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
 	// makes the additive a no-op when not set.
 	if (strcmp(name, "emissive") == 0)
 		return NX_WEBGL_UNIFORM_EMISSIVE;
+	// Three.js's HemisphereLight stock uniform names (single light only).
+	// Direction is view-space (Three.js converts world→view before upload).
+	// skyColor/groundColor have `intensity * scaleFactor` baked in by
+	// WebGLLights.setupLights — see [[threejs-r162-uselegacylights-trap]]
+	// for the scaleFactor history. Bridge composes the irradiance
+	// `mix(groundColor, skyColor, 0.5 * dot(N, dir) + 0.5)` and adds it
+	// to the ambient term (it's an ambient-class light per Three.js's
+	// `lights_fragment_begin` chunk — added to `irradiance`, not to the
+	// NdotL diffuse). Milestone #21 (webgl-buffergeometry-indexed).
+	if (strcmp(name, "hemisphereLights[0].direction") == 0)
+		return NX_WEBGL_UNIFORM_HEMI_LIGHT_DIRECTION;
+	if (strcmp(name, "hemisphereLights[0].skyColor") == 0)
+		return NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR;
+	if (strcmp(name, "hemisphereLights[0].groundColor") == 0)
+		return NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR;
 	return NX_WEBGL_UNIFORM_UNKNOWN;
 }
 
@@ -988,19 +1136,50 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	context->current_program = JS_UNDEFINED;
 	context->array_buffer_binding = JS_UNDEFINED;
 	context->element_array_buffer_binding = JS_UNDEFINED;
+	context->uniform_buffer_binding = JS_UNDEFINED;
+	context->copy_read_buffer_binding = JS_UNDEFINED;
+	context->copy_write_buffer_binding = JS_UNDEFINED;
+	context->pixel_pack_buffer_binding = JS_UNDEFINED;
+	context->pixel_unpack_buffer_binding = JS_UNDEFINED;
+	context->transform_feedback_buffer_binding = JS_UNDEFINED;
 	context->texture_2d_binding = JS_UNDEFINED;
 	context->texture_cube_binding = JS_UNDEFINED;
+	context->texture_3d_binding = JS_UNDEFINED;
+	context->texture_2d_array_binding = JS_UNDEFINED;
 	context->framebuffer_binding = JS_UNDEFINED;
 	context->renderbuffer_binding = JS_UNDEFINED;
 	context->active_texture = GL_TEXTURE0;
 	context->next_texture_id = 1;
 	context->hint_fragment_shader_derivative = GL_DONT_CARE;
 	context->hint_generate_mipmap = GL_DONT_CARE;
+	context->is_webgl2 = false;
+	context->vertex_array_binding = JS_UNDEFINED;
+	context->pack_row_length = 0;
+	context->pack_skip_rows = 0;
+	context->pack_skip_pixels = 0;
+	context->unpack_row_length = 0;
+	context->unpack_skip_rows = 0;
+	context->unpack_skip_pixels = 0;
+	context->unpack_image_height = 0;
+	context->unpack_skip_images = 0;
+	context->unpack_flip_y = false;
+	context->unpack_premultiply_alpha = false;
 	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 		context->vertex_attribs[i].buffer = JS_UNDEFINED;
 	context->egl = nx_webgl_egl_create(ctx, canvas);
 
 	JS_SetOpaque(obj, context);
+	return obj;
+}
+
+static JSValue nx_webgl2_context_new(JSContext *ctx, JSValueConst this_val,
+									 int argc, JSValueConst *argv) {
+	JSValue obj = nx_webgl_context_new(ctx, this_val, argc, argv);
+	if (JS_IsException(obj))
+		return obj;
+	nx_webgl_context_t *context = JS_GetOpaque(obj, nx_webgl_context_class_id);
+	if (context)
+		context->is_webgl2 = true;
 	return obj;
 }
 
@@ -1012,10 +1191,19 @@ static void finalizer_webgl_context(JSRuntime *rt, JSValue val) {
 		JS_FreeValueRT(rt, context->current_program);
 		JS_FreeValueRT(rt, context->array_buffer_binding);
 		JS_FreeValueRT(rt, context->element_array_buffer_binding);
+		JS_FreeValueRT(rt, context->uniform_buffer_binding);
+		JS_FreeValueRT(rt, context->copy_read_buffer_binding);
+		JS_FreeValueRT(rt, context->copy_write_buffer_binding);
+		JS_FreeValueRT(rt, context->pixel_pack_buffer_binding);
+		JS_FreeValueRT(rt, context->pixel_unpack_buffer_binding);
+		JS_FreeValueRT(rt, context->transform_feedback_buffer_binding);
 		JS_FreeValueRT(rt, context->texture_2d_binding);
 		JS_FreeValueRT(rt, context->texture_cube_binding);
+		JS_FreeValueRT(rt, context->texture_3d_binding);
+		JS_FreeValueRT(rt, context->texture_2d_array_binding);
 		JS_FreeValueRT(rt, context->framebuffer_binding);
 		JS_FreeValueRT(rt, context->renderbuffer_binding);
+		JS_FreeValueRT(rt, context->vertex_array_binding);
 		for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 			JS_FreeValueRT(rt, context->vertex_attribs[i].buffer);
 		nx_webgl_egl_destroy(rt, context->egl);
@@ -1105,7 +1293,9 @@ static void finalizer_webgl_framebuffer(JSRuntime *rt, JSValue val) {
 	nx_webgl_framebuffer_t *fb =
 		JS_GetOpaque(val, nx_webgl_framebuffer_class_id);
 	if (fb) {
-		JS_FreeValueRT(rt, fb->color_attachment);
+		for (int i = 0; i < NX_WEBGL_MAX_COLOR_ATTACHMENTS; i++) {
+			JS_FreeValueRT(rt, fb->color_attachments[i]);
+		}
 		JS_FreeValueRT(rt, fb->depth_attachment);
 		JS_FreeValueRT(rt, fb->stencil_attachment);
 		js_free_rt(rt, fb);
@@ -1204,6 +1394,31 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 	// either name; advertising both removes ambiguity.
 	JS_DefinePropertyValueUint32(ctx, arr, idx++,
 		JS_NewString(ctx, "OES_depth_texture"), JS_PROP_C_W_E);
+	// P2 (HDR/PMREM): expose float-texture support so Three.js's
+	// PMREMGenerator + RGBELoader can allocate HALF_FLOAT/FLOAT render
+	// targets + textures. Tegra GLES supports both natively. Linear
+	// filtering variants are required for prefiltered envmap sampling.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_texture_float"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_texture_float_linear"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_texture_half_float"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "OES_texture_half_float_linear"), JS_PROP_C_W_E);
+	// EXT_shader_texture_lod — exposes the textureCubeLod / texture2DLodEXT
+	// functions used in PMREMGenerator's prefilter shader for varying-LOD
+	// sampling of the prefiltered envmap. ES3 has texture*Lod core; the
+	// EXT name is the promotion-path token Three.js feature-detects.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "EXT_shader_texture_lod"), JS_PROP_C_W_E);
+	// EXT_color_buffer_float — render-to-FLOAT for HDR FBO writes that
+	// Three.js's PMREM pipeline performs. Tegra supports it; advertising
+	// the extension makes Three.js choose the HDR path instead of LDR.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "EXT_color_buffer_float"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "EXT_color_buffer_half_float"), JS_PROP_C_W_E);
 	return arr;
 }
 
@@ -1318,6 +1533,28 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 			return ext;
 		JS_DefinePropertyValueStr(ctx, ext, "UNSIGNED_INT_24_8_WEBGL",
 								  JS_NewInt32(ctx, 0x84FA), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// P2 (HDR/PMREM) extensions. These have no JS-callable methods; Three.js
+	// just uses `getExtension(name) !== null` for feature detection and then
+	// proceeds to call texImage2D with FLOAT / HALF_FLOAT_OES types (handled
+	// in the texImage2D accept-list). Returning a stub object satisfies the
+	// !== null check.
+	if (strcmp(name, "OES_texture_float") == 0 ||
+	    strcmp(name, "OES_texture_float_linear") == 0 ||
+	    strcmp(name, "OES_texture_half_float") == 0 ||
+	    strcmp(name, "OES_texture_half_float_linear") == 0 ||
+	    strcmp(name, "EXT_shader_texture_lod") == 0 ||
+	    strcmp(name, "EXT_color_buffer_float") == 0 ||
+	    strcmp(name, "EXT_color_buffer_half_float") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext))
+			return ext;
+		// OES_texture_half_float exposes the constant HALF_FLOAT_OES = 0x8D61.
+		JS_DefinePropertyValueStr(ctx, ext, "HALF_FLOAT_OES",
+								  JS_NewInt32(ctx, 0x8D61), JS_PROP_C_W_E);
 		return ext;
 	}
 
@@ -1677,10 +1914,29 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 	//   - `#define DEPTH_PACKING` — exclusive to MeshDepthMaterial's
 	//     auto-shader (the shadow-cast pass writes RGBA-packed depth via
 	//     `packDepthToRGBA(fragCoordZ)`).
+	//   - `#define USE_MORPHTARGETS` — emitted by Three.js into the
+	//     vertex shader prefix when the geometry has morph attributes
+	//     (`morphAttributes.position/normal/color`). The auto-generated
+	//     shader pulls in `morphtarget_pars_vertex` + `morphtarget_vertex`
+	//     which compose displacement from per-attribute morphTarget0..7
+	//     buffers with `morphTargetInfluences[8]` + `morphTargetBaseInfluence`
+	//     uniforms — none of which the bridge's hardcoded color/texture
+	//     programs read. See [[swb-threejs-webgl-morphtargets-sphere]].
+	//   - `#define SHADER_NAME ` (note trailing space) — injected by
+	//     Three.js's `WebGLProgram` into the prefix of EVERY generated
+	//     shader (both `RawShaderMaterial` paths and stock-material paths;
+	//     see `three-r162/src/renderers/webgl/WebGLProgram.js` lines 510,
+	//     527, 546, 773). Promotes ALL Three.js-generated shaders to the
+	//     passthrough path. Bridge programs (`bridge_color_program`,
+	//     `bridge_texture_program`, `bridge_lit_program`, `bridge_sprite_program`)
+	//     become fallback for hand-rolled non-Three.js WebGL only.
+	//     See [[swb-passthrough-pivot]] (2026-05-22 strategic pivot).
 	shader->raw_passthrough =
 		strstr(shader->source, "#pragma raw_passthrough") != NULL ||
 		strstr(shader->source, "#define USE_SHADOWMAP") != NULL ||
-		strstr(shader->source, "#define DEPTH_PACKING") != NULL;
+		strstr(shader->source, "#define DEPTH_PACKING") != NULL ||
+		strstr(shader->source, "#define USE_MORPHTARGETS") != NULL ||
+		strstr(shader->source, "#define SHADER_NAME ") != NULL;
 
 	char gles_log[2048];
 	bool gles_status = false;
@@ -2103,14 +2359,27 @@ static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
 	if (!context)
 		return JS_EXCEPTION;
 
+	// Stub for the "program is null/deleted/unlinked" cases — Three.js's
+	// WebGLProgram.onFirstUse() unconditionally calls `new WebGLUniforms(
+	// gl, program)` AFTER its LINK_STATUS check fails (it only logs the
+	// error, doesn't bail). WebGLUniforms then iterates and dereferences
+	// `.name` unconditionally, so returning null here crashes the renderer.
+	// The stub name is "_inactive" not "" because Three.js's parseUniform
+	// runs the name through `/(\w+)(\])?(\[|\.)?/.exec(name)` — an empty
+	// name produces a null match → "cannot read property '1' of null" crash.
+	// Using a non-empty word satisfies the regex.
+	// See [[nxjs-active-uniforms-attribs-lists]] / [[swb-passthrough-pivot]].
+	const char *stub_name = "_inactive";
+	nx_webgl_active_info_t stub = { (char *)stub_name, 0, 0 };
+
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
 		context->error = GL_INVALID_VALUE;
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	}
 	if (!program->link_status) {
 		context->error = GL_INVALID_OPERATION;
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	}
 
 	uint32_t index;
@@ -2120,19 +2389,24 @@ static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
 	// getProgramParameter for the rationale.
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
-		char name[256];
+		char name[256] = {0};
 		int size = 0;
 		uint32_t type = 0;
-		if (nx_webgl_egl_get_active_attrib(context->egl, program->gles_handle,
-										   index, name, sizeof(name), &size,
-										   &type)) {
-			nx_webgl_active_info_t info = {name, size, type};
-			return new_active_info(ctx, &info);
+		nx_webgl_egl_get_active_attrib(context->egl, program->gles_handle,
+									   index, name, sizeof(name), &size,
+									   &type);
+		// If native returned an empty name (inactive/optimized-out slot),
+		// substitute the parseable stub — same regex-crash rationale as
+		// above. Three.js's getAttribLocation("_inactive") returns -1
+		// and the rest of the iteration handles that fine.
+		if (name[0] == '\0') {
+			snprintf(name, sizeof(name), "_inactive");
 		}
-		return JS_NULL;
+		nx_webgl_active_info_t info = {name, size, type};
+		return new_active_info(ctx, &info);
 	}
 	if (index >= countof(active_attributes))
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	return new_active_info(ctx, &active_attributes[index]);
 }
 
@@ -2143,14 +2417,19 @@ static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
 	if (!context)
 		return JS_EXCEPTION;
 
+	// Same stub-on-error rationale as nx_webgl_get_active_attrib. "_inactive"
+	// not "" so Three.js's parseUniform regex matches.
+	const char *stub_name = "_inactive";
+	nx_webgl_active_info_t stub = { (char *)stub_name, 0, 0 };
+
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
 		context->error = GL_INVALID_VALUE;
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	}
 	if (!program->link_status) {
 		context->error = GL_INVALID_OPERATION;
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	}
 
 	uint32_t index;
@@ -2158,19 +2437,22 @@ static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
-		char name[256];
+		char name[256] = {0};
 		int size = 0;
 		uint32_t type = 0;
-		if (nx_webgl_egl_get_active_uniform(context->egl, program->gles_handle,
-											index, name, sizeof(name), &size,
-											&type)) {
-			nx_webgl_active_info_t info = {name, size, type};
-			return new_active_info(ctx, &info);
+		nx_webgl_egl_get_active_uniform(context->egl, program->gles_handle,
+										index, name, sizeof(name), &size,
+										&type);
+		// Substitute the parseable stub for inactive/optimized-out slots
+		// so Three.js's parseUniform regex doesn't crash on empty input.
+		if (name[0] == '\0') {
+			snprintf(name, sizeof(name), "_inactive");
 		}
-		return JS_NULL;
+		nx_webgl_active_info_t info = {name, size, type};
+		return new_active_info(ctx, &info);
 	}
 	if (index >= countof(active_uniforms))
-		return JS_NULL;
+		return new_active_info(ctx, &stub);
 	return new_active_info(ctx, &active_uniforms[index]);
 }
 
@@ -2226,15 +2508,14 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 	uint32_t target;
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+	JSValue *binding = buffer_binding_for_target(context, target);
+	if (!binding ||
+	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
 
 	if (JS_IsNull(argv[1])) {
-		JSValue *binding = target == GL_ARRAY_BUFFER
-							   ? &context->array_buffer_binding
-							   : &context->element_array_buffer_binding;
 		JS_FreeValue(ctx, *binding);
 		*binding = JS_UNDEFINED;
 		return JS_UNDEFINED;
@@ -2251,9 +2532,6 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 	}
 
 	buffer->target = target;
-	JSValue *binding = target == GL_ARRAY_BUFFER
-						   ? &context->array_buffer_binding
-						   : &context->element_array_buffer_binding;
 	JS_FreeValue(ctx, *binding);
 	*binding = JS_DupValue(ctx, argv[1]);
 	return JS_UNDEFINED;
@@ -2270,19 +2548,20 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 	uint32_t usage;
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &usage, argv[2]))
 		return JS_EXCEPTION;
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+	JSValue *binding = buffer_binding_for_target(context, target);
+	if (!binding ||
+	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
-	if (!is_buffer_usage(usage)) {
+	bool usage_ok = context->is_webgl2 ? is_buffer_usage_webgl2(usage)
+	                                    : is_buffer_usage(usage);
+	if (!usage_ok) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
 
-	nx_webgl_buffer_t *buffer =
-		nx_get_webgl_buffer(target == GL_ARRAY_BUFFER
-								? context->array_buffer_binding
-								: context->element_array_buffer_binding);
+	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
@@ -2380,7 +2659,9 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 	int32_t offset;
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &offset, argv[1]))
 		return JS_EXCEPTION;
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+	JSValue *binding = buffer_binding_for_target(context, target);
+	if (!binding ||
+	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -2389,10 +2670,7 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
-	nx_webgl_buffer_t *buffer =
-		nx_get_webgl_buffer(target == GL_ARRAY_BUFFER
-								? context->array_buffer_binding
-								: context->element_array_buffer_binding);
+	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted || buffer->target != target) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
@@ -2465,13 +2743,24 @@ static JSValue nx_webgl_delete_buffer(JSContext *ctx, JSValueConst this_val,
 		nx_webgl_egl_delete_native_buffer(context->egl, buffer->gles_handle);
 		buffer->gles_handle = 0;
 	}
-	if (nx_get_webgl_buffer(context->array_buffer_binding) == buffer) {
-		JS_FreeValue(ctx, context->array_buffer_binding);
-		context->array_buffer_binding = JS_UNDEFINED;
-	}
-	if (nx_get_webgl_buffer(context->element_array_buffer_binding) == buffer) {
-		JS_FreeValue(ctx, context->element_array_buffer_binding);
-		context->element_array_buffer_binding = JS_UNDEFINED;
+	// Clear any binding slot pointing at this buffer (across all 8 buffer
+	// targets — WebGL 1's 2 + WebGL 2's 6). Per spec the binding is reset
+	// to 0 (null) on deleteBuffer.
+	JSValue *slots[] = {
+		&context->array_buffer_binding,
+		&context->element_array_buffer_binding,
+		&context->uniform_buffer_binding,
+		&context->copy_read_buffer_binding,
+		&context->copy_write_buffer_binding,
+		&context->pixel_pack_buffer_binding,
+		&context->pixel_unpack_buffer_binding,
+		&context->transform_feedback_buffer_binding,
+	};
+	for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
+		if (nx_get_webgl_buffer(*slots[i]) == buffer) {
+			JS_FreeValue(ctx, *slots[i]);
+			*slots[i] = JS_UNDEFINED;
+		}
 	}
 	return JS_UNDEFINED;
 }
@@ -2488,7 +2777,9 @@ static JSValue nx_webgl_get_buffer_parameter(JSContext *ctx,
 	if (JS_ToUint32(ctx, &target, argv[0]) ||
 		JS_ToUint32(ctx, &pname, argv[1]))
 		return JS_EXCEPTION;
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER) {
+	JSValue *binding = buffer_binding_for_target(context, target);
+	if (!binding ||
+	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
 	}
@@ -2496,10 +2787,7 @@ static JSValue nx_webgl_get_buffer_parameter(JSContext *ctx,
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
 	}
-	nx_webgl_buffer_t *buffer =
-		nx_get_webgl_buffer(target == GL_ARRAY_BUFFER
-								? context->array_buffer_binding
-								: context->element_array_buffer_binding);
+	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_NULL;
@@ -2633,16 +2921,27 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 
 	switch (pname) {
 	case GL_TEXTURE_MIN_FILTER:
+		// MIN_FILTER accepts NEAREST / LINEAR plus the 4 mipmap variants
+		// (added 2026-05-22 for milestone #24). MAG_FILTER stays restricted
+		// to NEAREST / LINEAR per GLES 2.0 spec — mipmap-aware mag-filter
+		// is a GLES 3.0+ concept.
+		if (param != GL_NEAREST && param != GL_LINEAR &&
+		    param != GL_NEAREST_MIPMAP_NEAREST &&
+		    param != GL_LINEAR_MIPMAP_NEAREST &&
+		    param != GL_NEAREST_MIPMAP_LINEAR &&
+		    param != GL_LINEAR_MIPMAP_LINEAR) {
+			context->error = GL_INVALID_ENUM;
+			return JS_UNDEFINED;
+		}
+		texture->min_filter = param;
+		break;
 	case GL_TEXTURE_MAG_FILTER:
 		if (param != GL_NEAREST && param != GL_LINEAR) {
 			context->error = GL_INVALID_ENUM;
 			return JS_UNDEFINED;
 		}
-		if (pname == GL_TEXTURE_MIN_FILTER)
-			texture->min_filter = param;
-		else
-			texture->mag_filter = param;
-		return JS_UNDEFINED;
+		texture->mag_filter = param;
+		break;
 	case GL_TEXTURE_WRAP_S:
 	case GL_TEXTURE_WRAP_T:
 		if (param != GL_CLAMP_TO_EDGE && param != GL_REPEAT) {
@@ -2653,11 +2952,40 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 			texture->wrap_s = param;
 		else
 			texture->wrap_t = param;
-		return JS_UNDEFINED;
+		break;
+	// ----- WebGL 2 (ES 3.0) texParameteri pnames ----------------------
+	// Three.js's WebGL 2 path uses these for shadow-map sampler compare,
+	// mipmap level clamping, and 3D-texture wrapping. We accept them on
+	// WebGL 2 contexts unconditionally — the native GLES forward below
+	// is what actually validates the parameter against the driver.
+	case 0x884C: // TEXTURE_COMPARE_MODE
+	case 0x884D: // TEXTURE_COMPARE_FUNC
+	case 0x813C: // TEXTURE_BASE_LEVEL
+	case 0x813D: // TEXTURE_MAX_LEVEL
+	case 0x8072: // TEXTURE_WRAP_R
+	case 0x813A: // TEXTURE_MIN_LOD
+	case 0x813B: // TEXTURE_MAX_LOD
+		if (!context->is_webgl2) {
+			context->error = GL_INVALID_ENUM;
+			return JS_UNDEFINED;
+		}
+		break;
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
+	// If the texture has been promoted to a persistent native handle (FBO
+	// attachment, [[bridge-raw-shader-passthrough]] lazy-promote, or
+	// `generateMipmap`), forward the parameter change to native GLES so
+	// subsequent draws sample with the new setting. Bridge-mode dispatch
+	// re-uploads filter/wrap on each draw via `persistent_texture_image_2d`
+	// for cached textures, so unpromoted textures don't need this — they
+	// get the new value via the per-draw upload path.
+	if (texture->gles_handle) {
+		nx_webgl_egl_texture_set_parameteri(context->egl, target,
+		                                    texture->gles_handle, pname, param);
+	}
+	return JS_UNDEFINED;
 }
 
 static void update_texture_alpha_rows(nx_webgl_texture_t *texture, int start_y,
@@ -2687,6 +3015,102 @@ static void update_texture_alpha_rows(nx_webgl_texture_t *texture, int start_y,
 	}
 }
 
+// Returns true if `src` is a recognized image-like source — i.e. one of:
+//   - HTMLImageElement (`new Image()`, decoded via libpng/libjpeg-turbo/libwebp)
+//   - ImageBitmap (shares the `nx_image_t` backing with Image; `nx_get_image`
+//     returns non-NULL for both because `$.imageInit` registers BOTH JS
+//     classes against the same internal opaque ID)
+//   - Screen (`globalThis.screen`)
+//   - OffscreenCanvas
+// On success, fills *out_width / *out_height and allocates *out_rgba (a
+// freshly-malloc'd RGBA8 buffer ready for upload to GL — caller must
+// `js_free(ctx, *out_rgba)`). On failure (src isn't any of those, or the
+// decode/canvas surface isn't realized yet) returns false without
+// touching outputs.
+//
+// Honors the context's `unpack_flip_y` and `unpack_premultiply_alpha`
+// pixelStorei state. All four source types deliver pixels in cairo's
+// BGRA premultiplied byte order (PNG via `png_set_bgr`, JPEG via
+// `TJPF_BGRA`, WebP via `WebPDecodeBGRA`, canvas via cairo's
+// `CAIRO_FORMAT_ARGB32`). This helper:
+//   1. Swizzles BGRA → RGBA.
+//   2. Un-premultiplies if UNPACK_PREMULTIPLY_ALPHA_WEBGL is false
+//      (the WebGL default — Three.js usually leaves this unset).
+//   3. Flips rows bottom-to-top if UNPACK_FLIP_Y_WEBGL is true
+//      (Three.js sets this for almost every texture).
+//
+// All three steps happen in one pass over the pixels — for a 2048×2048
+// texture that's ~16 MB touched and well under 100 ms even on Tegra.
+static bool nx_webgl_extract_image_source(JSContext *ctx,
+                                          nx_webgl_context_t *context,
+                                          JSValueConst src,
+                                          int32_t *out_width,
+                                          int32_t *out_height,
+                                          uint8_t **out_rgba) {
+	int32_t w = 0, h = 0;
+	const uint8_t *src_data = NULL;
+	nx_image_t *image = nx_get_image(ctx, src);
+	if (image && image->data && image->width > 0 && image->height > 0) {
+		w = (int32_t)image->width;
+		h = (int32_t)image->height;
+		src_data = image->data;
+	} else {
+		// Try canvas-like (Screen / OffscreenCanvas — both back to
+		// `nx_canvas_t`). `data` is allocated lazily by the 2D context;
+		// if nothing's been drawn yet it'll be NULL and we treat that
+		// as "not a usable source" (consistent with browsers: an
+		// untouched canvas would upload as transparent black).
+		nx_canvas_t *canvas = nx_get_canvas(ctx, src);
+		if (canvas && canvas->data &&
+		    canvas->width > 0 && canvas->height > 0) {
+			w = (int32_t)canvas->width;
+			h = (int32_t)canvas->height;
+			src_data = canvas->data;
+		}
+	}
+	if (!src_data) {
+		return false;
+	}
+	size_t row_bytes = (size_t)w * 4;
+	size_t total_bytes = row_bytes * (size_t)h;
+	uint8_t *out = js_malloc(ctx, total_bytes);
+	if (!out) {
+		return false;
+	}
+	bool flip_y = context->unpack_flip_y;
+	bool keep_premul = context->unpack_premultiply_alpha;
+	for (int32_t y = 0; y < h; y++) {
+		const uint8_t *src_row = src_data + (size_t)y * row_bytes;
+		uint8_t *dst_row = out + (size_t)(flip_y ? (h - 1 - y) : y) * row_bytes;
+		for (int32_t x = 0; x < w; x++) {
+			uint8_t b = src_row[x * 4 + 0];
+			uint8_t g = src_row[x * 4 + 1];
+			uint8_t r = src_row[x * 4 + 2];
+			uint8_t a = src_row[x * 4 + 3];
+			if (!keep_premul && a != 0 && a != 255) {
+				// Decoded source is BGRA premultiplied (cairo
+				// convention). WebGL default is "store as-is" — i.e.,
+				// non-premultiplied — so divide each channel by alpha
+				// to recover the original color.
+				int32_t fr = (r * 255 + a / 2) / a;
+				int32_t fg = (g * 255 + a / 2) / a;
+				int32_t fb = (b * 255 + a / 2) / a;
+				r = fr > 255 ? 255 : (uint8_t)fr;
+				g = fg > 255 ? 255 : (uint8_t)fg;
+				b = fb > 255 ? 255 : (uint8_t)fb;
+			}
+			dst_row[x * 4 + 0] = r;
+			dst_row[x * 4 + 1] = g;
+			dst_row[x * 4 + 2] = b;
+			dst_row[x * 4 + 3] = a;
+		}
+	}
+	*out_width = w;
+	*out_height = h;
+	*out_rgba = out;
+	return true;
+}
+
 static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 									 int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
@@ -2696,31 +3120,111 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	uint32_t target;
 	int32_t level;
 	uint32_t internal_format;
-	int32_t width;
-	int32_t height;
-	int32_t border;
+	int32_t width = 0;
+	int32_t height = 0;
+	int32_t border = 0;
 	uint32_t format;
 	uint32_t type;
+	// Two call signatures per WebGL spec:
+	//   - Image-source form (argc == 6):
+	//       texImage2D(target, level, internalformat, format, type, source)
+	//     where `source` is HTMLImageElement / ImageBitmap / canvas-like.
+	//     Width / height come from the source's natural dimensions.
+	//   - Buffer form (argc == 9):
+	//       texImage2D(target, level, internalformat, width, height, border,
+	//                  format, type, pixels)
+	//     where `pixels` is an ArrayBufferView or null.
+	// In the 9-arg form, `pixels` MAY still carry an image source — uncommon
+	// but spec-allowed; we honor it and override the supplied width/height
+	// with the image's natural dims (matches Chrome / Firefox behavior).
+	bool short_form = (argc <= 6);
+	JSValueConst src_arg;
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &level, argv[1]) ||
-		JS_ToUint32(ctx, &internal_format, argv[2]) ||
-		JS_ToInt32(ctx, &width, argv[3]) || JS_ToInt32(ctx, &height, argv[4]) ||
-		JS_ToInt32(ctx, &border, argv[5]) || JS_ToUint32(ctx, &format, argv[6]) ||
-		JS_ToUint32(ctx, &type, argv[7]))
+		JS_ToUint32(ctx, &internal_format, argv[2]))
 		return JS_EXCEPTION;
+	if (short_form) {
+		if (JS_ToUint32(ctx, &format, argv[3]) ||
+			JS_ToUint32(ctx, &type, argv[4]))
+			return JS_EXCEPTION;
+		src_arg = argv[5];
+	} else {
+		if (JS_ToInt32(ctx, &width, argv[3]) ||
+			JS_ToInt32(ctx, &height, argv[4]) ||
+			JS_ToInt32(ctx, &border, argv[5]) ||
+			JS_ToUint32(ctx, &format, argv[6]) ||
+			JS_ToUint32(ctx, &type, argv[7]))
+			return JS_EXCEPTION;
+		src_arg = argv[8];
+	}
 
 	if (!is_texture_image_target(target)) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
+
+	// Try to extract an HTMLImageElement-like source. If successful, the
+	// image's natural dimensions override any width/height the caller
+	// supplied (per WebGL spec for the image-source form), and the source
+	// buffer below is replaced with the converted RGBA pixels.
+	uint8_t *image_buffer = NULL;
+	int32_t image_w = 0, image_h = 0;
+	bool from_image = nx_webgl_extract_image_source(
+		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+	if (from_image) {
+		width = image_w;
+		height = image_h;
+		border = 0;
+		// Image sources are RGBA8. Reject any other (format, type) tuple
+		// to match the WebGL spec — image uploads must use RGBA +
+		// UNSIGNED_BYTE (or the SRGB8_ALPHA8 sized variant which is also
+		// RGBA8 on the wire — handled by the broader format check below).
+		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+			js_free(ctx, image_buffer);
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	}
 	// Accept-list for (internalformat, format, type) tuples. WebGL 1 spec
 	// requires internalformat == format for unsized formats. Milestone #19.5
 	// widens this beyond the original RGBA+UNSIGNED_BYTE to also accept the
 	// depth-texture combos that WEBGL_depth_texture / OES_depth_texture
-	// enable. The dispatch path forwards (format, type) straight to native
-	// glTexImage2D via persistent_texture_image_2d for the NULL-source case
-	// (the FBO-attachment pattern Three.js's DepthTexture uses).
-	bool is_rgba_unorm = (internal_format == GL_RGBA &&
-	                      format == GL_RGBA && type == GL_UNSIGNED_BYTE);
+	// enable. P2 (HDR/PMREM) further widens to FLOAT + HALF_FLOAT_OES via
+	// OES_texture_float / OES_texture_half_float (the path Three.js's
+	// PMREMGenerator + RGBELoader use). Tegra GLES handles these natively;
+	// the dispatch path forwards (format, type) straight to native glTexImage2D
+	// via persistent_texture_image_2d.
+	// Three.js's WebGL 2 path uses SIZED internal formats for color
+	// textures (RGBA8 / SRGB8_ALPHA8 / RGB8), with the on-wire format
+	// + type still being RGBA/RGB + UNSIGNED_BYTE. Accept all of these
+	// — the sized variants ride the same byte-length math as the unsized
+	// equivalents and forward to native GLES via persistent_texture_image_2d.
+	bool is_rgba_unorm =
+	    ((internal_format == GL_RGBA || internal_format == 0x8058 /*RGBA8*/ ||
+	      internal_format == 0x8C43 /*SRGB8_ALPHA8*/) &&
+	     format == GL_RGBA && type == GL_UNSIGNED_BYTE);
+	bool is_rgb_unorm =
+	    ((internal_format == GL_RGB || internal_format == 0x8051 /*RGB8*/ ||
+	      internal_format == 0x8C41 /*SRGB8*/) &&
+	     format == GL_RGB && type == GL_UNSIGNED_BYTE);
+	// P2 HDR float texture combos. Three.js typically passes:
+	//   - texture.type = HalfFloatType (gl.HALF_FLOAT_OES = 0x8D61) for
+	//     PMREMGenerator render targets and RGBELoader output
+	//   - texture.type = FloatType (gl.FLOAT = 0x1406) for high-precision
+	//     env maps
+	// Both RGB and RGBA channel layouts can show up; sized internal formats
+	// (RGBA16F = 0x881A, RGBA32F = 0x8814, RGB16F = 0x881B, RGB32F = 0x8815)
+	// may also show up when Three.js detects WebGL 2 capabilities, though
+	// in WebGL 1 mode unsized is more common.
+	bool is_float_rgba = ((internal_format == GL_RGBA ||
+	                       internal_format == GL_RGBA16F ||
+	                       internal_format == GL_RGBA32F) &&
+	                      format == GL_RGBA &&
+	                      (type == GL_FLOAT || type == GL_HALF_FLOAT_OES));
+	bool is_float_rgb = ((internal_format == GL_RGB ||
+	                      internal_format == GL_RGB16F ||
+	                      internal_format == GL_RGB32F) &&
+	                     format == GL_RGB &&
+	                     (type == GL_FLOAT || type == GL_HALF_FLOAT_OES));
 	// Accept both unsized (GL_DEPTH_COMPONENT) and sized
 	// (GL_DEPTH_COMPONENT16/24/32F) internalformats with format =
 	// GL_DEPTH_COMPONENT. Three.js's WebGLTextures always passes the
@@ -2739,11 +3243,14 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	bool is_depth_stencil = (is_depth_stencil_internal &&
 	                         format == GL_DEPTH_STENCIL &&
 	                         type == GL_UNSIGNED_INT_24_8_WEBGL);
-	if (!is_rgba_unorm && !is_depth && !is_depth_stencil) {
+	if (!is_rgba_unorm && !is_rgb_unorm && !is_float_rgba && !is_float_rgb &&
+	    !is_depth && !is_depth_stencil) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
 	if (level != 0 || width <= 0 || height <= 0 || border != 0) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
@@ -2751,37 +3258,102 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	JSValue *binding = texture_binding_for_target(context, target);
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
 	if (!texture || texture->deleted) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 	uint32_t texture_target = texture_object_target_for_image_target(target);
 	if (texture->target != texture_target) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 
 	size_t byte_length = 0;
 	uint8_t *source = NULL;
-	bool null_source = JS_IsNull(argv[8]) || JS_IsUndefined(argv[8]);
-	if (!null_source)
-		source = NX_GetBufferSource(ctx, &byte_length, argv[8]);
-	size_t expected = (size_t)width * (size_t)height * 4;
+	bool null_source;
+	if (from_image) {
+		// Image-source path: pixels come from the helper-allocated RGBA
+		// buffer rather than a JS ArrayBuffer view. Skip the
+		// NX_GetBufferSource call (which would see a non-buffer and
+		// return NULL, mis-classifying the upload as null-source).
+		null_source = false;
+		source = image_buffer;
+		byte_length = (size_t)width * (size_t)height * 4;
+	} else {
+		null_source = JS_IsNull(src_arg) || JS_IsUndefined(src_arg);
+		if (!null_source)
+			source = NX_GetBufferSource(ctx, &byte_length, src_arg);
+	}
+	// Bytes per channel × channels for the (format, type) tuple.
+	size_t bytes_per_channel = 1;
+	if (type == GL_FLOAT) bytes_per_channel = 4;
+	else if (type == GL_HALF_FLOAT_OES) bytes_per_channel = 2;
+	else if (type == GL_UNSIGNED_SHORT) bytes_per_channel = 2;
+	else if (type == GL_UNSIGNED_INT) bytes_per_channel = 4;
+	else if (type == GL_UNSIGNED_INT_24_8_WEBGL) bytes_per_channel = 4;
+	size_t channels = 4;
+	if (format == GL_RGB) channels = 3;
+	else if (format == GL_DEPTH_COMPONENT) channels = 1;
+	else if (format == GL_DEPTH_STENCIL) channels = 1; // packed in 4 bytes via UI_24_8
+	size_t expected = (size_t)width * (size_t)height * bytes_per_channel * channels;
 	// Depth and depth-stencil textures may only be allocated with NULL data
 	// per the WEBGL_depth_texture spec (no client-side pixel upload). Reject
 	// non-null with INVALID_OPERATION to match the Khronos conformance
 	// behavior; Three.js's DepthTexture path always passes NULL anyway.
 	if (!null_source && (is_depth || is_depth_stencil)) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 	if (!null_source && (!source || byte_length < expected)) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
 
 	if (texture_target == GL_TEXTURE_CUBE_MAP) {
+		// Per-face upload to a persistent cube-map handle. Pre-2026-05-24
+		// this branch silently dropped the pixels (free + return), so
+		// CubeTextureLoader produced black faces. Milestone #25
+		// ([[swb-threejs-webgl-materials-cubemap]]) wires the upload
+		// through `nx_webgl_egl_persistent_cube_texture_image_2d`.
+		//
+		// Allocate the GLES handle on first face. The JS-side
+		// `bindTexture(CUBE_MAP, tex)` that preceded this call short-
+		// circuited the native bind (gles_handle was 0), so re-issue the
+		// activeTexture+bindTexture forward here so the passthrough draw
+		// path sees the cube bound on the right unit.
+		if (texture->gles_handle == 0) {
+			texture->gles_handle = nx_webgl_egl_create_persistent_texture(
+				context->egl, context->canvas);
+			if (texture->gles_handle == 0) {
+				if (from_image) js_free(ctx, image_buffer);
+				context->error = GL_OUT_OF_MEMORY;
+				return JS_UNDEFINED;
+			}
+			nx_webgl_egl_forward_active_texture(context->egl,
+			                                     context->active_texture);
+			nx_webgl_egl_forward_bind_texture(context->egl,
+			                                   GL_TEXTURE_CUBE_MAP,
+			                                   texture->gles_handle);
+		}
+		bool ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+			context->egl, texture->gles_handle, target /* face target */,
+			width, height, internal_format, format, type,
+			null_source ? NULL : source,
+			texture->min_filter, texture->mag_filter,
+			texture->wrap_s, texture->wrap_t);
+		if (from_image) js_free(ctx, image_buffer);
+		if (!ok) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
 		texture->width = width;
 		texture->height = height;
+		texture->internal_format = internal_format;
+		texture->format = format;
+		texture->type = type;
 		texture->revision++;
 		if (texture->revision == 0)
 			texture->revision = 1;
@@ -2826,9 +3398,19 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	}
 
 	uint8_t *copy = js_malloc(ctx, expected);
-	if (!copy)
+	if (!copy) {
+		if (from_image) js_free(ctx, image_buffer);
 		return JS_EXCEPTION;
+	}
 	memcpy(copy, source, expected);
+	// `source` either pointed into a JS ArrayBuffer (no free needed — the
+	// view keeps the buffer alive) OR was our helper-allocated image
+	// buffer (free now that memcpy has consumed it).
+	if (from_image) {
+		js_free(ctx, image_buffer);
+		image_buffer = NULL;
+		source = NULL;
+	}
 
 	int *alpha_min_x = js_malloc(ctx, sizeof(int) * (size_t)height);
 	int *alpha_max_x = js_malloc(ctx, sizeof(int) * (size_t)height);
@@ -2848,6 +3430,11 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	texture->width = width;
 	texture->height = height;
 	texture->target = target;
+	// Remember the format/type so a later lazy-promote uploads the texture
+	// to GLES with the right format (RGBELoader output is HALF_FLOAT_OES).
+	texture->internal_format = internal_format;
+	texture->format = format;
+	texture->type = type;
 	update_texture_alpha_rows(texture, 0, height);
 	texture->revision++;
 	if (texture->revision == 0)
@@ -2877,45 +3464,161 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	int32_t level;
 	int32_t xoffset;
 	int32_t yoffset;
-	int32_t width;
-	int32_t height;
+	int32_t width = 0;
+	int32_t height = 0;
 	uint32_t format;
 	uint32_t type;
+	// Two call signatures per WebGL spec:
+	//   - Image-source form (argc == 7):
+	//       texSubImage2D(target, level, xoffset, yoffset, format, type, source)
+	//   - Buffer form (argc == 9):
+	//       texSubImage2D(target, level, xoffset, yoffset, width, height,
+	//                     format, type, pixels)
+	bool short_form = (argc <= 7);
+	JSValueConst src_arg;
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &level, argv[1]) ||
 		JS_ToInt32(ctx, &xoffset, argv[2]) ||
-		JS_ToInt32(ctx, &yoffset, argv[3]) ||
-		JS_ToInt32(ctx, &width, argv[4]) || JS_ToInt32(ctx, &height, argv[5]) ||
-		JS_ToUint32(ctx, &format, argv[6]) || JS_ToUint32(ctx, &type, argv[7]))
+		JS_ToInt32(ctx, &yoffset, argv[3]))
 		return JS_EXCEPTION;
+	if (short_form) {
+		if (JS_ToUint32(ctx, &format, argv[4]) ||
+			JS_ToUint32(ctx, &type, argv[5]))
+			return JS_EXCEPTION;
+		src_arg = argv[6];
+	} else {
+		if (JS_ToInt32(ctx, &width, argv[4]) ||
+			JS_ToInt32(ctx, &height, argv[5]) ||
+			JS_ToUint32(ctx, &format, argv[6]) ||
+			JS_ToUint32(ctx, &type, argv[7]))
+			return JS_EXCEPTION;
+		src_arg = argv[8];
+	}
 
-	if (target != GL_TEXTURE_2D || format != GL_RGBA ||
-		type != GL_UNSIGNED_BYTE) {
+	if (target != GL_TEXTURE_2D) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+
+	// Try Image-source extract; override width/height with image dims.
+	uint8_t *image_buffer = NULL;
+	int32_t image_w = 0, image_h = 0;
+	bool from_image = nx_webgl_extract_image_source(
+		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+	if (from_image) {
+		width = image_w;
+		height = image_h;
+		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+			js_free(ctx, image_buffer);
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	}
+	// Accept-list for (format, type) tuples — must mirror what
+	// `texImage2D` / `texStorage2D` allocated. Three.js's WebGL 2 bone-
+	// texture upload uses RGBA + FLOAT against RGBA32F immutable storage;
+	// color/normal-map uploads use RGBA + UNSIGNED_BYTE against
+	// SRGB8_ALPHA8 / RGBA8 immutable storage.
+	bool format_ok =
+	    (format == GL_RGBA && (type == GL_UNSIGNED_BYTE ||
+	                           type == GL_FLOAT ||
+	                           type == GL_HALF_FLOAT_OES ||
+	                           type == 0x140B /* HALF_FLOAT */)) ||
+	    (format == GL_RGB && (type == GL_UNSIGNED_BYTE ||
+	                          type == GL_FLOAT ||
+	                          type == GL_HALF_FLOAT_OES ||
+	                          type == 0x140B));
+	if (!format_ok) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
 	if (level != 0 || xoffset < 0 || yoffset < 0 || width < 0 || height < 0) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (width == 0 || height == 0) {
+		if (from_image) js_free(ctx, image_buffer);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_texture_t *texture =
 		nx_get_webgl_texture(context->texture_2d_binding);
-	if (!texture || texture->deleted || !texture->data) {
+	if (!texture || texture->deleted) {
+		if (from_image) js_free(ctx, image_buffer);
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+
+	// Native-only path: the texture was allocated via `texStorage2D` (or
+	// is otherwise promoted to a persistent GLES handle with no CPU-side
+	// `data` mirror). Forward the sub-image upload straight to native GL.
+	// Three.js's WebGL 2 textures all take this path because Three.js
+	// always uses immutable storage on WebGL 2.
+	if (!texture->data && texture->gles_handle) {
+		size_t bytes_per_pixel = 4; // RGBA UBYTE default
+		size_t channels = (format == GL_RGB) ? 3 : 4;
+		size_t bytes_per_channel = 1;
+		if (type == GL_FLOAT) bytes_per_channel = 4;
+		else if (type == GL_HALF_FLOAT_OES || type == 0x140B) bytes_per_channel = 2;
+		bytes_per_pixel = channels * bytes_per_channel;
+		size_t expected = (size_t)width * (size_t)height * bytes_per_pixel;
+		size_t byte_length = 0;
+		uint8_t *source;
+		if (from_image) {
+			source = image_buffer;
+			byte_length = expected;
+		} else {
+			source = NX_GetBufferSource(ctx, &byte_length, src_arg);
+		}
+		if (!source || byte_length < expected) {
+			if (from_image) js_free(ctx, image_buffer);
+			context->error = GL_INVALID_VALUE;
+			return JS_UNDEFINED;
+		}
+		if (!nx_webgl_egl_persistent_texture_sub_image_2d(
+		        context->egl, texture->gles_handle, level, xoffset, yoffset,
+		        width, height, format, type, source)) {
+			context->error = GL_INVALID_OPERATION;
+		}
+		if (from_image) js_free(ctx, image_buffer);
+		texture->revision++;
+		if (texture->revision == 0) texture->revision = 1;
+		return JS_UNDEFINED;
+	}
+
+	// Legacy CPU-mirror path — for textures created via texImage2D that
+	// still have a `data` buffer (bridge-mode dispatch reads from it). Only
+	// RGBA UBYTE is supported; other formats here would need a parallel
+	// CPU codec which nx.js doesn't have.
+	if (!texture->data) {
+		if (from_image) js_free(ctx, image_buffer);
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 	if (xoffset + width > (int32_t)texture->width ||
 		yoffset + height > (int32_t)texture->height) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
-	if (width == 0 || height == 0)
-		return JS_UNDEFINED;
 
 	size_t byte_length = 0;
-	uint8_t *source = NX_GetBufferSource(ctx, &byte_length, argv[8]);
+	uint8_t *source;
 	size_t expected = (size_t)width * (size_t)height * 4;
+	if (from_image) {
+		source = image_buffer;
+		byte_length = expected;
+	} else {
+		source = NX_GetBufferSource(ctx, &byte_length, src_arg);
+	}
 	if (!source || byte_length < expected) {
+		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_VALUE;
 		return JS_UNDEFINED;
 	}
@@ -2929,6 +3632,15 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 			   (size_t)width * 4);
 	}
 	update_texture_alpha_rows(texture, yoffset, height);
+	// Mirror the upload to the persistent native handle too if it exists
+	// (FBO color attachments that double as sample sources after a render
+	// pass — see [[bridge-fbo-support]]'s mirror-on-update behavior).
+	if (texture->gles_handle) {
+		nx_webgl_egl_persistent_texture_sub_image_2d(
+		    context->egl, texture->gles_handle, level, xoffset, yoffset,
+		    width, height, format, type, source);
+	}
+	if (from_image) js_free(ctx, image_buffer);
 	texture->revision++;
 	if (texture->revision == 0)
 		texture->revision = 1;
@@ -2955,7 +3667,10 @@ static JSValue nx_webgl_pixel_storei(JSContext *ctx, JSValueConst this_val,
 		}
 		return JS_UNDEFINED;
 	case GL_UNPACK_FLIP_Y_WEBGL:
+		context->unpack_flip_y = (param != 0);
+		return JS_UNDEFINED;
 	case GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL:
+		context->unpack_premultiply_alpha = (param != 0);
 		return JS_UNDEFINED;
 	case GL_UNPACK_COLORSPACE_CONVERSION_WEBGL:
 		if ((uint32_t)param != GL_NONE &&
@@ -2964,11 +3679,45 @@ static JSValue nx_webgl_pixel_storei(JSContext *ctx, JSValueConst this_val,
 			return JS_UNDEFINED;
 		}
 		return JS_UNDEFINED;
-	default:
-		context->error = GL_INVALID_ENUM;
-		return JS_UNDEFINED;
+	// WebGL 2 pixel-storage pnames. Three.js's WebGLTextures path sets
+	// these on WebGL 2 contexts during texture uploads from arbitrary
+	// stride sources. nx.js doesn't honor them at the bridge layer (we
+	// upload full rectangular regions), but accepting + recording them
+	// avoids INVALID_ENUM during Three.js's per-frame texture state sync.
+	case 0x0CF2: // UNPACK_ROW_LENGTH
+		if (context->is_webgl2) { context->unpack_row_length = param; return JS_UNDEFINED; }
+		break;
+	case 0x0CF3: // UNPACK_SKIP_ROWS
+		if (context->is_webgl2) { context->unpack_skip_rows = param; return JS_UNDEFINED; }
+		break;
+	case 0x0CF4: // UNPACK_SKIP_PIXELS
+		if (context->is_webgl2) { context->unpack_skip_pixels = param; return JS_UNDEFINED; }
+		break;
+	case 0x806E: // UNPACK_IMAGE_HEIGHT
+		if (context->is_webgl2) { context->unpack_image_height = param; return JS_UNDEFINED; }
+		break;
+	case 0x806D: // UNPACK_SKIP_IMAGES
+		if (context->is_webgl2) { context->unpack_skip_images = param; return JS_UNDEFINED; }
+		break;
+	case 0x0D02: // PACK_ROW_LENGTH
+		if (context->is_webgl2) { context->pack_row_length = param; return JS_UNDEFINED; }
+		break;
+	case 0x0D03: // PACK_SKIP_ROWS
+		if (context->is_webgl2) { context->pack_skip_rows = param; return JS_UNDEFINED; }
+		break;
+	case 0x0D04: // PACK_SKIP_PIXELS
+		if (context->is_webgl2) { context->pack_skip_pixels = param; return JS_UNDEFINED; }
+		break;
 	}
+	context->error = GL_INVALID_ENUM;
+	return JS_UNDEFINED;
 }
+
+// Forward decl — definition lives near `try_draw_passthrough`. Shared by
+// generateMipmap (milestone #24) and the passthrough lazy-promote
+// (milestone #22).
+static bool ensure_texture_promoted(nx_webgl_context_t *context,
+                                     nx_webgl_texture_t *texture);
 
 static JSValue nx_webgl_generate_mipmap(JSContext *ctx, JSValueConst this_val,
 										int argc, JSValueConst *argv) {
@@ -2981,6 +3730,50 @@ static JSValue nx_webgl_generate_mipmap(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 	if (!is_texture_binding_target(target)) {
 		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	// Pre-2026-05-22 this was a complete no-op (validate target, return).
+	// Real impl added for milestone #24 ([[swb-threejs-webgl-materials-texture-filters]]):
+	// promote the bound texture to a persistent native handle if not
+	// already promoted, then call native glGenerateMipmap to fill levels
+	// 1..N. Required for proper minification on textures that use
+	// mipmap-aware min_filter (Three.js's TextureLoader default is
+	// LinearMipmapLinear). Cube-map support added 2026-05-24 for
+	// milestone #25 ([[swb-threejs-webgl-materials-cubemap]]) — cube
+	// textures are pre-promoted in `texImage2D` so the cube branch only
+	// needs to verify the handle exists.
+	JSValue *binding = texture_binding_for_target(context, target);
+	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
+	if (!texture || texture->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (target == GL_TEXTURE_2D) {
+		if (!ensure_texture_promoted(context, texture)) {
+			// Texture has no CPU data and no existing native handle —
+			// generateMipmap on an undefined texture is INVALID_OPERATION.
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		nx_webgl_egl_generate_mipmap(context->egl, texture->gles_handle,
+		                              target);
+	} else if (target == GL_TEXTURE_CUBE_MAP) {
+		// Cube-map textures are promoted in `texImage2D` directly. The
+		// EGL cube upload helper ALSO emits the full software mipmap
+		// chain inline (Mesa Nouveau's glGenerateMipmap on cube targets
+		// silently no-ops — see [[swb-threejs-webgl-materials-cubemap]]),
+		// so by the time the JS-side generateMipmap call lands, every
+		// level is already populated. The native glGenerateMipmap call
+		// is skipped here to avoid the driver clobbering our manually-
+		// emitted chain on any future driver that decides to actually
+		// honor the call.
+		if (texture->gles_handle == 0) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	} else {
+		// 3D / 2D_ARRAY mipmap generation deferred until a demo needs it.
+		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -3304,6 +4097,24 @@ static JSValue nx_webgl_uniform3f(JSContext *ctx, JSValueConst this_val,
 		program->emissive[1] = (float)clamp01(values[1]);
 		program->emissive[2] = (float)clamp01(values[2]);
 		program->has_emissive = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_DIRECTION) {
+		// Direction is a signed unit vector — no clamp.
+		program->hemi_light_direction[0] = values[0];
+		program->hemi_light_direction[1] = values[1];
+		program->hemi_light_direction[2] = values[2];
+		program->has_hemi_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR) {
+		// Three.js bakes `intensity * scaleFactor` into the uploaded color,
+		// so values can exceed 1.0 — don't clamp.
+		program->hemi_light_sky_color[0] = values[0];
+		program->hemi_light_sky_color[1] = values[1];
+		program->hemi_light_sky_color[2] = values[2];
+		program->has_hemi_light_sky_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR) {
+		program->hemi_light_ground_color[0] = values[0];
+		program->hemi_light_ground_color[1] = values[1];
+		program->hemi_light_ground_color[2] = values[2];
+		program->has_hemi_light_ground_color = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -3393,6 +4204,15 @@ static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 		program->emissive[1] = (float)clamp01(source[1]);
 		program->emissive[2] = (float)clamp01(source[2]);
 		program->has_emissive = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_DIRECTION) {
+		memcpy(program->hemi_light_direction, source, sizeof(float) * 3);
+		program->has_hemi_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR) {
+		memcpy(program->hemi_light_sky_color, source, sizeof(float) * 3);
+		program->has_hemi_light_sky_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR) {
+		memcpy(program->hemi_light_ground_color, source, sizeof(float) * 3);
+		program->has_hemi_light_ground_color = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -4757,7 +5577,8 @@ static bool draw_sprite_bridge(JSContext *ctx, nx_webgl_context_t *context,
 			false, 0u,  // cull face DISABLED for sprites — sprite quads are always camera-facing, no winding concerns
 			program->has_color ? program->color : NULL,
 			false, NULL, 0.f, NULL,
-			false);  // specular + emissive + derivative-normals DISABLED for sprites
+			false,
+			false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for sprites
 	}
 	return drew;
 }
@@ -4789,13 +5610,17 @@ static bool draw_indexed_textured_triangles_bridge(
 						   program->has_light_color;
 	bool has_point_light = program->has_point_light_position &&
 						   program->has_point_light_color;
+	bool has_hemi_light = program->has_hemi_light_direction &&
+						  program->has_hemi_light_sky_color &&
+						  program->has_hemi_light_ground_color;
 	// Lighting wants per-fragment normals; sourced from either the
 	// per-vertex `a_normal` buffer OR (milestone #16) the bridge fragment
 	// shader's view-position derivatives via OES_standard_derivatives.
 	// The derivative path activates when lighting uniforms are bound but
 	// the program has no `normal` attribute (Three.js's `flatShading: true`
 	// optimizer drops it — [[bridge-flatshading-gap]]).
-	bool has_lighting_uniforms = has_directional || has_point_light;
+	bool has_lighting_uniforms = has_directional || has_point_light ||
+								 has_hemi_light;
 	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyzuv =
@@ -4974,7 +5799,11 @@ static bool draw_indexed_textured_triangles_bridge(
 			program->has_specular ? program->specular : NULL,
 			program->has_shininess ? program->shininess : 30.f,
 			program->has_emissive ? program->emissive : NULL,
-			use_derivative_normals);
+			use_derivative_normals,
+			has_hemi_light,
+			has_hemi_light ? program->hemi_light_direction : NULL,
+			has_hemi_light ? program->hemi_light_sky_color : NULL,
+			has_hemi_light ? program->hemi_light_ground_color : NULL);
 	}
 	js_free(ctx, clip_xyzuv);
 	js_free(ctx, fog_depth_data);
@@ -5021,9 +5850,13 @@ static bool draw_indexed_triangles_bridge(
 						   program->has_light_color;
 	bool has_point_light = program->has_point_light_position &&
 						   program->has_point_light_color;
+	bool has_hemi_light = program->has_hemi_light_direction &&
+						  program->has_hemi_light_sky_color &&
+						  program->has_hemi_light_ground_color;
 	// See draw_indexed_textured_triangles_bridge for the derivative-normals
 	// gating rationale (milestone #16).
-	bool has_lighting_uniforms = has_directional || has_point_light;
+	bool has_lighting_uniforms = has_directional || has_point_light ||
+								 has_hemi_light;
 	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyz =
@@ -5194,7 +6027,11 @@ static bool draw_indexed_triangles_bridge(
 			program->has_specular ? program->specular : NULL,
 			program->has_shininess ? program->shininess : 30.f,
 			program->has_emissive ? program->emissive : NULL,
-			use_derivative_normals);
+			use_derivative_normals,
+			has_hemi_light,
+			has_hemi_light ? program->hemi_light_direction : NULL,
+			has_hemi_light ? program->hemi_light_sky_color : NULL,
+			has_hemi_light ? program->hemi_light_ground_color : NULL);
 	}
 	js_free(ctx, clip_xyz);
 	js_free(ctx, vertex_color_data);
@@ -6213,7 +7050,8 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 					NULL, false,  // map_transform — points don't use it
 					false, 0u,    // cull face — N/A for screen-aligned points
 					program->has_color ? program->color : NULL,
-					false, NULL, 0.f, NULL, false);  // specular + emissive + derivative-normals DISABLED for points
+					false, NULL, 0.f, NULL, false,
+					false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for points
 			} else {
 				drew = nx_webgl_egl_draw_triangles_bridge(
 					context->egl, canvas, clip_xyz,
@@ -6233,7 +7071,8 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 					program->has_fog_density, program->fog_density,
 					(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
 					context->cull_face,
-					false, NULL, 0.f, NULL, false);  // specular + emissive + derivative-normals DISABLED for points
+					false, NULL, 0.f, NULL, false,
+					false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for points
 			}
 			js_free(ctx, clip_xyz);
 			js_free(ctx, clip_xyzuv);
@@ -6288,6 +7127,69 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 // directly. Returns true if the draw was dispatched (success or GL error
 // inside the passthrough path); false to fall through to bridge-mode
 // dispatch. See [[bridge-raw-shader-passthrough]].
+// Promote a single CPU-data texture to a persistent GLES handle. Returns
+// true if the texture has a usable handle on exit (either was already
+// promoted, or got promoted now), false on OOM / missing data / failed
+// upload. Idempotent.
+//
+// Regular DataTextures (`texImage2D` with non-NULL data) only land in
+// `texture->data` (the bridge cache); their `gles_handle` stays 0 until
+// either FBO use or this helper fires. Two callers need promotion:
+//
+//   1. `ensure_passthrough_texture_promoted` (milestone #22 — passthrough
+//      sampling) — fires from `try_draw_passthrough`. Without it, the
+//      shader samples whatever happens to be natively bound (nothing →
+//      black).
+//   2. `nx_webgl_generate_mipmap` (milestone #24) — `glGenerateMipmap`
+//      requires a real native texture to generate levels 1..N into.
+//
+// Format assumed RGBA UByte — the only CPU-data path texImage2D supports
+// today. Depth/depth-stencil textures go through the NULL-source path
+// which already allocates a persistent handle.
+static bool ensure_texture_promoted(nx_webgl_context_t *context,
+                                     nx_webgl_texture_t *texture) {
+	if (!texture || texture->deleted) return false;
+	if (texture->gles_handle != 0) return true;  // already promoted
+	if (!texture->data || texture->width == 0 || texture->height == 0) return false;
+	uint32_t handle = nx_webgl_egl_create_persistent_texture(
+		context->egl, context->canvas);
+	if (!handle) return false;  // OOM
+	// Use the texture's recorded format/type if texImage2D filled them in;
+	// otherwise default to the classic RGBA/UBYTE for back-compat with
+	// callers that never set them (e.g. bridge-internal allocations).
+	uint32_t ifmt = texture->internal_format ? texture->internal_format : GL_RGBA;
+	uint32_t fmt = texture->format ? texture->format : GL_RGBA;
+	uint32_t ty = texture->type ? texture->type : GL_UNSIGNED_BYTE;
+	if (!nx_webgl_egl_persistent_texture_image_2d(
+			context->egl, handle, (int)texture->width, (int)texture->height,
+			ifmt, fmt, ty, texture->data,
+			texture->min_filter, texture->mag_filter,
+			texture->wrap_s, texture->wrap_t)) {
+		nx_webgl_egl_delete_persistent_texture(context->egl, handle);
+		return false;
+	}
+	texture->gles_handle = handle;
+	return true;
+}
+
+// Passthrough-specific wrapper: promote the bound 2D texture + re-issue
+// the activeTexture+bindTexture to native (the original bindTexture call
+// short-circuited because gles_handle was 0). See [[bridge-raw-shader-passthrough]]
+// for the broader rationale and the lazy-promote architecture.
+//
+// Operates on `context->texture_2d_binding` only — nx.js currently tracks
+// a single 2D-texture binding (not per-unit), so multi-texture-unit
+// passthrough sampling needs per-unit binding state which is deferred.
+static void ensure_passthrough_texture_promoted(nx_webgl_context_t *context) {
+	nx_webgl_texture_t *texture =
+		nx_get_webgl_texture(context->texture_2d_binding);
+	if (!ensure_texture_promoted(context, texture)) return;
+	// Re-issue the binding so native sees the handle.
+	nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
+	nx_webgl_egl_forward_bind_texture(context->egl, GL_TEXTURE_2D,
+	                                   texture->gles_handle);
+}
+
 static bool try_draw_passthrough(nx_webgl_context_t *context,
 								  nx_webgl_program_t *program,
 								  uint32_t mode, bool indexed,
@@ -6313,6 +7215,11 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 	// any enabled attrib (Three.js's instancing pattern).
 	if (!program->raw_passthrough && instance_count <= 0 && !any_divisor)
 		return false;
+
+	// We're committed to native dispatch. Promote any CPU-data 2D texture
+	// to a persistent GLES handle so passthrough sampling actually reaches
+	// the right texels.
+	ensure_passthrough_texture_promoted(context);
 
 	nx_webgl_egl_passthrough_attrib_t attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
 	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
@@ -6512,9 +7419,13 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 							   program->has_light_color;
 		bool has_point_light = program->has_point_light_position &&
 							   program->has_point_light_color;
+		bool has_hemi_light = program->has_hemi_light_direction &&
+							  program->has_hemi_light_sky_color &&
+							  program->has_hemi_light_ground_color;
 		// See draw_indexed_textured_triangles_bridge for derivative-normals
 		// (milestone #16) gating rationale.
-		bool has_lighting_uniforms = has_directional || has_point_light;
+		bool has_lighting_uniforms = has_directional || has_point_light ||
+									 has_hemi_light;
 		bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 		bool lighting_enabled = has_lighting_uniforms;
 
@@ -6649,7 +7560,11 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			program->has_specular ? program->specular : NULL,
 			program->has_shininess ? program->shininess : 30.f,
 			program->has_emissive ? program->emissive : NULL,
-			use_derivative_normals);
+			use_derivative_normals,
+			has_hemi_light,
+			has_hemi_light ? program->hemi_light_direction : NULL,
+			has_hemi_light ? program->hemi_light_sky_color : NULL,
+			has_hemi_light ? program->hemi_light_ground_color : NULL);
 			js_free(ctx, clip_xyz);
 			js_free(ctx, vertex_color_data);
 			js_free(ctx, fog_depth_data);
@@ -7400,7 +8315,9 @@ static JSValue nx_webgl_create_framebuffer(JSContext *ctx,
 		js_free(ctx, fb);
 		return obj;
 	}
-	fb->color_attachment = JS_UNDEFINED;
+	for (int i = 0; i < NX_WEBGL_MAX_COLOR_ATTACHMENTS; i++) {
+		fb->color_attachments[i] = JS_UNDEFINED;
+	}
 	fb->depth_attachment = JS_UNDEFINED;
 	fb->stencil_attachment = JS_UNDEFINED;
 	fb->handle = nx_webgl_egl_create_native_framebuffer(context->egl,
@@ -7460,7 +8377,14 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 	uint32_t target;
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
-	if (target != GL_FRAMEBUFFER) {
+	// WebGL 2 introduces DRAW_FRAMEBUFFER (0x8CA9) and READ_FRAMEBUFFER
+	// (0x8CA8) — Three.js's WebGL 2 path uses them in
+	// `WebGLState.bindFramebuffer` (binds both aliases) and the multisampled
+	// RT blit path. We don't model separate draw/read bindings — the bridge
+	// has one FBO + the user FBO slot — but we accept all three targets and
+	// the underlying state still works because Three.js follows up the
+	// DRAW/READ binds with a `gl.FRAMEBUFFER` rebind anyway.
+	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -7492,7 +8416,7 @@ static JSValue nx_webgl_check_framebuffer_status(JSContext *ctx,
 	uint32_t target;
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
-	if (target != GL_FRAMEBUFFER) {
+	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
 		context->error = GL_INVALID_ENUM;
 		return JS_NewUint32(ctx, 0);
 	}
@@ -7521,7 +8445,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	    JS_ToUint32(ctx, &textarget, argv[2]) ||
 	    JS_ToInt32(ctx, &level, argv[4]))
 		return JS_EXCEPTION;
-	if (target != GL_FRAMEBUFFER) {
+	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -7542,8 +8466,12 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 
 	uint32_t tex_handle = 0;
 	JSValue *slot = NULL;
-	if (attachment == GL_COLOR_ATTACHMENT0)
-		slot = &fb->color_attachment;
+	int color_attachment_index = -1;
+	if (attachment >= GL_COLOR_ATTACHMENT0 &&
+	    attachment < GL_COLOR_ATTACHMENT0 + NX_WEBGL_MAX_COLOR_ATTACHMENTS) {
+		color_attachment_index = (int)(attachment - GL_COLOR_ATTACHMENT0);
+		slot = &fb->color_attachments[color_attachment_index];
+	}
 	else if (attachment == GL_DEPTH_ATTACHMENT)
 		slot = &fb->depth_attachment;
 	else if (attachment == GL_STENCIL_ATTACHMENT)
@@ -7598,9 +8526,10 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 			*slot = JS_DupValue(ctx, argv[3]);
 		}
 		// Update the FBO's dims from the color attachment's dims. Three.js
-		// asks for matching color/depth dims, so updating from color is
+		// asks for matching color/depth dims (and MRT attachments must
+		// share dims per spec), so updating from any color attachment is
 		// sufficient for the bridge's viewport scaling.
-		if (attachment == GL_COLOR_ATTACHMENT0) {
+		if (color_attachment_index >= 0) {
 			fb->width = (int)texture->width;
 			fb->height = (int)texture->height;
 			// If this FBO is currently bound, push the new dims to the
@@ -7631,7 +8560,8 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 	    JS_ToUint32(ctx, &attachment, argv[1]) ||
 	    JS_ToUint32(ctx, &rbtarget, argv[2]))
 		return JS_EXCEPTION;
-	if (target != GL_FRAMEBUFFER || rbtarget != GL_RENDERBUFFER) {
+	if ((target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) ||
+	    rbtarget != GL_RENDERBUFFER) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -7644,8 +8574,10 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 
 	uint32_t rb_handle = 0;
 	JSValue *slot = NULL;
-	if (attachment == GL_COLOR_ATTACHMENT0)
-		slot = &fb->color_attachment;
+	if (attachment >= GL_COLOR_ATTACHMENT0 &&
+	    attachment < GL_COLOR_ATTACHMENT0 + NX_WEBGL_MAX_COLOR_ATTACHMENTS) {
+		slot = &fb->color_attachments[attachment - GL_COLOR_ATTACHMENT0];
+	}
 	else if (attachment == GL_DEPTH_ATTACHMENT)
 		slot = &fb->depth_attachment;
 	else if (attachment == GL_STENCIL_ATTACHMENT)
@@ -7992,6 +8924,16 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &pname, argv[0]))
 		return JS_EXCEPTION;
 
+	// On a WebGL 2 context, ensure the EGL backend has finished its probe
+	// before any of the WebGL 2 pnames below dispatch to native glGet*
+	// helpers. The bridge dispatch paths normally trigger this lazily on
+	// first compile/draw, but a page can legitimately query (e.g.)
+	// MAX_SAMPLES at capability-detection time before issuing any other
+	// GL call, and the native helpers gate on `backend->available`.
+	if (context->is_webgl2) {
+		(void)nx_webgl_egl_ensure_initialized(context->egl, context->canvas);
+	}
+
 	uint32_t cap_flag = cap_to_flag(pname);
 	if (cap_flag != 0)
 		return JS_NewBool(ctx, (context->enabled_caps & cap_flag) != 0);
@@ -8062,9 +9004,13 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	case GL_RENDERER:
 		return JS_NewString(ctx, "nx.js framebuffer WebGL skeleton");
 	case GL_VERSION:
-		return JS_NewString(ctx, "WebGL 1.0 (nx.js experimental)");
+		return JS_NewString(ctx, context->is_webgl2
+								? "WebGL 2.0 (nx.js experimental)"
+								: "WebGL 1.0 (nx.js experimental)");
 	case GL_SHADING_LANGUAGE_VERSION:
-		return JS_NewString(ctx, "WebGL GLSL ES 1.0 (nx.js experimental)");
+		return JS_NewString(ctx, context->is_webgl2
+								? "WebGL GLSL ES 3.00 (nx.js experimental)"
+								: "WebGL GLSL ES 1.0 (nx.js experimental)");
 	case GL_CURRENT_PROGRAM:
 		if (JS_IsUndefined(context->current_program))
 			return JS_NULL;
@@ -8077,6 +9023,33 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		if (JS_IsUndefined(context->element_array_buffer_binding))
 			return JS_NULL;
 		return JS_DupValue(ctx, context->element_array_buffer_binding);
+	// WebGL 2 buffer-binding pnames. Each returns null when nothing's bound.
+	// Note: COPY_READ_BUFFER and COPY_READ_BUFFER_BINDING share the same
+	// enum value (0x8F36) per the GL spec, ditto COPY_WRITE.
+	case 0x8A28: /* UNIFORM_BUFFER_BINDING */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->uniform_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->uniform_buffer_binding);
+	case 0x8F36: /* COPY_READ_BUFFER_BINDING (== COPY_READ_BUFFER) */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->copy_read_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->copy_read_buffer_binding);
+	case 0x8F37: /* COPY_WRITE_BUFFER_BINDING (== COPY_WRITE_BUFFER) */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->copy_write_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->copy_write_buffer_binding);
+	case 0x88ED: /* PIXEL_PACK_BUFFER_BINDING */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->pixel_pack_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->pixel_pack_buffer_binding);
+	case 0x88EF: /* PIXEL_UNPACK_BUFFER_BINDING */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->pixel_unpack_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->pixel_unpack_buffer_binding);
+	case 0x8C8F: /* TRANSFORM_FEEDBACK_BUFFER_BINDING */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->transform_feedback_buffer_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->transform_feedback_buffer_binding);
 	case GL_TEXTURE_BINDING_2D:
 		if (JS_IsUndefined(context->texture_2d_binding))
 			return JS_NULL;
@@ -8085,6 +9058,14 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		if (JS_IsUndefined(context->texture_cube_binding))
 			return JS_NULL;
 		return JS_DupValue(ctx, context->texture_cube_binding);
+	case 0x806A: /* TEXTURE_BINDING_3D */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->texture_3d_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->texture_3d_binding);
+	case 0x8C1D: /* TEXTURE_BINDING_2D_ARRAY */
+		if (!context->is_webgl2) break;
+		if (JS_IsUndefined(context->texture_2d_array_binding)) return JS_NULL;
+		return JS_DupValue(ctx, context->texture_2d_array_binding);
 	case GL_FRAMEBUFFER_BINDING:
 	case GL_RENDERBUFFER_BINDING:
 		return JS_NULL;
@@ -8116,7 +9097,16 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
 		return JS_NewUint32(ctx, 8);
 	case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
-		return JS_NewUint32(ctx, 0);
+		// ES3 spec requires >= 16 vertex texture units. Tegra GLES supports
+		// vertex texture sampling natively. Setting this to 0 (the pre-pivot
+		// default) forces Three.js into the uniform-array path for bone
+		// matrices, which can exhaust MAX_VERTEX_UNIFORM_VECTORS for rigs
+		// with >40 bones (the Soldier model has 49 → bone uniforms alone
+		// consume 196 of 256 vec4s, leaving no room for other uniforms +
+		// link fails silently). Reporting 16 lets Three.js use the bone-
+		// texture path (FLOAT texture sampled in vertex shader), which is
+		// exactly what the P2 FLOAT-texture work enables.
+		return JS_NewUint32(ctx, 16);
 	case GL_MAX_VERTEX_UNIFORM_VECTORS:
 		return JS_NewUint32(ctx, 256);
 	case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
@@ -8127,10 +9117,131 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		return JS_NewUint32(ctx, context->hint_generate_mipmap);
 	case GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES:
 		return JS_NewUint32(ctx, context->hint_fragment_shader_derivative);
+	// ----- WebGL 2 pnames: forward to native GLES via the EGL helpers ----
+	// Gated on `is_webgl2` so a WebGL 1 caller asking for one of these
+	// still gets INVALID_ENUM per spec, while WebGL 2 callers get the
+	// real native value. The first time a WebGL 2 pname is queried we
+	// also drive the EGL probe through the rest of its steps — the
+	// bridge dispatch paths normally do this lazily on first compile/
+	// draw, but a page that asks `gl.getParameter(MAX_SAMPLES)` before
+	// any other GL call would otherwise hit a not-yet-initialized
+	// backend and get 0 from every native query.
+	case 0x8D57: // MAX_SAMPLES
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_samples(context->egl));
+		break;
+	case 0x8073: // MAX_3D_TEXTURE_SIZE
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_3d_texture_size(context->egl));
+		break;
+	case 0x88FF: // MAX_ARRAY_TEXTURE_LAYERS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_array_texture_layers(context->egl));
+		break;
+	case 0x8824: // MAX_DRAW_BUFFERS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_draw_buffers(context->egl));
+		break;
+	case 0x8CDF: // MAX_COLOR_ATTACHMENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_color_attachments(context->egl));
+		break;
+	case 0x8A2F: // MAX_UNIFORM_BUFFER_BINDINGS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_uniform_buffer_bindings(context->egl));
+		break;
+	case 0x8A34: // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_uniform_buffer_offset_alignment(context->egl));
+		break;
+	case 0x8A2B: // MAX_VERTEX_UNIFORM_BLOCKS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_vertex_uniform_blocks(context->egl));
+		break;
+	case 0x8A2D: // MAX_FRAGMENT_UNIFORM_BLOCKS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_fragment_uniform_blocks(context->egl));
+		break;
+	case 0x8A2E: // MAX_COMBINED_UNIFORM_BLOCKS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_combined_uniform_blocks(context->egl));
+		break;
+	case 0x8A30: // MAX_UNIFORM_BLOCK_SIZE — GLES 3.0 minimum is 16384.
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, 16384);
+		break;
+	case 0x8C80: // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_transform_feedback_separate_components(context->egl));
+		break;
+	case 0x8C7A: // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_transform_feedback_interleaved_components(context->egl));
+		break;
+	case 0x8C8B: // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_transform_feedback_separate_attribs(context->egl));
+		break;
+	case 0x8D6B: // MAX_ELEMENT_INDEX
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_element_index(context->egl));
+		break;
+	case 0x80E8: // MAX_ELEMENTS_VERTICES
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_elements_vertices(context->egl));
+		break;
+	case 0x80E9: // MAX_ELEMENTS_INDICES
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_elements_indices(context->egl));
+		break;
+	case 0x9111: // MAX_SERVER_WAIT_TIMEOUT
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_server_wait_timeout(context->egl));
+		break;
+	case 0x8905: // MAX_PROGRAM_TEXEL_OFFSET
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_program_texel_offset(context->egl));
+		break;
+	case 0x8904: // MIN_PROGRAM_TEXEL_OFFSET
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_min_program_texel_offset(context->egl));
+		break;
+	case 0x8B4B: // MAX_VARYING_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_varying_components(context->egl));
+		break;
+	case 0x8B4A: // MAX_VERTEX_UNIFORM_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_vertex_uniform_components(context->egl));
+		break;
+	case 0x8B49: // MAX_FRAGMENT_UNIFORM_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_fragment_uniform_components(context->egl));
+		break;
+	case 0x9122: // MAX_VERTEX_OUTPUT_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_vertex_output_components(context->egl));
+		break;
+	case 0x9125: // MAX_FRAGMENT_INPUT_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_fragment_input_components(context->egl));
+		break;
+	case 0x84FD: // MAX_TEXTURE_LOD_BIAS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_texture_lod_bias(context->egl));
+		break;
+	case 0x85B5: // VERTEX_ARRAY_BINDING
+		if (context->is_webgl2) {
+			if (JS_IsUndefined(context->vertex_array_binding))
+				return JS_NULL;
+			return JS_DupValue(ctx, context->vertex_array_binding);
+		}
+		break;
 	default:
-		context->error = GL_INVALID_ENUM;
-		return JS_NULL;
+		break;
 	}
+	context->error = GL_INVALID_ENUM;
+	return JS_NULL;
 }
 
 static JSValue nx_webgl_get_error(JSContext *ctx, JSValueConst this_val,
@@ -8355,6 +9466,2222 @@ static JSValue nx_webgl_set_gpu_bridge_resolution_prototype(
 	context->bridge_clear_pending = false;
 	return JS_NewBool(ctx, true);
 }
+
+// ============================================================================
+// WebGL 2 surface — JS wrappers
+// ============================================================================
+// All WebGL 2 entry points share the same nx_webgl_context_t opaque; the
+// JS-side `WebGL2RenderingContext` class extends `WebGLRenderingContext`,
+// inheriting every WebGL 1 method via the JS prototype chain. The methods
+// defined here land on the WebGL 2 prototype only.
+//
+// Native trampolines live in webgl_egl.[ch]; this layer is responsible for
+// JS↔C marshalling, validation, and bridge_pending_readback signaling for
+// draws that bypass `try_draw_passthrough`.
+
+static JSClassID nx_webgl_vao_class_id;
+static JSClassID nx_webgl_sampler_class_id;
+static JSClassID nx_webgl_query_class_id;
+static JSClassID nx_webgl_sync_class_id;
+static JSClassID nx_webgl_transform_feedback_class_id;
+
+typedef struct {
+	uint32_t handle;
+	bool deleted;
+	// Per-VAO snapshot of attribute pointers + element-buffer binding.
+	// In nx.js, gl.vertexAttribPointer / enableVertexAttribArray / bindBuffer
+	// don't push to native GL — they only update JS-side `context->vertex_attribs[]`
+	// + `context->element_array_buffer_binding`. The bridge re-applies these
+	// from JS state at draw time. With multi-mesh scenes that means the
+	// GLOBAL JS state reflects only the LAST-set-up mesh, so a re-render of
+	// an earlier mesh (Three.js's "bind VAO + skip re-pointer-call" pattern)
+	// gets the wrong attribute pointers. Per-VAO save+restore here makes the
+	// global state match the bound VAO again, so the bridge re-apply uses
+	// the right data. See [[swb-threejs-webgl-shaders-sky]] sky-stripe bug.
+	nx_webgl_vertex_attrib_t saved_attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
+	JSValue saved_element_array_buffer_binding;
+	bool has_saved_state;
+} nx_webgl_vao_t;
+typedef struct {
+	uint32_t handle;
+	bool deleted;
+} nx_webgl_sampler_t;
+typedef struct {
+	uint32_t handle;
+	bool deleted;
+	uint32_t target;  // 0 until first beginQuery
+} nx_webgl_query_t;
+typedef struct {
+	void *handle;     // GLsync pointer
+	bool deleted;
+} nx_webgl_sync_t;
+typedef struct {
+	uint32_t handle;
+	bool deleted;
+} nx_webgl_transform_feedback_t;
+
+static void finalizer_webgl_vao(JSRuntime *rt, JSValue val) {
+	nx_webgl_vao_t *o = JS_GetOpaque(val, nx_webgl_vao_class_id);
+	if (o) {
+		if (o->has_saved_state) {
+			for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+				JS_FreeValueRT(rt, o->saved_attribs[i].buffer);
+			}
+			JS_FreeValueRT(rt, o->saved_element_array_buffer_binding);
+		}
+		js_free_rt(rt, o);
+	}
+}
+static void finalizer_webgl_sampler(JSRuntime *rt, JSValue val) {
+	nx_webgl_sampler_t *o = JS_GetOpaque(val, nx_webgl_sampler_class_id);
+	if (o)
+		js_free_rt(rt, o);
+}
+static void finalizer_webgl_query(JSRuntime *rt, JSValue val) {
+	nx_webgl_query_t *o = JS_GetOpaque(val, nx_webgl_query_class_id);
+	if (o)
+		js_free_rt(rt, o);
+}
+static void finalizer_webgl_sync(JSRuntime *rt, JSValue val) {
+	nx_webgl_sync_t *o = JS_GetOpaque(val, nx_webgl_sync_class_id);
+	if (o)
+		js_free_rt(rt, o);
+}
+static void finalizer_webgl_transform_feedback(JSRuntime *rt, JSValue val) {
+	nx_webgl_transform_feedback_t *o =
+		JS_GetOpaque(val, nx_webgl_transform_feedback_class_id);
+	if (o)
+		js_free_rt(rt, o);
+}
+
+static nx_webgl_vao_t *nx_get_webgl_vao(JSValueConst v) {
+	if (JS_IsUndefined(v) || JS_IsNull(v))
+		return NULL;
+	return JS_GetOpaque(v, nx_webgl_vao_class_id);
+}
+static nx_webgl_sampler_t *nx_get_webgl_sampler(JSValueConst v) {
+	if (JS_IsUndefined(v) || JS_IsNull(v))
+		return NULL;
+	return JS_GetOpaque(v, nx_webgl_sampler_class_id);
+}
+static nx_webgl_query_t *nx_get_webgl_query(JSValueConst v) {
+	if (JS_IsUndefined(v) || JS_IsNull(v))
+		return NULL;
+	return JS_GetOpaque(v, nx_webgl_query_class_id);
+}
+static nx_webgl_sync_t *nx_get_webgl_sync(JSValueConst v) {
+	if (JS_IsUndefined(v) || JS_IsNull(v))
+		return NULL;
+	return JS_GetOpaque(v, nx_webgl_sync_class_id);
+}
+static nx_webgl_transform_feedback_t *nx_get_webgl_transform_feedback(
+	JSValueConst v) {
+	if (JS_IsUndefined(v) || JS_IsNull(v))
+		return NULL;
+	return JS_GetOpaque(v, nx_webgl_transform_feedback_class_id);
+}
+
+// ---- VAO ------------------------------------------------------------------
+
+static JSValue nx_webgl_create_vertex_array(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	(void)argc; (void)argv;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t h = nx_webgl_egl_gen_vertex_array(context->egl);
+	if (h == 0) {
+		context->error = GL_OUT_OF_MEMORY;
+		return JS_NULL;
+	}
+	nx_webgl_vao_t *o = js_mallocz(ctx, sizeof(*o));
+	if (!o) {
+		nx_webgl_egl_delete_vertex_array(context->egl, h);
+		return JS_EXCEPTION;
+	}
+	o->handle = h;
+	JSValue obj = JS_NewObjectClass(ctx, nx_webgl_vao_class_id);
+	if (JS_IsException(obj)) {
+		js_free(ctx, o);
+		nx_webgl_egl_delete_vertex_array(context->egl, h);
+		return obj;
+	}
+	JS_SetOpaque(obj, o);
+	return obj;
+}
+
+static JSValue nx_webgl_delete_vertex_array(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (argc < 1 || JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))
+		return JS_UNDEFINED;
+	nx_webgl_vao_t *o = nx_get_webgl_vao(argv[0]);
+	if (!o || o->deleted)
+		return JS_UNDEFINED;
+	if (nx_get_webgl_vao(context->vertex_array_binding) == o) {
+		JS_FreeValue(ctx, context->vertex_array_binding);
+		context->vertex_array_binding = JS_UNDEFINED;
+		nx_webgl_egl_set_user_vao(context->egl, 0);
+	}
+	if (o->handle) {
+		nx_webgl_egl_delete_vertex_array(context->egl, o->handle);
+		o->handle = 0;
+	}
+	o->deleted = true;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_is_vertex_array(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+	(void)this_val;
+	if (argc < 1)
+		return JS_NewBool(ctx, false);
+	nx_webgl_vao_t *o = nx_get_webgl_vao(argv[0]);
+	return JS_NewBool(ctx, o && !o->deleted && o->handle != 0);
+}
+
+// Save the context's current attribute + element-buffer state INTO a VAO's
+// per-VAO snapshot. Called by bindVertexArray immediately before switching
+// VAOs so the outgoing VAO retains "what was set up under it" in JS-land.
+static void vao_save_state(JSContext *ctx, nx_webgl_vao_t *vao,
+                            nx_webgl_context_t *context) {
+	if (!vao) return;
+	if (vao->has_saved_state) {
+		for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+			JS_FreeValue(ctx, vao->saved_attribs[i].buffer);
+		}
+		JS_FreeValue(ctx, vao->saved_element_array_buffer_binding);
+	}
+	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+		vao->saved_attribs[i] = context->vertex_attribs[i];
+		vao->saved_attribs[i].buffer =
+			JS_DupValue(ctx, context->vertex_attribs[i].buffer);
+	}
+	vao->saved_element_array_buffer_binding =
+		JS_DupValue(ctx, context->element_array_buffer_binding);
+	vao->has_saved_state = true;
+}
+
+// Restore a VAO's saved state INTO the context. Called by bindVertexArray
+// after switching so subsequent JS gl calls (and the bridge's draw-time
+// re-apply) see the right per-VAO data. When the VAO has never been
+// unbound before (`has_saved_state == false`) this resets the context to
+// the WebGL initial-state defaults instead — matches the behaviour of a
+// freshly-bound, never-modified VAO.
+static void vao_restore_state(JSContext *ctx, nx_webgl_vao_t *vao,
+                               nx_webgl_context_t *context) {
+	if (!vao || !vao->has_saved_state) {
+		for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+			JS_FreeValue(ctx, context->vertex_attribs[i].buffer);
+			context->vertex_attribs[i].enabled = false;
+			context->vertex_attribs[i].size = 4;
+			context->vertex_attribs[i].type = GL_FLOAT;
+			context->vertex_attribs[i].normalized = false;
+			context->vertex_attribs[i].stride = 0;
+			context->vertex_attribs[i].offset = 0;
+			context->vertex_attribs[i].buffer = JS_UNDEFINED;
+			context->vertex_attribs[i].divisor = 0;
+		}
+		JS_FreeValue(ctx, context->element_array_buffer_binding);
+		context->element_array_buffer_binding = JS_UNDEFINED;
+		return;
+	}
+	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++) {
+		JS_FreeValue(ctx, context->vertex_attribs[i].buffer);
+		context->vertex_attribs[i] = vao->saved_attribs[i];
+		context->vertex_attribs[i].buffer =
+			JS_DupValue(ctx, vao->saved_attribs[i].buffer);
+	}
+	JS_FreeValue(ctx, context->element_array_buffer_binding);
+	context->element_array_buffer_binding =
+		JS_DupValue(ctx, vao->saved_element_array_buffer_binding);
+}
+
+static JSValue nx_webgl_bind_vertex_array(JSContext *ctx,
+                                           JSValueConst this_val, int argc,
+                                           JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_vao_t *target = NULL;
+	if (argc >= 1 && !JS_IsNull(argv[0]) && !JS_IsUndefined(argv[0])) {
+		target = nx_get_webgl_vao(argv[0]);
+		if (!target || target->deleted || target->handle == 0) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	}
+	// Save the outgoing VAO's state, restore the incoming VAO's state.
+	// Skipping when target == current is just an optimisation; the
+	// semantics are identical either way.
+	nx_webgl_vao_t *current = nx_get_webgl_vao(context->vertex_array_binding);
+	if (current != target) {
+		if (current) vao_save_state(ctx, current, context);
+		vao_restore_state(ctx, target, context);
+	}
+	JS_FreeValue(ctx, context->vertex_array_binding);
+	if (target) {
+		context->vertex_array_binding = JS_DupValue(ctx, argv[0]);
+		nx_webgl_egl_set_user_vao(context->egl, target->handle);
+	} else {
+		context->vertex_array_binding = JS_UNDEFINED;
+		nx_webgl_egl_set_user_vao(context->egl, 0);
+	}
+	return JS_UNDEFINED;
+}
+
+// ---- integer vertex attribs ----------------------------------------------
+
+static JSValue nx_webgl_vertex_attrib_i_pointer(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t index;
+	int32_t size, stride, offset;
+	uint32_t type;
+	if (JS_ToUint32(ctx, &index, argv[0]) || JS_ToInt32(ctx, &size, argv[1]) ||
+		JS_ToUint32(ctx, &type, argv[2]) || JS_ToInt32(ctx, &stride, argv[3]) ||
+		JS_ToInt32(ctx, &offset, argv[4]))
+		return JS_EXCEPTION;
+	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_vertex_attrib_t *a = &context->vertex_attribs[index];
+	JS_FreeValue(ctx, a->buffer);
+	a->buffer = JS_DupValue(ctx, context->array_buffer_binding);
+	a->size = size;
+	a->type = type;
+	a->normalized = false;
+	a->stride = stride;
+	a->offset = offset;
+	nx_webgl_egl_vertex_attrib_i_pointer(context->egl, index, size, type,
+	                                      stride, offset);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_vertex_attrib_i4i(JSContext *ctx,
+                                           JSValueConst this_val, int argc,
+                                           JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t index;
+	int32_t x, y, z, w;
+	if (JS_ToUint32(ctx, &index, argv[0]) || JS_ToInt32(ctx, &x, argv[1]) ||
+		JS_ToInt32(ctx, &y, argv[2]) || JS_ToInt32(ctx, &z, argv[3]) ||
+		JS_ToInt32(ctx, &w, argv[4]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_vertex_attrib_i4i(context->egl, index, x, y, z, w);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_vertex_attrib_i4ui(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t index, x, y, z, w;
+	if (JS_ToUint32(ctx, &index, argv[0]) || JS_ToUint32(ctx, &x, argv[1]) ||
+		JS_ToUint32(ctx, &y, argv[2]) || JS_ToUint32(ctx, &z, argv[3]) ||
+		JS_ToUint32(ctx, &w, argv[4]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_vertex_attrib_i4ui(context->egl, index, x, y, z, w);
+	return JS_UNDEFINED;
+}
+
+// Reads a JS Int32Array / Uint32Array / Array into a typed-array slice.
+// Returns false on failure (with INVALID_VALUE set). Caller frees nothing.
+static bool js_to_int_array(JSContext *ctx, nx_webgl_context_t *context,
+                             JSValueConst v, int *out_count,
+                             int32_t **out_buf, int32_t *stack_buf,
+                             int stack_buf_cap) {
+	size_t byte_off, byte_len;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &byte_off, &byte_len, NULL);
+	if (!JS_IsException(ab)) {
+		size_t buf_len;
+		uint8_t *raw = JS_GetArrayBuffer(ctx, &buf_len, ab);
+		JS_FreeValue(ctx, ab);
+		if (raw) {
+			*out_count = (int)(byte_len / 4);
+			*out_buf = (int32_t *)(raw + byte_off);
+			return true;
+		}
+	}
+	uint32_t len;
+	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
+	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
+		JS_FreeValue(ctx, len_v);
+		context->error = GL_INVALID_VALUE;
+		return false;
+	}
+	JS_FreeValue(ctx, len_v);
+	int32_t *buf = stack_buf;
+	if ((int)len > stack_buf_cap) {
+		buf = js_mallocz(ctx, len * sizeof(int32_t));
+		if (!buf)
+			return false;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue el = JS_GetPropertyUint32(ctx, v, i);
+		int32_t n;
+		if (JS_ToInt32(ctx, &n, el)) {
+			JS_FreeValue(ctx, el);
+			if (buf != stack_buf)
+				js_free(ctx, buf);
+			context->error = GL_INVALID_VALUE;
+			return false;
+		}
+		JS_FreeValue(ctx, el);
+		buf[i] = n;
+	}
+	*out_count = (int)len;
+	*out_buf = buf;
+	return true;
+}
+
+static bool js_to_uint_array(JSContext *ctx, nx_webgl_context_t *context,
+                              JSValueConst v, int *out_count,
+                              uint32_t **out_buf, uint32_t *stack_buf,
+                              int stack_buf_cap) {
+	size_t byte_off, byte_len;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &byte_off, &byte_len, NULL);
+	if (!JS_IsException(ab)) {
+		size_t buf_len;
+		uint8_t *raw = JS_GetArrayBuffer(ctx, &buf_len, ab);
+		JS_FreeValue(ctx, ab);
+		if (raw) {
+			*out_count = (int)(byte_len / 4);
+			*out_buf = (uint32_t *)(raw + byte_off);
+			return true;
+		}
+	}
+	uint32_t len;
+	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
+	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
+		JS_FreeValue(ctx, len_v);
+		context->error = GL_INVALID_VALUE;
+		return false;
+	}
+	JS_FreeValue(ctx, len_v);
+	uint32_t *buf = stack_buf;
+	if ((int)len > stack_buf_cap) {
+		buf = js_mallocz(ctx, len * sizeof(uint32_t));
+		if (!buf)
+			return false;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue el = JS_GetPropertyUint32(ctx, v, i);
+		uint32_t n;
+		if (JS_ToUint32(ctx, &n, el)) {
+			JS_FreeValue(ctx, el);
+			if (buf != stack_buf)
+				js_free(ctx, buf);
+			context->error = GL_INVALID_VALUE;
+			return false;
+		}
+		JS_FreeValue(ctx, el);
+		buf[i] = n;
+	}
+	*out_count = (int)len;
+	*out_buf = buf;
+	return true;
+}
+
+static JSValue nx_webgl_vertex_attrib_i4iv(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t index;
+	if (JS_ToUint32(ctx, &index, argv[0]))
+		return JS_EXCEPTION;
+	int32_t stack[4];
+	int count;
+	int32_t *buf;
+	if (!js_to_int_array(ctx, context, argv[1], &count, &buf, stack, 4))
+		return JS_UNDEFINED;
+	if (count >= 4)
+		nx_webgl_egl_vertex_attrib_i4i(context->egl, index, buf[0], buf[1],
+		                                buf[2], buf[3]);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_vertex_attrib_i4uiv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t index;
+	if (JS_ToUint32(ctx, &index, argv[0]))
+		return JS_EXCEPTION;
+	uint32_t stack[4];
+	int count;
+	uint32_t *buf;
+	if (!js_to_uint_array(ctx, context, argv[1], &count, &buf, stack, 4))
+		return JS_UNDEFINED;
+	if (count >= 4)
+		nx_webgl_egl_vertex_attrib_i4ui(context->egl, index, buf[0], buf[1],
+		                                 buf[2], buf[3]);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+// ---- uint uniforms --------------------------------------------------------
+
+#define UNIFORM_LOC_FROM_ARG(name)                                            \
+	int32_t name;                                                              \
+	{                                                                          \
+		nx_webgl_uniform_location_t *_loc_obj =                                 \
+			nx_get_webgl_uniform_location(argv[0]);                            \
+		name = _loc_obj ? _loc_obj->location : -1;                              \
+	}
+
+// `nx_webgl_uniform_location_t` is defined earlier in this file (above the
+// class IDs). `nx_get_webgl_uniform_location` likewise.
+
+static JSValue nx_webgl_uniform1ui_v2(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	UNIFORM_LOC_FROM_ARG(loc);
+	uint32_t v0;
+	if (JS_ToUint32(ctx, &v0, argv[1]))
+		return JS_EXCEPTION;
+	if (loc >= 0)
+		nx_webgl_egl_uniform1ui(context->egl, loc, v0);
+	return JS_UNDEFINED;
+}
+static JSValue nx_webgl_uniform2ui_v2(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	UNIFORM_LOC_FROM_ARG(loc);
+	uint32_t v0, v1;
+	if (JS_ToUint32(ctx, &v0, argv[1]) || JS_ToUint32(ctx, &v1, argv[2]))
+		return JS_EXCEPTION;
+	if (loc >= 0)
+		nx_webgl_egl_uniform2ui(context->egl, loc, v0, v1);
+	return JS_UNDEFINED;
+}
+static JSValue nx_webgl_uniform3ui_v2(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	UNIFORM_LOC_FROM_ARG(loc);
+	uint32_t v0, v1, v2;
+	if (JS_ToUint32(ctx, &v0, argv[1]) || JS_ToUint32(ctx, &v1, argv[2]) ||
+		JS_ToUint32(ctx, &v2, argv[3]))
+		return JS_EXCEPTION;
+	if (loc >= 0)
+		nx_webgl_egl_uniform3ui(context->egl, loc, v0, v1, v2);
+	return JS_UNDEFINED;
+}
+static JSValue nx_webgl_uniform4ui_v2(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	UNIFORM_LOC_FROM_ARG(loc);
+	uint32_t v0, v1, v2, v3;
+	if (JS_ToUint32(ctx, &v0, argv[1]) || JS_ToUint32(ctx, &v1, argv[2]) ||
+		JS_ToUint32(ctx, &v2, argv[3]) || JS_ToUint32(ctx, &v3, argv[4]))
+		return JS_EXCEPTION;
+	if (loc >= 0)
+		nx_webgl_egl_uniform4ui(context->egl, loc, v0, v1, v2, v3);
+	return JS_UNDEFINED;
+}
+
+#define UNIFORM_UIV_BODY(arity, fn)                                         \
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);        \
+	if (!context) return JS_EXCEPTION;                                        \
+	(void)argc;                                                                \
+	UNIFORM_LOC_FROM_ARG(loc);                                                 \
+	uint32_t stack[16];                                                        \
+	int count;                                                                 \
+	uint32_t *buf;                                                             \
+	if (!js_to_uint_array(ctx, context, argv[1], &count, &buf, stack, 16))    \
+		return JS_UNDEFINED;                                                   \
+	if (loc >= 0 && count >= (arity))                                          \
+		fn(context->egl, loc, count / (arity), buf);                           \
+	if (buf != stack) js_free(ctx, buf);                                       \
+	return JS_UNDEFINED;
+
+static JSValue nx_webgl_uniform1uiv_v2(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	UNIFORM_UIV_BODY(1, nx_webgl_egl_uniform1uiv)
+}
+static JSValue nx_webgl_uniform2uiv_v2(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	UNIFORM_UIV_BODY(2, nx_webgl_egl_uniform2uiv)
+}
+static JSValue nx_webgl_uniform3uiv_v2(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	UNIFORM_UIV_BODY(3, nx_webgl_egl_uniform3uiv)
+}
+static JSValue nx_webgl_uniform4uiv_v2(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	UNIFORM_UIV_BODY(4, nx_webgl_egl_uniform4uiv)
+}
+
+// ---- non-square matrix uniforms ------------------------------------------
+
+static bool js_to_float_array(JSContext *ctx, nx_webgl_context_t *context,
+                               JSValueConst v, int *out_count, float **out_buf,
+                               float *stack_buf, int stack_buf_cap) {
+	size_t byte_off, byte_len;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &byte_off, &byte_len, NULL);
+	if (!JS_IsException(ab)) {
+		size_t buf_len;
+		uint8_t *raw = JS_GetArrayBuffer(ctx, &buf_len, ab);
+		JS_FreeValue(ctx, ab);
+		if (raw) {
+			*out_count = (int)(byte_len / 4);
+			*out_buf = (float *)(raw + byte_off);
+			return true;
+		}
+	}
+	uint32_t len;
+	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
+	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
+		JS_FreeValue(ctx, len_v);
+		context->error = GL_INVALID_VALUE;
+		return false;
+	}
+	JS_FreeValue(ctx, len_v);
+	float *buf = stack_buf;
+	if ((int)len > stack_buf_cap) {
+		buf = js_mallocz(ctx, len * sizeof(float));
+		if (!buf)
+			return false;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue el = JS_GetPropertyUint32(ctx, v, i);
+		double d;
+		if (JS_ToFloat64(ctx, &d, el)) {
+			JS_FreeValue(ctx, el);
+			if (buf != stack_buf)
+				js_free(ctx, buf);
+			context->error = GL_INVALID_VALUE;
+			return false;
+		}
+		JS_FreeValue(ctx, el);
+		buf[i] = (float)d;
+	}
+	*out_count = (int)len;
+	*out_buf = buf;
+	return true;
+}
+
+#define UNIFORM_MATRIX_NXM_BODY(elem_count, fn)                              \
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);        \
+	if (!context) return JS_EXCEPTION;                                        \
+	(void)argc;                                                                \
+	UNIFORM_LOC_FROM_ARG(loc);                                                 \
+	bool transpose = JS_ToBool(ctx, argv[1]);                                 \
+	float stack[64];                                                           \
+	int count;                                                                 \
+	float *buf;                                                                \
+	if (!js_to_float_array(ctx, context, argv[2], &count, &buf, stack, 64))   \
+		return JS_UNDEFINED;                                                   \
+	if (loc >= 0 && count >= (elem_count))                                     \
+		fn(context->egl, loc, count / (elem_count), transpose, buf);           \
+	if (buf != stack) js_free(ctx, buf);                                       \
+	return JS_UNDEFINED;
+
+static JSValue nx_webgl_uniform_matrix2x3fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(6, nx_webgl_egl_uniform_matrix2x3fv)
+}
+static JSValue nx_webgl_uniform_matrix3x2fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(6, nx_webgl_egl_uniform_matrix3x2fv)
+}
+static JSValue nx_webgl_uniform_matrix2x4fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(8, nx_webgl_egl_uniform_matrix2x4fv)
+}
+static JSValue nx_webgl_uniform_matrix4x2fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(8, nx_webgl_egl_uniform_matrix4x2fv)
+}
+static JSValue nx_webgl_uniform_matrix3x4fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(12, nx_webgl_egl_uniform_matrix3x4fv)
+}
+static JSValue nx_webgl_uniform_matrix4x3fv(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	UNIFORM_MATRIX_NXM_BODY(12, nx_webgl_egl_uniform_matrix4x3fv)
+}
+
+// ---- MRT / FBO ops --------------------------------------------------------
+
+static JSValue nx_webgl_draw_buffers(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t stack[16];
+	int count;
+	uint32_t *buf;
+	if (!js_to_uint_array(ctx, context, argv[0], &count, &buf, stack, 16))
+		return JS_UNDEFINED;
+	// Three.js's setRenderTarget(null) path on a WebGL 2 context calls
+	// `gl.drawBuffers([gl.BACK])` to restore the default framebuffer's
+	// draw buffer. But our "default framebuffer" is `bridge_framebuffer`,
+	// an application-created FBO — ES3 spec rejects GL_BACK on
+	// application FBOs with INVALID_OPERATION and the FBO's drawBuffers
+	// state ends up at NONE, silently dropping subsequent fragment
+	// outputs. When the bound framebuffer is the pseudo-default (no
+	// user FBO bound), translate GL_BACK → GL_COLOR_ATTACHMENT0 so the
+	// bridge FBO actually receives the post-process composite.
+	bool targeting_default = JS_IsUndefined(context->framebuffer_binding) ||
+	                         JS_IsNull(context->framebuffer_binding);
+	if (targeting_default) {
+		for (int i = 0; i < count; i++) {
+			if (buf[i] == GL_BACK)
+				buf[i] = GL_COLOR_ATTACHMENT0;
+		}
+	}
+	nx_webgl_egl_draw_buffers(context->egl, count, buf);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_invalidate_framebuffer(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	uint32_t stack[8];
+	int count;
+	uint32_t *buf;
+	if (!js_to_uint_array(ctx, context, argv[1], &count, &buf, stack, 8))
+		return JS_UNDEFINED;
+	nx_webgl_egl_invalidate_framebuffer(context->egl, target, count, buf);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_invalidate_sub_framebuffer(JSContext *ctx,
+                                                    JSValueConst this_val,
+                                                    int argc,
+                                                    JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	int32_t x, y, w, h;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToInt32(ctx, &x, argv[2]) ||
+		JS_ToInt32(ctx, &y, argv[3]) || JS_ToInt32(ctx, &w, argv[4]) ||
+		JS_ToInt32(ctx, &h, argv[5]))
+		return JS_EXCEPTION;
+	uint32_t stack[8];
+	int count;
+	uint32_t *buf;
+	if (!js_to_uint_array(ctx, context, argv[1], &count, &buf, stack, 8))
+		return JS_UNDEFINED;
+	nx_webgl_egl_invalidate_sub_framebuffer(context->egl, target, count, buf,
+	                                          x, y, w, h);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_blit_framebuffer(JSContext *ctx,
+                                          JSValueConst this_val, int argc,
+                                          JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	int32_t s[8];
+	uint32_t mask, filter;
+	for (int i = 0; i < 8; i++)
+		if (JS_ToInt32(ctx, &s[i], argv[i]))
+			return JS_EXCEPTION;
+	if (JS_ToUint32(ctx, &mask, argv[8]) ||
+		JS_ToUint32(ctx, &filter, argv[9]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_blit_framebuffer(context->egl, s[0], s[1], s[2], s[3], s[4],
+	                                s[5], s[6], s[7], mask, filter);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_read_buffer(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t src;
+	if (JS_ToUint32(ctx, &src, argv[0]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_read_buffer(context->egl, src);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_renderbuffer_storage_multisample(JSContext *ctx,
+                                                          JSValueConst this_val,
+                                                          int argc,
+                                                          JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t samples, width, height;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &samples, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]) ||
+		JS_ToInt32(ctx, &width, argv[3]) ||
+		JS_ToInt32(ctx, &height, argv[4]))
+		return JS_EXCEPTION;
+	if (target != GL_RENDERBUFFER) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	if (width < 0 || height < 0 || samples < 0) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_renderbuffer_t *rb =
+		nx_get_webgl_renderbuffer(context->renderbuffer_binding);
+	if (!rb || rb->deleted || !rb->handle) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_renderbuffer_storage_multisample(context->egl, rb->handle,
+	                                                    samples,
+	                                                    internalformat,
+	                                                    width, height)) {
+		context->error = GL_INVALID_OPERATION;
+	} else {
+		rb->internal_format = internalformat;
+		rb->width = width;
+		rb->height = height;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_framebuffer_texture_layer(JSContext *ctx,
+                                                   JSValueConst this_val,
+                                                   int argc,
+                                                   JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, attachment;
+	int32_t level, layer;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &attachment, argv[1]) ||
+		JS_ToInt32(ctx, &level, argv[3]) || JS_ToInt32(ctx, &layer, argv[4]))
+		return JS_EXCEPTION;
+	(void)target;
+	nx_webgl_framebuffer_t *fb =
+		nx_get_webgl_framebuffer(context->framebuffer_binding);
+	if (!fb || fb->deleted || !fb->handle) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_texture_t *tex = NULL;
+	uint32_t tex_handle = 0;
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
+		tex = nx_get_webgl_texture(argv[2]);
+		if (!tex || tex->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		// Lazy-promote: if no native handle yet, allocate one.
+		if (tex->gles_handle == 0) {
+			tex->gles_handle = nx_webgl_egl_create_persistent_texture(
+				context->egl, context->canvas);
+		}
+		tex_handle = tex->gles_handle;
+	}
+	if (!nx_webgl_egl_framebuffer_texture_layer(context->egl, fb->handle,
+	                                              attachment, tex_handle,
+	                                              level, layer)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+// ---- 3D texture upload + immutable storage -------------------------------
+
+// Helper: extract a pixel pointer + byte length from a JSValue that's either
+// null, a TypedArray, or an ArrayBuffer. Returns NULL pixels with size==0
+// when arg is null/undefined.
+static bool js_pixels_pointer(JSContext *ctx, JSValueConst v, void **out_ptr,
+                               size_t *out_len) {
+	if (JS_IsNull(v) || JS_IsUndefined(v)) {
+		*out_ptr = NULL;
+		*out_len = 0;
+		return true;
+	}
+	size_t byte_off, byte_len;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &byte_off, &byte_len, NULL);
+	if (!JS_IsException(ab)) {
+		size_t buf_len;
+		uint8_t *raw = JS_GetArrayBuffer(ctx, &buf_len, ab);
+		JS_FreeValue(ctx, ab);
+		if (raw) {
+			*out_ptr = raw + byte_off;
+			*out_len = byte_len;
+			return true;
+		}
+	}
+	size_t ab_len;
+	uint8_t *ab_raw = JS_GetArrayBuffer(ctx, &ab_len, v);
+	if (ab_raw) {
+		*out_ptr = ab_raw;
+		*out_len = ab_len;
+		return true;
+	}
+	return false;
+}
+
+static JSValue nx_webgl_tex_image_3d(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat, format, type;
+	int32_t level, width = 0, height = 0, depth = 1, border = 0;
+	// Two call signatures:
+	//   - Image-source form (argc == 6):
+	//       texImage3D(target, level, internalformat, format, type, source)
+	//     image occupies a single slice (depth=1).
+	//   - Buffer form (argc == 10):
+	//       texImage3D(target, level, internalformat, width, height, depth,
+	//                  border, format, type, pixels)
+	bool short_form = (argc <= 6);
+	JSValueConst src_arg;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]))
+		return JS_EXCEPTION;
+	if (short_form) {
+		if (JS_ToUint32(ctx, &format, argv[3]) ||
+			JS_ToUint32(ctx, &type, argv[4]))
+			return JS_EXCEPTION;
+		src_arg = argv[5];
+	} else {
+		if (JS_ToInt32(ctx, &width, argv[3]) ||
+			JS_ToInt32(ctx, &height, argv[4]) ||
+			JS_ToInt32(ctx, &depth, argv[5]) ||
+			JS_ToInt32(ctx, &border, argv[6]) ||
+			JS_ToUint32(ctx, &format, argv[7]) ||
+			JS_ToUint32(ctx, &type, argv[8]))
+			return JS_EXCEPTION;
+		src_arg = argv[9];
+	}
+
+	// Try Image-source extract. For 3D the image fills depth=1.
+	uint8_t *image_buffer = NULL;
+	int32_t image_w = 0, image_h = 0;
+	bool from_image = nx_webgl_extract_image_source(
+		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+	if (from_image) {
+		width = image_w;
+		height = image_h;
+		depth = 1;
+		border = 0;
+		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+			js_free(ctx, image_buffer);
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	}
+
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (from_image) {
+		pixels = image_buffer;
+		pixels_len = (size_t)width * (size_t)height * 4;
+	} else if (!js_pixels_pointer(ctx, src_arg, &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	// Ensure the currently-bound texture has a persistent GLES handle so
+	// the native upload lands on the right object. Use the target-specific
+	// binding slot — `texture_2d_binding` is the WRONG slot for TEXTURE_3D
+	// / TEXTURE_2D_ARRAY targets (pre-fix bug: texImage3D was looking up
+	// the 2D-bound texture and uploading to its persistent handle instead
+	// of the 3D-bound texture, leaving the 3D texture empty → sampler3D
+	// reads zero in the conformance test).
+	JSValue *binding = texture_binding_for_target(context, target);
+	nx_webgl_texture_t *tex = binding ? nx_get_webgl_texture(*binding) : NULL;
+	if (tex && tex->gles_handle == 0) {
+		tex->gles_handle = nx_webgl_egl_create_persistent_texture(context->egl,
+		                                                            context->canvas);
+		if (tex->gles_handle)
+			nx_webgl_egl_forward_bind_texture(context->egl, target,
+			                                    tex->gles_handle);
+	}
+	if (!nx_webgl_egl_tex_image_3d(context->egl, target, level, internalformat,
+	                                 width, height, depth, border, format, type,
+	                                 pixels)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	if (from_image) js_free(ctx, image_buffer);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_tex_sub_image_3d(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, format, type;
+	int32_t level, xoff, yoff, zoff, width = 0, height = 0, depth = 1;
+	// Two call signatures:
+	//   - Image-source form (argc == 8):
+	//       texSubImage3D(target, level, xoffset, yoffset, zoffset,
+	//                     format, type, source)
+	//     image fills depth=1 at the given zoffset slice.
+	//   - Buffer form (argc == 11):
+	//       texSubImage3D(target, level, xoffset, yoffset, zoffset, width,
+	//                     height, depth, format, type, pixels)
+	bool short_form = (argc <= 8);
+	JSValueConst src_arg;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToInt32(ctx, &xoff, argv[2]) || JS_ToInt32(ctx, &yoff, argv[3]) ||
+		JS_ToInt32(ctx, &zoff, argv[4]))
+		return JS_EXCEPTION;
+	if (short_form) {
+		if (JS_ToUint32(ctx, &format, argv[5]) ||
+			JS_ToUint32(ctx, &type, argv[6]))
+			return JS_EXCEPTION;
+		src_arg = argv[7];
+	} else {
+		if (JS_ToInt32(ctx, &width, argv[5]) ||
+			JS_ToInt32(ctx, &height, argv[6]) ||
+			JS_ToInt32(ctx, &depth, argv[7]) ||
+			JS_ToUint32(ctx, &format, argv[8]) ||
+			JS_ToUint32(ctx, &type, argv[9]))
+			return JS_EXCEPTION;
+		src_arg = (argc > 10) ? argv[10] : JS_UNDEFINED;
+	}
+
+	// Try Image-source extract. For 3D the image fills depth=1 slice.
+	uint8_t *image_buffer = NULL;
+	int32_t image_w = 0, image_h = 0;
+	bool from_image = nx_webgl_extract_image_source(
+		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+	if (from_image) {
+		width = image_w;
+		height = image_h;
+		depth = 1;
+		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+			js_free(ctx, image_buffer);
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+	}
+
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (from_image) {
+		pixels = image_buffer;
+		pixels_len = (size_t)width * (size_t)height * 4;
+	} else if (!JS_IsUndefined(src_arg) &&
+		!js_pixels_pointer(ctx, src_arg, &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_tex_sub_image_3d(context->egl, target, level, xoff, yoff,
+	                                     zoff, width, height, depth, format,
+	                                     type, pixels)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	if (from_image) js_free(ctx, image_buffer);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_copy_tex_sub_image_3d(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	int32_t level, xoff, yoff, zoff, x, y, w, h;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToInt32(ctx, &xoff, argv[2]) || JS_ToInt32(ctx, &yoff, argv[3]) ||
+		JS_ToInt32(ctx, &zoff, argv[4]) || JS_ToInt32(ctx, &x, argv[5]) ||
+		JS_ToInt32(ctx, &y, argv[6]) || JS_ToInt32(ctx, &w, argv[7]) ||
+		JS_ToInt32(ctx, &h, argv[8]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_copy_tex_sub_image_3d(context->egl, target, level, xoff,
+	                                          yoff, zoff, x, y, w, h)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_compressed_tex_image_3d(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t level, width, height, depth, border;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]) ||
+		JS_ToInt32(ctx, &width, argv[3]) ||
+		JS_ToInt32(ctx, &height, argv[4]) ||
+		JS_ToInt32(ctx, &depth, argv[5]) ||
+		JS_ToInt32(ctx, &border, argv[6]))
+		return JS_EXCEPTION;
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (!js_pixels_pointer(ctx, argv[7], &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_compressed_tex_image_3d(context->egl, target, level,
+	                                            internalformat, width, height,
+	                                            depth, border, pixels_len,
+	                                            pixels)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_compressed_tex_sub_image_3d(JSContext *ctx,
+                                                      JSValueConst this_val,
+                                                      int argc,
+                                                      JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, format;
+	int32_t level, xoff, yoff, zoff, width, height, depth;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToInt32(ctx, &xoff, argv[2]) || JS_ToInt32(ctx, &yoff, argv[3]) ||
+		JS_ToInt32(ctx, &zoff, argv[4]) || JS_ToInt32(ctx, &width, argv[5]) ||
+		JS_ToInt32(ctx, &height, argv[6]) ||
+		JS_ToInt32(ctx, &depth, argv[7]) ||
+		JS_ToUint32(ctx, &format, argv[8]))
+		return JS_EXCEPTION;
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (!js_pixels_pointer(ctx, argv[9], &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_compressed_tex_sub_image_3d(context->egl, target, level,
+	                                                xoff, yoff, zoff, width,
+	                                                height, depth, format,
+	                                                pixels_len, pixels)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_tex_storage_2d(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t levels, width, height;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &levels, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]) ||
+		JS_ToInt32(ctx, &width, argv[3]) ||
+		JS_ToInt32(ctx, &height, argv[4]))
+		return JS_EXCEPTION;
+	nx_webgl_texture_t *tex = nx_get_webgl_texture(context->texture_2d_binding);
+	if (tex && tex->gles_handle == 0) {
+		tex->gles_handle = nx_webgl_egl_create_persistent_texture(context->egl,
+		                                                            context->canvas);
+		if (tex->gles_handle)
+			nx_webgl_egl_forward_bind_texture(context->egl, target,
+			                                    tex->gles_handle);
+	}
+	if (!nx_webgl_egl_tex_storage_2d(context->egl, target, levels,
+	                                  internalformat, width, height)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	// Flush any sampler parameters the user set BEFORE texStorage2D ran —
+	// they were stored in `tex->{min,mag}_filter` and `tex->wrap_{s,t}`
+	// because the native handle didn't exist yet, so the `texParameteri`
+	// forward in `nx_webgl_tex_parameteri` was a no-op. Without this flush
+	// the native texture keeps its default `LINEAR_MIPMAP_LINEAR` MIN_FILTER,
+	// which makes a single-level immutable texture INCOMPLETE for filtering
+	// — `texelFetch` then returns undefined/zero in vertex shaders, which
+	// is what hid the Soldier in the WebGL 2 skinning demo (boneTexture
+	// data was uploaded but read back as all zeros).
+	if (tex && tex->gles_handle) {
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_MIN_FILTER,
+		                                     tex->min_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_MAG_FILTER,
+		                                     tex->mag_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_WRAP_S,
+		                                     tex->wrap_s);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_WRAP_T,
+		                                     tex->wrap_t);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_tex_storage_3d(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t levels, width, height, depth;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &levels, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]) ||
+		JS_ToInt32(ctx, &width, argv[3]) ||
+		JS_ToInt32(ctx, &height, argv[4]) ||
+		JS_ToInt32(ctx, &depth, argv[5]))
+		return JS_EXCEPTION;
+	nx_webgl_texture_t *tex = nx_get_webgl_texture(context->texture_2d_binding);
+	if (tex && tex->gles_handle == 0) {
+		tex->gles_handle = nx_webgl_egl_create_persistent_texture(context->egl,
+		                                                            context->canvas);
+		if (tex->gles_handle)
+			nx_webgl_egl_forward_bind_texture(context->egl, target,
+			                                    tex->gles_handle);
+	}
+	if (!nx_webgl_egl_tex_storage_3d(context->egl, target, levels,
+	                                  internalformat, width, height, depth)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	// Flush JS-side sampler params — same reason as in texStorage2D.
+	if (tex && tex->gles_handle) {
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_MIN_FILTER,
+		                                     tex->min_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_MAG_FILTER,
+		                                     tex->mag_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_WRAP_S,
+		                                     tex->wrap_s);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
+		                                     GL_TEXTURE_WRAP_T,
+		                                     tex->wrap_t);
+	}
+	return JS_UNDEFINED;
+}
+
+// ---- clearBuffer family --------------------------------------------------
+
+static JSValue nx_webgl_clear_buffer_iv(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t buffer;
+	int32_t drawbuffer;
+	if (JS_ToUint32(ctx, &buffer, argv[0]) ||
+		JS_ToInt32(ctx, &drawbuffer, argv[1]))
+		return JS_EXCEPTION;
+	int32_t stack[4];
+	int count;
+	int32_t *buf;
+	if (!js_to_int_array(ctx, context, argv[2], &count, &buf, stack, 4))
+		return JS_UNDEFINED;
+	nx_webgl_egl_clear_buffer_iv(context->egl, buffer, drawbuffer, buf);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_clear_buffer_uiv(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t buffer;
+	int32_t drawbuffer;
+	if (JS_ToUint32(ctx, &buffer, argv[0]) ||
+		JS_ToInt32(ctx, &drawbuffer, argv[1]))
+		return JS_EXCEPTION;
+	uint32_t stack[4];
+	int count;
+	uint32_t *buf;
+	if (!js_to_uint_array(ctx, context, argv[2], &count, &buf, stack, 4))
+		return JS_UNDEFINED;
+	nx_webgl_egl_clear_buffer_uiv(context->egl, buffer, drawbuffer, buf);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_clear_buffer_fv(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t buffer;
+	int32_t drawbuffer;
+	if (JS_ToUint32(ctx, &buffer, argv[0]) ||
+		JS_ToInt32(ctx, &drawbuffer, argv[1]))
+		return JS_EXCEPTION;
+	float stack[4];
+	int count;
+	float *buf;
+	if (!js_to_float_array(ctx, context, argv[2], &count, &buf, stack, 4))
+		return JS_UNDEFINED;
+	nx_webgl_egl_clear_buffer_fv(context->egl, buffer, drawbuffer, buf);
+	if (buf != stack)
+		js_free(ctx, buf);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_clear_buffer_fi(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t buffer;
+	int32_t drawbuffer, stencil;
+	double depth;
+	if (JS_ToUint32(ctx, &buffer, argv[0]) ||
+		JS_ToInt32(ctx, &drawbuffer, argv[1]) ||
+		JS_ToFloat64(ctx, &depth, argv[2]) ||
+		JS_ToInt32(ctx, &stencil, argv[3]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_clear_buffer_fi(context->egl, buffer, drawbuffer, (float)depth,
+	                              stencil);
+	return JS_UNDEFINED;
+}
+
+// ---- buffer copy / readback ----------------------------------------------
+
+static JSValue nx_webgl_copy_buffer_sub_data(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t read_target, write_target;
+	int64_t read_offset, write_offset, size;
+	if (JS_ToUint32(ctx, &read_target, argv[0]) ||
+		JS_ToUint32(ctx, &write_target, argv[1]) ||
+		JS_ToInt64(ctx, &read_offset, argv[2]) ||
+		JS_ToInt64(ctx, &write_offset, argv[3]) ||
+		JS_ToInt64(ctx, &size, argv[4]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_copy_buffer_sub_data(context->egl, read_target, write_target,
+	                                    (size_t)read_offset,
+	                                    (size_t)write_offset, (size_t)size);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_buffer_sub_data(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	int64_t src_offset;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt64(ctx, &src_offset, argv[1]))
+		return JS_EXCEPTION;
+	void *dst = NULL;
+	size_t dst_len = 0;
+	if (!js_pixels_pointer(ctx, argv[2], &dst, &dst_len) || !dst) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	int64_t dst_off = 0, length = 0;
+	if (argc > 3 && !JS_IsUndefined(argv[3]) &&
+		JS_ToInt64(ctx, &dst_off, argv[3]))
+		return JS_EXCEPTION;
+	if (argc > 4 && !JS_IsUndefined(argv[4]) &&
+		JS_ToInt64(ctx, &length, argv[4]))
+		return JS_EXCEPTION;
+	size_t bytes = length ? (size_t)length * 4 : dst_len - (size_t)dst_off * 4;
+	nx_webgl_egl_get_buffer_sub_data(context->egl, target, (size_t)src_offset,
+	                                   bytes, (uint8_t *)dst + dst_off * 4);
+	return JS_UNDEFINED;
+}
+
+// ---- UBOs ----------------------------------------------------------------
+
+static JSValue nx_webgl_bind_buffer_base(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, index;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &index, argv[1]))
+		return JS_EXCEPTION;
+	uint32_t buffer = 0;
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
+		nx_webgl_buffer_t *buf = nx_get_webgl_buffer(argv[2]);
+		if (!buf || buf->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		buffer = buf->gles_handle;
+	}
+	nx_webgl_egl_bind_buffer_base(context->egl, target, index, buffer);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_bind_buffer_range(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, index;
+	int64_t offset, size;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &index, argv[1]) ||
+		JS_ToInt64(ctx, &offset, argv[3]) || JS_ToInt64(ctx, &size, argv[4]))
+		return JS_EXCEPTION;
+	uint32_t buffer = 0;
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
+		nx_webgl_buffer_t *buf = nx_get_webgl_buffer(argv[2]);
+		if (!buf || buf->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		buffer = buf->gles_handle;
+	}
+	nx_webgl_egl_bind_buffer_range(context->egl, target, index, buffer,
+	                                 (size_t)offset, (size_t)size);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_uniform_indices(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	uint32_t len;
+	JSValue len_v = JS_GetPropertyStr(ctx, argv[1], "length");
+	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
+		JS_FreeValue(ctx, len_v);
+		return JS_NULL;
+	}
+	JS_FreeValue(ctx, len_v);
+	JSValue out = JS_NewArray(ctx);
+	for (uint32_t i = 0; i < len; i++) {
+		JSValue name_v = JS_GetPropertyUint32(ctx, argv[1], i);
+		const char *name = JS_ToCString(ctx, name_v);
+		uint32_t idx = name ? nx_webgl_egl_get_uniform_block_index(
+		                          context->egl, program->gles_handle, name)
+		                    : 0xFFFFFFFFu;
+		JS_FreeValue(ctx, name_v);
+		if (name)
+			JS_FreeCString(ctx, name);
+		JS_SetPropertyUint32(ctx, out, i, JS_NewUint32(ctx, idx));
+	}
+	return out;
+}
+
+static JSValue nx_webgl_get_active_uniforms(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	uint32_t stack[16];
+	int count;
+	uint32_t *indices;
+	if (!js_to_uint_array(ctx, context, argv[1], &count, &indices, stack, 16))
+		return JS_NULL;
+	uint32_t pname;
+	if (JS_ToUint32(ctx, &pname, argv[2])) {
+		if (indices != stack)
+			js_free(ctx, indices);
+		return JS_EXCEPTION;
+	}
+	int32_t *out = js_mallocz(ctx, count * sizeof(int32_t));
+	if (!out || !nx_webgl_egl_get_active_uniforms_iv(
+	                 context->egl, program->gles_handle, count, indices,
+	                 pname, out)) {
+		if (indices != stack)
+			js_free(ctx, indices);
+		if (out)
+			js_free(ctx, out);
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	JSValue arr = JS_NewArray(ctx);
+	for (int i = 0; i < count; i++) {
+		// UNIFORM_IS_ROW_MAJOR returns a bool; others are ints.
+		if (pname == 0x8A3E /* GL_UNIFORM_IS_ROW_MAJOR */)
+			JS_SetPropertyUint32(ctx, arr, i, JS_NewBool(ctx, out[i] != 0));
+		else
+			JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, out[i]));
+	}
+	if (indices != stack)
+		js_free(ctx, indices);
+	js_free(ctx, out);
+	return arr;
+}
+
+static JSValue nx_webgl_get_uniform_block_index(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NewUint32(ctx, 0xFFFFFFFFu);
+	}
+	const char *name = JS_ToCString(ctx, argv[1]);
+	uint32_t idx = name ? nx_webgl_egl_get_uniform_block_index(
+	                          context->egl, program->gles_handle, name)
+	                    : 0xFFFFFFFFu;
+	if (name)
+		JS_FreeCString(ctx, name);
+	return JS_NewUint32(ctx, idx);
+}
+
+static JSValue nx_webgl_get_active_uniform_block_parameter(
+	JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	uint32_t block_index, pname;
+	if (JS_ToUint32(ctx, &block_index, argv[1]) ||
+		JS_ToUint32(ctx, &pname, argv[2]))
+		return JS_EXCEPTION;
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	// UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES returns an array; everything
+	// else returns an int (or bool for the two boolean pnames).
+	if (pname == 0x8A43 /* UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES */) {
+		int active_count = 0;
+		if (!nx_webgl_egl_get_active_uniform_block_iv(
+		        context->egl, program->gles_handle, block_index,
+		        0x8A42 /* UNIFORM_BLOCK_ACTIVE_UNIFORMS */, &active_count))
+			return JS_NULL;
+		int32_t *out = js_mallocz(ctx, active_count * sizeof(int32_t));
+		if (!out)
+			return JS_NULL;
+		if (!nx_webgl_egl_get_active_uniform_block_iv(context->egl,
+		                                                program->gles_handle,
+		                                                block_index, pname,
+		                                                out)) {
+			js_free(ctx, out);
+			return JS_NULL;
+		}
+		JSValue arr = JS_NewArray(ctx);
+		for (int i = 0; i < active_count; i++)
+			JS_SetPropertyUint32(ctx, arr, i, JS_NewUint32(ctx, (uint32_t)out[i]));
+		js_free(ctx, out);
+		return arr;
+	}
+	int v = 0;
+	if (!nx_webgl_egl_get_active_uniform_block_iv(context->egl,
+	                                                program->gles_handle,
+	                                                block_index, pname, &v))
+		return JS_NULL;
+	if (pname == 0x8A44 /* REFERENCED_BY_VERTEX_SHADER */ ||
+		pname == 0x8A46 /* REFERENCED_BY_FRAGMENT_SHADER */)
+		return JS_NewBool(ctx, v != 0);
+	return JS_NewUint32(ctx, (uint32_t)v);
+}
+
+static JSValue nx_webgl_get_active_uniform_block_name(JSContext *ctx,
+                                                        JSValueConst this_val,
+                                                        int argc,
+                                                        JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	uint32_t block_index;
+	if (JS_ToUint32(ctx, &block_index, argv[1]))
+		return JS_EXCEPTION;
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	char name[256] = {0};
+	if (!nx_webgl_egl_get_active_uniform_block_name(context->egl,
+	                                                  program->gles_handle,
+	                                                  block_index, name,
+	                                                  sizeof(name)))
+		return JS_NULL;
+	return JS_NewString(ctx, name);
+}
+
+static JSValue nx_webgl_uniform_block_binding(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	uint32_t block_index, binding;
+	if (JS_ToUint32(ctx, &block_index, argv[1]) ||
+		JS_ToUint32(ctx, &binding, argv[2]))
+		return JS_EXCEPTION;
+	if (!program || !program->link_status) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_egl_uniform_block_binding(context->egl, program->gles_handle,
+	                                    block_index, binding);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_indexed_parameter(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	(void)argv;
+	context->error = GL_INVALID_ENUM;
+	return JS_NULL; // Spec-completeness stub.
+}
+
+// ---- sampler objects ------------------------------------------------------
+
+#define DEFINE_HANDLE_CREATE(name, struct_t, class_id, gen_fn, del_fn)        \
+static JSValue name(JSContext *ctx, JSValueConst this_val, int argc,           \
+                     JSValueConst *argv) {                                     \
+	(void)argc; (void)argv;                                                    \
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);         \
+	if (!context) return JS_EXCEPTION;                                         \
+	uint32_t h = gen_fn(context->egl);                                          \
+	if (h == 0) { context->error = GL_OUT_OF_MEMORY; return JS_NULL; }          \
+	struct_t *o = js_mallocz(ctx, sizeof(*o));                                  \
+	if (!o) { del_fn(context->egl, h); return JS_EXCEPTION; }                    \
+	o->handle = h;                                                              \
+	JSValue obj = JS_NewObjectClass(ctx, class_id);                             \
+	if (JS_IsException(obj)) {                                                  \
+		js_free(ctx, o); del_fn(context->egl, h); return obj;                    \
+	}                                                                            \
+	JS_SetOpaque(obj, o);                                                       \
+	return obj;                                                                 \
+}
+
+#define DEFINE_HANDLE_DELETE(name, struct_t, get_fn, del_fn)                  \
+static JSValue name(JSContext *ctx, JSValueConst this_val, int argc,           \
+                     JSValueConst *argv) {                                     \
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);         \
+	if (!context) return JS_EXCEPTION;                                         \
+	if (argc < 1 || JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))             \
+		return JS_UNDEFINED;                                                   \
+	struct_t *o = get_fn(argv[0]);                                              \
+	if (!o || o->deleted) return JS_UNDEFINED;                                  \
+	if (o->handle) { del_fn(context->egl, o->handle); o->handle = 0; }          \
+	o->deleted = true;                                                          \
+	return JS_UNDEFINED;                                                        \
+}
+
+#define DEFINE_HANDLE_IS(name, struct_t, get_fn)                              \
+static JSValue name(JSContext *ctx, JSValueConst this_val, int argc,           \
+                     JSValueConst *argv) {                                     \
+	(void)this_val;                                                            \
+	if (argc < 1) return JS_NewBool(ctx, false);                                \
+	struct_t *o = get_fn(argv[0]);                                              \
+	return JS_NewBool(ctx, o && !o->deleted && o->handle != 0);                 \
+}
+
+DEFINE_HANDLE_CREATE(nx_webgl_create_sampler, nx_webgl_sampler_t,
+                      nx_webgl_sampler_class_id, nx_webgl_egl_gen_sampler,
+                      nx_webgl_egl_delete_sampler)
+DEFINE_HANDLE_DELETE(nx_webgl_delete_sampler, nx_webgl_sampler_t,
+                      nx_get_webgl_sampler, nx_webgl_egl_delete_sampler)
+DEFINE_HANDLE_IS(nx_webgl_is_sampler, nx_webgl_sampler_t,
+                  nx_get_webgl_sampler)
+
+static JSValue nx_webgl_bind_sampler(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t unit;
+	if (JS_ToUint32(ctx, &unit, argv[0]))
+		return JS_EXCEPTION;
+	uint32_t handle = 0;
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+		nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[1]);
+		if (!s || s->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		handle = s->handle;
+	}
+	nx_webgl_egl_bind_sampler(context->egl, unit, handle);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_sampler_parameteri(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
+	if (!s || s->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	uint32_t pname;
+	int32_t param;
+	if (JS_ToUint32(ctx, &pname, argv[1]) || JS_ToInt32(ctx, &param, argv[2]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_sampler_parameteri(context->egl, s->handle, pname, param);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_sampler_parameterf(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
+	if (!s || s->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	uint32_t pname;
+	double param;
+	if (JS_ToUint32(ctx, &pname, argv[1]) ||
+		JS_ToFloat64(ctx, &param, argv[2]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_sampler_parameterf(context->egl, s->handle, pname,
+	                                  (float)param);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_sampler_parameter(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
+	uint32_t pname;
+	if (!s || s->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	int v = 0;
+	if (!nx_webgl_egl_get_sampler_parameter_iv(context->egl, s->handle, pname,
+	                                            &v))
+		return JS_NULL;
+	return JS_NewInt32(ctx, v);
+}
+
+// ---- sync objects ---------------------------------------------------------
+
+static JSValue nx_webgl_fence_sync(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t condition, flags;
+	if (JS_ToUint32(ctx, &condition, argv[0]) ||
+		JS_ToUint32(ctx, &flags, argv[1]))
+		return JS_EXCEPTION;
+	void *h = nx_webgl_egl_fence_sync(context->egl, condition, flags);
+	if (!h)
+		return JS_NULL;
+	nx_webgl_sync_t *o = js_mallocz(ctx, sizeof(*o));
+	if (!o) {
+		nx_webgl_egl_delete_sync(context->egl, h);
+		return JS_EXCEPTION;
+	}
+	o->handle = h;
+	JSValue obj = JS_NewObjectClass(ctx, nx_webgl_sync_class_id);
+	if (JS_IsException(obj)) {
+		js_free(ctx, o);
+		nx_webgl_egl_delete_sync(context->egl, h);
+		return obj;
+	}
+	JS_SetOpaque(obj, o);
+	return obj;
+}
+
+static JSValue nx_webgl_delete_sync(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (argc < 1 || JS_IsNull(argv[0]) || JS_IsUndefined(argv[0]))
+		return JS_UNDEFINED;
+	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
+	if (!o || o->deleted)
+		return JS_UNDEFINED;
+	if (o->handle) {
+		nx_webgl_egl_delete_sync(context->egl, o->handle);
+		o->handle = NULL;
+	}
+	o->deleted = true;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_is_sync(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+	(void)this_val;
+	if (argc < 1)
+		return JS_NewBool(ctx, false);
+	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
+	return JS_NewBool(ctx, o && !o->deleted && o->handle != NULL);
+}
+
+static JSValue nx_webgl_client_wait_sync(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
+	uint32_t flags;
+	int64_t timeout;
+	if (!o || o->deleted || JS_ToUint32(ctx, &flags, argv[1]) ||
+		JS_ToInt64(ctx, &timeout, argv[2])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NewUint32(ctx, 0x911D); // WAIT_FAILED
+	}
+	uint32_t r = nx_webgl_egl_client_wait_sync(context->egl, o->handle, flags,
+	                                            (uint64_t)timeout);
+	return JS_NewUint32(ctx, r);
+}
+
+static JSValue nx_webgl_wait_sync(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
+	uint32_t flags;
+	int64_t timeout;
+	if (!o || o->deleted || JS_ToUint32(ctx, &flags, argv[1]) ||
+		JS_ToInt64(ctx, &timeout, argv[2])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	nx_webgl_egl_wait_sync(context->egl, o->handle, flags, (uint64_t)timeout);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_sync_parameter(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
+	uint32_t pname;
+	if (!o || o->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	int v = 0;
+	if (!nx_webgl_egl_get_sync_iv(context->egl, o->handle, pname, &v))
+		return JS_NULL;
+	return JS_NewInt32(ctx, v);
+}
+
+// ---- query objects --------------------------------------------------------
+
+DEFINE_HANDLE_CREATE(nx_webgl_create_query, nx_webgl_query_t,
+                      nx_webgl_query_class_id, nx_webgl_egl_gen_query,
+                      nx_webgl_egl_delete_query)
+DEFINE_HANDLE_DELETE(nx_webgl_delete_query, nx_webgl_query_t,
+                      nx_get_webgl_query, nx_webgl_egl_delete_query)
+DEFINE_HANDLE_IS(nx_webgl_is_query, nx_webgl_query_t, nx_get_webgl_query)
+
+static JSValue nx_webgl_begin_query(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	nx_webgl_query_t *q = nx_get_webgl_query(argv[1]);
+	if (!q || q->deleted) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	q->target = target;
+	nx_webgl_egl_begin_query(context->egl, target, q->handle);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_end_query(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_end_query(context->egl, target);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_query(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, pname;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &pname, argv[1]))
+		return JS_EXCEPTION;
+	int v = 0;
+	if (!nx_webgl_egl_get_query_iv(context->egl, target, pname, &v))
+		return JS_NULL;
+	return JS_NewInt32(ctx, v);
+}
+
+static JSValue nx_webgl_get_query_parameter(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_query_t *q = nx_get_webgl_query(argv[0]);
+	uint32_t pname;
+	if (!q || q->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	uint32_t v = 0;
+	if (!nx_webgl_egl_get_query_object_uiv(context->egl, q->handle, pname, &v))
+		return JS_NULL;
+	if (pname == 0x8867 /* QUERY_RESULT_AVAILABLE */)
+		return JS_NewBool(ctx, v != 0);
+	return JS_NewUint32(ctx, v);
+}
+
+// ---- transform feedback ---------------------------------------------------
+
+DEFINE_HANDLE_CREATE(nx_webgl_create_transform_feedback,
+                      nx_webgl_transform_feedback_t,
+                      nx_webgl_transform_feedback_class_id,
+                      nx_webgl_egl_gen_transform_feedback,
+                      nx_webgl_egl_delete_transform_feedback)
+DEFINE_HANDLE_DELETE(nx_webgl_delete_transform_feedback,
+                      nx_webgl_transform_feedback_t,
+                      nx_get_webgl_transform_feedback,
+                      nx_webgl_egl_delete_transform_feedback)
+DEFINE_HANDLE_IS(nx_webgl_is_transform_feedback,
+                  nx_webgl_transform_feedback_t,
+                  nx_get_webgl_transform_feedback)
+
+static JSValue nx_webgl_bind_transform_feedback(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc,
+                                                 JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[0]))
+		return JS_EXCEPTION;
+	uint32_t handle = 0;
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+		nx_webgl_transform_feedback_t *tf =
+			nx_get_webgl_transform_feedback(argv[1]);
+		if (!tf || tf->deleted) {
+			context->error = GL_INVALID_OPERATION;
+			return JS_UNDEFINED;
+		}
+		handle = tf->handle;
+	}
+	nx_webgl_egl_bind_transform_feedback(context->egl, target, handle);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_begin_transform_feedback(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t mode;
+	if (JS_ToUint32(ctx, &mode, argv[0]))
+		return JS_EXCEPTION;
+	nx_webgl_egl_begin_transform_feedback(context->egl, mode);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_end_transform_feedback(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc,
+                                                 JSValueConst *argv) {
+	(void)argc; (void)argv;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_egl_end_transform_feedback(context->egl);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_pause_transform_feedback(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv) {
+	(void)argc; (void)argv;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_egl_pause_transform_feedback(context->egl);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_resume_transform_feedback(JSContext *ctx,
+                                                   JSValueConst this_val,
+                                                   int argc,
+                                                   JSValueConst *argv) {
+	(void)argc; (void)argv;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_egl_resume_transform_feedback(context->egl);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_transform_feedback_varyings(JSContext *ctx,
+                                                      JSValueConst this_val,
+                                                      int argc,
+                                                      JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_UNDEFINED;
+	}
+	uint32_t buffer_mode;
+	if (JS_ToUint32(ctx, &buffer_mode, argv[2]))
+		return JS_EXCEPTION;
+	uint32_t len;
+	JSValue len_v = JS_GetPropertyStr(ctx, argv[1], "length");
+	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
+		JS_FreeValue(ctx, len_v);
+		return JS_UNDEFINED;
+	}
+	JS_FreeValue(ctx, len_v);
+	const char **varyings = js_mallocz(ctx, len * sizeof(const char *));
+	if (!varyings)
+		return JS_UNDEFINED;
+	JSValue *strs = js_mallocz(ctx, len * sizeof(JSValue));
+	if (!strs) {
+		js_free(ctx, varyings);
+		return JS_UNDEFINED;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		strs[i] = JS_GetPropertyUint32(ctx, argv[1], i);
+		varyings[i] = JS_ToCString(ctx, strs[i]);
+	}
+	nx_webgl_egl_transform_feedback_varyings(context->egl, program->gles_handle,
+	                                          len, varyings, buffer_mode);
+	for (uint32_t i = 0; i < len; i++) {
+		if (varyings[i])
+			JS_FreeCString(ctx, varyings[i]);
+		JS_FreeValue(ctx, strs[i]);
+	}
+	js_free(ctx, strs);
+	js_free(ctx, varyings);
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_get_transform_feedback_varying(JSContext *ctx,
+                                                         JSValueConst this_val,
+                                                         int argc,
+                                                         JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	uint32_t index;
+	if (!program || JS_ToUint32(ctx, &index, argv[1])) {
+		context->error = GL_INVALID_OPERATION;
+		return JS_NULL;
+	}
+	char name[256] = {0};
+	int size = 0;
+	uint32_t type = 0;
+	if (!nx_webgl_egl_get_transform_feedback_varying(context->egl,
+	                                                   program->gles_handle,
+	                                                   index, name, sizeof(name),
+	                                                   &size, &type))
+		return JS_NULL;
+	nx_webgl_active_info_t info = {name, size, type};
+	return new_active_info(ctx, &info);
+}
+
+// ---- misc -----------------------------------------------------------------
+
+static JSValue nx_webgl_get_frag_data_location(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	if (!program)
+		return JS_NewInt32(ctx, -1);
+	const char *name = JS_ToCString(ctx, argv[1]);
+	int r = -1;
+	if (name)
+		r = nx_webgl_egl_get_frag_data_location(context->egl,
+		                                          program->gles_handle, name);
+	if (name)
+		JS_FreeCString(ctx, name);
+	return JS_NewInt32(ctx, r);
+}
+
+static JSValue nx_webgl_get_internal_format_parameter(JSContext *ctx,
+                                                        JSValueConst this_val,
+                                                        int argc,
+                                                        JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t target, internalformat, pname;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToUint32(ctx, &internalformat, argv[1]) ||
+		JS_ToUint32(ctx, &pname, argv[2]))
+		return JS_EXCEPTION;
+	int32_t scratch[64];
+	if (!nx_webgl_egl_get_internal_format_iv(context->egl, target,
+	                                            internalformat, pname, 64,
+	                                            scratch))
+		return JS_NULL;
+	int n = 1;
+	if (pname == 0x80A9 /* SAMPLES */)
+		n = scratch[0] < 0 ? 0 : (scratch[0] > 63 ? 63 : scratch[0]);
+	// Wrap result in an Int32Array.
+	JSValue ab = JS_NewArrayBufferCopy(ctx, (const uint8_t *)scratch,
+	                                    n * sizeof(int32_t));
+	if (JS_IsException(ab))
+		return JS_NULL;
+	JSValue ctor = JS_GetPropertyStr(ctx, JS_GetGlobalObject(ctx), "Int32Array");
+	JSValue args[1] = {ab};
+	JSValue arr = JS_CallConstructor(ctx, ctor, 1, args);
+	JS_FreeValue(ctx, ctor);
+	JS_FreeValue(ctx, ab);
+	return arr;
+}
+
+// ---- WebGL 2 init class ---------------------------------------------------
+
+static JSValue nx_webgl2_context_init_class(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv);
 
 static void define_constant(JSContext *ctx, JSValueConst obj, const char *name,
 							int32_t value) {
@@ -8709,6 +12036,15 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "TEXTURE_WRAP_T", GL_TEXTURE_WRAP_T);
 	define_constant(ctx, proto, "NEAREST", GL_NEAREST);
 	define_constant(ctx, proto, "LINEAR", GL_LINEAR);
+	// Mipmap-aware MIN_FILTER constants (milestone #24).
+	define_constant(ctx, proto, "NEAREST_MIPMAP_NEAREST",
+	                GL_NEAREST_MIPMAP_NEAREST);
+	define_constant(ctx, proto, "LINEAR_MIPMAP_NEAREST",
+	                GL_LINEAR_MIPMAP_NEAREST);
+	define_constant(ctx, proto, "NEAREST_MIPMAP_LINEAR",
+	                GL_NEAREST_MIPMAP_LINEAR);
+	define_constant(ctx, proto, "LINEAR_MIPMAP_LINEAR",
+	                GL_LINEAR_MIPMAP_LINEAR);
 	define_constant(ctx, proto, "CLAMP_TO_EDGE", GL_CLAMP_TO_EDGE);
 	define_constant(ctx, proto, "REPEAT", GL_REPEAT);
 	define_constant(ctx, proto, "RGBA", GL_RGBA);
@@ -8752,9 +12088,429 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	return JS_UNDEFINED;
 }
 
+// ============================================================================
+// WebGL 2 init class
+// ----------------------------------------------------------------------------
+// Defines WebGL 2-specific methods + constants on the WebGL2RenderingContext
+// prototype only. The class extends WebGLRenderingContext in JS, so every
+// WebGL 1 method/constant is inherited via the JS prototype chain. Some
+// WebGL 1 entry points are re-bound here when their JS-visible name differs
+// (e.g. native `drawArraysInstanced` vs WebGL 1's ANGLE-suffixed wrapper).
+static JSValue nx_webgl2_context_init_class(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+	(void)this_val;
+	(void)argc;
+	JSValue proto = JS_GetPropertyStr(ctx, argv[0], "prototype");
+
+	// VAOs.
+	NX_DEF_FUNC(proto, "createVertexArray", nx_webgl_create_vertex_array, 0);
+	NX_DEF_FUNC(proto, "deleteVertexArray", nx_webgl_delete_vertex_array, 1);
+	NX_DEF_FUNC(proto, "isVertexArray", nx_webgl_is_vertex_array, 1);
+	NX_DEF_FUNC(proto, "bindVertexArray", nx_webgl_bind_vertex_array, 1);
+
+	// Native instancing (same C functions the ANGLE_instanced_arrays
+	// wrapper forwards to; here they're first-class on the v2 proto).
+	NX_DEF_FUNC(proto, "drawArraysInstanced",
+	            nx_webgl_draw_arrays_instanced, 4);
+	NX_DEF_FUNC(proto, "drawElementsInstanced",
+	            nx_webgl_draw_elements_instanced, 5);
+	NX_DEF_FUNC(proto, "vertexAttribDivisor",
+	            nx_webgl_vertex_attrib_divisor, 2);
+
+	// Integer vertex attributes.
+	NX_DEF_FUNC(proto, "vertexAttribIPointer",
+	            nx_webgl_vertex_attrib_i_pointer, 5);
+	NX_DEF_FUNC(proto, "vertexAttribI4i", nx_webgl_vertex_attrib_i4i, 5);
+	NX_DEF_FUNC(proto, "vertexAttribI4ui", nx_webgl_vertex_attrib_i4ui, 5);
+	NX_DEF_FUNC(proto, "vertexAttribI4iv", nx_webgl_vertex_attrib_i4iv, 2);
+	NX_DEF_FUNC(proto, "vertexAttribI4uiv", nx_webgl_vertex_attrib_i4uiv, 2);
+
+	// Unsigned-integer uniforms.
+	NX_DEF_FUNC(proto, "uniform1ui", nx_webgl_uniform1ui_v2, 2);
+	NX_DEF_FUNC(proto, "uniform2ui", nx_webgl_uniform2ui_v2, 3);
+	NX_DEF_FUNC(proto, "uniform3ui", nx_webgl_uniform3ui_v2, 4);
+	NX_DEF_FUNC(proto, "uniform4ui", nx_webgl_uniform4ui_v2, 5);
+	NX_DEF_FUNC(proto, "uniform1uiv", nx_webgl_uniform1uiv_v2, 2);
+	NX_DEF_FUNC(proto, "uniform2uiv", nx_webgl_uniform2uiv_v2, 2);
+	NX_DEF_FUNC(proto, "uniform3uiv", nx_webgl_uniform3uiv_v2, 2);
+	NX_DEF_FUNC(proto, "uniform4uiv", nx_webgl_uniform4uiv_v2, 2);
+
+	// Non-square matrix uniforms.
+	NX_DEF_FUNC(proto, "uniformMatrix2x3fv", nx_webgl_uniform_matrix2x3fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix3x2fv", nx_webgl_uniform_matrix3x2fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix2x4fv", nx_webgl_uniform_matrix2x4fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix4x2fv", nx_webgl_uniform_matrix4x2fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix3x4fv", nx_webgl_uniform_matrix3x4fv, 3);
+	NX_DEF_FUNC(proto, "uniformMatrix4x3fv", nx_webgl_uniform_matrix4x3fv, 3);
+
+	// MRT / FBO ops.
+	NX_DEF_FUNC(proto, "drawBuffers", nx_webgl_draw_buffers, 1);
+	NX_DEF_FUNC(proto, "invalidateFramebuffer",
+	            nx_webgl_invalidate_framebuffer, 2);
+	NX_DEF_FUNC(proto, "invalidateSubFramebuffer",
+	            nx_webgl_invalidate_sub_framebuffer, 6);
+	NX_DEF_FUNC(proto, "blitFramebuffer", nx_webgl_blit_framebuffer, 10);
+	NX_DEF_FUNC(proto, "readBuffer", nx_webgl_read_buffer, 1);
+	NX_DEF_FUNC(proto, "renderbufferStorageMultisample",
+	            nx_webgl_renderbuffer_storage_multisample, 5);
+	NX_DEF_FUNC(proto, "framebufferTextureLayer",
+	            nx_webgl_framebuffer_texture_layer, 5);
+
+	// 3D / array texture upload + immutable storage.
+	NX_DEF_FUNC(proto, "texImage3D", nx_webgl_tex_image_3d, 10);
+	NX_DEF_FUNC(proto, "texSubImage3D", nx_webgl_tex_sub_image_3d, 11);
+	NX_DEF_FUNC(proto, "copyTexSubImage3D", nx_webgl_copy_tex_sub_image_3d, 9);
+	NX_DEF_FUNC(proto, "compressedTexImage3D",
+	            nx_webgl_compressed_tex_image_3d, 8);
+	NX_DEF_FUNC(proto, "compressedTexSubImage3D",
+	            nx_webgl_compressed_tex_sub_image_3d, 10);
+	NX_DEF_FUNC(proto, "texStorage2D", nx_webgl_tex_storage_2d, 5);
+	NX_DEF_FUNC(proto, "texStorage3D", nx_webgl_tex_storage_3d, 6);
+
+	// clearBuffer family.
+	NX_DEF_FUNC(proto, "clearBufferiv", nx_webgl_clear_buffer_iv, 3);
+	NX_DEF_FUNC(proto, "clearBufferuiv", nx_webgl_clear_buffer_uiv, 3);
+	NX_DEF_FUNC(proto, "clearBufferfv", nx_webgl_clear_buffer_fv, 3);
+	NX_DEF_FUNC(proto, "clearBufferfi", nx_webgl_clear_buffer_fi, 4);
+
+	// Buffer copy/readback.
+	NX_DEF_FUNC(proto, "copyBufferSubData", nx_webgl_copy_buffer_sub_data, 5);
+	NX_DEF_FUNC(proto, "getBufferSubData", nx_webgl_get_buffer_sub_data, 3);
+
+	// UBOs.
+	NX_DEF_FUNC(proto, "bindBufferBase", nx_webgl_bind_buffer_base, 3);
+	NX_DEF_FUNC(proto, "bindBufferRange", nx_webgl_bind_buffer_range, 5);
+	NX_DEF_FUNC(proto, "getUniformIndices", nx_webgl_get_uniform_indices, 2);
+	NX_DEF_FUNC(proto, "getActiveUniforms", nx_webgl_get_active_uniforms, 3);
+	NX_DEF_FUNC(proto, "getUniformBlockIndex",
+	            nx_webgl_get_uniform_block_index, 2);
+	NX_DEF_FUNC(proto, "getActiveUniformBlockParameter",
+	            nx_webgl_get_active_uniform_block_parameter, 3);
+	NX_DEF_FUNC(proto, "getActiveUniformBlockName",
+	            nx_webgl_get_active_uniform_block_name, 2);
+	NX_DEF_FUNC(proto, "uniformBlockBinding",
+	            nx_webgl_uniform_block_binding, 3);
+	NX_DEF_FUNC(proto, "getIndexedParameter",
+	            nx_webgl_get_indexed_parameter, 2);
+
+	// Sampler objects.
+	NX_DEF_FUNC(proto, "createSampler", nx_webgl_create_sampler, 0);
+	NX_DEF_FUNC(proto, "deleteSampler", nx_webgl_delete_sampler, 1);
+	NX_DEF_FUNC(proto, "isSampler", nx_webgl_is_sampler, 1);
+	NX_DEF_FUNC(proto, "bindSampler", nx_webgl_bind_sampler, 2);
+	NX_DEF_FUNC(proto, "samplerParameteri", nx_webgl_sampler_parameteri, 3);
+	NX_DEF_FUNC(proto, "samplerParameterf", nx_webgl_sampler_parameterf, 3);
+	NX_DEF_FUNC(proto, "getSamplerParameter",
+	            nx_webgl_get_sampler_parameter, 2);
+
+	// Sync objects.
+	NX_DEF_FUNC(proto, "fenceSync", nx_webgl_fence_sync, 2);
+	NX_DEF_FUNC(proto, "isSync", nx_webgl_is_sync, 1);
+	NX_DEF_FUNC(proto, "deleteSync", nx_webgl_delete_sync, 1);
+	NX_DEF_FUNC(proto, "clientWaitSync", nx_webgl_client_wait_sync, 3);
+	NX_DEF_FUNC(proto, "waitSync", nx_webgl_wait_sync, 3);
+	NX_DEF_FUNC(proto, "getSyncParameter", nx_webgl_get_sync_parameter, 2);
+
+	// Query objects.
+	NX_DEF_FUNC(proto, "createQuery", nx_webgl_create_query, 0);
+	NX_DEF_FUNC(proto, "deleteQuery", nx_webgl_delete_query, 1);
+	NX_DEF_FUNC(proto, "isQuery", nx_webgl_is_query, 1);
+	NX_DEF_FUNC(proto, "beginQuery", nx_webgl_begin_query, 2);
+	NX_DEF_FUNC(proto, "endQuery", nx_webgl_end_query, 1);
+	NX_DEF_FUNC(proto, "getQuery", nx_webgl_get_query, 2);
+	NX_DEF_FUNC(proto, "getQueryParameter",
+	            nx_webgl_get_query_parameter, 2);
+
+	// Transform feedback.
+	NX_DEF_FUNC(proto, "createTransformFeedback",
+	            nx_webgl_create_transform_feedback, 0);
+	NX_DEF_FUNC(proto, "deleteTransformFeedback",
+	            nx_webgl_delete_transform_feedback, 1);
+	NX_DEF_FUNC(proto, "isTransformFeedback",
+	            nx_webgl_is_transform_feedback, 1);
+	NX_DEF_FUNC(proto, "bindTransformFeedback",
+	            nx_webgl_bind_transform_feedback, 2);
+	NX_DEF_FUNC(proto, "beginTransformFeedback",
+	            nx_webgl_begin_transform_feedback, 1);
+	NX_DEF_FUNC(proto, "endTransformFeedback",
+	            nx_webgl_end_transform_feedback, 0);
+	NX_DEF_FUNC(proto, "pauseTransformFeedback",
+	            nx_webgl_pause_transform_feedback, 0);
+	NX_DEF_FUNC(proto, "resumeTransformFeedback",
+	            nx_webgl_resume_transform_feedback, 0);
+	NX_DEF_FUNC(proto, "transformFeedbackVaryings",
+	            nx_webgl_transform_feedback_varyings, 3);
+	NX_DEF_FUNC(proto, "getTransformFeedbackVarying",
+	            nx_webgl_get_transform_feedback_varying, 2);
+
+	// Misc.
+	NX_DEF_FUNC(proto, "getFragDataLocation",
+	            nx_webgl_get_frag_data_location, 2);
+	NX_DEF_FUNC(proto, "getInternalformatParameter",
+	            nx_webgl_get_internal_format_parameter, 3);
+
+	// ---- WebGL 2 constants (all v2-only — parent untouched) -----------
+	define_constant(ctx, proto, "READ_BUFFER", 0x0C02);
+	define_constant(ctx, proto, "UNPACK_ROW_LENGTH", 0x0CF2);
+	define_constant(ctx, proto, "UNPACK_SKIP_ROWS", 0x0CF3);
+	define_constant(ctx, proto, "UNPACK_SKIP_PIXELS", 0x0CF4);
+	define_constant(ctx, proto, "PACK_ROW_LENGTH", 0x0D02);
+	define_constant(ctx, proto, "PACK_SKIP_ROWS", 0x0D03);
+	define_constant(ctx, proto, "PACK_SKIP_PIXELS", 0x0D04);
+	define_constant(ctx, proto, "COLOR", 0x1800);
+	define_constant(ctx, proto, "DEPTH", 0x1801);
+	define_constant(ctx, proto, "STENCIL", 0x1802);
+	define_constant(ctx, proto, "RED", 0x1903);
+	define_constant(ctx, proto, "RGB8", 0x8051);
+	define_constant(ctx, proto, "RGBA8", 0x8058);
+	define_constant(ctx, proto, "RGB10_A2", 0x8059);
+	define_constant(ctx, proto, "TEXTURE_BINDING_3D", 0x806A);
+	define_constant(ctx, proto, "UNPACK_SKIP_IMAGES", 0x806D);
+	define_constant(ctx, proto, "UNPACK_IMAGE_HEIGHT", 0x806E);
+	define_constant(ctx, proto, "TEXTURE_3D", 0x806F);
+	define_constant(ctx, proto, "TEXTURE_WRAP_R", 0x8072);
+	define_constant(ctx, proto, "MAX_3D_TEXTURE_SIZE", 0x8073);
+	define_constant(ctx, proto, "UNSIGNED_INT_2_10_10_10_REV", 0x8368);
+	define_constant(ctx, proto, "MAX_ELEMENTS_VERTICES", 0x80E8);
+	define_constant(ctx, proto, "MAX_ELEMENTS_INDICES", 0x80E9);
+	define_constant(ctx, proto, "TEXTURE_MIN_LOD", 0x813A);
+	define_constant(ctx, proto, "TEXTURE_MAX_LOD", 0x813B);
+	define_constant(ctx, proto, "TEXTURE_BASE_LEVEL", 0x813C);
+	define_constant(ctx, proto, "TEXTURE_MAX_LEVEL", 0x813D);
+	define_constant(ctx, proto, "MIN", 0x8007);
+	define_constant(ctx, proto, "MAX", 0x8008);
+	define_constant(ctx, proto, "DEPTH_COMPONENT24", 0x81A6);
+	define_constant(ctx, proto, "MAX_TEXTURE_LOD_BIAS", 0x84FD);
+	define_constant(ctx, proto, "TEXTURE_COMPARE_MODE", 0x884C);
+	define_constant(ctx, proto, "TEXTURE_COMPARE_FUNC", 0x884D);
+	define_constant(ctx, proto, "CURRENT_QUERY", 0x8865);
+	define_constant(ctx, proto, "QUERY_RESULT", 0x8866);
+	define_constant(ctx, proto, "QUERY_RESULT_AVAILABLE", 0x8867);
+	define_constant(ctx, proto, "STREAM_READ", 0x88E1);
+	define_constant(ctx, proto, "STREAM_COPY", 0x88E2);
+	define_constant(ctx, proto, "STATIC_READ", 0x88E5);
+	define_constant(ctx, proto, "STATIC_COPY", 0x88E6);
+	define_constant(ctx, proto, "DYNAMIC_READ", 0x88E9);
+	define_constant(ctx, proto, "DYNAMIC_COPY", 0x88EA);
+	define_constant(ctx, proto, "MAX_DRAW_BUFFERS", 0x8824);
+	for (int i = 0; i < 16; i++) {
+		char name[24];
+		snprintf(name, sizeof(name), "DRAW_BUFFER%d", i);
+		define_constant(ctx, proto, name, 0x8825 + i);
+	}
+	define_constant(ctx, proto, "MAX_FRAGMENT_UNIFORM_COMPONENTS", 0x8B49);
+	define_constant(ctx, proto, "MAX_VERTEX_UNIFORM_COMPONENTS", 0x8B4A);
+	define_constant(ctx, proto, "SAMPLER_3D", 0x8B5F);
+	define_constant(ctx, proto, "SAMPLER_2D_SHADOW", 0x8B62);
+	define_constant(ctx, proto, "FRAGMENT_SHADER_DERIVATIVE_HINT", 0x8B8B);
+	define_constant(ctx, proto, "PIXEL_PACK_BUFFER", 0x88EB);
+	define_constant(ctx, proto, "PIXEL_UNPACK_BUFFER", 0x88EC);
+	define_constant(ctx, proto, "PIXEL_PACK_BUFFER_BINDING", 0x88ED);
+	define_constant(ctx, proto, "PIXEL_UNPACK_BUFFER_BINDING", 0x88EF);
+	define_constant(ctx, proto, "FLOAT_MAT2x3", 0x8B65);
+	define_constant(ctx, proto, "FLOAT_MAT2x4", 0x8B66);
+	define_constant(ctx, proto, "FLOAT_MAT3x2", 0x8B67);
+	define_constant(ctx, proto, "FLOAT_MAT3x4", 0x8B68);
+	define_constant(ctx, proto, "FLOAT_MAT4x2", 0x8B69);
+	define_constant(ctx, proto, "FLOAT_MAT4x3", 0x8B6A);
+	define_constant(ctx, proto, "SRGB", 0x8C40);
+	define_constant(ctx, proto, "SRGB8", 0x8C41);
+	define_constant(ctx, proto, "SRGB8_ALPHA8", 0x8C43);
+	define_constant(ctx, proto, "COMPARE_REF_TO_TEXTURE", 0x884E);
+	define_constant(ctx, proto, "RGBA32F", 0x8814);
+	define_constant(ctx, proto, "RGB32F", 0x8815);
+	define_constant(ctx, proto, "RGBA16F", 0x881A);
+	define_constant(ctx, proto, "RGB16F", 0x881B);
+	define_constant(ctx, proto, "VERTEX_ATTRIB_ARRAY_INTEGER", 0x88FD);
+	define_constant(ctx, proto, "MAX_ARRAY_TEXTURE_LAYERS", 0x88FF);
+	define_constant(ctx, proto, "MIN_PROGRAM_TEXEL_OFFSET", 0x8904);
+	define_constant(ctx, proto, "MAX_PROGRAM_TEXEL_OFFSET", 0x8905);
+	define_constant(ctx, proto, "MAX_VARYING_COMPONENTS", 0x8B4B);
+	define_constant(ctx, proto, "TEXTURE_2D_ARRAY", 0x8C1A);
+	define_constant(ctx, proto, "TEXTURE_BINDING_2D_ARRAY", 0x8C1D);
+	define_constant(ctx, proto, "R11F_G11F_B10F", 0x8C3A);
+	define_constant(ctx, proto, "UNSIGNED_INT_10F_11F_11F_REV", 0x8C3B);
+	define_constant(ctx, proto, "RGB9_E5", 0x8C3D);
+	define_constant(ctx, proto, "UNSIGNED_INT_5_9_9_9_REV", 0x8C3E);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BUFFER_MODE", 0x8C7F);
+	define_constant(ctx, proto, "MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS",
+	                0x8C80);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_VARYINGS", 0x8C83);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BUFFER_START", 0x8C84);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BUFFER_SIZE", 0x8C85);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN", 0x8C88);
+	define_constant(ctx, proto, "RASTERIZER_DISCARD", 0x8C89);
+	define_constant(ctx, proto,
+	                "MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS", 0x8C7A);
+	define_constant(ctx, proto, "MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS",
+	                0x8C8B);
+	define_constant(ctx, proto, "INTERLEAVED_ATTRIBS", 0x8C8C);
+	define_constant(ctx, proto, "SEPARATE_ATTRIBS", 0x8C8D);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BUFFER", 0x8C8E);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BUFFER_BINDING", 0x8C8F);
+	define_constant(ctx, proto, "RGBA32UI", 0x8D70);
+	define_constant(ctx, proto, "RGB32UI", 0x8D71);
+	define_constant(ctx, proto, "RGBA16UI", 0x8D76);
+	define_constant(ctx, proto, "RGB16UI", 0x8D77);
+	define_constant(ctx, proto, "RGBA8UI", 0x8D7C);
+	define_constant(ctx, proto, "RGB8UI", 0x8D7D);
+	define_constant(ctx, proto, "RGBA32I", 0x8D82);
+	define_constant(ctx, proto, "RGB32I", 0x8D83);
+	define_constant(ctx, proto, "RGBA16I", 0x8D88);
+	define_constant(ctx, proto, "RGB16I", 0x8D89);
+	define_constant(ctx, proto, "RGBA8I", 0x8D8E);
+	define_constant(ctx, proto, "RGB8I", 0x8D8F);
+	define_constant(ctx, proto, "RED_INTEGER", 0x8D94);
+	define_constant(ctx, proto, "RGB_INTEGER", 0x8D98);
+	define_constant(ctx, proto, "RGBA_INTEGER", 0x8D99);
+	define_constant(ctx, proto, "SAMPLER_2D_ARRAY", 0x8DC1);
+	define_constant(ctx, proto, "SAMPLER_2D_ARRAY_SHADOW", 0x8DC4);
+	define_constant(ctx, proto, "SAMPLER_CUBE_SHADOW", 0x8DC5);
+	define_constant(ctx, proto, "UNSIGNED_INT_VEC2", 0x8DC6);
+	define_constant(ctx, proto, "UNSIGNED_INT_VEC3", 0x8DC7);
+	define_constant(ctx, proto, "UNSIGNED_INT_VEC4", 0x8DC8);
+	define_constant(ctx, proto, "INT_SAMPLER_2D", 0x8DCA);
+	define_constant(ctx, proto, "INT_SAMPLER_3D", 0x8DCB);
+	define_constant(ctx, proto, "INT_SAMPLER_CUBE", 0x8DCC);
+	define_constant(ctx, proto, "INT_SAMPLER_2D_ARRAY", 0x8DCF);
+	define_constant(ctx, proto, "UNSIGNED_INT_SAMPLER_2D", 0x8DD2);
+	define_constant(ctx, proto, "UNSIGNED_INT_SAMPLER_3D", 0x8DD3);
+	define_constant(ctx, proto, "UNSIGNED_INT_SAMPLER_CUBE", 0x8DD4);
+	define_constant(ctx, proto, "UNSIGNED_INT_SAMPLER_2D_ARRAY", 0x8DD7);
+	define_constant(ctx, proto, "DEPTH_COMPONENT32F", 0x8CAC);
+	define_constant(ctx, proto, "DEPTH32F_STENCIL8", 0x8CAD);
+	define_constant(ctx, proto, "FLOAT_32_UNSIGNED_INT_24_8_REV", 0x8DAD);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING", 0x8210);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE", 0x8211);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_RED_SIZE", 0x8212);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_GREEN_SIZE", 0x8213);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_BLUE_SIZE", 0x8214);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE", 0x8215);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE", 0x8216);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE", 0x8217);
+	define_constant(ctx, proto, "FRAMEBUFFER_DEFAULT", 0x8218);
+	define_constant(ctx, proto, "UNSIGNED_INT_24_8", 0x84FA);
+	define_constant(ctx, proto, "DEPTH24_STENCIL8", 0x88F0);
+	define_constant(ctx, proto, "UNSIGNED_NORMALIZED", 0x8C17);
+	define_constant(ctx, proto, "DRAW_FRAMEBUFFER_BINDING", 0x8CA6);
+	define_constant(ctx, proto, "READ_FRAMEBUFFER", 0x8CA8);
+	define_constant(ctx, proto, "DRAW_FRAMEBUFFER", 0x8CA9);
+	define_constant(ctx, proto, "READ_FRAMEBUFFER_BINDING", 0x8CAA);
+	define_constant(ctx, proto, "RENDERBUFFER_SAMPLES", 0x8CAB);
+	define_constant(ctx, proto, "FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER", 0x8CD4);
+	define_constant(ctx, proto, "MAX_COLOR_ATTACHMENTS", 0x8CDF);
+	for (int i = 1; i < 16; i++) {
+		char name[24];
+		snprintf(name, sizeof(name), "COLOR_ATTACHMENT%d", i);
+		define_constant(ctx, proto, name, 0x8CE0 + i);
+	}
+	define_constant(ctx, proto, "FRAMEBUFFER_INCOMPLETE_MULTISAMPLE", 0x8D56);
+	define_constant(ctx, proto, "MAX_SAMPLES", 0x8D57);
+	define_constant(ctx, proto, "HALF_FLOAT", 0x140B);
+	define_constant(ctx, proto, "RG", 0x8227);
+	define_constant(ctx, proto, "RG_INTEGER", 0x8228);
+	define_constant(ctx, proto, "R8", 0x8229);
+	define_constant(ctx, proto, "RG8", 0x822B);
+	define_constant(ctx, proto, "R16F", 0x822D);
+	define_constant(ctx, proto, "R32F", 0x822E);
+	define_constant(ctx, proto, "RG16F", 0x822F);
+	define_constant(ctx, proto, "RG32F", 0x8230);
+	define_constant(ctx, proto, "R8I", 0x8231);
+	define_constant(ctx, proto, "R8UI", 0x8232);
+	define_constant(ctx, proto, "R16I", 0x8233);
+	define_constant(ctx, proto, "R16UI", 0x8234);
+	define_constant(ctx, proto, "R32I", 0x8235);
+	define_constant(ctx, proto, "R32UI", 0x8236);
+	define_constant(ctx, proto, "RG8I", 0x8237);
+	define_constant(ctx, proto, "RG8UI", 0x8238);
+	define_constant(ctx, proto, "RG16I", 0x8239);
+	define_constant(ctx, proto, "RG16UI", 0x823A);
+	define_constant(ctx, proto, "RG32I", 0x823B);
+	define_constant(ctx, proto, "RG32UI", 0x823C);
+	define_constant(ctx, proto, "VERTEX_ARRAY_BINDING", 0x85B5);
+	define_constant(ctx, proto, "R8_SNORM", 0x8F94);
+	define_constant(ctx, proto, "RG8_SNORM", 0x8F95);
+	define_constant(ctx, proto, "RGB8_SNORM", 0x8F96);
+	define_constant(ctx, proto, "RGBA8_SNORM", 0x8F97);
+	define_constant(ctx, proto, "SIGNED_NORMALIZED", 0x8F9C);
+	define_constant(ctx, proto, "COPY_READ_BUFFER", 0x8F36);
+	define_constant(ctx, proto, "COPY_WRITE_BUFFER", 0x8F37);
+	define_constant(ctx, proto, "COPY_READ_BUFFER_BINDING", 0x8F36);
+	define_constant(ctx, proto, "COPY_WRITE_BUFFER_BINDING", 0x8F37);
+	define_constant(ctx, proto, "UNIFORM_BUFFER", 0x8A11);
+	define_constant(ctx, proto, "UNIFORM_BUFFER_BINDING", 0x8A28);
+	define_constant(ctx, proto, "UNIFORM_BUFFER_START", 0x8A29);
+	define_constant(ctx, proto, "UNIFORM_BUFFER_SIZE", 0x8A2A);
+	define_constant(ctx, proto, "MAX_VERTEX_UNIFORM_BLOCKS", 0x8A2B);
+	define_constant(ctx, proto, "MAX_FRAGMENT_UNIFORM_BLOCKS", 0x8A2D);
+	define_constant(ctx, proto, "MAX_COMBINED_UNIFORM_BLOCKS", 0x8A2E);
+	define_constant(ctx, proto, "MAX_UNIFORM_BUFFER_BINDINGS", 0x8A2F);
+	define_constant(ctx, proto, "MAX_UNIFORM_BLOCK_SIZE", 0x8A30);
+	define_constant(ctx, proto, "MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS",
+	                0x8A31);
+	define_constant(ctx, proto, "MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS",
+	                0x8A33);
+	define_constant(ctx, proto, "UNIFORM_BUFFER_OFFSET_ALIGNMENT", 0x8A34);
+	define_constant(ctx, proto, "ACTIVE_UNIFORM_BLOCKS", 0x8A36);
+	define_constant(ctx, proto, "UNIFORM_TYPE", 0x8A37);
+	define_constant(ctx, proto, "UNIFORM_SIZE", 0x8A38);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_INDEX", 0x8A3A);
+	define_constant(ctx, proto, "UNIFORM_OFFSET", 0x8A3B);
+	define_constant(ctx, proto, "UNIFORM_ARRAY_STRIDE", 0x8A3C);
+	define_constant(ctx, proto, "UNIFORM_MATRIX_STRIDE", 0x8A3D);
+	define_constant(ctx, proto, "UNIFORM_IS_ROW_MAJOR", 0x8A3E);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_BINDING", 0x8A3F);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_DATA_SIZE", 0x8A40);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_ACTIVE_UNIFORMS", 0x8A42);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES", 0x8A43);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER",
+	                0x8A44);
+	define_constant(ctx, proto, "UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER",
+	                0x8A46);
+	define_constant(ctx, proto, "INVALID_INDEX", 0xFFFFFFFFu);
+	define_constant(ctx, proto, "MAX_VERTEX_OUTPUT_COMPONENTS", 0x9122);
+	define_constant(ctx, proto, "MAX_FRAGMENT_INPUT_COMPONENTS", 0x9125);
+	define_constant(ctx, proto, "MAX_SERVER_WAIT_TIMEOUT", 0x9111);
+	define_constant(ctx, proto, "OBJECT_TYPE", 0x9112);
+	define_constant(ctx, proto, "SYNC_CONDITION", 0x9113);
+	define_constant(ctx, proto, "SYNC_STATUS", 0x9114);
+	define_constant(ctx, proto, "SYNC_FLAGS", 0x9115);
+	define_constant(ctx, proto, "SYNC_FENCE", 0x9116);
+	define_constant(ctx, proto, "SYNC_GPU_COMMANDS_COMPLETE", 0x9117);
+	define_constant(ctx, proto, "UNSIGNALED", 0x9118);
+	define_constant(ctx, proto, "SIGNALED", 0x9119);
+	define_constant(ctx, proto, "ALREADY_SIGNALED", 0x911A);
+	define_constant(ctx, proto, "TIMEOUT_EXPIRED", 0x911B);
+	define_constant(ctx, proto, "CONDITION_SATISFIED", 0x911C);
+	define_constant(ctx, proto, "WAIT_FAILED", 0x911D);
+	define_constant(ctx, proto, "SYNC_FLUSH_COMMANDS_BIT", 0x00000001);
+	define_constant(ctx, proto, "VERTEX_ATTRIB_ARRAY_DIVISOR", 0x88FE);
+	define_constant(ctx, proto, "ANY_SAMPLES_PASSED", 0x8C2F);
+	define_constant(ctx, proto, "ANY_SAMPLES_PASSED_CONSERVATIVE", 0x8D6A);
+	define_constant(ctx, proto, "SAMPLER_BINDING", 0x8919);
+	define_constant(ctx, proto, "RGB10_A2UI", 0x906F);
+	define_constant(ctx, proto, "INT_2_10_10_10_REV", 0x8D9F);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK", 0x8E22);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_PAUSED", 0x8E23);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_ACTIVE", 0x8E24);
+	define_constant(ctx, proto, "TRANSFORM_FEEDBACK_BINDING", 0x8E25);
+	define_constant(ctx, proto, "TEXTURE_IMMUTABLE_FORMAT", 0x912F);
+	define_constant(ctx, proto, "MAX_ELEMENT_INDEX", 0x8D6B);
+	define_constant(ctx, proto, "TEXTURE_IMMUTABLE_LEVELS", 0x82DF);
+	// JS spec: TIMEOUT_IGNORED is -1 as a Number; defined here for symmetry.
+	define_constant(ctx, proto, "TIMEOUT_IGNORED", -1);
+	define_constant(ctx, proto, "MAX_CLIENT_WAIT_TIMEOUT_WEBGL", 0x9247);
+
+	JS_FreeValue(ctx, proto);
+	return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry init_function_list[] = {
 	JS_CFUNC_DEF("webglContextNew", 0, nx_webgl_context_new),
 	JS_CFUNC_DEF("webglContextInitClass", 0, nx_webgl_context_init_class),
+	JS_CFUNC_DEF("webgl2ContextNew", 0, nx_webgl2_context_new),
+	JS_CFUNC_DEF("webgl2ContextInitClass", 0, nx_webgl2_context_init_class),
 };
 
 void nx_init_webgl(JSContext *ctx, JSValueConst init_obj) {
@@ -8816,6 +12572,42 @@ void nx_init_webgl(JSContext *ctx, JSValueConst init_obj) {
 		.finalizer = finalizer_webgl_renderbuffer,
 	};
 	JS_NewClass(rt, nx_webgl_renderbuffer_class_id, &webgl_renderbuffer_class);
+
+	JS_NewClassID(rt, &nx_webgl_vao_class_id);
+	JSClassDef webgl_vao_class = {
+		"nx_webgl_vao_t",
+		.finalizer = finalizer_webgl_vao,
+	};
+	JS_NewClass(rt, nx_webgl_vao_class_id, &webgl_vao_class);
+
+	JS_NewClassID(rt, &nx_webgl_sampler_class_id);
+	JSClassDef webgl_sampler_class = {
+		"nx_webgl_sampler_t",
+		.finalizer = finalizer_webgl_sampler,
+	};
+	JS_NewClass(rt, nx_webgl_sampler_class_id, &webgl_sampler_class);
+
+	JS_NewClassID(rt, &nx_webgl_query_class_id);
+	JSClassDef webgl_query_class = {
+		"nx_webgl_query_t",
+		.finalizer = finalizer_webgl_query,
+	};
+	JS_NewClass(rt, nx_webgl_query_class_id, &webgl_query_class);
+
+	JS_NewClassID(rt, &nx_webgl_sync_class_id);
+	JSClassDef webgl_sync_class = {
+		"nx_webgl_sync_t",
+		.finalizer = finalizer_webgl_sync,
+	};
+	JS_NewClass(rt, nx_webgl_sync_class_id, &webgl_sync_class);
+
+	JS_NewClassID(rt, &nx_webgl_transform_feedback_class_id);
+	JSClassDef webgl_transform_feedback_class = {
+		"nx_webgl_transform_feedback_t",
+		.finalizer = finalizer_webgl_transform_feedback,
+	};
+	JS_NewClass(rt, nx_webgl_transform_feedback_class_id,
+				&webgl_transform_feedback_class);
 
 	JS_SetPropertyFunctionList(ctx, init_obj, init_function_list,
 							   countof(init_function_list));

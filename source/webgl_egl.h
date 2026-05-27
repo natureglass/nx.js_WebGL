@@ -102,7 +102,11 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
   const float *specular_color,
   float shininess,
   const float *emissive_color,
-  bool use_derivative_normals);
+  bool use_derivative_normals,
+  bool hemi_light_enabled,
+  const float *hemi_light_direction,
+  const float *hemi_light_sky_color,
+  const float *hemi_light_ground_color);
 bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
   nx_canvas_t *canvas,
   const float *clip_xyz,
@@ -184,7 +188,11 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
   const float *specular_color,
   float shininess,
   const float *emissive_color,
-  bool use_derivative_normals);
+  bool use_derivative_normals,
+  bool hemi_light_enabled,
+  const float *hemi_light_direction,
+  const float *hemi_light_sky_color,
+  const float *hemi_light_ground_color);
 bool nx_webgl_egl_clear_prototype(nx_webgl_egl_t *backend,
 								  nx_canvas_t *canvas);
 bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas);
@@ -381,6 +389,23 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
                                                 uint32_t mag_filter,
                                                 uint32_t wrap_s,
                                                 uint32_t wrap_t);
+// Upload one face of a TEXTURE_CUBE_MAP persistent texture. `face_target`
+// must be one of GL_TEXTURE_CUBE_MAP_POSITIVE_X..NEGATIVE_Z. Filter/wrap
+// parameters apply to GL_TEXTURE_CUBE_MAP and are idempotent across faces.
+// Used by the cube branch of `texImage2D` ([[swb-threejs-webgl-materials-cubemap]],
+// milestone #25). `data` may be NULL for cube render-target init.
+bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    uint32_t face_target,
+                                                    int width, int height,
+                                                    uint32_t internalformat,
+                                                    uint32_t format,
+                                                    uint32_t type,
+                                                    const uint8_t *data,
+                                                    uint32_t min_filter,
+                                                    uint32_t mag_filter,
+                                                    uint32_t wrap_s,
+                                                    uint32_t wrap_t);
 uint32_t nx_webgl_egl_check_framebuffer_status(nx_webgl_egl_t *backend,
                                                  uint32_t handle);
 bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,
@@ -406,6 +431,21 @@ void nx_webgl_egl_forward_active_texture(nx_webgl_egl_t *backend,
 void nx_webgl_egl_forward_bind_texture(nx_webgl_egl_t *backend,
                                         uint32_t target, uint32_t handle);
 
+// Apply a glTexParameteri to a persistent texture handle. Used when the
+// JS-side `gl.texParameteri` call lands on a texture that's already
+// been promoted to a native GLES handle — the change needs to reach
+// native so subsequent draws sample with the new filter/wrap. Milestone
+// #24 ([[swb-threejs-webgl-materials-texture-filters]]).
+void nx_webgl_egl_texture_set_parameteri(nx_webgl_egl_t *backend,
+                                          uint32_t target,
+                                          uint32_t handle, uint32_t pname,
+                                          uint32_t param);
+// Generate mipmaps on a persistent texture handle. Caller must have
+// promoted the texture and uploaded the level-0 texels first. Milestone
+// #24.
+void nx_webgl_egl_generate_mipmap(nx_webgl_egl_t *backend,
+                                    uint32_t handle, uint32_t target);
+
 // Read pixels from a user-bound FBO. Standard GL bottom-up convention
 // (no y-flip — the user FBO doesn't share the bridge FBO's canvas-y
 // top-down quirk). Restores binding to whatever was current. Used when
@@ -415,3 +455,307 @@ bool nx_webgl_egl_read_user_fbo_pixels(nx_webgl_egl_t *backend,
                                         int x, int y, int width, int height,
                                         uint32_t format, uint32_t type,
                                         uint8_t *dst);
+
+// ============================================================================
+// WebGL 2 (ES 3.0) native trampolines
+// ============================================================================
+// All of these resolve their underlying entry point lazily via
+// `eglGetProcAddress` at backend init (alongside the existing instancing /
+// VAO probes). `nx_webgl_egl_has_webgl2(backend)` reports whether the core
+// set required by Three.js (instancing + VAOs + uint uniforms + drawBuffers +
+// vertex-array integer pointer) loaded; finer-grained queries follow.
+
+bool nx_webgl_egl_has_webgl2(nx_webgl_egl_t *backend);
+
+// Ensure the EGL/GLES backend is fully initialized (probe loop run to
+// completion). Caller-driven version of the lazy init that the existing
+// bridge dispatch paths trigger internally — needed when a JS entry point
+// like `gl.getParameter(MAX_SAMPLES)` calls a native GLES helper directly
+// without going through the bridge first. Returns true if available
+// (already initialized or just finished), false if the probe failed.
+bool nx_webgl_egl_ensure_initialized(nx_webgl_egl_t *backend,
+                                      nx_canvas_t *canvas);
+
+// Forward a glTexSubImage2D to a persistent native texture handle. Used by
+// `gl.texSubImage2D` after `gl.texStorage2D` allocated immutable storage
+// (Three.js's WebGL 2 texture upload pattern). The persistent handle is
+// already bound at the JS-side `bindTexture` so we don't re-bind here —
+// just make-current and forward.
+bool nx_webgl_egl_persistent_texture_sub_image_2d(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    int level,
+                                                    int xoffset, int yoffset,
+                                                    int width, int height,
+                                                    uint32_t format,
+                                                    uint32_t type,
+                                                    const void *pixels);
+
+// VAOs — exposed as user-managed bindings (in addition to the existing
+// passthrough_vao). `set_user_vao(handle)` is what `gl.bindVertexArray`
+// records; the passthrough dispatch consults it and binds the user's VAO
+// when non-zero, else the passthrough_vao. `0` means "bind the passthrough
+// VAO" (i.e. the WebGL 1 path).
+uint32_t nx_webgl_egl_gen_vertex_array(nx_webgl_egl_t *backend);
+void nx_webgl_egl_delete_vertex_array(nx_webgl_egl_t *backend, uint32_t handle);
+void nx_webgl_egl_set_user_vao(nx_webgl_egl_t *backend, uint32_t handle);
+uint32_t nx_webgl_egl_get_user_vao(nx_webgl_egl_t *backend);
+
+// drawBuffers (WebGL 2 native — replaces WEBGL_draw_buffers extension).
+void nx_webgl_egl_draw_buffers(nx_webgl_egl_t *backend, int n,
+                                const uint32_t *bufs);
+
+// invalidateFramebuffer / invalidateSubFramebuffer.
+void nx_webgl_egl_invalidate_framebuffer(nx_webgl_egl_t *backend,
+                                          uint32_t target, int n,
+                                          const uint32_t *attachments);
+void nx_webgl_egl_invalidate_sub_framebuffer(nx_webgl_egl_t *backend,
+                                              uint32_t target, int n,
+                                              const uint32_t *attachments,
+                                              int x, int y, int w, int h);
+
+// blitFramebuffer / readBuffer / renderbufferStorageMultisample /
+// framebufferTextureLayer.
+void nx_webgl_egl_blit_framebuffer(nx_webgl_egl_t *backend,
+                                    int srcX0, int srcY0, int srcX1, int srcY1,
+                                    int dstX0, int dstY0, int dstX1, int dstY1,
+                                    uint32_t mask, uint32_t filter);
+void nx_webgl_egl_read_buffer(nx_webgl_egl_t *backend, uint32_t src);
+bool nx_webgl_egl_renderbuffer_storage_multisample(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    int samples,
+                                                    uint32_t internalformat,
+                                                    int width, int height);
+bool nx_webgl_egl_framebuffer_texture_layer(nx_webgl_egl_t *backend,
+                                             uint32_t framebuffer_handle,
+                                             uint32_t attachment,
+                                             uint32_t texture_handle,
+                                             int level, int layer);
+
+// 3D / array texture upload + immutable storage.
+bool nx_webgl_egl_tex_image_3d(nx_webgl_egl_t *backend,
+                                uint32_t target, int level,
+                                uint32_t internalformat,
+                                int width, int height, int depth,
+                                int border, uint32_t format, uint32_t type,
+                                const void *data);
+bool nx_webgl_egl_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                    uint32_t target, int level,
+                                    int xoff, int yoff, int zoff,
+                                    int width, int height, int depth,
+                                    uint32_t format, uint32_t type,
+                                    const void *data);
+bool nx_webgl_egl_copy_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                         uint32_t target, int level,
+                                         int xoff, int yoff, int zoff,
+                                         int x, int y, int w, int h);
+bool nx_webgl_egl_compressed_tex_image_3d(nx_webgl_egl_t *backend,
+                                           uint32_t target, int level,
+                                           uint32_t internalformat,
+                                           int width, int height, int depth,
+                                           int border, size_t image_size,
+                                           const void *data);
+bool nx_webgl_egl_compressed_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                               uint32_t target, int level,
+                                               int xoff, int yoff, int zoff,
+                                               int width, int height, int depth,
+                                               uint32_t format, size_t image_size,
+                                               const void *data);
+bool nx_webgl_egl_tex_storage_2d(nx_webgl_egl_t *backend,
+                                  uint32_t target, int levels,
+                                  uint32_t internalformat,
+                                  int width, int height);
+bool nx_webgl_egl_tex_storage_3d(nx_webgl_egl_t *backend,
+                                  uint32_t target, int levels,
+                                  uint32_t internalformat,
+                                  int width, int height, int depth);
+
+// clearBuffer family.
+void nx_webgl_egl_clear_buffer_iv(nx_webgl_egl_t *backend,
+                                   uint32_t buffer, int drawbuffer,
+                                   const int *value);
+void nx_webgl_egl_clear_buffer_uiv(nx_webgl_egl_t *backend,
+                                    uint32_t buffer, int drawbuffer,
+                                    const uint32_t *value);
+void nx_webgl_egl_clear_buffer_fv(nx_webgl_egl_t *backend,
+                                   uint32_t buffer, int drawbuffer,
+                                   const float *value);
+void nx_webgl_egl_clear_buffer_fi(nx_webgl_egl_t *backend,
+                                   uint32_t buffer, int drawbuffer,
+                                   float depth, int stencil);
+
+// Integer vertex attributes.
+void nx_webgl_egl_vertex_attrib_i_pointer(nx_webgl_egl_t *backend,
+                                           uint32_t index, int size,
+                                           uint32_t type, int stride,
+                                           int offset);
+void nx_webgl_egl_vertex_attrib_i4i(nx_webgl_egl_t *backend, uint32_t index,
+                                     int x, int y, int z, int w);
+void nx_webgl_egl_vertex_attrib_i4ui(nx_webgl_egl_t *backend, uint32_t index,
+                                      uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t w);
+
+// Unsigned-integer + non-square matrix uniforms (ES 3 only — applied to the
+// currently bound GLES program, mirroring the existing uniform1f/etc. shape).
+void nx_webgl_egl_uniform1ui(nx_webgl_egl_t *backend, int location, uint32_t x);
+void nx_webgl_egl_uniform2ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y);
+void nx_webgl_egl_uniform3ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y, uint32_t z);
+void nx_webgl_egl_uniform4ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y, uint32_t z, uint32_t w);
+void nx_webgl_egl_uniform1uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value);
+void nx_webgl_egl_uniform2uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value);
+void nx_webgl_egl_uniform3uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value);
+void nx_webgl_egl_uniform4uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value);
+void nx_webgl_egl_uniform_matrix2x3fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+void nx_webgl_egl_uniform_matrix3x2fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+void nx_webgl_egl_uniform_matrix2x4fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+void nx_webgl_egl_uniform_matrix4x2fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+void nx_webgl_egl_uniform_matrix3x4fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+void nx_webgl_egl_uniform_matrix4x3fv(nx_webgl_egl_t *backend, int location,
+                                       int count, bool transpose,
+                                       const float *value);
+
+// Buffer copy / readback.
+void nx_webgl_egl_copy_buffer_sub_data(nx_webgl_egl_t *backend,
+                                        uint32_t read_target,
+                                        uint32_t write_target,
+                                        size_t read_offset, size_t write_offset,
+                                        size_t size);
+void nx_webgl_egl_get_buffer_sub_data(nx_webgl_egl_t *backend,
+                                       uint32_t target, size_t offset,
+                                       size_t size, void *dst);
+
+// UBOs.
+void nx_webgl_egl_bind_buffer_base(nx_webgl_egl_t *backend, uint32_t target,
+                                    uint32_t index, uint32_t buffer);
+void nx_webgl_egl_bind_buffer_range(nx_webgl_egl_t *backend, uint32_t target,
+                                     uint32_t index, uint32_t buffer,
+                                     size_t offset, size_t size);
+uint32_t nx_webgl_egl_get_uniform_block_index(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                const char *name);
+void nx_webgl_egl_uniform_block_binding(nx_webgl_egl_t *backend,
+                                         uint32_t program_handle,
+                                         uint32_t block_index,
+                                         uint32_t binding);
+bool nx_webgl_egl_get_active_uniform_block_iv(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                uint32_t block_index,
+                                                uint32_t pname,
+                                                int *out);
+bool nx_webgl_egl_get_active_uniform_block_name(nx_webgl_egl_t *backend,
+                                                  uint32_t program_handle,
+                                                  uint32_t block_index,
+                                                  char *name, size_t name_size);
+bool nx_webgl_egl_get_active_uniforms_iv(nx_webgl_egl_t *backend,
+                                          uint32_t program_handle,
+                                          int count, const uint32_t *indices,
+                                          uint32_t pname, int *out);
+
+// Sampler objects.
+uint32_t nx_webgl_egl_gen_sampler(nx_webgl_egl_t *backend);
+void nx_webgl_egl_delete_sampler(nx_webgl_egl_t *backend, uint32_t handle);
+void nx_webgl_egl_bind_sampler(nx_webgl_egl_t *backend, uint32_t unit,
+                                uint32_t handle);
+void nx_webgl_egl_sampler_parameteri(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t pname, int param);
+void nx_webgl_egl_sampler_parameterf(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t pname, float param);
+bool nx_webgl_egl_get_sampler_parameter_iv(nx_webgl_egl_t *backend,
+                                             uint32_t handle, uint32_t pname,
+                                             int *out);
+
+// Sync objects.
+void *nx_webgl_egl_fence_sync(nx_webgl_egl_t *backend, uint32_t condition,
+                               uint32_t flags);
+void nx_webgl_egl_delete_sync(nx_webgl_egl_t *backend, void *sync);
+uint32_t nx_webgl_egl_client_wait_sync(nx_webgl_egl_t *backend, void *sync,
+                                         uint32_t flags, uint64_t timeout);
+void nx_webgl_egl_wait_sync(nx_webgl_egl_t *backend, void *sync,
+                             uint32_t flags, uint64_t timeout);
+bool nx_webgl_egl_get_sync_iv(nx_webgl_egl_t *backend, void *sync,
+                                uint32_t pname, int *out);
+
+// Query objects.
+uint32_t nx_webgl_egl_gen_query(nx_webgl_egl_t *backend);
+void nx_webgl_egl_delete_query(nx_webgl_egl_t *backend, uint32_t handle);
+void nx_webgl_egl_begin_query(nx_webgl_egl_t *backend, uint32_t target,
+                               uint32_t handle);
+void nx_webgl_egl_end_query(nx_webgl_egl_t *backend, uint32_t target);
+bool nx_webgl_egl_get_query_iv(nx_webgl_egl_t *backend, uint32_t target,
+                                uint32_t pname, int *out);
+bool nx_webgl_egl_get_query_object_uiv(nx_webgl_egl_t *backend,
+                                         uint32_t handle, uint32_t pname,
+                                         uint32_t *out);
+
+// Transform feedback.
+uint32_t nx_webgl_egl_gen_transform_feedback(nx_webgl_egl_t *backend);
+void nx_webgl_egl_delete_transform_feedback(nx_webgl_egl_t *backend,
+                                              uint32_t handle);
+void nx_webgl_egl_bind_transform_feedback(nx_webgl_egl_t *backend,
+                                            uint32_t target, uint32_t handle);
+void nx_webgl_egl_begin_transform_feedback(nx_webgl_egl_t *backend,
+                                             uint32_t primitive_mode);
+void nx_webgl_egl_end_transform_feedback(nx_webgl_egl_t *backend);
+void nx_webgl_egl_pause_transform_feedback(nx_webgl_egl_t *backend);
+void nx_webgl_egl_resume_transform_feedback(nx_webgl_egl_t *backend);
+void nx_webgl_egl_transform_feedback_varyings(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                int count,
+                                                const char *const *varyings,
+                                                uint32_t buffer_mode);
+bool nx_webgl_egl_get_transform_feedback_varying(nx_webgl_egl_t *backend,
+                                                   uint32_t program_handle,
+                                                   uint32_t index,
+                                                   char *name, size_t name_size,
+                                                   int *size, uint32_t *type);
+
+// Misc.
+int nx_webgl_egl_get_frag_data_location(nx_webgl_egl_t *backend,
+                                          uint32_t program_handle,
+                                          const char *name);
+bool nx_webgl_egl_get_internal_format_iv(nx_webgl_egl_t *backend,
+                                           uint32_t target,
+                                           uint32_t internalformat,
+                                           uint32_t pname, int buf_size,
+                                           int *out);
+int nx_webgl_egl_get_max_samples(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_3d_texture_size(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_array_texture_layers(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_draw_buffers(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_color_attachments(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_uniform_buffer_bindings(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_uniform_buffer_offset_alignment(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_vertex_uniform_blocks(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_fragment_uniform_blocks(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_combined_uniform_blocks(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_transform_feedback_separate_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_transform_feedback_interleaved_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_transform_feedback_separate_attribs(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_element_index(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_elements_vertices(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_elements_indices(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_server_wait_timeout(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_program_texel_offset(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_min_program_texel_offset(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_varying_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_vertex_uniform_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_fragment_uniform_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_vertex_output_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_fragment_input_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_texture_lod_bias(nx_webgl_egl_t *backend);

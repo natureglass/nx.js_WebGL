@@ -1,0 +1,18 @@
+{
+  "name": "canvas-webgl2",
+  "version": "0.0.0",
+  "private": true,
+  "description": "nx.js app using raw WebGL 2 (GLSL ES 3.00) — Sunset Sea procedural ShaderToy scene with FBM water, a chrome cube wearing the nx.js logo, soft shadow + reflection streak",
+  "scripts": {
+    "build": "esbuild --bundle --sourcemap --sources-content=false --target=es2022 --format=esm --outdir=romfs src/main.ts",
+    "nro": "nxjs-nro",
+    "nsp": "nxjs-nsp"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@nx.js/nro": "workspace:^",
+    "@nx.js/nsp": "workspace:^",
+    "@nx.js/runtime": "workspace:^",
+    "esbuild": "catalog:"
+  }
+}

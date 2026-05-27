@@ -1,19 +1,22 @@
-// nx.js standalone WebGL demo — Ocean Cube.
+// nx.js standalone WebGL 1 demo — Moonlit Ocean Cube.
 //
-// All four shader programs (background sky/stars/planes, billboard moon,
-// animated ocean grid, chrome cube with logo) opt into the bridge's
-// raw-shader passthrough path via `#pragma raw_passthrough` so the
-// custom GLSL runs end-to-end on native GLES. Required because the
-// shader uniform/attribute names (uTime, uCamRight, uCubeYaw, etc.)
-// aren't in nx.js's hardcoded allowlist.
+// Direct port of switch-web-browser's inline `nxjs-webgl-demo` page
+// (romfs/pages/nxjs-webgl-demo/assets/main.js). Source of truth lives
+// there; this app is a wholesale clean port adapted only for the
+// standalone nx.js runtime (screen-canvas acquisition, romfs asset
+// path, gamepad-only input, no status-canvas globals, no console
+// silencing).
 //
-// Right stick orbits the camera; left stick (push up/down) zooms.
-// Touch + drag on the screen also orbits.
+// All four shader programs (background sky+stars, moon billboard,
+// FBM-displaced ocean grid, chrome cube with logo) opt into the
+// bridge's raw-shader passthrough path via `#pragma raw_passthrough`
+// so the custom GLSL runs end-to-end on native GLES. Required because
+// the shader uniform/attribute names (uTime, uCamRight, uCubeYaw,
+// uMoonSize, etc.) aren't in nx.js's hardcoded allowlist.
+//
+// Touch + drag on the screen orbits the camera. Right stick = orbit,
+// left stick (push up/down) = zoom.
 
-// nx.js's `screen` extends Canvas — it has getContext + addEventListener.
-// The bundled @nx.js/runtime types aren't always resolvable in the IDE
-// (they sit in the package's source not its build), so cast to `any`
-// at the API boundary. esbuild ignores TS types when bundling.
 const _screen: any = screen;
 const W = screen.width;
 const H = screen.height;
@@ -23,8 +26,8 @@ const H = screen.height;
 // but NOT by getContext('webgl'). If we only ever ask for a WebGL
 // context, the launching-screen-console never clears AND the WebGL
 // bridge's output never reaches the visible screen. Trigger the
-// framebuffer init by acquiring the 2D context once up front (we don't
-// actually use it after this), then proceed with WebGL.
+// framebuffer init by acquiring the 2D context once up front, then
+// proceed with WebGL.
 _screen.getContext('2d');
 
 const gl: WebGLRenderingContext | null = _screen.getContext('webgl', {
@@ -35,9 +38,7 @@ const gl: WebGLRenderingContext | null = _screen.getContext('webgl', {
 	premultipliedAlpha: false,
 	preserveDrawingBuffer: false,
 });
-if (!gl) {
-	throw new Error('WebGL is not available');
-}
+if (!gl) throw new Error('WebGL is not available');
 
 // Opt into the bridge's GPU-accelerated path. Without this the bridge
 // falls back to software cairo rasterization which can't run our
@@ -46,7 +47,7 @@ if (typeof (gl as any).enableGpuBridgePrototype === 'function') {
 	(gl as any).enableGpuBridgePrototype(true);
 }
 
-function compile(type: GLenum, src: string): WebGLShader {
+function shader(type: GLenum, src: string): WebGLShader {
 	const s = gl!.createShader(type)!;
 	gl!.shaderSource(s, src);
 	gl!.compileShader(s);
@@ -55,10 +56,10 @@ function compile(type: GLenum, src: string): WebGLShader {
 	}
 	return s;
 }
-function link(vs: string, fs: string): WebGLProgram {
+function program(vs: string, fs: string): WebGLProgram {
 	const p = gl!.createProgram()!;
-	gl!.attachShader(p, compile(gl!.VERTEX_SHADER, vs));
-	gl!.attachShader(p, compile(gl!.FRAGMENT_SHADER, fs));
+	gl!.attachShader(p, shader(gl!.VERTEX_SHADER, vs));
+	gl!.attachShader(p, shader(gl!.FRAGMENT_SHADER, fs));
 	gl!.linkProgram(p);
 	if (!gl!.getProgramParameter(p, gl!.LINK_STATUS)) {
 		throw new Error('program link: ' + gl!.getProgramInfoLog(p));
@@ -66,10 +67,9 @@ function link(vs: string, fs: string): WebGLProgram {
 	return p;
 }
 
-// --- Shader sources ----------------------------------------------------
-// All start with `#pragma raw_passthrough` so the bridge promotes the
-// program to native-GLES dispatch — required because the custom uniform
-// and attribute names aren't recognized by the bridge's allowlist.
+// --- Shader sources. All start with `#pragma raw_passthrough` so the
+// nx.js bridge promotes the program to native-GLES dispatch (the
+// custom uniform / attribute names aren't in the bridge's allowlist).
 
 const bgVS = `#pragma raw_passthrough
 	precision mediump float;
@@ -125,48 +125,14 @@ const bgFS = `#pragma raw_passthrough
 		vec2 starPos = vec2(hash(cell + 1.3), hash(cell + 4.7)) - 0.5;
 		float dist = length(f - starPos * 0.70);
 
-		float phaseA = hash(cell + 13.1) * 6.2831853;
-		float phaseB = hash(cell + 29.7) * 6.2831853;
-		float speedA = 1.8 + hash(cell + 8.2) * 4.8;
-		float speedB = 3.0 + hash(cell + 17.4) * 6.0;
-		float waveA = 0.5 + 0.5 * sin(uTime * speedA + phaseA);
-		float waveB = 0.5 + 0.5 * sin(uTime * speedB + phaseB);
-		float blinkGate = smoothstep(0.58, 0.92, waveA);
-		float flash = smoothstep(0.72, 1.0, hash(cell + floor(vec2(uTime * (1.10 + hash(cell + 5.6) * 2.0)))));
-		float twinkle = clamp(0.06 + waveA * 0.34 + waveB * 0.18 + blinkGate * 0.38 + flash * 0.52, 0.0, 1.15);
+		// Static per-cell brightness so the sky still has variation
+		// without time-driven twinkle/blink.
+		float twinkle = 0.55 + 0.45 * hash(cell + 7.1);
 
 		float spark = smoothstep(0.08, 0.0, dist) * star * twinkle * 1.18;
 		float halo = smoothstep(0.18, 0.0, dist) * star * 0.42 * (0.22 + twinkle * 0.78);
 
 		c += (vec3(0.92, 0.96, 1.0) * spark + vec3(0.56, 0.64, 0.92) * halo) * starMask * 1.20;
-
-		vec3 planeWhite = vec3(1.00, 0.96, 0.78);
-		vec3 planeRed = vec3(1.00, 0.035, 0.018);
-
-		for (int i = 0; i < 20; i++) {
-			float fi = float(i);
-			float baseLon = -3.14159265 + (fi + 0.5) * (6.2831853 / 20.0);
-			float planeLat = 0.018 + sin(fi * 2.17) * 0.006 + sin(uTime * 0.035 + fi) * 0.0012;
-			float planeSpeed = 0.012 + fract(sin(fi * 19.13) * 43758.5453) * 0.010;
-			float dirRand = fract(sin(fi * 53.71 + 1.23) * 43758.5453);
-			float planeDir = mix(-1.0, 1.0, step(0.5, dirRand));
-			float planeLon = mod(baseLon + uTime * planeSpeed * planeDir + 3.14159265, 6.2831853) - 3.14159265;
-
-			float dLon = atan(sin(lon - planeLon), cos(lon - planeLon));
-			float dLat = lat - planeLat;
-			float planeD = length(vec2(dLon * cos(planeLat), dLat));
-
-			float planeCore = smoothstep(0.00115, 0.0, planeD);
-
-			float planePhase = mod(uTime + fi * 0.173, 2.0);
-			float redBlinkA = smoothstep(0.00, 0.020, planePhase) * (1.0 - smoothstep(0.055, 0.085, planePhase));
-			float redBlinkB = smoothstep(0.105, 0.125, planePhase) * (1.0 - smoothstep(0.160, 0.190, planePhase));
-			float redBlink = clamp(redBlinkA + redBlinkB, 0.0, 1.0);
-			float planeTwinkle = 0.92 + 0.08 * sin(uTime * (5.2 + fi * 0.07) + fi);
-			vec3 planeColor = mix(planeWhite, planeRed, redBlink);
-
-			c += planeColor * planeCore * 2.45 * planeTwinkle;
-		}
 
 		c = pow(c, vec3(0.4545));
 		gl_FragColor = vec4(c, 1.0);
@@ -488,9 +454,6 @@ const cubeVS = `#pragma raw_passthrough
 	}
 `;
 
-// Note: nx.js's UNPACK_FLIP_Y_WEBGL is a no-op, so the cube UV scheme
-// (v=0 at face top) already maps row 0 of the source PNG to face top.
-// No `1.0 - vUv.y` flip needed.
 const cubeFS = `#pragma raw_passthrough
 	precision highp float;
 	uniform vec3 uCam;
@@ -546,33 +509,98 @@ const cubeFS = `#pragma raw_passthrough
 	}
 `;
 
-const bgProg = link(bgVS, bgFS);
-const moonProg = link(moonVS, moonFS);
-const waterProg = link(waterVS, waterFS);
-const cubeProg = link(cubeVS, cubeFS);
+const bgProg = program(bgVS, bgFS);
+const moonProg = program(moonVS, moonFS);
+const waterProg = program(waterVS, waterFS);
+const cubeProg = program(cubeVS, cubeFS);
 
-function attrib(prog: WebGLProgram, name: string, size: number, stride: number, offset: number) {
-	const loc = gl!.getAttribLocation(prog, name);
+// Resolve every uniform + attribute location ONCE per program. The
+// draw loop used to call `gl.getUniformLocation` ~25× and
+// `gl.getAttribLocation` ~6× per frame — each is a JS→native FFI hop
+// into nx.js that walks the linked program's active-uniform /
+// active-attrib list to match the name string. At 60 fps the constant
+// lookup cost adds up to several ms/frame on hardware. Pay it once.
+const U = {
+	bg: {
+		uTime: gl.getUniformLocation(bgProg, 'uTime'),
+		uCamRight: gl.getUniformLocation(bgProg, 'uCamRight'),
+		uCamUp: gl.getUniformLocation(bgProg, 'uCamUp'),
+		uCamForward: gl.getUniformLocation(bgProg, 'uCamForward'),
+		uAspect: gl.getUniformLocation(bgProg, 'uAspect'),
+		uTanHalfFov: gl.getUniformLocation(bgProg, 'uTanHalfFov'),
+	},
+	moon: {
+		uProj: gl.getUniformLocation(moonProg, 'uProj'),
+		uView: gl.getUniformLocation(moonProg, 'uView'),
+		uMoonCenter: gl.getUniformLocation(moonProg, 'uMoonCenter'),
+		uCamRight: gl.getUniformLocation(moonProg, 'uCamRight'),
+		uCamUp: gl.getUniformLocation(moonProg, 'uCamUp'),
+		uMoonSize: gl.getUniformLocation(moonProg, 'uMoonSize'),
+	},
+	water: {
+		uProj: gl.getUniformLocation(waterProg, 'uProj'),
+		uView: gl.getUniformLocation(waterProg, 'uView'),
+		uTime: gl.getUniformLocation(waterProg, 'uTime'),
+		uCam: gl.getUniformLocation(waterProg, 'uCam'),
+		uCubeCenter: gl.getUniformLocation(waterProg, 'uCubeCenter'),
+		uCubeYaw: gl.getUniformLocation(waterProg, 'uCubeYaw'),
+	},
+	cube: {
+		uProj: gl.getUniformLocation(cubeProg, 'uProj'),
+		uView: gl.getUniformLocation(cubeProg, 'uView'),
+		uCam: gl.getUniformLocation(cubeProg, 'uCam'),
+		uCenter: gl.getUniformLocation(cubeProg, 'uCenter'),
+		uTilt: gl.getUniformLocation(cubeProg, 'uTilt'),
+		uYaw: gl.getUniformLocation(cubeProg, 'uYaw'),
+		uLogo: gl.getUniformLocation(cubeProg, 'uLogo'),
+	},
+};
+const A = {
+	bg: { aPos: gl.getAttribLocation(bgProg, 'aPos') },
+	moon: { aPos: gl.getAttribLocation(moonProg, 'aPos') },
+	water: {
+		aPos: gl.getAttribLocation(waterProg, 'aPos'),
+		aUv: gl.getAttribLocation(waterProg, 'aUv'),
+	},
+	cube: {
+		aPos: gl.getAttribLocation(cubeProg, 'aPos'),
+		aNormal: gl.getAttribLocation(cubeProg, 'aNormal'),
+		aUv: gl.getAttribLocation(cubeProg, 'aUv'),
+	},
+};
+
+// Scratch buffers for vec3 uniform uploads — preallocating these
+// eliminates ~10 `new Float32Array(...)` allocations per frame and the
+// QuickJS GC pressure they cause.
+const scratchVec3A = new Float32Array(3);
+const scratchVec3B = new Float32Array(3);
+const scratchVec3C = new Float32Array(3);
+const scratchVec3D = new Float32Array(3);
+function fillVec3(dst: Float32Array, x: number, y: number, z: number): Float32Array {
+	dst[0] = x; dst[1] = y; dst[2] = z;
+	return dst;
+}
+
+function attribByLoc(loc: number, size: number, stride: number, offset: number): void {
 	if (loc < 0) return;
 	gl!.enableVertexAttribArray(loc);
 	gl!.vertexAttribPointer(loc, size, gl!.FLOAT, false, stride, offset);
 }
 
 function perspective(fovy: number, aspect: number, near: number, far: number): Float32Array {
-	const f = 1 / Math.tan(fovy / 2),
-		nf = 1 / (near - far);
+	const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
 	return new Float32Array([
 		f / aspect, 0, 0, 0,
 		0, f, 0, 0,
 		0, 0, (far + near) * nf, -1,
-		0, 0, (2 * far * near) * nf, 0,
+		0, 0, (2 * far * near) * nf, 0
 	]);
 }
-function nrm3(v: number[]) {
+function normalize3(v: number[]): number[] {
 	const l = Math.hypot(v[0], v[1], v[2]) || 1;
 	return [v[0] / l, v[1] / l, v[2] / l];
 }
-function cross(a: number[], b: number[]) {
+function cross(a: number[], b: number[]): number[] {
 	return [
 		a[1] * b[2] - a[2] * b[1],
 		a[2] * b[0] - a[0] * b[2],
@@ -580,21 +608,21 @@ function cross(a: number[], b: number[]) {
 	];
 }
 function lookAt(eye: number[], center: number[], up: number[]): Float32Array {
-	const z = nrm3([eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]]);
-	const x = nrm3(cross(up, z));
+	const z = normalize3([eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]]);
+	const x = normalize3(cross(up, z));
 	const y = cross(z, x);
 	return new Float32Array([
 		x[0], y[0], z[0], 0,
 		x[1], y[1], z[1], 0,
 		x[2], y[2], z[2], 0,
-		-(x[0] * eye[0] + x[1] * eye[1] + x[2] * eye[2]),
-		-(y[0] * eye[0] + y[1] * eye[1] + y[2] * eye[2]),
-		-(z[0] * eye[0] + z[1] * eye[1] + z[2] * eye[2]),
-		1,
+		-(x[0]*eye[0] + x[1]*eye[1] + x[2]*eye[2]),
+		-(y[0]*eye[0] + y[1]*eye[1] + y[2]*eye[2]),
+		-(z[0]*eye[0] + z[1]*eye[1] + z[2]*eye[2]),
+		1
 	]);
 }
 
-function makeGrid(n: number, size: number) {
+function makeGrid(n: number, size: number): { verts: Float32Array; inds: Uint16Array } {
 	const verts: number[] = [];
 	const inds: number[] = [];
 	for (let z = 0; z <= n; z++) {
@@ -613,9 +641,9 @@ function makeGrid(n: number, size: number) {
 	return { verts: new Float32Array(verts), inds: new Uint16Array(inds) };
 }
 
-function makeCube(size: number) {
+function makeCube(size: number): Float32Array {
 	const s = size * 0.5;
-	return new Float32Array([
+	const data = [
 		// +Z
 		-s,-s, s, 0,0,1, 0,1,   s,-s, s, 0,0,1, 1,1,   s, s, s, 0,0,1, 1,0,
 		-s,-s, s, 0,0,1, 0,1,   s, s, s, 0,0,1, 1,0,  -s, s, s, 0,0,1, 0,0,
@@ -634,9 +662,14 @@ function makeCube(size: number) {
 		// -Y
 		-s,-s,-s, 0,-1,0, 0,1,  s,-s,-s, 0,-1,0, 1,1,  s,-s, s, 0,-1,0, 1,0,
 		-s,-s,-s, 0,-1,0, 0,1,  s,-s, s, 0,-1,0, 1,0, -s,-s, s, 0,-1,0, 0,0,
-	]);
+	];
+	return new Float32Array(data);
 }
 
+// 220-segment grid → 220×220×2 = 96 800 triangles. Heavy for the
+// bridge but the demo intentionally pushes through it via passthrough
+// (the CPU-side perspective divide cost the bridge would otherwise
+// pay is gone — the user shader runs natively).
 const grid = makeGrid(220, 170);
 const waterVbo = gl.createBuffer()!;
 gl.bindBuffer(gl.ARRAY_BUFFER, waterVbo);
@@ -647,11 +680,11 @@ gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, grid.inds, gl.STATIC_DRAW);
 
 const bgVbo = gl.createBuffer()!;
 gl.bindBuffer(gl.ARRAY_BUFFER, bgVbo);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
 const moonVbo = gl.createBuffer()!;
 gl.bindBuffer(gl.ARRAY_BUFFER, moonVbo);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
 const cubeVerts = makeCube(4.2);
 const cubeVbo = gl.createBuffer()!;
@@ -680,45 +713,39 @@ logoImg.onload = () => {
 		tctx.fillStyle = '#111111';
 		tctx.fillRect(0, 0, TEX_SIZE, TEX_SIZE);
 		const pad = 96;
-		tctx.drawImage(logoImg, pad, pad, TEX_SIZE - pad * 2, TEX_SIZE - pad * 2);
+		tctx.drawImage(logoImg as any, pad, pad, TEX_SIZE - pad * 2, TEX_SIZE - pad * 2);
 		const imgData = tctx.getImageData(0, 0, TEX_SIZE, TEX_SIZE);
 		gl!.bindTexture(gl!.TEXTURE_2D, cubeTex);
 		gl!.texImage2D(
-			gl!.TEXTURE_2D,
-			0,
-			gl!.RGBA,
-			TEX_SIZE,
-			TEX_SIZE,
-			0,
-			gl!.RGBA,
-			gl!.UNSIGNED_BYTE,
+			gl!.TEXTURE_2D, 0, gl!.RGBA, TEX_SIZE, TEX_SIZE, 0,
+			gl!.RGBA, gl!.UNSIGNED_BYTE,
 			new Uint8Array(imgData.data.buffer),
 		);
 	} catch (e) {
-		console.debug('[nxjs-webgl] texture upload failed:', e);
+		console.debug('[canvas-webgl] texture upload failed:', e);
 	}
 };
 logoImg.onerror = () => {
-	console.debug('[nxjs-webgl] failed to load romfs:/logo.png');
+	console.debug('[canvas-webgl] failed to load romfs:/logo.png');
 };
-logoImg.src = 'romfs:/logo.png';
+(logoImg as any).src = 'romfs:/logo.png';
 
-// CPU mirror of the wave field so the cube floats on the water.
+// Wave height function for the cube floating math (CPU mirror of the
+// GLSL waveField).
 function waveAt(x: number, z: number, t: number): number {
 	const norm = (a: number, b: number): [number, number] => {
-		const l = Math.hypot(a, b);
-		return [a / l, b / l];
+		const l = Math.hypot(a, b); return [a / l, b / l];
 	};
-	const d = (ax: number, az: number, dir: [number, number]) => ax * dir[0] + az * dir[1];
+	const dot = (ax: number, az: number, d: [number, number]) => ax * d[0] + az * d[1];
 	let h = 0;
-	h += Math.sin(d(x, z, norm(0.90, 0.24)) * 0.54 + t * 0.62 + 0.0) * 0.25;
-	h += Math.sin(d(x, z, norm(0.27, 0.96)) * 0.92 + t * 0.84 + 1.7) * 0.18;
-	h += Math.sin(d(x, z, norm(-0.82, 0.43)) * 1.62 + t * 1.14 + 2.4) * 0.11;
-	h += Math.sin(d(x, z, norm(0.66, -0.75)) * 3.52 + t * 1.75 + 0.8) * 0.055;
-	h += Math.sin(d(x + Math.sin(t * 0.07) * 4.0, z + Math.cos(t * 0.08) * 4.0, norm(-0.15, 1.0)) * 8.0 + t * 2.35 + 3.2) * 0.024;
+	h += Math.sin(dot(x, z, norm( 0.90,  0.24)) * 0.54 + t * 0.62 + 0.0) * 0.25;
+	h += Math.sin(dot(x, z, norm( 0.27,  0.96)) * 0.92 + t * 0.84 + 1.7) * 0.18;
+	h += Math.sin(dot(x, z, norm(-0.82,  0.43)) * 1.62 + t * 1.14 + 2.4) * 0.11;
+	h += Math.sin(dot(x, z, norm( 0.66, -0.75)) * 3.52 + t * 1.75 + 0.8) * 0.055;
+	h += Math.sin(dot(x + Math.sin(t * 0.07) * 4.0, z + Math.cos(t * 0.08) * 4.0, norm(-0.15, 1.0)) * 8.0 + t * 2.35 + 3.2) * 0.024;
 	return h;
 }
-function slopeAt(x: number, z: number, t: number) {
+function slopeAt(x: number, z: number, t: number): { dx: number; dz: number } {
 	const e = 0.16;
 	const hL = waveAt(x - e, z, t);
 	const hR = waveAt(x + e, z, t);
@@ -727,26 +754,45 @@ function slopeAt(x: number, z: number, t: number) {
 	return { dx: (hR - hL) / (2 * e), dz: (hU - hD) / (2 * e) };
 }
 
-// Camera state.
+// Camera state. Default view is aligned toward the moon side.
 const cam = {
 	yaw: 2.77,
 	pitch: -0.12,
 	dist: 17.5,
 };
 
-// Touch input — nx.js native way. The screen IS the canvas; touch
-// events dispatch on it directly (see `apps/touchscreen` example).
-let activeTouchId: number | null = null;
-let dragActive = false;
-let lastX = 0;
-let lastY = 0;
+// Switch gamepad polling. Right stick orbits the camera (yaw + pitch),
+// left-stick Y zooms in / out.
+function pollGamepad(dt: number): void {
+	const pads = navigator.getGamepads();
+	const gp = pads && pads[0];
+	if (!gp) return;
+	const dead = 0.12;
+	const rx = gp.axes[2] || 0;
+	const ry = gp.axes[3] || 0;
+	if (Math.abs(rx) > dead) cam.yaw += rx * dt * 1.6;
+	if (Math.abs(ry) > dead) {
+		cam.pitch = Math.max(-0.75, Math.min(-0.05, cam.pitch + ry * dt * 0.9));
+	}
+	// Left stick Y = zoom. Push UP (negative Y per gamepad convention)
+	// → zoom in (decrease dist). Push DOWN → zoom out (increase dist).
+	const ly = gp.axes[1] || 0;
+	if (Math.abs(ly) > dead) {
+		cam.dist = Math.max(9, Math.min(28, cam.dist + ly * dt * 12));
+	}
+}
 
-function startDrag(x: number, y: number) {
+// Touch input — single-touch drag orbits the camera. Identifier-tracked
+// so a second finger doesn't hijack the drag mid-gesture.
+let dragActive = false;
+let activeTouchId: number | null = null;
+let lastX = 0, lastY = 0;
+function startDrag(x: number, y: number): void {
 	dragActive = true;
 	lastX = x;
 	lastY = y;
 }
-function moveDrag(x: number, y: number) {
+function moveDrag(x: number, y: number): void {
 	if (!dragActive) return;
 	const dx = x - lastX;
 	const dy = y - lastY;
@@ -755,7 +801,7 @@ function moveDrag(x: number, y: number) {
 	cam.yaw += dx * 0.006;
 	cam.pitch = Math.max(-0.75, Math.min(-0.05, cam.pitch + dy * 0.005));
 }
-function endDrag() {
+function endDrag(): void {
 	dragActive = false;
 	activeTouchId = null;
 }
@@ -787,45 +833,27 @@ _screen.addEventListener('touchend', (e: TouchEvent) => {
 	}
 });
 
-// Gamepad polling. Right stick orbits, left-stick Y zooms.
-function pollGamepad(dt: number) {
-	const pads = navigator.getGamepads();
-	const gp = pads && pads[0];
-	if (!gp) return;
-	const dead = 0.12;
-	// Right stick = orbit. Standard Gamepad API axis 2 = right-X,
-	// axis 3 = right-Y.
-	const rx = gp.axes[2] || 0;
-	const ry = gp.axes[3] || 0;
-	if (Math.abs(rx) > dead) cam.yaw += rx * dt * 1.6;
-	if (Math.abs(ry) > dead) {
-		cam.pitch = Math.max(-0.75, Math.min(-0.05, cam.pitch + ry * dt * 0.9));
-	}
-	// Left stick Y = zoom. Push UP (negative Y) → zoom in.
-	const ly = gp.axes[1] || 0;
-	if (Math.abs(ly) > dead) {
-		cam.dist = Math.max(9, Math.min(28, cam.dist + ly * dt * 12));
-	}
-}
-
 gl.enable(gl.DEPTH_TEST);
 gl.disable(gl.CULL_FACE);
 
-let lastMs = 0;
+let lastMs = performance.now();
 
-function draw(ms: number) {
+// Projection matrix is constant (fov, aspect, near, far never change
+// during the demo). Compute once at boot instead of every frame —
+// `perspective()` allocates a fresh Float32Array(16) each call, so
+// this also saves a per-frame GC nibble.
+const proj = perspective(45 * Math.PI / 180, W / H, 0.1, 500.0);
+
+function draw(ms: number): void {
 	requestAnimationFrame(draw);
 	const t = ms * 0.001;
-	const dt = lastMs > 0 ? Math.min(0.1, (ms - lastMs) * 0.001) : 0.016;
+	const dt = Math.min(0.1, (ms - lastMs) * 0.001);
 	lastMs = ms;
 
 	pollGamepad(dt);
 
 	gl!.viewport(0, 0, W, H);
-
-	const proj = perspective((45 * Math.PI) / 180, W / H, 0.1, 500.0);
-	const cy = Math.cos(cam.pitch);
-	const sy = Math.sin(cam.pitch);
+	const cy = Math.cos(cam.pitch), sy = Math.sin(cam.pitch);
 	const eye = [
 		Math.sin(cam.yaw) * cam.dist * cy,
 		4.4 - sy * cam.dist * 0.32,
@@ -839,33 +867,33 @@ function draw(ms: number) {
 	// --- Background sky/stars (no depth test).
 	gl!.disable(gl!.DEPTH_TEST);
 	gl!.useProgram(bgProg);
-	gl!.uniform1f(gl!.getUniformLocation(bgProg, 'uTime'), t);
+	gl!.uniform1f(U.bg.uTime, t);
 	const target = [0, 0.2, 0];
-	const bgForward = nrm3([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
-	const bgRight = nrm3(cross(bgForward, [0, 1, 0]));
-	const bgUp = nrm3(cross(bgRight, bgForward));
-	const tanHalfFov = Math.tan(((45 * Math.PI) / 180) * 0.5);
-	gl!.uniform3fv(gl!.getUniformLocation(bgProg, 'uCamRight'), new Float32Array(bgRight));
-	gl!.uniform3fv(gl!.getUniformLocation(bgProg, 'uCamUp'), new Float32Array(bgUp));
-	gl!.uniform3fv(gl!.getUniformLocation(bgProg, 'uCamForward'), new Float32Array(bgForward));
-	gl!.uniform1f(gl!.getUniformLocation(bgProg, 'uAspect'), W / H);
-	gl!.uniform1f(gl!.getUniformLocation(bgProg, 'uTanHalfFov'), tanHalfFov);
+	const bgForward = normalize3([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
+	const bgRight = normalize3(cross(bgForward, [0, 1, 0]));
+	const bgUp = normalize3(cross(bgRight, bgForward));
+	const tanHalfFov = Math.tan(45 * Math.PI / 180 * 0.5);
+	gl!.uniform3fv(U.bg.uCamRight, fillVec3(scratchVec3A, bgRight[0], bgRight[1], bgRight[2]));
+	gl!.uniform3fv(U.bg.uCamUp, fillVec3(scratchVec3B, bgUp[0], bgUp[1], bgUp[2]));
+	gl!.uniform3fv(U.bg.uCamForward, fillVec3(scratchVec3C, bgForward[0], bgForward[1], bgForward[2]));
+	gl!.uniform1f(U.bg.uAspect, W / H);
+	gl!.uniform1f(U.bg.uTanHalfFov, tanHalfFov);
 	gl!.bindBuffer(gl!.ARRAY_BUFFER, bgVbo);
-	attrib(bgProg, 'aPos', 2, 8, 0);
+	attribByLoc(A.bg.aPos, 2, 8, 0);
 	gl!.drawArrays(gl!.TRIANGLE_STRIP, 0, 4);
 
 	// --- Moon billboard (blended over sky).
 	gl!.enable(gl!.BLEND);
 	gl!.blendFunc(gl!.SRC_ALPHA, gl!.ONE_MINUS_SRC_ALPHA);
 	gl!.useProgram(moonProg);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(moonProg, 'uProj'), false, proj);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(moonProg, 'uView'), false, view);
-	gl!.uniform3fv(gl!.getUniformLocation(moonProg, 'uMoonCenter'), new Float32Array([-78.0, 34.0, 126.0]));
-	gl!.uniform3fv(gl!.getUniformLocation(moonProg, 'uCamRight'), new Float32Array(bgRight));
-	gl!.uniform3fv(gl!.getUniformLocation(moonProg, 'uCamUp'), new Float32Array(bgUp));
-	gl!.uniform1f(gl!.getUniformLocation(moonProg, 'uMoonSize'), 24.0);
+	gl!.uniformMatrix4fv(U.moon.uProj, false, proj);
+	gl!.uniformMatrix4fv(U.moon.uView, false, view);
+	gl!.uniform3fv(U.moon.uMoonCenter, fillVec3(scratchVec3D, -78.0, 34.0, 126.0));
+	gl!.uniform3fv(U.moon.uCamRight, scratchVec3A);
+	gl!.uniform3fv(U.moon.uCamUp, scratchVec3B);
+	gl!.uniform1f(U.moon.uMoonSize, 24.0);
 	gl!.bindBuffer(gl!.ARRAY_BUFFER, moonVbo);
-	attrib(moonProg, 'aPos', 2, 8, 0);
+	attribByLoc(A.moon.aPos, 2, 8, 0);
 	gl!.drawArrays(gl!.TRIANGLE_STRIP, 0, 4);
 	gl!.disable(gl!.BLEND);
 
@@ -875,37 +903,36 @@ function draw(ms: number) {
 	const cubeZ = -0.2;
 	const surf = waveAt(cubeX, cubeZ, t);
 	const slope = slopeAt(cubeX, cubeZ, t);
-	const cubeCenter = [cubeX, surf * 0.55 + 0.70, cubeZ];
-	const cubeTilt = [slope.dz * 0.42, 0.0, -slope.dx * 0.42];
 	const cubeYaw = t * 0.10;
 
 	gl!.useProgram(waterProg);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(waterProg, 'uProj'), false, proj);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(waterProg, 'uView'), false, view);
-	gl!.uniform1f(gl!.getUniformLocation(waterProg, 'uTime'), t);
-	gl!.uniform3fv(gl!.getUniformLocation(waterProg, 'uCam'), new Float32Array(eye));
-	gl!.uniform3fv(gl!.getUniformLocation(waterProg, 'uCubeCenter'), new Float32Array(cubeCenter));
-	gl!.uniform1f(gl!.getUniformLocation(waterProg, 'uCubeYaw'), cubeYaw);
+	gl!.uniformMatrix4fv(U.water.uProj, false, proj);
+	gl!.uniformMatrix4fv(U.water.uView, false, view);
+	gl!.uniform1f(U.water.uTime, t);
+	gl!.uniform3fv(U.water.uCam, fillVec3(scratchVec3A, eye[0], eye[1], eye[2]));
+	const cubeCenterY = surf * 0.55 + 0.70;
+	gl!.uniform3fv(U.water.uCubeCenter, fillVec3(scratchVec3B, cubeX, cubeCenterY, cubeZ));
+	gl!.uniform1f(U.water.uCubeYaw, cubeYaw);
 	gl!.bindBuffer(gl!.ARRAY_BUFFER, waterVbo);
 	gl!.bindBuffer(gl!.ELEMENT_ARRAY_BUFFER, waterIbo);
-	attrib(waterProg, 'aPos', 3, 20, 0);
-	attrib(waterProg, 'aUv', 2, 20, 12);
+	attribByLoc(A.water.aPos, 3, 20, 0);
+	attribByLoc(A.water.aUv, 2, 20, 12);
 	gl!.drawElements(gl!.TRIANGLES, grid.inds.length, gl!.UNSIGNED_SHORT, 0);
 
 	gl!.useProgram(cubeProg);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(cubeProg, 'uProj'), false, proj);
-	gl!.uniformMatrix4fv(gl!.getUniformLocation(cubeProg, 'uView'), false, view);
-	gl!.uniform3fv(gl!.getUniformLocation(cubeProg, 'uCam'), new Float32Array(eye));
-	gl!.uniform3fv(gl!.getUniformLocation(cubeProg, 'uCenter'), new Float32Array(cubeCenter));
-	gl!.uniform3fv(gl!.getUniformLocation(cubeProg, 'uTilt'), new Float32Array(cubeTilt));
-	gl!.uniform1f(gl!.getUniformLocation(cubeProg, 'uYaw'), cubeYaw);
+	gl!.uniformMatrix4fv(U.cube.uProj, false, proj);
+	gl!.uniformMatrix4fv(U.cube.uView, false, view);
+	gl!.uniform3fv(U.cube.uCam, scratchVec3A);
+	gl!.uniform3fv(U.cube.uCenter, scratchVec3B);
+	gl!.uniform3fv(U.cube.uTilt, fillVec3(scratchVec3C, slope.dz * 0.42, 0.0, -slope.dx * 0.42));
+	gl!.uniform1f(U.cube.uYaw, cubeYaw);
 	gl!.activeTexture(gl!.TEXTURE0);
 	gl!.bindTexture(gl!.TEXTURE_2D, cubeTex);
-	gl!.uniform1i(gl!.getUniformLocation(cubeProg, 'uLogo'), 0);
+	gl!.uniform1i(U.cube.uLogo, 0);
 	gl!.bindBuffer(gl!.ARRAY_BUFFER, cubeVbo);
-	attrib(cubeProg, 'aPos', 3, 32, 0);
-	attrib(cubeProg, 'aNormal', 3, 32, 12);
-	attrib(cubeProg, 'aUv', 2, 32, 24);
+	attribByLoc(A.cube.aPos, 3, 32, 0);
+	attribByLoc(A.cube.aNormal, 3, 32, 12);
+	attribByLoc(A.cube.aUv, 2, 32, 24);
 	gl!.drawArrays(gl!.TRIANGLES, 0, cubeVerts.length / 8);
 }
 

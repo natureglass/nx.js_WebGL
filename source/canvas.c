@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <mbedtls/base64.h>
 #include <turbojpeg.h>
 #include <webp/encode.h>
@@ -1663,8 +1664,9 @@ static JSValue nx_canvas_context_2d_put_image_data(JSContext *ctx,
 	cols = min(sw, context->canvas->width - dx);
 	rows = min(sh, context->canvas->height - dy);
 
-	if (cols <= 0 || rows <= 0)
+	if (cols <= 0 || rows <= 0) {
 		return JS_UNDEFINED;
+	}
 
 	// Build the swizzled BGRA-premultiplied pixels in a temporary
 	// buffer, then route them through cairo (set_source_surface +
@@ -1715,9 +1717,6 @@ static JSValue nx_canvas_context_2d_put_image_data(JSContext *ctx,
 	(void)dstStride;
 	cairo_surface_t *tmp_surface = cairo_image_surface_create_for_data(
 		tmp, CAIRO_FORMAT_ARGB32, cols, rows, (int)tmp_stride);
-	// Mark the temp surface dirty so cairo definitely sees the bytes
-	// we just wrote (the surface was created from a freshly malloc'd
-	// buffer; cairo might cache "blank" state otherwise).
 	cairo_surface_mark_dirty(tmp_surface);
 	cairo_save(cr);
 	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
@@ -1725,12 +1724,9 @@ static JSValue nx_canvas_context_2d_put_image_data(JSContext *ctx,
 	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
 	cairo_paint(cr);
 	// Reset the source so cairo's reference to tmp_surface is released
-	// before we destroy it. set_source_surface increments the pattern's
-	// surface refcount; clearing the source releases that hold.
+	// before we destroy it.
 	cairo_set_source_rgba(cr, 0, 0, 0, 1);
 	cairo_restore(cr);
-	// Flush the destination so cairo finalizes pending writes to
-	// canvas->data before downstream callers read from canvas->surface.
 	cairo_surface_flush(context->canvas->surface);
 
 	cairo_surface_destroy(tmp_surface);

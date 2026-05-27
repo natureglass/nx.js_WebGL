@@ -217,6 +217,27 @@ export function writeFileSync(path: PathLike, data: string | BufferSource) {
 }
 
 /**
+ * Synchronously appends the contents of `data` to the file at `path`.
+ * Creates the file (and any parent directories) if it does not exist.
+ *
+ * Use this instead of {@link writeFileSync | `writeFileSync`} for log files
+ * or other "many-small-appends" patterns — `writeFileSync` truncates and
+ * re-uploads the entire file on every call, which degenerates to O(n^2)
+ * total cost over a run.
+ *
+ * @example
+ *
+ * ```typescript
+ * Switch.appendFileSync('sdmc:/switch/app/run.log', `tick=${Date.now()}\n`);
+ * ```
+ */
+export function appendFileSync(path: PathLike, data: string | BufferSource) {
+	const d = typeof data === 'string' ? encoder.encode(data) : data;
+	const ab = bufferSourceToArrayBuffer(d);
+	return $.appendFileSync(pathToString(path), ab);
+}
+
+/**
  * Removes the file or directory recursively specified by `path`.
  *
  * @param path File path to remove.

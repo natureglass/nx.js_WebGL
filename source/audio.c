@@ -1,6 +1,7 @@
 #include "audio.h"
 #include "async.h"
 #include <malloc.h>
+#include <pthread.h>
 #include <string.h>
 #include <switch.h>
 
@@ -23,15 +24,54 @@
 #define AUDIO_NUM_VOICES 24
 #define AUDIO_ALIGN 0x1000
 
+// Per-video audio sub-allocation. Each slot fits one <video>'s wave-buf
+// ring (matches video.c's AUDIO_TOTAL_BUF_BYTES = 4 × 10240 = 40960).
+// 40960 = 10 × AUDIO_ALIGN so slot offsets stay page-aligned naturally.
+// NUM_SLOTS = 8 caps concurrent audio-bearing videos; oversize fixtures
+// degrade gracefully (extra videos return NULL from acquire and play
+// without audio). 8 × 40960 = 327680 bytes, comfortably inside the 1 MB
+// main mempool reserved below.
+#define NX_VIDEO_AUDIO_SLOT_BYTES 0xA000
+#define NX_VIDEO_AUDIO_NUM_SLOTS 8
+
 static bool audio_initialized = false;
 static AudioDriver audio_driver;
 static bool voice_in_use[AUDIO_NUM_VOICES];
 static void *audio_mempool_ptr = NULL;
 static size_t audio_mempool_size = 0;
 static int audio_mempool_id = -1;
+static bool video_audio_slot_in_use[NX_VIDEO_AUDIO_NUM_SLOTS];
 
 /* Per-voice wave buffer tracking */
 static AudioDriverWaveBuf voice_wavebufs[AUDIO_NUM_VOICES];
+
+/* Slice-2b: serializes every audrv* call site. Recursive so nested
+ * acquires (e.g. nx_audio_acquire_voice → audrvVoiceStop after a leak)
+ * don't self-deadlock. Initialized via the standard recursive
+ * attribute below. */
+static pthread_mutex_t audio_driver_lock;
+static bool audio_driver_lock_initialized = false;
+
+static void ensure_audio_driver_lock(void) {
+	if (audio_driver_lock_initialized) return;
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&audio_driver_lock, &attr);
+	pthread_mutexattr_destroy(&attr);
+	audio_driver_lock_initialized = true;
+}
+
+void nx_audio_lock(void) {
+	ensure_audio_driver_lock();
+	pthread_mutex_lock(&audio_driver_lock);
+}
+
+void nx_audio_unlock(void) {
+	pthread_mutex_unlock(&audio_driver_lock);
+}
+
+AudioDriver *nx_audio_get_driver(void) { return &audio_driver; }
 
 static const AudioRendererConfig arConfig = {
 	.output_rate     = AudioRendererOutputRate_48kHz,
@@ -171,24 +211,35 @@ static JSValue decode_audio_after_work(JSContext *ctx, nx_work_t *req) {
 	return result;
 }
 
-/* ── Native JS functions ── */
+/* ── Internal init (shared with source/video.c via audio.h) ── */
 
-static JSValue nx_audio_init(JSContext *ctx, JSValueConst this_val, int argc,
-							 JSValueConst *argv) {
-	if (audio_initialized)
-		return JS_UNDEFINED;
+bool nx_audio_ensure_initialized(void) {
+	nx_audio_lock();
+	if (audio_initialized) {
+		nx_audio_unlock();
+		return true;
+	}
 
 	Result rc = audrenInitialize(&arConfig);
 	if (R_FAILED(rc)) {
-		JS_ThrowInternalError(ctx, "audrenInitialize failed: 0x%X", rc);
-		return JS_EXCEPTION;
+		nx_audio_unlock();
+		return false;
 	}
 
+	// num_mempools: 2 is sufficient — slot 0 = the main 1 MB mempool
+	// allocated below, which now ALSO hosts per-video audio sub-slots
+	// (see nx_audio_acquire_video_buf); slot 1 = headroom for
+	// nx_audio_play's per-call mempool. Per-video audio used to call its
+	// own audrvMemPoolAdd, but that capped at 1 video (and bumping to 32
+	// mempools froze Citron's audrv mixer with 6 concurrent voices, all
+	// reading from distinct mempools — see [[nvtegra-unreliable-on-citron]]
+	// for the Citron audio-renderer constraints). Sub-allocation inside
+	// one shared mempool sidesteps both.
 	rc = audrvCreate(&audio_driver, &arConfig, 2);
 	if (R_FAILED(rc)) {
 		audrenExit();
-		JS_ThrowInternalError(ctx, "audrvCreate failed: 0x%X", rc);
-		return JS_EXCEPTION;
+		nx_audio_unlock();
+		return false;
 	}
 
 	/* Set up a default memory pool (1 MB, can grow later) */
@@ -197,7 +248,8 @@ static JSValue nx_audio_init(JSContext *ctx, JSValueConst this_val, int argc,
 	if (!audio_mempool_ptr) {
 		audrvClose(&audio_driver);
 		audrenExit();
-		return JS_ThrowInternalError(ctx, "Failed to allocate audio mempool");
+		nx_audio_unlock();
+		return false;
 	}
 	memset(audio_mempool_ptr, 0, audio_mempool_size);
 	armDCacheFlush(audio_mempool_ptr, audio_mempool_size);
@@ -215,8 +267,8 @@ static JSValue nx_audio_init(JSContext *ctx, JSValueConst this_val, int argc,
 	if (R_FAILED(rc)) {
 		audrvClose(&audio_driver);
 		audrenExit();
-		JS_ThrowInternalError(ctx, "audrenStartAudioRenderer failed: 0x%X", rc);
-		return JS_EXCEPTION;
+		nx_audio_unlock();
+		return false;
 	}
 
 	audrvUpdate(&audio_driver);
@@ -224,13 +276,87 @@ static JSValue nx_audio_init(JSContext *ctx, JSValueConst this_val, int argc,
 	memset(voice_in_use, 0, sizeof(voice_in_use));
 	memset(voice_wavebufs, 0, sizeof(voice_wavebufs));
 	audio_initialized = true;
+	nx_audio_unlock();
+	return true;
+}
+
+int nx_audio_acquire_voice(void) {
+	nx_audio_lock();
+	for (int i = 0; i < AUDIO_NUM_VOICES; i++) {
+		if (!voice_in_use[i]) {
+			voice_in_use[i] = true;
+			nx_audio_unlock();
+			return i;
+		}
+	}
+	nx_audio_unlock();
+	return -1;
+}
+
+void nx_audio_release_voice(int voice_id) {
+	if (voice_id < 0 || voice_id >= AUDIO_NUM_VOICES) return;
+	nx_audio_lock();
+	if (audio_initialized) {
+		audrvVoiceStop(&audio_driver, voice_id);
+		audrvUpdate(&audio_driver);
+	}
+	voice_in_use[voice_id] = false;
+	nx_audio_unlock();
+}
+
+size_t nx_audio_video_slot_size(void) {
+	return NX_VIDEO_AUDIO_SLOT_BYTES;
+}
+
+void *nx_audio_acquire_video_buf(size_t bytes) {
+	if (bytes > NX_VIDEO_AUDIO_SLOT_BYTES) return NULL;
+	if (!nx_audio_ensure_initialized()) return NULL;
+	nx_audio_lock();
+	for (int i = 0; i < NX_VIDEO_AUDIO_NUM_SLOTS; i++) {
+		if (!video_audio_slot_in_use[i]) {
+			video_audio_slot_in_use[i] = true;
+			void *ptr = (uint8_t *)audio_mempool_ptr +
+				(size_t)i * NX_VIDEO_AUDIO_SLOT_BYTES;
+			memset(ptr, 0, NX_VIDEO_AUDIO_SLOT_BYTES);
+			armDCacheFlush(ptr, NX_VIDEO_AUDIO_SLOT_BYTES);
+			nx_audio_unlock();
+			return ptr;
+		}
+	}
+	nx_audio_unlock();
+	return NULL;
+}
+
+void nx_audio_release_video_buf(void *ptr) {
+	if (!ptr || !audio_mempool_ptr) return;
+	nx_audio_lock();
+	size_t offset = (size_t)((uint8_t *)ptr - (uint8_t *)audio_mempool_ptr);
+	if (offset % NX_VIDEO_AUDIO_SLOT_BYTES == 0) {
+		size_t idx = offset / NX_VIDEO_AUDIO_SLOT_BYTES;
+		if (idx < NX_VIDEO_AUDIO_NUM_SLOTS) {
+			video_audio_slot_in_use[idx] = false;
+		}
+	}
+	nx_audio_unlock();
+}
+
+/* ── Native JS functions ── */
+
+static JSValue nx_audio_init(JSContext *ctx, JSValueConst this_val, int argc,
+							 JSValueConst *argv) {
+	if (!nx_audio_ensure_initialized()) {
+		return JS_ThrowInternalError(ctx, "audio renderer init failed");
+	}
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_exit(JSContext *ctx, JSValueConst this_val, int argc,
 							 JSValueConst *argv) {
-	if (!audio_initialized)
+	nx_audio_lock();
+	if (!audio_initialized) {
+		nx_audio_unlock();
 		return JS_UNDEFINED;
+	}
 
 	for (int i = 0; i < AUDIO_NUM_VOICES; i++) {
 		if (voice_in_use[i]) {
@@ -250,8 +376,10 @@ static JSValue nx_audio_exit(JSContext *ctx, JSValueConst this_val, int argc,
 		free(audio_mempool_ptr);
 		audio_mempool_ptr = NULL;
 	}
+	memset(video_audio_slot_in_use, 0, sizeof(video_audio_slot_in_use));
 
 	audio_initialized = false;
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
@@ -310,10 +438,12 @@ static JSValue nx_audio_play(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_EXCEPTION;
 	total_samples = (uint64_t)samples_dbl;
 
+	nx_audio_lock();
 	/* Add the PCM buffer as a mempool */
 	size_t aligned_size = ALIGN_UP(pcm_size, AUDIO_ALIGN);
 	int pool_id = audrvMemPoolAdd(&audio_driver, pcm_data, aligned_size);
 	if (pool_id < 0) {
+		nx_audio_unlock();
 		return JS_ThrowInternalError(ctx, "Failed to add audio mempool");
 	}
 	audrvMemPoolAttach(&audio_driver, pool_id);
@@ -345,118 +475,121 @@ static JSValue nx_audio_play(JSContext *ctx, JSValueConst this_val, int argc,
 	audrvVoiceAddWaveBuf(&audio_driver, voice_id, wavebuf);
 	audrvVoiceStart(&audio_driver, voice_id);
 	audrvUpdate(&audio_driver);
+	nx_audio_unlock();
 
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_stop(JSContext *ctx, JSValueConst this_val, int argc,
 							 JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_UNDEFINED;
 	int voice_id;
 	if (JS_ToInt32(ctx, &voice_id, argv[0]))
 		return JS_EXCEPTION;
 	if (voice_id < 0 || voice_id >= AUDIO_NUM_VOICES)
 		return JS_ThrowRangeError(ctx, "Invalid voice ID");
-
-	audrvVoiceStop(&audio_driver, voice_id);
-	audrvUpdate(&audio_driver);
+	nx_audio_lock();
+	if (audio_initialized) {
+		audrvVoiceStop(&audio_driver, voice_id);
+		audrvUpdate(&audio_driver);
+	}
 	voice_in_use[voice_id] = false;
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_pause(JSContext *ctx, JSValueConst this_val, int argc,
 							  JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_UNDEFINED;
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
 	int paused = JS_ToBool(ctx, argv[1]);
 	if (paused == -1)
 		return JS_EXCEPTION;
-	audrvVoiceSetPaused(&audio_driver, voice_id, paused);
-	audrvUpdate(&audio_driver);
+	nx_audio_lock();
+	if (audio_initialized) {
+		audrvVoiceSetPaused(&audio_driver, voice_id, paused);
+		audrvUpdate(&audio_driver);
+	}
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_set_volume(JSContext *ctx, JSValueConst this_val,
 								   int argc, JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_UNDEFINED;
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
 	double volume;
 	JS_ToFloat64(ctx, &volume, argv[1]);
-	audrvVoiceSetVolume(&audio_driver, voice_id, (float)volume);
-	audrvUpdate(&audio_driver);
+	nx_audio_lock();
+	if (audio_initialized) {
+		audrvVoiceSetVolume(&audio_driver, voice_id, (float)volume);
+		audrvUpdate(&audio_driver);
+	}
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_set_pitch(JSContext *ctx, JSValueConst this_val,
 								  int argc, JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_UNDEFINED;
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
 	double pitch;
 	JS_ToFloat64(ctx, &pitch, argv[1]);
-	audrvVoiceSetPitch(&audio_driver, voice_id, (float)pitch);
-	audrvUpdate(&audio_driver);
+	nx_audio_lock();
+	if (audio_initialized) {
+		audrvVoiceSetPitch(&audio_driver, voice_id, (float)pitch);
+		audrvUpdate(&audio_driver);
+	}
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_update(JSContext *ctx, JSValueConst this_val, int argc,
 							   JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_UNDEFINED;
-	audrvUpdate(&audio_driver);
+	nx_audio_lock();
+	if (audio_initialized) audrvUpdate(&audio_driver);
+	nx_audio_unlock();
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_get_played_samples(JSContext *ctx,
 										   JSValueConst this_val, int argc,
 										   JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_NewFloat64(ctx, 0);
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
-	u64 count = audrvVoiceGetPlayedSampleCount(&audio_driver, voice_id);
+	u64 count = 0;
+	nx_audio_lock();
+	if (audio_initialized) count = audrvVoiceGetPlayedSampleCount(&audio_driver, voice_id);
+	nx_audio_unlock();
 	return JS_NewFloat64(ctx, (double)count);
 }
 
 static JSValue nx_audio_alloc_voice(JSContext *ctx, JSValueConst this_val,
 									int argc, JSValueConst *argv) {
-	for (int i = 0; i < AUDIO_NUM_VOICES; i++) {
-		if (!voice_in_use[i]) {
-			voice_in_use[i] = true;
-			return JS_NewInt32(ctx, i);
-		}
-	}
-	return JS_ThrowInternalError(ctx, "No free audio voices");
+	int v = nx_audio_acquire_voice();
+	if (v < 0) return JS_ThrowInternalError(ctx, "No free audio voices");
+	return JS_NewInt32(ctx, v);
 }
 
 static JSValue nx_audio_free_voice(JSContext *ctx, JSValueConst this_val,
 								   int argc, JSValueConst *argv) {
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
-	if (voice_id >= 0 && voice_id < AUDIO_NUM_VOICES) {
-		if (audio_initialized) {
-			audrvVoiceStop(&audio_driver, voice_id);
-			audrvUpdate(&audio_driver);
-		}
-		voice_in_use[voice_id] = false;
-	}
+	nx_audio_release_voice(voice_id);
 	return JS_UNDEFINED;
 }
 
 static JSValue nx_audio_is_playing(JSContext *ctx, JSValueConst this_val,
 								   int argc, JSValueConst *argv) {
-	if (!audio_initialized)
-		return JS_FALSE;
 	int voice_id;
 	JS_ToInt32(ctx, &voice_id, argv[0]);
-	AudioDriverWaveBuf *wb = &voice_wavebufs[voice_id];
-	return JS_NewBool(ctx, wb->state == AudioDriverWaveBufState_Playing);
+	bool playing = false;
+	nx_audio_lock();
+	if (audio_initialized) {
+		AudioDriverWaveBuf *wb = &voice_wavebufs[voice_id];
+		playing = wb->state == AudioDriverWaveBufState_Playing;
+	}
+	nx_audio_unlock();
+	return JS_NewBool(ctx, playing);
 }
 
 static const JSCFunctionListEntry function_list[] = {

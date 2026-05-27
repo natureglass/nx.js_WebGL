@@ -115,7 +115,24 @@ export function findFont(
 	return null;
 }
 
+// Idempotent: if a FontFace for `family` is already registered, return it
+// without allocating. `findFont` matches style/weight/stretch strictly, so
+// `ctx.font = 'bold 16px system-ui'` will always miss the cached "normal"
+// face and fall through to addSystemFont — without this short-circuit, every
+// such assignment would copy the entire shared-system-font into a fresh
+// QuickJS-heap ArrayBuffer + a fresh nx_font_face_t buffer + a FreeType
+// face + a Cairo face + a HarfBuzz font, and the new FontFace would sit
+// pinned in FontFaceSet.#set forever. ~3 bold-font assignments per UI frame
+// were enough to OOM the QuickJS heap after ~4800 frames in
+// full-webgl1-conformance's renderStatus loop.
+//
+// Bold/italic rendering still degrades to "normal" — the JS-side bold/italic
+// synthesis pattern (double-draw + skew transform) remains the supported
+// workaround. See feedback_nxjs_font_no_bold_italic.md for context.
 export function addSystemFont(fonts: FontFaceSet): FontFace {
+	for (const fontFace of fonts) {
+		if (fontFace.family === 'system-ui') return fontFace;
+	}
 	const data = $.getSystemFont(0 /* PlSharedFontType_Standard */);
 	const f = new FontFace('system-ui', data);
 	fonts.add(f);
@@ -124,6 +141,9 @@ export function addSystemFont(fonts: FontFaceSet): FontFace {
 }
 
 export function addIconFont(fonts: FontFaceSet): FontFace {
+	for (const fontFace of fonts) {
+		if (fontFace.family === 'system-icons') return fontFace;
+	}
 	const data = $.getSystemFont(5 /* PlSharedFontType_NintendoExt */);
 	const f = new FontFace('system-icons', data);
 	fonts.add(f);

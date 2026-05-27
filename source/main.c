@@ -40,6 +40,7 @@
 #include "uint8array.h"
 #include "url.h"
 #include "util.h"
+#include "video.h"
 #include "wasm.h"
 #include "web.h"
 #include "webgl.h"
@@ -720,6 +721,7 @@ int main(int argc, char *argv[]) {
 	nx_init_uint8array(ctx, nx_ctx->init_obj);
 	nx_init_url(ctx, nx_ctx->init_obj);
 	nx_init_swkbd(ctx, nx_ctx->init_obj);
+	nx_init_video(ctx, nx_ctx->init_obj);
 	nx_init_wasm(ctx, nx_ctx->init_obj);
 	nx_init_web(ctx, nx_ctx->init_obj);
 	nx_init_webgl(ctx, nx_ctx->init_obj);

@@ -304,6 +304,7 @@ export interface Init {
 	statSync(path: string): Stats | null;
 	writeFile(path: string, data: ArrayBuffer): Promise<void>;
 	writeFileSync(path: string, data: ArrayBuffer): void;
+	appendFileSync(path: string, data: ArrayBuffer): void;
 
 	// fsdev.c
 	fsInit(c: ClassOf<FileSystem>): void;
@@ -333,6 +334,25 @@ export interface Init {
 	imageNew(width?: number, height?: number): Image | ImageBitmap;
 	imageDecode(img: Image | ImageBitmap, data: ArrayBuffer): Promise<void>;
 	imageClose(img: ImageBitmap): void;
+	imageWriteRGBA(
+		img: Image | ImageBitmap,
+		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+	): void;
+
+	// video.c
+	videoDecoderInit(c: any): void;
+	videoDecoderNew(url: string, opts?: { hwAccel?: boolean }): any;
+	videoDecoderClose(v: any): void;
+	videoDecoderPlay(v: any): void;
+	videoDecoderPause(v: any): void;
+	videoDecoderSeek(v: any, seconds: number): void;
+	videoDecoderNextFrame(v: any): {
+		data: ArrayBuffer | null;
+		width: number;
+		height: number;
+		pts: number;
+		ended: boolean;
+	} | null;
 
 	// irs.c
 	irsInit(): () => void;

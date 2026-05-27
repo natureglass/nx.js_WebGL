@@ -11,13 +11,17 @@ import { Blob } from './polyfills/blob';
 import { EventTarget } from './polyfills/event-target';
 import { INTERNAL_SYMBOL } from './internal';
 import { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
-import { WebGLRenderingContext } from './canvas/webgl-rendering-context';
+import {
+	WebGLRenderingContext,
+	WebGL2RenderingContext,
+} from './canvas/webgl-rendering-context';
 import { initTouchscreen } from './touchscreen';
 import type { TouchEvent } from './polyfills/event';
 
 interface ScreenInternal {
 	context2d?: CanvasRenderingContext2D;
 	webgl?: WebGLRenderingContext;
+	webgl2?: WebGL2RenderingContext;
 }
 
 const _ = createInternal<Screen, ScreenInternal>();
@@ -75,12 +79,37 @@ export class Screen extends EventTarget implements globalThis.Screen {
 
 	getContext(contextId: '2d'): CanvasRenderingContext2D;
 	getContext(contextId: 'webgl' | 'experimental-webgl'): WebGLRenderingContext;
-	getContext(contextId: string): CanvasRenderingContext2D | WebGLRenderingContext | null {
-		if (contextId !== '2d' && contextId !== 'webgl' && contextId !== 'experimental-webgl') {
+	getContext(contextId: 'webgl2'): WebGL2RenderingContext;
+	getContext(contextId: string): CanvasRenderingContext2D | WebGLRenderingContext | WebGL2RenderingContext | null {
+		if (
+			contextId !== '2d' &&
+			contextId !== 'webgl' &&
+			contextId !== 'experimental-webgl' &&
+			contextId !== 'webgl2'
+		) {
 			return null;
 		}
 
 		const i = _(this);
+		if (contextId === 'webgl2') {
+			// The Screen canvas is the shared underlying surface
+			// (see [[swb-webgl-inline]]) — different inline canvases on
+			// the page may ask for different context kinds. Both v1 and
+			// v2 instances wrap the SAME native EGL/GLES context; the
+			// only difference is the JS class identity (which gates
+			// Three.js's `gl.constructor.name === 'WebGL2RenderingContext'`
+			// detection). The spec's "one kind per canvas" rule applies
+			// to the inline canvas — enforced there by the runner — not
+			// at this layer.
+			if (!i.webgl2) {
+				i.webgl2 = new WebGL2RenderingContext(
+					// @ts-expect-error Internal constructor
+					INTERNAL_SYMBOL,
+					this,
+				);
+			}
+			return i.webgl2;
+		}
 		if (contextId === 'webgl' || contextId === 'experimental-webgl') {
 			if (!i.webgl) {
 				i.webgl = new WebGLRenderingContext(

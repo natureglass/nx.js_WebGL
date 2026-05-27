@@ -19,6 +19,7 @@ export {
 	listenDatagram,
 } from '../udp';
 export * from './album';
+export * from './bitmap';
 export * from './dns';
 export * from './env';
 export * from './file-system';
@@ -29,6 +30,7 @@ export * from './ns';
 export * from './profile';
 export * from './savedata';
 export * from './service';
+export * from './video-decoder';
 export { Socket, Server };
 export { WebApplet, type WebAppletOptions } from '../web-applet';
 

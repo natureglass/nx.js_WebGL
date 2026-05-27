@@ -57,14 +57,15 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			-DLIBNX_VERSION="\"$(LIBNX_VERSION)\"" \
 			-DLIBTURBOJPEG_VERSION="\"$(LIBTURBOJPEG_VERSION)\""
 
-CFLAGS	+=	$(INCLUDE) -D__SWITCH__ `aarch64-none-elf-pkg-config freetype2 cairo --cflags`
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__ `aarch64-none-elf-pkg-config freetype2 cairo libavformat libavcodec libswscale libswresample libavutil --cflags`
 
 CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=${DEVKITPRO}/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:=  -pthread -lmbedtls -lmbedx509 -lmbedcrypto -lharfbuzz `aarch64-none-elf-pkg-config freetype2 cairo --libs` -lturbojpeg -lwebp -lqjs -lm3 -lm -lzstd
+LIBS	:=  -pthread -lmbedtls -lmbedx509 -lmbedcrypto -lharfbuzz `aarch64-none-elf-pkg-config freetype2 cairo --libs` -lturbojpeg -lwebp -lqjs -lm3 -lm -lzstd \
+		-Wl,--start-group `aarch64-none-elf-pkg-config libavformat libavcodec libswscale libswresample libavutil --libs` -lbz2 -lnx -Wl,--end-group
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

@@ -136,6 +136,20 @@ GLuint bridge_color_program;
 	GLint bridge_color_specular_loc;
 	GLint bridge_color_emissive_loc;
 	GLint bridge_color_shininess_loc;
+	// HemisphereLight uniforms (milestone #21). Three.js's HemisphereLight
+	// uploads `hemisphereLights[0].direction/skyColor/groundColor`; the
+	// bridge composes `mix(ground, sky, 0.5 * dot(N, dir) + 0.5)` and adds
+	// it to the ambient term (it's an ambient-class irradiance per
+	// Three.js's `lights_fragment_begin`). Same applies to the texture
+	// program below.
+	GLint bridge_color_hemi_light_enabled_loc;
+	GLint bridge_color_hemi_light_direction_loc;
+	GLint bridge_color_hemi_light_sky_color_loc;
+	GLint bridge_color_hemi_light_ground_color_loc;
+	GLint bridge_texture_hemi_light_enabled_loc;
+	GLint bridge_texture_hemi_light_direction_loc;
+	GLint bridge_texture_hemi_light_sky_color_loc;
+	GLint bridge_texture_hemi_light_ground_color_loc;
 	// OES_standard_derivatives derivative-normals fallback (milestone #16).
 	// When `lighting_enabled && !has_normals`, the dispatch sets
 	// `u_useDerivativeNormals = 1` and the fragment shader computes
@@ -244,6 +258,100 @@ GLuint bridge_color_program;
 	GLuint current_user_framebuffer;
 	int current_user_framebuffer_width;
 	int current_user_framebuffer_height;
+	// User-bound VAO (gl.bindVertexArray). 0 means use the internal
+	// passthrough_vao (legacy WebGL 1 path). Non-zero overrides
+	// passthrough_vao at draw time.
+	GLuint current_user_vao;
+	// UBO indexed binding slot tracking. Mesa Nouveau resets these on
+	// eglMakeCurrent (even when making the same context current — likely a
+	// driver bug). The passthrough dispatch calls eglMakeCurrent at the
+	// start of every draw, so we must snapshot user-set slot bindings via
+	// bind_buffer_base / bind_buffer_range and re-apply them at the top of
+	// every passthrough draw. Sized to match MAX_UNIFORM_BUFFER_BINDINGS
+	// (84 per smoke test) with headroom. Index = binding slot.
+	#define NX_WEBGL_MAX_UBO_BINDINGS 96
+	GLuint ubo_indexed_bindings[NX_WEBGL_MAX_UBO_BINDINGS];
+	// Range-binding offsets/sizes for bind_buffer_range. Offset=0 size=0
+	// means "use bind_buffer_base semantics" (whole buffer).
+	GLintptr ubo_indexed_offsets[NX_WEBGL_MAX_UBO_BINDINGS];
+	GLsizeiptr ubo_indexed_sizes[NX_WEBGL_MAX_UBO_BINDINGS];
+	// WebGL 2 (GLES 3) entry points resolved lazily via eglGetProcAddress
+	// at probe step 8. NULL pointers mean "feature not available on this
+	// driver" — JS-side wrappers set INVALID_OPERATION when missing.
+	bool webgl2_present;
+	void *fn_vertex_attrib_i_pointer;
+	void *fn_vertex_attrib_i4i;
+	void *fn_vertex_attrib_i4ui;
+	void *fn_uniform1ui;
+	void *fn_uniform2ui;
+	void *fn_uniform3ui;
+	void *fn_uniform4ui;
+	void *fn_uniform1uiv;
+	void *fn_uniform2uiv;
+	void *fn_uniform3uiv;
+	void *fn_uniform4uiv;
+	void *fn_uniform_matrix2x3fv;
+	void *fn_uniform_matrix3x2fv;
+	void *fn_uniform_matrix2x4fv;
+	void *fn_uniform_matrix4x2fv;
+	void *fn_uniform_matrix3x4fv;
+	void *fn_uniform_matrix4x3fv;
+	void *fn_draw_buffers;
+	void *fn_invalidate_framebuffer;
+	void *fn_invalidate_sub_framebuffer;
+	void *fn_blit_framebuffer;
+	void *fn_read_buffer;
+	void *fn_renderbuffer_storage_multisample;
+	void *fn_framebuffer_texture_layer;
+	void *fn_tex_image_3d;
+	void *fn_tex_sub_image_3d;
+	void *fn_copy_tex_sub_image_3d;
+	void *fn_compressed_tex_image_3d;
+	void *fn_compressed_tex_sub_image_3d;
+	void *fn_tex_storage_2d;
+	void *fn_tex_storage_3d;
+	void *fn_clear_buffer_iv;
+	void *fn_clear_buffer_uiv;
+	void *fn_clear_buffer_fv;
+	void *fn_clear_buffer_fi;
+	void *fn_copy_buffer_sub_data;
+	void *fn_get_buffer_sub_data;
+	void *fn_bind_buffer_base;
+	void *fn_bind_buffer_range;
+	void *fn_get_uniform_block_index;
+	void *fn_uniform_block_binding;
+	void *fn_get_active_uniform_block_iv;
+	void *fn_get_active_uniform_block_name;
+	void *fn_get_active_uniforms_iv;
+	void *fn_get_uniform_indices;
+	void *fn_gen_samplers;
+	void *fn_delete_samplers;
+	void *fn_bind_sampler;
+	void *fn_sampler_parameteri;
+	void *fn_sampler_parameterf;
+	void *fn_get_sampler_parameter_iv;
+	void *fn_fence_sync;
+	void *fn_delete_sync;
+	void *fn_client_wait_sync;
+	void *fn_wait_sync;
+	void *fn_get_sync_iv;
+	void *fn_gen_queries;
+	void *fn_delete_queries;
+	void *fn_begin_query;
+	void *fn_end_query;
+	void *fn_get_query_iv;
+	void *fn_get_query_object_uiv;
+	void *fn_gen_transform_feedbacks;
+	void *fn_delete_transform_feedbacks;
+	void *fn_bind_transform_feedback;
+	void *fn_begin_transform_feedback;
+	void *fn_end_transform_feedback;
+	void *fn_pause_transform_feedback;
+	void *fn_resume_transform_feedback;
+	void *fn_transform_feedback_varyings;
+	void *fn_get_transform_feedback_varying;
+	void *fn_get_frag_data_location;
+	void *fn_get_internal_format_iv;
 #endif
 };
 
@@ -820,6 +928,10 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 		"uniform vec3 u_specular;\n"
 		"uniform float u_shininess;\n"
 		"uniform vec3 u_emissive;\n"
+		"uniform float u_hemiLightEnabled;\n"
+		"uniform vec3 u_hemiLightDirection;\n"
+		"uniform vec3 u_hemiLightSkyColor;\n"
+		"uniform vec3 u_hemiLightGroundColor;\n"
 		"uniform float u_useDerivativeNormals;\n"
 		"varying vec3 v_color;\n"
 		"varying float v_fogDepth;\n"
@@ -871,7 +983,18 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
 		"      }\n"
 		"    }\n"
-		"    vec3 lit = base.rgb * (u_ambientLightColor + diffuse) + u_specular * specular;\n"
+		// HemisphereLight (Three.js): an ambient-class irradiance that
+		// blends sky and ground colors by the normal's projection onto
+		// the up axis. Added to ambient (not to NdotL diffuse) to match
+		// Three.js's `lights_fragment_begin.glsl.js`:
+		//   irradiance += mix(ground, sky, 0.5 * dot(N, dir) + 0.5)
+		"    vec3 hemiIrradiance = vec3(0.0);\n"
+		"    if (u_hemiLightEnabled > 0.5) {\n"
+		"      float hemiDotNL = dot(N, u_hemiLightDirection);\n"
+		"      float hemiDiffuseWeight = 0.5 * hemiDotNL + 0.5;\n"
+		"      hemiIrradiance = mix(u_hemiLightGroundColor, u_hemiLightSkyColor, hemiDiffuseWeight);\n"
+		"    }\n"
+		"    vec3 lit = base.rgb * (u_ambientLightColor + hemiIrradiance + diffuse) + u_specular * specular;\n"
 		"    gl_FragColor = vec4(lit, base.a);\n"
 		"  } else {\n"
 		"    gl_FragColor = base;\n"
@@ -984,6 +1107,14 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 			backend->bridge_color_program, "u_shininess");
 		backend->bridge_color_emissive_loc = glGetUniformLocation(
 			backend->bridge_color_program, "u_emissive");
+		backend->bridge_color_hemi_light_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_hemiLightEnabled");
+		backend->bridge_color_hemi_light_direction_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_hemiLightDirection");
+		backend->bridge_color_hemi_light_sky_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_hemiLightSkyColor");
+		backend->bridge_color_hemi_light_ground_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_hemiLightGroundColor");
 		backend->bridge_color_use_derivative_normals_loc = glGetUniformLocation(
 			backend->bridge_color_program, "u_useDerivativeNormals");
 	}
@@ -1103,6 +1234,10 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		"uniform vec3 u_specular;\n"
 		"uniform float u_shininess;\n"
 		"uniform vec3 u_emissive;\n"
+		"uniform float u_hemiLightEnabled;\n"
+		"uniform vec3 u_hemiLightDirection;\n"
+		"uniform vec3 u_hemiLightSkyColor;\n"
+		"uniform vec3 u_hemiLightGroundColor;\n"
 		"uniform float u_useDerivativeNormals;\n"
 		"varying vec2 v_uv;\n"
 		"varying float v_fogDepth;\n"
@@ -1148,7 +1283,17 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
 		"      }\n"
 		"    }\n"
-		"    vec3 lit = base.rgb * (u_ambientLightColor + diffuse) + u_specular * specular;\n"
+		// HemisphereLight (Three.js) — see bridge_color_program's
+		// fragment shader for the full rationale. Ambient-class irradiance
+		// blended from sky/ground by the normal's projection onto the
+		// hemisphere direction.
+		"    vec3 hemiIrradiance = vec3(0.0);\n"
+		"    if (u_hemiLightEnabled > 0.5) {\n"
+		"      float hemiDotNL = dot(N, u_hemiLightDirection);\n"
+		"      float hemiDiffuseWeight = 0.5 * hemiDotNL + 0.5;\n"
+		"      hemiIrradiance = mix(u_hemiLightGroundColor, u_hemiLightSkyColor, hemiDiffuseWeight);\n"
+		"    }\n"
+		"    vec3 lit = base.rgb * (u_ambientLightColor + hemiIrradiance + diffuse) + u_specular * specular;\n"
 		"    gl_FragColor = vec4(lit, base.a);\n"
 		"  } else {\n"
 		"    gl_FragColor = base;\n"
@@ -1262,6 +1407,14 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		backend->bridge_texture_program, "u_shininess");
 	backend->bridge_texture_emissive_loc = glGetUniformLocation(
 		backend->bridge_texture_program, "u_emissive");
+	backend->bridge_texture_hemi_light_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_hemiLightEnabled");
+	backend->bridge_texture_hemi_light_direction_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_hemiLightDirection");
+	backend->bridge_texture_hemi_light_sky_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_hemiLightSkyColor");
+	backend->bridge_texture_hemi_light_ground_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_hemiLightGroundColor");
 	backend->bridge_texture_use_derivative_normals_loc = glGetUniformLocation(
 		backend->bridge_texture_program, "u_useDerivativeNormals");
 
@@ -1455,8 +1608,33 @@ static bool ensure_bridge_line_program(nx_webgl_egl_t *backend) {
 	return true;
 }
 
+// Used by the bridge's per-draw texture cache (one level only). Mipmap
+// minFilter variants collapse to NEAREST because the cache uploads level
+// 0 only — sampling with LINEAR_MIPMAP_LINEAR on a non-mipmap-complete
+// texture is undefined.
 static GLenum bridge_texture_filter(uint32_t filter) {
 	return filter == GL_LINEAR ? GL_LINEAR : GL_NEAREST;
+}
+
+// Used by the persistent-handle path. ALL minFilter variants flow
+// through — when paired with `glGenerateMipmap` ([[bridge-raw-shader-passthrough]]
+// helper added 2026-05-22 for milestone #24), mipmap sampling actually
+// works. magFilter is still NEAREST/LINEAR only (GLES 2.0 spec).
+#define GL_NEAREST_MIPMAP_NEAREST_LOCAL 0x2700
+#define GL_LINEAR_MIPMAP_NEAREST_LOCAL 0x2701
+#define GL_NEAREST_MIPMAP_LINEAR_LOCAL 0x2702
+#define GL_LINEAR_MIPMAP_LINEAR_LOCAL 0x2703
+static GLenum bridge_texture_filter_persistent(uint32_t filter) {
+	switch (filter) {
+	case GL_LINEAR:
+	case GL_NEAREST_MIPMAP_NEAREST_LOCAL:
+	case GL_LINEAR_MIPMAP_NEAREST_LOCAL:
+	case GL_NEAREST_MIPMAP_LINEAR_LOCAL:
+	case GL_LINEAR_MIPMAP_LINEAR_LOCAL:
+		return (GLenum)filter;
+	default:
+		return GL_NEAREST;
+	}
 }
 
 static GLenum bridge_texture_wrap(uint32_t wrap) {
@@ -1843,6 +2021,140 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 			gen(1, &vao);
 			backend->passthrough_vao = vao;
 		}
+
+		// WebGL 2 / GLES 3.0 entry points. Resolved unconditionally; the
+		// presence flag is true iff the core set we need for Three.js
+		// (uint uniforms + integer vertex attribs + drawBuffers +
+		// texImage3D + texStorage2D + bindBufferBase) all loaded.
+		backend->fn_vertex_attrib_i_pointer =
+			(void *)eglGetProcAddress("glVertexAttribIPointer");
+		backend->fn_vertex_attrib_i4i =
+			(void *)eglGetProcAddress("glVertexAttribI4i");
+		backend->fn_vertex_attrib_i4ui =
+			(void *)eglGetProcAddress("glVertexAttribI4ui");
+		backend->fn_uniform1ui = (void *)eglGetProcAddress("glUniform1ui");
+		backend->fn_uniform2ui = (void *)eglGetProcAddress("glUniform2ui");
+		backend->fn_uniform3ui = (void *)eglGetProcAddress("glUniform3ui");
+		backend->fn_uniform4ui = (void *)eglGetProcAddress("glUniform4ui");
+		backend->fn_uniform1uiv = (void *)eglGetProcAddress("glUniform1uiv");
+		backend->fn_uniform2uiv = (void *)eglGetProcAddress("glUniform2uiv");
+		backend->fn_uniform3uiv = (void *)eglGetProcAddress("glUniform3uiv");
+		backend->fn_uniform4uiv = (void *)eglGetProcAddress("glUniform4uiv");
+		backend->fn_uniform_matrix2x3fv =
+			(void *)eglGetProcAddress("glUniformMatrix2x3fv");
+		backend->fn_uniform_matrix3x2fv =
+			(void *)eglGetProcAddress("glUniformMatrix3x2fv");
+		backend->fn_uniform_matrix2x4fv =
+			(void *)eglGetProcAddress("glUniformMatrix2x4fv");
+		backend->fn_uniform_matrix4x2fv =
+			(void *)eglGetProcAddress("glUniformMatrix4x2fv");
+		backend->fn_uniform_matrix3x4fv =
+			(void *)eglGetProcAddress("glUniformMatrix3x4fv");
+		backend->fn_uniform_matrix4x3fv =
+			(void *)eglGetProcAddress("glUniformMatrix4x3fv");
+		backend->fn_draw_buffers = (void *)eglGetProcAddress("glDrawBuffers");
+		backend->fn_invalidate_framebuffer =
+			(void *)eglGetProcAddress("glInvalidateFramebuffer");
+		backend->fn_invalidate_sub_framebuffer =
+			(void *)eglGetProcAddress("glInvalidateSubFramebuffer");
+		backend->fn_blit_framebuffer =
+			(void *)eglGetProcAddress("glBlitFramebuffer");
+		backend->fn_read_buffer = (void *)eglGetProcAddress("glReadBuffer");
+		backend->fn_renderbuffer_storage_multisample =
+			(void *)eglGetProcAddress("glRenderbufferStorageMultisample");
+		backend->fn_framebuffer_texture_layer =
+			(void *)eglGetProcAddress("glFramebufferTextureLayer");
+		backend->fn_tex_image_3d = (void *)eglGetProcAddress("glTexImage3D");
+		backend->fn_tex_sub_image_3d =
+			(void *)eglGetProcAddress("glTexSubImage3D");
+		backend->fn_copy_tex_sub_image_3d =
+			(void *)eglGetProcAddress("glCopyTexSubImage3D");
+		backend->fn_compressed_tex_image_3d =
+			(void *)eglGetProcAddress("glCompressedTexImage3D");
+		backend->fn_compressed_tex_sub_image_3d =
+			(void *)eglGetProcAddress("glCompressedTexSubImage3D");
+		backend->fn_tex_storage_2d =
+			(void *)eglGetProcAddress("glTexStorage2D");
+		backend->fn_tex_storage_3d =
+			(void *)eglGetProcAddress("glTexStorage3D");
+		backend->fn_clear_buffer_iv =
+			(void *)eglGetProcAddress("glClearBufferiv");
+		backend->fn_clear_buffer_uiv =
+			(void *)eglGetProcAddress("glClearBufferuiv");
+		backend->fn_clear_buffer_fv =
+			(void *)eglGetProcAddress("glClearBufferfv");
+		backend->fn_clear_buffer_fi =
+			(void *)eglGetProcAddress("glClearBufferfi");
+		backend->fn_copy_buffer_sub_data =
+			(void *)eglGetProcAddress("glCopyBufferSubData");
+		backend->fn_get_buffer_sub_data =
+			(void *)eglGetProcAddress("glGetBufferSubData");
+		backend->fn_bind_buffer_base =
+			(void *)eglGetProcAddress("glBindBufferBase");
+		backend->fn_bind_buffer_range =
+			(void *)eglGetProcAddress("glBindBufferRange");
+		backend->fn_get_uniform_block_index =
+			(void *)eglGetProcAddress("glGetUniformBlockIndex");
+		backend->fn_uniform_block_binding =
+			(void *)eglGetProcAddress("glUniformBlockBinding");
+		backend->fn_get_active_uniform_block_iv =
+			(void *)eglGetProcAddress("glGetActiveUniformBlockiv");
+		backend->fn_get_active_uniform_block_name =
+			(void *)eglGetProcAddress("glGetActiveUniformBlockName");
+		backend->fn_get_active_uniforms_iv =
+			(void *)eglGetProcAddress("glGetActiveUniformsiv");
+		backend->fn_get_uniform_indices =
+			(void *)eglGetProcAddress("glGetUniformIndices");
+		backend->fn_gen_samplers = (void *)eglGetProcAddress("glGenSamplers");
+		backend->fn_delete_samplers =
+			(void *)eglGetProcAddress("glDeleteSamplers");
+		backend->fn_bind_sampler = (void *)eglGetProcAddress("glBindSampler");
+		backend->fn_sampler_parameteri =
+			(void *)eglGetProcAddress("glSamplerParameteri");
+		backend->fn_sampler_parameterf =
+			(void *)eglGetProcAddress("glSamplerParameterf");
+		backend->fn_get_sampler_parameter_iv =
+			(void *)eglGetProcAddress("glGetSamplerParameteriv");
+		backend->fn_fence_sync = (void *)eglGetProcAddress("glFenceSync");
+		backend->fn_delete_sync = (void *)eglGetProcAddress("glDeleteSync");
+		backend->fn_client_wait_sync =
+			(void *)eglGetProcAddress("glClientWaitSync");
+		backend->fn_wait_sync = (void *)eglGetProcAddress("glWaitSync");
+		backend->fn_get_sync_iv = (void *)eglGetProcAddress("glGetSynciv");
+		backend->fn_gen_queries = (void *)eglGetProcAddress("glGenQueries");
+		backend->fn_delete_queries =
+			(void *)eglGetProcAddress("glDeleteQueries");
+		backend->fn_begin_query = (void *)eglGetProcAddress("glBeginQuery");
+		backend->fn_end_query = (void *)eglGetProcAddress("glEndQuery");
+		backend->fn_get_query_iv = (void *)eglGetProcAddress("glGetQueryiv");
+		backend->fn_get_query_object_uiv =
+			(void *)eglGetProcAddress("glGetQueryObjectuiv");
+		backend->fn_gen_transform_feedbacks =
+			(void *)eglGetProcAddress("glGenTransformFeedbacks");
+		backend->fn_delete_transform_feedbacks =
+			(void *)eglGetProcAddress("glDeleteTransformFeedbacks");
+		backend->fn_bind_transform_feedback =
+			(void *)eglGetProcAddress("glBindTransformFeedback");
+		backend->fn_begin_transform_feedback =
+			(void *)eglGetProcAddress("glBeginTransformFeedback");
+		backend->fn_end_transform_feedback =
+			(void *)eglGetProcAddress("glEndTransformFeedback");
+		backend->fn_pause_transform_feedback =
+			(void *)eglGetProcAddress("glPauseTransformFeedback");
+		backend->fn_resume_transform_feedback =
+			(void *)eglGetProcAddress("glResumeTransformFeedback");
+		backend->fn_transform_feedback_varyings =
+			(void *)eglGetProcAddress("glTransformFeedbackVaryings");
+		backend->fn_get_transform_feedback_varying =
+			(void *)eglGetProcAddress("glGetTransformFeedbackVarying");
+		backend->fn_get_frag_data_location =
+			(void *)eglGetProcAddress("glGetFragDataLocation");
+		backend->fn_get_internal_format_iv =
+			(void *)eglGetProcAddress("glGetInternalformativ");
+		backend->webgl2_present =
+			backend->fn_vertex_attrib_i_pointer && backend->fn_uniform1ui &&
+			backend->fn_draw_buffers && backend->fn_tex_image_3d &&
+			backend->fn_tex_storage_2d && backend->fn_bind_buffer_base;
 	}
 
 	backend->available = true;
@@ -2406,22 +2718,30 @@ bool nx_webgl_egl_draw_passthrough(
 		return false;
 	}
 
+	// (UBO re-apply moved closer to glDrawArrays — see just before draw)
+
 	bridge_target_t target;
 	if (!bridge_acquire_target(backend, canvas, &target))
 		return false;
 
 	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
 
-	// Bind the persistent passthrough VAO so vertex attribute state has
-	// somewhere to land. On ES 3+ the default VAO 0 is reserved (no
-	// attribute state, all draws no-op silently); on ES 2 with
-	// OES_vertex_array_object we get the same plumbing for free. If VAO
-	// support isn't available (fn_bind_vertex_array == NULL), fall through
-	// — we'll be on plain ES 2 and the default VAO 0 still works.
-	if (backend->fn_bind_vertex_array && backend->passthrough_vao) {
+	// Bind a VAO so vertex attribute state has somewhere to land. On
+	// ES 3+ the default VAO 0 is reserved (no attribute state, all draws
+	// no-op silently); on ES 2 with OES_vertex_array_object we get the
+	// same plumbing for free. WebGL 2 users can bind their own VAO via
+	// gl.bindVertexArray — when that's set, honor it (the user manages
+	// their own attribute state). Otherwise fall back to the persistent
+	// passthrough VAO so legacy WebGL 1 code that doesn't know about VAOs
+	// keeps working.
+	if (backend->fn_bind_vertex_array) {
 		typedef void (*pfn_bind_vao_t)(GLuint);
 		pfn_bind_vao_t bind = (pfn_bind_vao_t)backend->fn_bind_vertex_array;
-		bind((GLuint)backend->passthrough_vao);
+		GLuint vao = backend->current_user_vao
+		                 ? backend->current_user_vao
+		                 : (GLuint)backend->passthrough_vao;
+		if (vao)
+			bind(vao);
 	}
 
 	glUseProgram((GLuint)program_handle);
@@ -2577,6 +2897,53 @@ bool nx_webgl_egl_draw_passthrough(
 	glFrontFace(gl_front);
 
 	(void)glGetError();  // drain stale errors
+
+	// Re-apply tracked UBO slot bindings + program block bindings right
+	// before every draw. Mesa Nouveau on Citron has a deep driver bug
+	// where the second-and-later draws of a program reading from a UBO
+	// silently return zero — even when the slot bindings AND the program's
+	// block-to-slot mappings are correctly established at API level. We
+	// re-issue everything here as a best-effort defensive measure; the
+	// actual fix lives in real Tegra hardware where this driver bug
+	// doesn't exist. See [[mesa-nouveau-ubo-second-draw-bug]] memory.
+	{
+		typedef void (*pfn_base_t)(GLenum, GLuint, GLuint);
+		typedef void (*pfn_range_t)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr);
+		pfn_base_t fn_base = (pfn_base_t)backend->fn_bind_buffer_base;
+		pfn_range_t fn_range = (pfn_range_t)backend->fn_bind_buffer_range;
+		if (fn_base) {
+			for (int i = 0; i < NX_WEBGL_MAX_UBO_BINDINGS; i++) {
+				GLuint buf = backend->ubo_indexed_bindings[i];
+				if (buf == 0) continue;
+				if (backend->ubo_indexed_sizes[i] > 0 && fn_range) {
+					fn_range(0x8A11, (GLuint)i, buf,
+					         backend->ubo_indexed_offsets[i],
+					         backend->ubo_indexed_sizes[i]);
+				} else {
+					fn_base(0x8A11, (GLuint)i, buf);
+				}
+			}
+			(void)glGetError();
+		}
+		typedef void (*pfn_ubb_t)(GLuint, GLuint, GLuint);
+		typedef void (*pfn_gaubi_t)(GLuint, GLuint, GLenum, GLint *);
+		pfn_ubb_t fn_ubb = (pfn_ubb_t)backend->fn_uniform_block_binding;
+		pfn_gaubi_t fn_gaubi = (pfn_gaubi_t)backend->fn_get_active_uniform_block_iv;
+		if (fn_ubb && fn_gaubi) {
+			GLint num_blocks = 0;
+			glGetProgramiv((GLuint)program_handle, 0x8A36 /* ACTIVE_UNIFORM_BLOCKS */,
+			               &num_blocks);
+			(void)glGetError();
+			for (GLint b = 0; b < num_blocks && b < 16; b++) {
+				GLint binding = 0;
+				fn_gaubi((GLuint)program_handle, (GLuint)b,
+				         0x8A3F /* UNIFORM_BLOCK_BINDING */, &binding);
+				(void)glGetError();
+				fn_ubb((GLuint)program_handle, (GLuint)b, (GLuint)binding);
+			}
+			(void)glGetError();
+		}
+	}
 
 	if (indexed) {
 		if (element_buffer_handle == 0) {
@@ -2851,8 +3218,12 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	                    backend->context))
 		return false;
 	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
+	// Persistent textures may carry mipmap minFilter variants (set by JS
+	// via tex_parameteri + generateMipmap). Pass them through to native
+	// instead of collapsing — that's what makes real mipmap sampling
+	// work. MAG_FILTER stays NEAREST/LINEAR per GLES spec.
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-	                bridge_texture_filter(min_filter));
+	                bridge_texture_filter_persistent(min_filter));
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
 	                bridge_texture_filter(mag_filter));
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -2873,13 +3244,188 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	} else if (format == 0x84F9 /* GL_DEPTH_STENCIL */) {
 		if (internal == 0x84F9 /* unsized */)
 			internal = 0x88F0 /* GL_DEPTH24_STENCIL8 */;
+	} else if (type == 0x1406 /* GL_FLOAT */) {
+		// P2 (HDR): promote unsized RGBA / RGB to sized 32F variants for
+		// FLOAT textures. ES3 requires sized internalformats for float
+		// textures. Three.js's WebGL 1 path passes the unsized form;
+		// auto-promote here.
+		if (format == 0x1908 /* GL_RGBA */ && internal == 0x1908)
+			internal = 0x8814 /* GL_RGBA32F */;
+		else if (format == 0x1907 /* GL_RGB */ && internal == 0x1907)
+			internal = 0x8815 /* GL_RGB32F */;
+	} else if (type == 0x8D61 /* GL_HALF_FLOAT_OES */) {
+		// Same for HALF_FLOAT_OES → RGBA16F / RGB16F. Also normalize the
+		// type token: GLES3 native is GL_HALF_FLOAT (0x140B), which is what
+		// the driver expects for the SIZED internal format path. The OES
+		// token (0x8D61) only works with UNSIZED internal — but we just
+		// promoted internal to sized, so swap the type too.
+		if (format == 0x1908 /* GL_RGBA */ && internal == 0x1908)
+			internal = 0x881A /* GL_RGBA16F */;
+		else if (format == 0x1907 /* GL_RGB */ && internal == 0x1907)
+			internal = 0x881B /* GL_RGB16F */;
+	}
+	// If we promoted to a sized FLOAT/HALF_FLOAT internalformat, the OES
+	// type token must be swapped for the GLES3 core token, which the driver
+	// requires for sized formats.
+	GLenum native_type = (GLenum)type;
+	if (type == 0x8D61 /* GL_HALF_FLOAT_OES */ &&
+	    (internal == 0x881A /* RGBA16F */ || internal == 0x881B /* RGB16F */)) {
+		native_type = 0x140B /* GL_HALF_FLOAT */;
 	}
 	// For UNSIGNED_INT_24_8_WEBGL the native enum is GL_UNSIGNED_INT_24_8
 	// which has the same value (0x84FA). No remap needed.
 	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
-	             (GLenum)format, (GLenum)type, data);
+	             (GLenum)format, native_type, data);
 	GLenum err = glGetError();
 	return err == GL_NO_ERROR;
+#endif
+}
+
+#if NXJS_HAS_EGL_GLES
+// Box-filter downsample of RGBA / RGB UByte image data: average 4 source
+// pixels per channel into one destination pixel. Bounds-clamped on
+// odd src dimensions so we never read past the source buffer; pow2
+// inputs (the cubemap demos' 512×512 faces) hit the clean 2:1 case
+// every level. Returns true if dst was filled; false on bad inputs.
+static bool downsample_box_rgba_ubyte(const uint8_t *src, int src_w, int src_h,
+                                      uint8_t *dst, int dst_w, int dst_h,
+                                      int channels) {
+	if (!src || !dst || src_w <= 0 || src_h <= 0 ||
+	    dst_w <= 0 || dst_h <= 0 || channels <= 0 || channels > 4)
+		return false;
+	for (int y = 0; y < dst_h; y++) {
+		int sy0 = y * 2;
+		int sy1 = (sy0 + 1 < src_h) ? sy0 + 1 : sy0;
+		for (int x = 0; x < dst_w; x++) {
+			int sx0 = x * 2;
+			int sx1 = (sx0 + 1 < src_w) ? sx0 + 1 : sx0;
+			for (int c = 0; c < channels; c++) {
+				int sum = (int)src[(sy0 * src_w + sx0) * channels + c] +
+				          (int)src[(sy0 * src_w + sx1) * channels + c] +
+				          (int)src[(sy1 * src_w + sx0) * channels + c] +
+				          (int)src[(sy1 * src_w + sx1) * channels + c];
+				dst[(y * dst_w + x) * channels + c] = (uint8_t)(sum / 4);
+			}
+		}
+	}
+	return true;
+}
+#endif
+
+bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    uint32_t face_target,
+                                                    int width, int height,
+                                                    uint32_t internalformat,
+                                                    uint32_t format,
+                                                    uint32_t type,
+                                                    const uint8_t *data,
+                                                    uint32_t min_filter,
+                                                    uint32_t mag_filter,
+                                                    uint32_t wrap_s,
+                                                    uint32_t wrap_t) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)face_target;
+	(void)width; (void)height;
+	(void)internalformat; (void)format; (void)type; (void)data;
+	(void)min_filter; (void)mag_filter; (void)wrap_s; (void)wrap_t;
+	return false;
+#else
+	if (!backend || handle == 0 || width <= 0 || height <= 0) return false;
+	if (face_target < 0x8515 /* GL_TEXTURE_CUBE_MAP_POSITIVE_X */ ||
+	    face_target > 0x851A /* GL_TEXTURE_CUBE_MAP_NEGATIVE_Z */)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)handle);
+	// Filter/wrap apply to the whole cube map; re-applying per face is
+	// idempotent and saves the caller from sequencing this with the first
+	// face upload. mip-aware MIN_FILTER stays here so post-upload sampling
+	// at higher LODs hits the manually-emitted mipmap chain below.
+	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
+	                bridge_texture_filter_persistent(min_filter));
+	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER,
+	                bridge_texture_filter(mag_filter));
+	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S,
+	                bridge_texture_wrap(wrap_s));
+	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T,
+	                bridge_texture_wrap(wrap_t));
+	(void)glGetError();
+	// Use sized internal format for cube uploads. Mesa Nouveau is
+	// stricter about this than the 2D path: discovered while bringing up
+	// milestone #25 ([[swb-threejs-webgl-materials-cubemap]]).
+	GLint internal = (GLint)internalformat;
+	if (format == 0x1908 /* GL_RGBA */ && type == GL_UNSIGNED_BYTE &&
+	    internal == 0x1908 /* unsized GL_RGBA */) {
+		internal = 0x8058 /* GL_RGBA8 */;
+	} else if (format == 0x1907 /* GL_RGB */ && type == GL_UNSIGNED_BYTE &&
+	           internal == 0x1907 /* unsized GL_RGB */) {
+		internal = 0x8051 /* GL_RGB8 */;
+	}
+	glTexImage2D((GLenum)face_target, 0, internal, width, height,
+	             0, (GLenum)format, (GLenum)type, data);
+	GLenum err = glGetError();
+	if (err != GL_NO_ERROR) return false;
+
+	// Software mipmap chain. Mesa Nouveau's `glGenerateMipmap(GL_TEXTURE_CUBE_MAP)`
+	// silently no-ops even when the cube is complete and uses a sized
+	// internalformat — confirmed during milestone #25 hw bring-up: with
+	// driver-side generation, head materials (which sample at LOD ≥ 1 due
+	// to curvature) read (0,0,0) while the background quad (LOD 0) works.
+	// We sidestep the driver entirely by computing the box-filtered chain
+	// CPU-side and uploading each level via glTexImage2D — deterministic
+	// and works on every GLES driver. ~33 % memory overhead per face,
+	// acceptable for cube textures.
+	//
+	// Only fires when caller actually supplied pixels AND the format is
+	// one of our supported UByte tuples. NULL-data uploads (cube render
+	// targets) skip — they're written into by FBO attachments, not
+	// sampled with mipmaps in our current demos.
+	if (data && type == GL_UNSIGNED_BYTE &&
+	    (format == 0x1908 /* GL_RGBA */ || format == 0x1907 /* GL_RGB */)) {
+		int channels = (format == 0x1907 /* GL_RGB */) ? 3 : 4;
+		int w = width, h = height;
+		int level = 1;
+		const uint8_t *src = data;
+		uint8_t *src_alloc = NULL;
+		while (w > 1 || h > 1) {
+			int new_w = w > 1 ? w / 2 : 1;
+			int new_h = h > 1 ? h / 2 : 1;
+			uint8_t *dst = (uint8_t *)malloc((size_t)new_w * (size_t)new_h *
+			                                  (size_t)channels);
+			if (!dst) {
+				if (src_alloc) free(src_alloc);
+				return false;
+			}
+			if (!downsample_box_rgba_ubyte(src, w, h, dst, new_w, new_h,
+			                                channels)) {
+				free(dst);
+				if (src_alloc) free(src_alloc);
+				return false;
+			}
+			(void)glGetError();
+			glTexImage2D((GLenum)face_target, level, internal, new_w, new_h,
+			             0, (GLenum)format, (GLenum)type, dst);
+			err = glGetError();
+			if (err != GL_NO_ERROR) {
+				free(dst);
+				if (src_alloc) free(src_alloc);
+				return false;
+			}
+			// Free previous level's source buffer; promote dst to next
+			// iteration's source (we keep ownership until the next
+			// allocation succeeds or we exit the loop).
+			if (src_alloc) free(src_alloc);
+			src_alloc = dst;
+			src = dst;
+			w = new_w;
+			h = new_h;
+			level++;
+		}
+		if (src_alloc) free(src_alloc);
+	}
+	return true;
 #endif
 }
 
@@ -2978,7 +3524,15 @@ void nx_webgl_egl_set_user_framebuffer(nx_webgl_egl_t *backend,
 	    backend->current_user_framebuffer != (GLuint)handle) {
 		if (eglMakeCurrent(backend->display, backend->surface,
 		                    backend->surface, backend->context)) {
-			glFlush();
+			// glFlush() suffices for milestone #19.5's depth-texture sample,
+			// but it's NOT enough for MRT color sampling on Mesa Nouveau:
+			// after a draw to a 2-attachment FBO, sampling either attachment
+			// in a subsequent pass returns (0,0,0,0) unless we force full
+			// completion. glFinish() blocks until all prior commands actually
+			// retire, including the per-tile resolve into the texture's
+			// memory. This is the standard "MRT writeback → sample-as-texture"
+			// hazard the GLES spec says drivers should handle implicitly.
+			glFinish();
 		}
 	}
 	backend->current_user_framebuffer = (GLuint)handle;
@@ -3010,6 +3564,46 @@ void nx_webgl_egl_forward_bind_texture(nx_webgl_egl_t *backend,
 	                    backend->context))
 		return;
 	glBindTexture((GLenum)target, (GLuint)handle);
+#endif
+}
+
+// Bind the given persistent texture handle to GL_TEXTURE_2D and apply
+// the parameter. Used by `nx_webgl_tex_parameteri` to forward filter/wrap
+// changes to native GLES when the texture has been promoted to a
+// persistent handle (so subsequent draws sample with the new params).
+// See [[swb-threejs-webgl-materials-texture-filters]] milestone #24.
+void nx_webgl_egl_texture_set_parameteri(nx_webgl_egl_t *backend,
+                                          uint32_t target,
+                                          uint32_t handle, uint32_t pname,
+                                          uint32_t param) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)target; (void)handle; (void)pname; (void)param;
+#else
+	if (!backend || !handle) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glBindTexture((GLenum)target, (GLuint)handle);
+	glTexParameteri((GLenum)target, (GLenum)pname, (GLint)param);
+#endif
+}
+
+// Bind the given persistent texture handle to GL_TEXTURE_2D and call
+// native glGenerateMipmap to fill levels 1..N from the level-0 texels.
+// Caller must have already promoted the texture (`gles_handle != 0`)
+// and uploaded the base level via `nx_webgl_egl_persistent_texture_image_2d`.
+// Milestone #24.
+void nx_webgl_egl_generate_mipmap(nx_webgl_egl_t *backend,
+                                    uint32_t handle, uint32_t target) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)target;
+#else
+	if (!backend || !handle) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glBindTexture((GLenum)target, (GLuint)handle);
+	glGenerateMipmap((GLenum)target);
 #endif
 }
 
@@ -3812,7 +4406,11 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										const float *specular_color,
 										float shininess,
 										const float *emissive_color,
-										bool use_derivative_normals) {
+										bool use_derivative_normals,
+										bool hemi_light_enabled,
+										const float *hemi_light_direction,
+										const float *hemi_light_sky_color,
+										const float *hemi_light_ground_color) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -3857,6 +4455,10 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	(void)shininess;
 	(void)emissive_color;
 	(void)use_derivative_normals;
+	(void)hemi_light_enabled;
+	(void)hemi_light_direction;
+	(void)hemi_light_sky_color;
+	(void)hemi_light_ground_color;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -4010,6 +4612,42 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		} else {
 			glUniform3f(backend->bridge_color_emissive_loc, 0.f, 0.f, 0.f);
 		}
+	}
+	// HemisphereLight (Three.js). Active when lit AND all three uniforms
+	// were bound on the program. Always upload an enabled-flag so a prior
+	// program's value can't leak; also always upload the three color/dir
+	// uniforms (default zero) so the shader's mix() doesn't read stale
+	// values when the program toggles between hemi-lit and non-hemi-lit
+	// draws within a frame. See [[bridge-lighting-support]].
+	bool hemi_active = light_active && hemi_light_enabled &&
+					   hemi_light_direction && hemi_light_sky_color &&
+					   hemi_light_ground_color;
+	if (backend->bridge_color_hemi_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_hemi_light_enabled_loc,
+					hemi_active ? 1.f : 0.f);
+	if (hemi_active) {
+		if (backend->bridge_color_hemi_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_direction_loc,
+						hemi_light_direction[0], hemi_light_direction[1],
+						hemi_light_direction[2]);
+		if (backend->bridge_color_hemi_light_sky_color_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_sky_color_loc,
+						hemi_light_sky_color[0], hemi_light_sky_color[1],
+						hemi_light_sky_color[2]);
+		if (backend->bridge_color_hemi_light_ground_color_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_ground_color_loc,
+						hemi_light_ground_color[0], hemi_light_ground_color[1],
+						hemi_light_ground_color[2]);
+	} else {
+		if (backend->bridge_color_hemi_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_direction_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_color_hemi_light_sky_color_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_sky_color_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_color_hemi_light_ground_color_loc >= 0)
+			glUniform3f(backend->bridge_color_hemi_light_ground_color_loc,
+						0.f, 0.f, 0.f);
 	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	glEnableVertexAttribArray(0);
@@ -4416,7 +5054,11 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	const float *specular_color,
 	float shininess,
 	const float *emissive_color,
-	bool use_derivative_normals) {
+	bool use_derivative_normals,
+	bool hemi_light_enabled,
+	const float *hemi_light_direction,
+	const float *hemi_light_sky_color,
+	const float *hemi_light_ground_color) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -4472,6 +5114,10 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)shininess;
 	(void)emissive_color;
 	(void)use_derivative_normals;
+	(void)hemi_light_enabled;
+	(void)hemi_light_direction;
+	(void)hemi_light_sky_color;
+	(void)hemi_light_ground_color;
 	return false;
 #else
 	// Persistent-handle textures (FBO color attachments) have no CPU `data` —
@@ -4682,6 +5328,37 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		} else {
 			glUniform3f(backend->bridge_texture_emissive_loc, 0.f, 0.f, 0.f);
 		}
+	}
+	// HemisphereLight (Three.js) — see color-program dispatch comment.
+	bool hemi_active = light_active && hemi_light_enabled &&
+					   hemi_light_direction && hemi_light_sky_color &&
+					   hemi_light_ground_color;
+	if (backend->bridge_texture_hemi_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_hemi_light_enabled_loc,
+					hemi_active ? 1.f : 0.f);
+	if (hemi_active) {
+		if (backend->bridge_texture_hemi_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_direction_loc,
+						hemi_light_direction[0], hemi_light_direction[1],
+						hemi_light_direction[2]);
+		if (backend->bridge_texture_hemi_light_sky_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_sky_color_loc,
+						hemi_light_sky_color[0], hemi_light_sky_color[1],
+						hemi_light_sky_color[2]);
+		if (backend->bridge_texture_hemi_light_ground_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_ground_color_loc,
+						hemi_light_ground_color[0], hemi_light_ground_color[1],
+						hemi_light_ground_color[2]);
+	} else {
+		if (backend->bridge_texture_hemi_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_direction_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_texture_hemi_light_sky_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_sky_color_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_texture_hemi_light_ground_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_hemi_light_ground_color_loc,
+						0.f, 0.f, 0.f);
 	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	glEnableVertexAttribArray(0);
@@ -5920,6 +6597,12 @@ bool nx_webgl_egl_get_active_attrib(nx_webgl_egl_t *backend,
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context))
 		return false;
+	// Drain any stale GL error so the post-call glGetError() reflects ONLY
+	// glGetActiveAttrib's result. See [[bridge-stale-glerror-trap]].
+	(void)glGetError();
+	name[0] = '\0';
+	if (size) *size = 0;
+	if (type) *type = 0;
 	glGetActiveAttrib((GLuint)program_handle, index, (GLsizei)name_size, NULL,
 					  (GLint *)size, (GLenum *)type, name);
 	return glGetError() == GL_NO_ERROR;
@@ -5949,6 +6632,12 @@ bool nx_webgl_egl_get_active_uniform(nx_webgl_egl_t *backend,
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context))
 		return false;
+	// Drain any stale GL error so the post-call glGetError() reflects ONLY
+	// glGetActiveUniform's result. See [[bridge-stale-glerror-trap]].
+	(void)glGetError();
+	name[0] = '\0';
+	if (size) *size = 0;
+	if (type) *type = 0;
 	glGetActiveUniform((GLuint)program_handle, index, (GLsizei)name_size, NULL,
 					   (GLint *)size, (GLenum *)type, name);
 	return glGetError() == GL_NO_ERROR;
@@ -5974,6 +6663,13 @@ bool nx_webgl_egl_get_program_iv(nx_webgl_egl_t *backend,
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context))
 		return false;
+	// Drain any stale GL error so the post-call glGetError() reflects ONLY
+	// glGetProgramiv's result. See [[bridge-stale-glerror-trap]]. A stale
+	// error here would make us falsely return false, and the JS-side
+	// fallback returns countof(active_uniforms)=12 — Three.js then iterates
+	// 12 slots, native returns empty name for slots that don't exist,
+	// parseUniform's regex crashes on the empty name.
+	(void)glGetError();
 	GLint v = 0;
 	glGetProgramiv((GLuint)program_handle, (GLenum)pname, &v);
 	if (glGetError() != GL_NO_ERROR)
@@ -5986,5 +6682,1517 @@ bool nx_webgl_egl_get_program_iv(nx_webgl_egl_t *backend,
 	(void)pname;
 	(void)out_value;
 	return false;
+#endif
+}
+
+// ============================================================================
+// WebGL 2 (GLES 3) trampolines.
+// ----------------------------------------------------------------------------
+// Each function:
+//  - Refuses if the backend isn't initialized / not available
+//  - eglMakeCurrent's so calls land on our context
+//  - Drains glGetError() FIRST per [[bridge-stale-glerror-trap]] when reporting
+//    success/failure via the post-call error code
+//  - Casts the resolved function pointer to a local typedef and trampolines
+//
+// Constants for ES3 enums used below (kept local so the header stays
+// GLES2-only).
+#if NXJS_HAS_EGL_GLES
+#ifndef GL_TEXTURE_3D
+#define GL_TEXTURE_3D 0x806F
+#endif
+#ifndef GL_TEXTURE_2D_ARRAY
+#define GL_TEXTURE_2D_ARRAY 0x8C1A
+#endif
+#ifndef GL_MAX_SAMPLES
+#define GL_MAX_SAMPLES 0x8D57
+#endif
+#ifndef GL_MAX_3D_TEXTURE_SIZE
+#define GL_MAX_3D_TEXTURE_SIZE 0x8073
+#endif
+#ifndef GL_MAX_ARRAY_TEXTURE_LAYERS
+#define GL_MAX_ARRAY_TEXTURE_LAYERS 0x88FF
+#endif
+#ifndef GL_MAX_DRAW_BUFFERS
+#define GL_MAX_DRAW_BUFFERS 0x8824
+#endif
+#ifndef GL_MAX_COLOR_ATTACHMENTS
+#define GL_MAX_COLOR_ATTACHMENTS 0x8CDF
+#endif
+#ifndef GL_MAX_UNIFORM_BUFFER_BINDINGS
+#define GL_MAX_UNIFORM_BUFFER_BINDINGS 0x8A2F
+#endif
+#ifndef GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
+#endif
+#ifndef GL_MAX_VERTEX_UNIFORM_BLOCKS
+#define GL_MAX_VERTEX_UNIFORM_BLOCKS 0x8A2B
+#endif
+#ifndef GL_MAX_FRAGMENT_UNIFORM_BLOCKS
+#define GL_MAX_FRAGMENT_UNIFORM_BLOCKS 0x8A2D
+#endif
+#ifndef GL_MAX_COMBINED_UNIFORM_BLOCKS
+#define GL_MAX_COMBINED_UNIFORM_BLOCKS 0x8A2E
+#endif
+#ifndef GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+#define GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS 0x8C80
+#endif
+#ifndef GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+#define GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS 0x8C7A
+#endif
+#ifndef GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+#define GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS 0x8C8B
+#endif
+#ifndef GL_MAX_ELEMENT_INDEX
+#define GL_MAX_ELEMENT_INDEX 0x8D6B
+#endif
+#ifndef GL_MAX_ELEMENTS_VERTICES
+#define GL_MAX_ELEMENTS_VERTICES 0x80E8
+#endif
+#ifndef GL_MAX_ELEMENTS_INDICES
+#define GL_MAX_ELEMENTS_INDICES 0x80E9
+#endif
+#ifndef GL_MAX_SERVER_WAIT_TIMEOUT
+#define GL_MAX_SERVER_WAIT_TIMEOUT 0x9111
+#endif
+#ifndef GL_MAX_PROGRAM_TEXEL_OFFSET
+#define GL_MAX_PROGRAM_TEXEL_OFFSET 0x8905
+#endif
+#ifndef GL_MIN_PROGRAM_TEXEL_OFFSET
+#define GL_MIN_PROGRAM_TEXEL_OFFSET 0x8904
+#endif
+#ifndef GL_MAX_VARYING_COMPONENTS
+#define GL_MAX_VARYING_COMPONENTS 0x8B4B
+#endif
+#ifndef GL_MAX_VERTEX_UNIFORM_COMPONENTS
+#define GL_MAX_VERTEX_UNIFORM_COMPONENTS 0x8B4A
+#endif
+#ifndef GL_MAX_FRAGMENT_UNIFORM_COMPONENTS
+#define GL_MAX_FRAGMENT_UNIFORM_COMPONENTS 0x8B49
+#endif
+#ifndef GL_MAX_VERTEX_OUTPUT_COMPONENTS
+#define GL_MAX_VERTEX_OUTPUT_COMPONENTS 0x9122
+#endif
+#ifndef GL_MAX_FRAGMENT_INPUT_COMPONENTS
+#define GL_MAX_FRAGMENT_INPUT_COMPONENTS 0x9125
+#endif
+#ifndef GL_MAX_TEXTURE_LOD_BIAS
+#define GL_MAX_TEXTURE_LOD_BIAS 0x84FD
+#endif
+#endif // NXJS_HAS_EGL_GLES
+
+bool nx_webgl_egl_has_webgl2(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->webgl2_present;
+#else
+	(void)backend;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_ensure_initialized(nx_webgl_egl_t *backend,
+                                      nx_canvas_t *canvas) {
+	return nx_webgl_egl_initialize(backend, canvas);
+}
+
+bool nx_webgl_egl_persistent_texture_sub_image_2d(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    int level,
+                                                    int xoffset, int yoffset,
+                                                    int width, int height,
+                                                    uint32_t format,
+                                                    uint32_t type,
+                                                    const void *pixels) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || !handle)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return false;
+	(void)glGetError();
+	// On ES 3.0, GL_HALF_FLOAT_OES (0x8D61) is invalid as a sub-image type;
+	// the native enum is GL_HALF_FLOAT (0x140B). Translate.
+	GLenum native_type = (GLenum)type;
+	if (native_type == 0x8D61)
+		native_type = 0x140B;
+	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
+	glTexSubImage2D(GL_TEXTURE_2D, level, xoffset, yoffset, (GLsizei)width,
+	                (GLsizei)height, (GLenum)format, native_type, pixels);
+	GLenum err = glGetError();
+	return err == GL_NO_ERROR;
+#else
+	(void)backend; (void)handle; (void)level; (void)xoffset; (void)yoffset;
+	(void)width; (void)height; (void)format; (void)type; (void)pixels;
+	return false;
+#endif
+}
+
+// VAOs ----------------------------------------------------------------------
+
+uint32_t nx_webgl_egl_gen_vertex_array(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || !backend->fn_gen_vertex_arrays)
+		return 0;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return 0;
+	typedef void (*pfn_t)(GLsizei, GLuint *);
+	pfn_t gen = (pfn_t)backend->fn_gen_vertex_arrays;
+	GLuint h = 0;
+	gen(1, &h);
+	return (uint32_t)h;
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+
+void nx_webgl_egl_delete_vertex_array(nx_webgl_egl_t *backend,
+                                       uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->available || !handle ||
+		!backend->fn_delete_vertex_arrays)
+		return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return;
+	if (backend->current_user_vao == handle)
+		backend->current_user_vao = 0;
+	typedef void (*pfn_t)(GLsizei, const GLuint *);
+	pfn_t del = (pfn_t)backend->fn_delete_vertex_arrays;
+	GLuint h = (GLuint)handle;
+	del(1, &h);
+#else
+	(void)backend;
+	(void)handle;
+#endif
+}
+
+void nx_webgl_egl_set_user_vao(nx_webgl_egl_t *backend, uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend)
+		return;
+	backend->current_user_vao = (GLuint)handle;
+	// Push to native immediately so non-passthrough state-setting calls
+	// (bindBuffer / vertexAttribPointer / enableVertexAttribArray) land
+	// on the right VAO.
+	if (backend->available && backend->fn_bind_vertex_array &&
+		eglMakeCurrent(backend->display, backend->surface, backend->surface,
+					   backend->context)) {
+		typedef void (*pfn_t)(GLuint);
+		pfn_t bind = (pfn_t)backend->fn_bind_vertex_array;
+		bind((GLuint)handle);
+	}
+#else
+	(void)backend;
+	(void)handle;
+#endif
+}
+
+uint32_t nx_webgl_egl_get_user_vao(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend ? (uint32_t)backend->current_user_vao : 0;
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+
+// Helper: make-current + (void)glGetError() drain. Returns false on failure.
+#if NXJS_HAS_EGL_GLES
+static bool webgl2_make_current(nx_webgl_egl_t *backend) {
+	if (!backend || !backend->available)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+						backend->context))
+		return false;
+	(void)glGetError();
+	return true;
+}
+#endif
+
+// drawBuffers / invalidate / blit / read / MSAA / texture layer ------------
+
+void nx_webgl_egl_draw_buffers(nx_webgl_egl_t *backend, int n,
+                                const uint32_t *bufs) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_draw_buffers)
+		return;
+	typedef void (*pfn_t)(GLsizei, const GLenum *);
+	((pfn_t)backend->fn_draw_buffers)((GLsizei)n, (const GLenum *)bufs);
+#else
+	(void)backend; (void)n; (void)bufs;
+#endif
+}
+
+void nx_webgl_egl_invalidate_framebuffer(nx_webgl_egl_t *backend,
+                                          uint32_t target, int n,
+                                          const uint32_t *attachments) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_invalidate_framebuffer)
+		return;
+	typedef void (*pfn_t)(GLenum, GLsizei, const GLenum *);
+	((pfn_t)backend->fn_invalidate_framebuffer)((GLenum)target, (GLsizei)n,
+	                                            (const GLenum *)attachments);
+#else
+	(void)backend; (void)target; (void)n; (void)attachments;
+#endif
+}
+
+void nx_webgl_egl_invalidate_sub_framebuffer(nx_webgl_egl_t *backend,
+                                              uint32_t target, int n,
+                                              const uint32_t *attachments,
+                                              int x, int y, int w, int h) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_invalidate_sub_framebuffer)
+		return;
+	typedef void (*pfn_t)(GLenum, GLsizei, const GLenum *, GLint, GLint,
+	                       GLsizei, GLsizei);
+	((pfn_t)backend->fn_invalidate_sub_framebuffer)(
+		(GLenum)target, (GLsizei)n, (const GLenum *)attachments,
+		x, y, (GLsizei)w, (GLsizei)h);
+#else
+	(void)backend; (void)target; (void)n; (void)attachments;
+	(void)x; (void)y; (void)w; (void)h;
+#endif
+}
+
+void nx_webgl_egl_blit_framebuffer(nx_webgl_egl_t *backend,
+                                    int srcX0, int srcY0, int srcX1, int srcY1,
+                                    int dstX0, int dstY0, int dstX1, int dstY1,
+                                    uint32_t mask, uint32_t filter) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_blit_framebuffer)
+		return;
+	typedef void (*pfn_t)(GLint, GLint, GLint, GLint, GLint, GLint, GLint,
+	                       GLint, GLbitfield, GLenum);
+	((pfn_t)backend->fn_blit_framebuffer)(srcX0, srcY0, srcX1, srcY1,
+	                                       dstX0, dstY0, dstX1, dstY1,
+	                                       (GLbitfield)mask, (GLenum)filter);
+#else
+	(void)backend; (void)srcX0; (void)srcY0; (void)srcX1; (void)srcY1;
+	(void)dstX0; (void)dstY0; (void)dstX1; (void)dstY1;
+	(void)mask; (void)filter;
+#endif
+}
+
+void nx_webgl_egl_read_buffer(nx_webgl_egl_t *backend, uint32_t src) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_read_buffer)
+		return;
+	typedef void (*pfn_t)(GLenum);
+	((pfn_t)backend->fn_read_buffer)((GLenum)src);
+#else
+	(void)backend; (void)src;
+#endif
+}
+
+bool nx_webgl_egl_renderbuffer_storage_multisample(nx_webgl_egl_t *backend,
+                                                    uint32_t handle,
+                                                    int samples,
+                                                    uint32_t internalformat,
+                                                    int width, int height) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_renderbuffer_storage_multisample)
+		return false;
+	glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)handle);
+	typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+	((pfn_t)backend->fn_renderbuffer_storage_multisample)(
+		GL_RENDERBUFFER, (GLsizei)samples, (GLenum)internalformat,
+		(GLsizei)width, (GLsizei)height);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)handle; (void)samples; (void)internalformat;
+	(void)width; (void)height;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_framebuffer_texture_layer(nx_webgl_egl_t *backend,
+                                             uint32_t framebuffer_handle,
+                                             uint32_t attachment,
+                                             uint32_t texture_handle,
+                                             int level, int layer) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_framebuffer_texture_layer)
+		return false;
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer_handle);
+	typedef void (*pfn_t)(GLenum, GLenum, GLuint, GLint, GLint);
+	((pfn_t)backend->fn_framebuffer_texture_layer)(
+		GL_FRAMEBUFFER, (GLenum)attachment, (GLuint)texture_handle,
+		(GLint)level, (GLint)layer);
+	GLenum err = glGetError();
+	// Restore previously-bound user FBO (which the bridge tracks). The
+	// JS wrapper sets framebuffer_binding state separately.
+	glBindFramebuffer(GL_FRAMEBUFFER, backend->current_user_framebuffer);
+	return err == GL_NO_ERROR;
+#else
+	(void)backend; (void)framebuffer_handle; (void)attachment;
+	(void)texture_handle; (void)level; (void)layer;
+	return false;
+#endif
+}
+
+// 3D texture upload + immutable storage ------------------------------------
+
+bool nx_webgl_egl_tex_image_3d(nx_webgl_egl_t *backend,
+                                uint32_t target, int level,
+                                uint32_t internalformat,
+                                int width, int height, int depth,
+                                int border, uint32_t format, uint32_t type,
+                                const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_tex_image_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei,
+	                       GLint, GLenum, GLenum, const void *);
+	((pfn_t)backend->fn_tex_image_3d)((GLenum)target, level,
+	                                   (GLint)internalformat,
+	                                   width, height, depth, border,
+	                                   (GLenum)format, (GLenum)type, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)internalformat;
+	(void)width; (void)height; (void)depth; (void)border;
+	(void)format; (void)type; (void)data;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                    uint32_t target, int level,
+                                    int xoff, int yoff, int zoff,
+                                    int width, int height, int depth,
+                                    uint32_t format, uint32_t type,
+                                    const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_tex_sub_image_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLint, GLint, GLint, GLsizei,
+	                       GLsizei, GLsizei, GLenum, GLenum, const void *);
+	((pfn_t)backend->fn_tex_sub_image_3d)((GLenum)target, level,
+	                                       xoff, yoff, zoff,
+	                                       width, height, depth,
+	                                       (GLenum)format, (GLenum)type, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
+	(void)zoff; (void)width; (void)height; (void)depth;
+	(void)format; (void)type; (void)data;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_copy_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                         uint32_t target, int level,
+                                         int xoff, int yoff, int zoff,
+                                         int x, int y, int w, int h) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_copy_tex_sub_image_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLint, GLint, GLint, GLint, GLint,
+	                       GLsizei, GLsizei);
+	((pfn_t)backend->fn_copy_tex_sub_image_3d)((GLenum)target, level,
+	                                            xoff, yoff, zoff,
+	                                            x, y, w, h);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
+	(void)zoff; (void)x; (void)y; (void)w; (void)h;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_compressed_tex_image_3d(nx_webgl_egl_t *backend,
+                                           uint32_t target, int level,
+                                           uint32_t internalformat,
+                                           int width, int height, int depth,
+                                           int border, size_t image_size,
+                                           const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_compressed_tex_image_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLsizei,
+	                       GLint, GLsizei, const void *);
+	((pfn_t)backend->fn_compressed_tex_image_3d)((GLenum)target, level,
+	                                              (GLenum)internalformat,
+	                                              width, height, depth, border,
+	                                              (GLsizei)image_size, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)internalformat;
+	(void)width; (void)height; (void)depth; (void)border;
+	(void)image_size; (void)data;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_compressed_tex_sub_image_3d(nx_webgl_egl_t *backend,
+                                               uint32_t target, int level,
+                                               int xoff, int yoff, int zoff,
+                                               int width, int height, int depth,
+                                               uint32_t format, size_t image_size,
+                                               const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_compressed_tex_sub_image_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei,
+	                       GLsizei, GLenum, GLsizei, const void *);
+	((pfn_t)backend->fn_compressed_tex_sub_image_3d)(
+		(GLenum)target, level, xoff, yoff, zoff,
+		width, height, depth, (GLenum)format, (GLsizei)image_size, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
+	(void)zoff; (void)width; (void)height; (void)depth;
+	(void)format; (void)image_size; (void)data;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_tex_storage_2d(nx_webgl_egl_t *backend,
+                                  uint32_t target, int levels,
+                                  uint32_t internalformat,
+                                  int width, int height) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_tex_storage_2d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+	((pfn_t)backend->fn_tex_storage_2d)((GLenum)target, (GLsizei)levels,
+	                                     (GLenum)internalformat,
+	                                     (GLsizei)width, (GLsizei)height);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)levels; (void)internalformat;
+	(void)width; (void)height;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_tex_storage_3d(nx_webgl_egl_t *backend,
+                                  uint32_t target, int levels,
+                                  uint32_t internalformat,
+                                  int width, int height, int depth) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_tex_storage_3d)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
+	((pfn_t)backend->fn_tex_storage_3d)((GLenum)target, (GLsizei)levels,
+	                                     (GLenum)internalformat,
+	                                     (GLsizei)width, (GLsizei)height,
+	                                     (GLsizei)depth);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)levels; (void)internalformat;
+	(void)width; (void)height; (void)depth;
+	return false;
+#endif
+}
+
+// clearBuffer family --------------------------------------------------------
+
+void nx_webgl_egl_clear_buffer_iv(nx_webgl_egl_t *backend, uint32_t buffer,
+                                   int drawbuffer, const int *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_clear_buffer_iv)
+		return;
+	typedef void (*pfn_t)(GLenum, GLint, const GLint *);
+	((pfn_t)backend->fn_clear_buffer_iv)((GLenum)buffer, (GLint)drawbuffer,
+	                                      value);
+#else
+	(void)backend; (void)buffer; (void)drawbuffer; (void)value;
+#endif
+}
+
+void nx_webgl_egl_clear_buffer_uiv(nx_webgl_egl_t *backend, uint32_t buffer,
+                                    int drawbuffer, const uint32_t *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_clear_buffer_uiv)
+		return;
+	typedef void (*pfn_t)(GLenum, GLint, const GLuint *);
+	((pfn_t)backend->fn_clear_buffer_uiv)((GLenum)buffer, (GLint)drawbuffer,
+	                                       (const GLuint *)value);
+#else
+	(void)backend; (void)buffer; (void)drawbuffer; (void)value;
+#endif
+}
+
+void nx_webgl_egl_clear_buffer_fv(nx_webgl_egl_t *backend, uint32_t buffer,
+                                   int drawbuffer, const float *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_clear_buffer_fv)
+		return;
+	typedef void (*pfn_t)(GLenum, GLint, const GLfloat *);
+	((pfn_t)backend->fn_clear_buffer_fv)((GLenum)buffer, (GLint)drawbuffer,
+	                                      value);
+#else
+	(void)backend; (void)buffer; (void)drawbuffer; (void)value;
+#endif
+}
+
+void nx_webgl_egl_clear_buffer_fi(nx_webgl_egl_t *backend, uint32_t buffer,
+                                   int drawbuffer, float depth, int stencil) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_clear_buffer_fi)
+		return;
+	typedef void (*pfn_t)(GLenum, GLint, GLfloat, GLint);
+	((pfn_t)backend->fn_clear_buffer_fi)((GLenum)buffer, (GLint)drawbuffer,
+	                                      depth, stencil);
+#else
+	(void)backend; (void)buffer; (void)drawbuffer; (void)depth; (void)stencil;
+#endif
+}
+
+// Integer vertex attributes ------------------------------------------------
+
+void nx_webgl_egl_vertex_attrib_i_pointer(nx_webgl_egl_t *backend,
+                                           uint32_t index, int size,
+                                           uint32_t type, int stride,
+                                           int offset) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_vertex_attrib_i_pointer)
+		return;
+	typedef void (*pfn_t)(GLuint, GLint, GLenum, GLsizei, const void *);
+	((pfn_t)backend->fn_vertex_attrib_i_pointer)((GLuint)index, size,
+	                                              (GLenum)type,
+	                                              (GLsizei)stride,
+	                                              (const void *)(intptr_t)offset);
+#else
+	(void)backend; (void)index; (void)size; (void)type; (void)stride;
+	(void)offset;
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_i4i(nx_webgl_egl_t *backend, uint32_t index,
+                                     int x, int y, int z, int w) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_vertex_attrib_i4i)
+		return;
+	typedef void (*pfn_t)(GLuint, GLint, GLint, GLint, GLint);
+	((pfn_t)backend->fn_vertex_attrib_i4i)((GLuint)index, x, y, z, w);
+#else
+	(void)backend; (void)index; (void)x; (void)y; (void)z; (void)w;
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_i4ui(nx_webgl_egl_t *backend, uint32_t index,
+                                      uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t w) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_vertex_attrib_i4ui)
+		return;
+	typedef void (*pfn_t)(GLuint, GLuint, GLuint, GLuint, GLuint);
+	((pfn_t)backend->fn_vertex_attrib_i4ui)((GLuint)index, x, y, z, w);
+#else
+	(void)backend; (void)index; (void)x; (void)y; (void)z; (void)w;
+#endif
+}
+
+// Uint + non-square matrix uniforms ----------------------------------------
+
+void nx_webgl_egl_uniform1ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform1ui)
+		return;
+	typedef void (*pfn_t)(GLint, GLuint);
+	((pfn_t)backend->fn_uniform1ui)(location, x);
+#else
+	(void)backend; (void)location; (void)x;
+#endif
+}
+
+void nx_webgl_egl_uniform2ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform2ui)
+		return;
+	typedef void (*pfn_t)(GLint, GLuint, GLuint);
+	((pfn_t)backend->fn_uniform2ui)(location, x, y);
+#else
+	(void)backend; (void)location; (void)x; (void)y;
+#endif
+}
+
+void nx_webgl_egl_uniform3ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y, uint32_t z) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform3ui)
+		return;
+	typedef void (*pfn_t)(GLint, GLuint, GLuint, GLuint);
+	((pfn_t)backend->fn_uniform3ui)(location, x, y, z);
+#else
+	(void)backend; (void)location; (void)x; (void)y; (void)z;
+#endif
+}
+
+void nx_webgl_egl_uniform4ui(nx_webgl_egl_t *backend, int location,
+                              uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform4ui)
+		return;
+	typedef void (*pfn_t)(GLint, GLuint, GLuint, GLuint, GLuint);
+	((pfn_t)backend->fn_uniform4ui)(location, x, y, z, w);
+#else
+	(void)backend; (void)location; (void)x; (void)y; (void)z; (void)w;
+#endif
+}
+
+void nx_webgl_egl_uniform1uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform1uiv)
+		return;
+	typedef void (*pfn_t)(GLint, GLsizei, const GLuint *);
+	((pfn_t)backend->fn_uniform1uiv)(location, (GLsizei)count, value);
+#else
+	(void)backend; (void)location; (void)count; (void)value;
+#endif
+}
+
+void nx_webgl_egl_uniform2uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform2uiv)
+		return;
+	typedef void (*pfn_t)(GLint, GLsizei, const GLuint *);
+	((pfn_t)backend->fn_uniform2uiv)(location, (GLsizei)count, value);
+#else
+	(void)backend; (void)location; (void)count; (void)value;
+#endif
+}
+
+void nx_webgl_egl_uniform3uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform3uiv)
+		return;
+	typedef void (*pfn_t)(GLint, GLsizei, const GLuint *);
+	((pfn_t)backend->fn_uniform3uiv)(location, (GLsizei)count, value);
+#else
+	(void)backend; (void)location; (void)count; (void)value;
+#endif
+}
+
+void nx_webgl_egl_uniform4uiv(nx_webgl_egl_t *backend, int location,
+                               int count, const uint32_t *value) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform4uiv)
+		return;
+	typedef void (*pfn_t)(GLint, GLsizei, const GLuint *);
+	((pfn_t)backend->fn_uniform4uiv)(location, (GLsizei)count, value);
+#else
+	(void)backend; (void)location; (void)count; (void)value;
+#endif
+}
+
+#define NX_WEBGL2_MATRIX_NXM_IMPL(name, fnfield)                          \
+void name(nx_webgl_egl_t *backend, int location, int count, bool transpose,\
+           const float *value) {                                           \
+	if (!webgl2_make_current(backend) || !backend->fnfield)                 \
+		return;                                                             \
+	typedef void (*pfn_t)(GLint, GLsizei, GLboolean, const GLfloat *);      \
+	((pfn_t)backend->fnfield)(location, (GLsizei)count,                     \
+	                          transpose ? GL_TRUE : GL_FALSE, value);       \
+}
+
+#if NXJS_HAS_EGL_GLES
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix2x3fv, fn_uniform_matrix2x3fv)
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix3x2fv, fn_uniform_matrix3x2fv)
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix2x4fv, fn_uniform_matrix2x4fv)
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix4x2fv, fn_uniform_matrix4x2fv)
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix3x4fv, fn_uniform_matrix3x4fv)
+NX_WEBGL2_MATRIX_NXM_IMPL(nx_webgl_egl_uniform_matrix4x3fv, fn_uniform_matrix4x3fv)
+#else
+void nx_webgl_egl_uniform_matrix2x3fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+void nx_webgl_egl_uniform_matrix3x2fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+void nx_webgl_egl_uniform_matrix2x4fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+void nx_webgl_egl_uniform_matrix4x2fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+void nx_webgl_egl_uniform_matrix3x4fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+void nx_webgl_egl_uniform_matrix4x3fv(nx_webgl_egl_t *b, int l, int c, bool t, const float *v) { (void)b;(void)l;(void)c;(void)t;(void)v; }
+#endif
+
+// Buffer copy + readback ---------------------------------------------------
+
+void nx_webgl_egl_copy_buffer_sub_data(nx_webgl_egl_t *backend,
+                                        uint32_t read_target,
+                                        uint32_t write_target,
+                                        size_t read_offset, size_t write_offset,
+                                        size_t size) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_copy_buffer_sub_data)
+		return;
+	typedef void (*pfn_t)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
+	((pfn_t)backend->fn_copy_buffer_sub_data)((GLenum)read_target,
+	                                           (GLenum)write_target,
+	                                           (GLintptr)read_offset,
+	                                           (GLintptr)write_offset,
+	                                           (GLsizeiptr)size);
+#else
+	(void)backend; (void)read_target; (void)write_target; (void)read_offset;
+	(void)write_offset; (void)size;
+#endif
+}
+
+void nx_webgl_egl_get_buffer_sub_data(nx_webgl_egl_t *backend,
+                                       uint32_t target, size_t offset,
+                                       size_t size, void *dst) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_buffer_sub_data)
+		return;
+	typedef void (*pfn_t)(GLenum, GLintptr, GLsizeiptr, void *);
+	((pfn_t)backend->fn_get_buffer_sub_data)((GLenum)target, (GLintptr)offset,
+	                                          (GLsizeiptr)size, dst);
+#else
+	(void)backend; (void)target; (void)offset; (void)size; (void)dst;
+#endif
+}
+
+// UBO surface --------------------------------------------------------------
+
+void nx_webgl_egl_bind_buffer_base(nx_webgl_egl_t *backend, uint32_t target,
+                                    uint32_t index, uint32_t buffer) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_bind_buffer_base)
+		return;
+	typedef void (*pfn_t)(GLenum, GLuint, GLuint);
+	((pfn_t)backend->fn_bind_buffer_base)((GLenum)target, (GLuint)index,
+	                                       (GLuint)buffer);
+	// Track UBO slot bindings so we can re-apply them at the top of every
+	// passthrough draw (Mesa Nouveau resets indexed buffer bindings on
+	// eglMakeCurrent — see passthrough re-application loop).
+	if (target == 0x8A11 /* GL_UNIFORM_BUFFER */ &&
+	    index < NX_WEBGL_MAX_UBO_BINDINGS) {
+		backend->ubo_indexed_bindings[index] = (GLuint)buffer;
+		backend->ubo_indexed_offsets[index] = 0;
+		backend->ubo_indexed_sizes[index] = 0;
+	}
+#else
+	(void)backend; (void)target; (void)index; (void)buffer;
+#endif
+}
+
+void nx_webgl_egl_bind_buffer_range(nx_webgl_egl_t *backend, uint32_t target,
+                                     uint32_t index, uint32_t buffer,
+                                     size_t offset, size_t size) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_bind_buffer_range)
+		return;
+	typedef void (*pfn_t)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr);
+	((pfn_t)backend->fn_bind_buffer_range)((GLenum)target, (GLuint)index,
+	                                        (GLuint)buffer, (GLintptr)offset,
+	                                        (GLsizeiptr)size);
+	if (target == 0x8A11 /* GL_UNIFORM_BUFFER */ &&
+	    index < NX_WEBGL_MAX_UBO_BINDINGS) {
+		backend->ubo_indexed_bindings[index] = (GLuint)buffer;
+		backend->ubo_indexed_offsets[index] = (GLintptr)offset;
+		backend->ubo_indexed_sizes[index] = (GLsizeiptr)size;
+	}
+#else
+	(void)backend; (void)target; (void)index; (void)buffer; (void)offset;
+	(void)size;
+#endif
+}
+
+// (UBO binding re-apply is inlined at the top of nx_webgl_egl_draw_passthrough
+// to avoid a static/extern forward-declaration dance.)
+
+uint32_t nx_webgl_egl_get_uniform_block_index(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_uniform_block_index)
+		return 0xFFFFFFFFu;
+	typedef GLuint (*pfn_t)(GLuint, const GLchar *);
+	return (uint32_t)((pfn_t)backend->fn_get_uniform_block_index)(
+		(GLuint)program_handle, (const GLchar *)name);
+#else
+	(void)backend; (void)program_handle; (void)name;
+	return 0xFFFFFFFFu;
+#endif
+}
+
+void nx_webgl_egl_uniform_block_binding(nx_webgl_egl_t *backend,
+                                         uint32_t program_handle,
+                                         uint32_t block_index,
+                                         uint32_t binding) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_uniform_block_binding)
+		return;
+	typedef void (*pfn_t)(GLuint, GLuint, GLuint);
+	((pfn_t)backend->fn_uniform_block_binding)((GLuint)program_handle,
+	                                            (GLuint)block_index,
+	                                            (GLuint)binding);
+#else
+	(void)backend; (void)program_handle; (void)block_index; (void)binding;
+#endif
+}
+
+bool nx_webgl_egl_get_active_uniform_block_iv(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                uint32_t block_index,
+                                                uint32_t pname,
+                                                int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_active_uniform_block_iv ||
+		!out)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLuint, GLenum, GLint *);
+	((pfn_t)backend->fn_get_active_uniform_block_iv)((GLuint)program_handle,
+	                                                  (GLuint)block_index,
+	                                                  (GLenum)pname, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program_handle; (void)block_index; (void)pname;
+	(void)out;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_get_active_uniform_block_name(nx_webgl_egl_t *backend,
+                                                  uint32_t program_handle,
+                                                  uint32_t block_index,
+                                                  char *name, size_t name_size) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_get_active_uniform_block_name || !name || !name_size)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLuint, GLsizei, GLsizei *, GLchar *);
+	GLsizei written = 0;
+	((pfn_t)backend->fn_get_active_uniform_block_name)((GLuint)program_handle,
+	                                                    (GLuint)block_index,
+	                                                    (GLsizei)name_size,
+	                                                    &written, name);
+	if (name_size > 0)
+		name[name_size - 1] = '\0';
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program_handle; (void)block_index;
+	(void)name; (void)name_size;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_get_active_uniforms_iv(nx_webgl_egl_t *backend,
+                                          uint32_t program_handle,
+                                          int count, const uint32_t *indices,
+                                          uint32_t pname, int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_active_uniforms_iv ||
+		!out || count <= 0)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLsizei, const GLuint *, GLenum, GLint *);
+	((pfn_t)backend->fn_get_active_uniforms_iv)((GLuint)program_handle,
+	                                             (GLsizei)count,
+	                                             (const GLuint *)indices,
+	                                             (GLenum)pname, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program_handle; (void)count; (void)indices;
+	(void)pname; (void)out;
+	return false;
+#endif
+}
+
+// Sampler objects ----------------------------------------------------------
+
+uint32_t nx_webgl_egl_gen_sampler(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_gen_samplers)
+		return 0;
+	typedef void (*pfn_t)(GLsizei, GLuint *);
+	GLuint h = 0;
+	((pfn_t)backend->fn_gen_samplers)(1, &h);
+	return (uint32_t)h;
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+
+void nx_webgl_egl_delete_sampler(nx_webgl_egl_t *backend, uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_delete_samplers || !handle)
+		return;
+	typedef void (*pfn_t)(GLsizei, const GLuint *);
+	GLuint h = (GLuint)handle;
+	((pfn_t)backend->fn_delete_samplers)(1, &h);
+#else
+	(void)backend; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_bind_sampler(nx_webgl_egl_t *backend, uint32_t unit,
+                                uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_bind_sampler)
+		return;
+	typedef void (*pfn_t)(GLuint, GLuint);
+	((pfn_t)backend->fn_bind_sampler)((GLuint)unit, (GLuint)handle);
+#else
+	(void)backend; (void)unit; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_sampler_parameteri(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t pname, int param) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_sampler_parameteri)
+		return;
+	typedef void (*pfn_t)(GLuint, GLenum, GLint);
+	((pfn_t)backend->fn_sampler_parameteri)((GLuint)handle, (GLenum)pname,
+	                                         param);
+#else
+	(void)backend; (void)handle; (void)pname; (void)param;
+#endif
+}
+
+void nx_webgl_egl_sampler_parameterf(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t pname, float param) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_sampler_parameterf)
+		return;
+	typedef void (*pfn_t)(GLuint, GLenum, GLfloat);
+	((pfn_t)backend->fn_sampler_parameterf)((GLuint)handle, (GLenum)pname,
+	                                         param);
+#else
+	(void)backend; (void)handle; (void)pname; (void)param;
+#endif
+}
+
+bool nx_webgl_egl_get_sampler_parameter_iv(nx_webgl_egl_t *backend,
+                                             uint32_t handle, uint32_t pname,
+                                             int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_sampler_parameter_iv ||
+		!out)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLenum, GLint *);
+	((pfn_t)backend->fn_get_sampler_parameter_iv)((GLuint)handle,
+	                                                (GLenum)pname, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)handle; (void)pname; (void)out;
+	return false;
+#endif
+}
+
+// Sync objects -------------------------------------------------------------
+
+void *nx_webgl_egl_fence_sync(nx_webgl_egl_t *backend, uint32_t condition,
+                               uint32_t flags) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_fence_sync)
+		return NULL;
+	typedef void *(*pfn_t)(GLenum, GLbitfield);
+	return ((pfn_t)backend->fn_fence_sync)((GLenum)condition,
+	                                        (GLbitfield)flags);
+#else
+	(void)backend; (void)condition; (void)flags;
+	return NULL;
+#endif
+}
+
+void nx_webgl_egl_delete_sync(nx_webgl_egl_t *backend, void *sync) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_delete_sync || !sync)
+		return;
+	typedef void (*pfn_t)(void *);
+	((pfn_t)backend->fn_delete_sync)(sync);
+#else
+	(void)backend; (void)sync;
+#endif
+}
+
+uint32_t nx_webgl_egl_client_wait_sync(nx_webgl_egl_t *backend, void *sync,
+                                         uint32_t flags, uint64_t timeout) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_client_wait_sync || !sync)
+		return 0x911D; // WAIT_FAILED
+	typedef GLenum (*pfn_t)(void *, GLbitfield, GLuint64);
+	return (uint32_t)((pfn_t)backend->fn_client_wait_sync)(sync,
+	                                                        (GLbitfield)flags,
+	                                                        (GLuint64)timeout);
+#else
+	(void)backend; (void)sync; (void)flags; (void)timeout;
+	return 0x911D;
+#endif
+}
+
+void nx_webgl_egl_wait_sync(nx_webgl_egl_t *backend, void *sync, uint32_t flags,
+                             uint64_t timeout) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_wait_sync || !sync)
+		return;
+	typedef void (*pfn_t)(void *, GLbitfield, GLuint64);
+	((pfn_t)backend->fn_wait_sync)(sync, (GLbitfield)flags, (GLuint64)timeout);
+#else
+	(void)backend; (void)sync; (void)flags; (void)timeout;
+#endif
+}
+
+bool nx_webgl_egl_get_sync_iv(nx_webgl_egl_t *backend, void *sync,
+                                uint32_t pname, int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_sync_iv || !sync ||
+		!out)
+		return false;
+	typedef void (*pfn_t)(void *, GLenum, GLsizei, GLsizei *, GLint *);
+	GLsizei length = 0;
+	((pfn_t)backend->fn_get_sync_iv)(sync, (GLenum)pname, 1, &length, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)sync; (void)pname; (void)out;
+	return false;
+#endif
+}
+
+// Query objects ------------------------------------------------------------
+
+uint32_t nx_webgl_egl_gen_query(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_gen_queries)
+		return 0;
+	typedef void (*pfn_t)(GLsizei, GLuint *);
+	GLuint h = 0;
+	((pfn_t)backend->fn_gen_queries)(1, &h);
+	return (uint32_t)h;
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+
+void nx_webgl_egl_delete_query(nx_webgl_egl_t *backend, uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_delete_queries || !handle)
+		return;
+	typedef void (*pfn_t)(GLsizei, const GLuint *);
+	GLuint h = (GLuint)handle;
+	((pfn_t)backend->fn_delete_queries)(1, &h);
+#else
+	(void)backend; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_begin_query(nx_webgl_egl_t *backend, uint32_t target,
+                               uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_begin_query)
+		return;
+	typedef void (*pfn_t)(GLenum, GLuint);
+	((pfn_t)backend->fn_begin_query)((GLenum)target, (GLuint)handle);
+#else
+	(void)backend; (void)target; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_end_query(nx_webgl_egl_t *backend, uint32_t target) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_end_query)
+		return;
+	typedef void (*pfn_t)(GLenum);
+	((pfn_t)backend->fn_end_query)((GLenum)target);
+#else
+	(void)backend; (void)target;
+#endif
+}
+
+bool nx_webgl_egl_get_query_iv(nx_webgl_egl_t *backend, uint32_t target,
+                                uint32_t pname, int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_query_iv || !out)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLenum, GLint *);
+	((pfn_t)backend->fn_get_query_iv)((GLenum)target, (GLenum)pname, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)pname; (void)out;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_get_query_object_uiv(nx_webgl_egl_t *backend, uint32_t handle,
+                                         uint32_t pname, uint32_t *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_query_object_uiv ||
+		!out)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLenum, GLuint *);
+	((pfn_t)backend->fn_get_query_object_uiv)((GLuint)handle, (GLenum)pname,
+	                                           (GLuint *)out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)handle; (void)pname; (void)out;
+	return false;
+#endif
+}
+
+// Transform feedback -------------------------------------------------------
+
+uint32_t nx_webgl_egl_gen_transform_feedback(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_gen_transform_feedbacks)
+		return 0;
+	typedef void (*pfn_t)(GLsizei, GLuint *);
+	GLuint h = 0;
+	((pfn_t)backend->fn_gen_transform_feedbacks)(1, &h);
+	return (uint32_t)h;
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+
+void nx_webgl_egl_delete_transform_feedback(nx_webgl_egl_t *backend,
+                                              uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_delete_transform_feedbacks || !handle)
+		return;
+	typedef void (*pfn_t)(GLsizei, const GLuint *);
+	GLuint h = (GLuint)handle;
+	((pfn_t)backend->fn_delete_transform_feedbacks)(1, &h);
+#else
+	(void)backend; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_bind_transform_feedback(nx_webgl_egl_t *backend,
+                                            uint32_t target, uint32_t handle) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_bind_transform_feedback)
+		return;
+	typedef void (*pfn_t)(GLenum, GLuint);
+	((pfn_t)backend->fn_bind_transform_feedback)((GLenum)target,
+	                                              (GLuint)handle);
+#else
+	(void)backend; (void)target; (void)handle;
+#endif
+}
+
+void nx_webgl_egl_begin_transform_feedback(nx_webgl_egl_t *backend,
+                                             uint32_t primitive_mode) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_begin_transform_feedback)
+		return;
+	typedef void (*pfn_t)(GLenum);
+	((pfn_t)backend->fn_begin_transform_feedback)((GLenum)primitive_mode);
+#else
+	(void)backend; (void)primitive_mode;
+#endif
+}
+
+void nx_webgl_egl_end_transform_feedback(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_end_transform_feedback)
+		return;
+	typedef void (*pfn_t)(void);
+	((pfn_t)backend->fn_end_transform_feedback)();
+#else
+	(void)backend;
+#endif
+}
+
+void nx_webgl_egl_pause_transform_feedback(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_pause_transform_feedback)
+		return;
+	typedef void (*pfn_t)(void);
+	((pfn_t)backend->fn_pause_transform_feedback)();
+#else
+	(void)backend;
+#endif
+}
+
+void nx_webgl_egl_resume_transform_feedback(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_resume_transform_feedback)
+		return;
+	typedef void (*pfn_t)(void);
+	((pfn_t)backend->fn_resume_transform_feedback)();
+#else
+	(void)backend;
+#endif
+}
+
+void nx_webgl_egl_transform_feedback_varyings(nx_webgl_egl_t *backend,
+                                                uint32_t program_handle,
+                                                int count,
+                                                const char *const *varyings,
+                                                uint32_t buffer_mode) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_transform_feedback_varyings)
+		return;
+	typedef void (*pfn_t)(GLuint, GLsizei, const GLchar *const *, GLenum);
+	((pfn_t)backend->fn_transform_feedback_varyings)((GLuint)program_handle,
+	                                                  (GLsizei)count,
+	                                                  (const GLchar *const *)varyings,
+	                                                  (GLenum)buffer_mode);
+#else
+	(void)backend; (void)program_handle; (void)count; (void)varyings;
+	(void)buffer_mode;
+#endif
+}
+
+bool nx_webgl_egl_get_transform_feedback_varying(nx_webgl_egl_t *backend,
+                                                   uint32_t program_handle,
+                                                   uint32_t index,
+                                                   char *name, size_t name_size,
+                                                   int *size, uint32_t *type) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) ||
+		!backend->fn_get_transform_feedback_varying || !name || !size || !type)
+		return false;
+	typedef void (*pfn_t)(GLuint, GLuint, GLsizei, GLsizei *, GLsizei *,
+	                       GLenum *, GLchar *);
+	GLsizei length = 0;
+	GLsizei sz = 0;
+	GLenum ty = 0;
+	((pfn_t)backend->fn_get_transform_feedback_varying)((GLuint)program_handle,
+	                                                     (GLuint)index,
+	                                                     (GLsizei)name_size,
+	                                                     &length, &sz, &ty, name);
+	*size = (int)sz;
+	*type = (uint32_t)ty;
+	if (name_size > 0)
+		name[name_size - 1] = '\0';
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program_handle; (void)index;
+	(void)name; (void)name_size; (void)size; (void)type;
+	return false;
+#endif
+}
+
+// Misc ---------------------------------------------------------------------
+
+int nx_webgl_egl_get_frag_data_location(nx_webgl_egl_t *backend,
+                                          uint32_t program_handle,
+                                          const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_frag_data_location)
+		return -1;
+	typedef GLint (*pfn_t)(GLuint, const GLchar *);
+	return (int)((pfn_t)backend->fn_get_frag_data_location)(
+		(GLuint)program_handle, (const GLchar *)name);
+#else
+	(void)backend; (void)program_handle; (void)name;
+	return -1;
+#endif
+}
+
+bool nx_webgl_egl_get_internal_format_iv(nx_webgl_egl_t *backend,
+                                           uint32_t target,
+                                           uint32_t internalformat,
+                                           uint32_t pname, int buf_size,
+                                           int *out) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend) || !backend->fn_get_internal_format_iv ||
+		!out || buf_size <= 0)
+		return false;
+	typedef void (*pfn_t)(GLenum, GLenum, GLenum, GLsizei, GLint *);
+	((pfn_t)backend->fn_get_internal_format_iv)((GLenum)target,
+	                                             (GLenum)internalformat,
+	                                             (GLenum)pname,
+	                                             (GLsizei)buf_size, out);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)internalformat; (void)pname;
+	(void)buf_size; (void)out;
+	return false;
+#endif
+}
+
+#if NXJS_HAS_EGL_GLES
+static int webgl2_get_int(nx_webgl_egl_t *backend, GLenum pname) {
+	if (!webgl2_make_current(backend))
+		return 0;
+	GLint v = 0;
+	glGetIntegerv(pname, &v);
+	if (glGetError() != GL_NO_ERROR)
+		return 0;
+	return (int)v;
+}
+#endif
+
+int nx_webgl_egl_get_max_samples(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_SAMPLES);
+#else
+	(void)backend;
+	return 0;
+#endif
+}
+int nx_webgl_egl_get_max_3d_texture_size(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_3D_TEXTURE_SIZE);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_array_texture_layers(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_ARRAY_TEXTURE_LAYERS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_draw_buffers(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_DRAW_BUFFERS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_color_attachments(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_COLOR_ATTACHMENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_uniform_buffer_bindings(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_UNIFORM_BUFFER_BINDINGS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_uniform_buffer_offset_alignment(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+#else
+	(void)backend; return 256;
+#endif
+}
+int nx_webgl_egl_get_max_vertex_uniform_blocks(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_VERTEX_UNIFORM_BLOCKS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_fragment_uniform_blocks(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_FRAGMENT_UNIFORM_BLOCKS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_combined_uniform_blocks(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_COMBINED_UNIFORM_BLOCKS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_transform_feedback_separate_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_transform_feedback_interleaved_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_transform_feedback_separate_attribs(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_element_index(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_ELEMENT_INDEX);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_elements_vertices(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_ELEMENTS_VERTICES);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_elements_indices(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_ELEMENTS_INDICES);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_server_wait_timeout(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_SERVER_WAIT_TIMEOUT);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_program_texel_offset(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_PROGRAM_TEXEL_OFFSET);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_min_program_texel_offset(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MIN_PROGRAM_TEXEL_OFFSET);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_varying_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_VARYING_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_vertex_uniform_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_VERTEX_UNIFORM_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_fragment_uniform_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_FRAGMENT_UNIFORM_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_vertex_output_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_VERTEX_OUTPUT_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_fragment_input_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_FRAGMENT_INPUT_COMPONENTS);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_texture_lod_bias(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, GL_MAX_TEXTURE_LOD_BIAS);
+#else
+	(void)backend; return 0;
 #endif
 }

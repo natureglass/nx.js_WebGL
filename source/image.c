@@ -296,6 +296,99 @@ JSValue nx_image_close(JSContext *ctx, JSValueConst this_val, int argc,
 	return JS_UNDEFINED;
 }
 
+// Copies width*height*4 RGBA bytes from `argv[1]` (ArrayBuffer or any
+// TypedArray view onto one) into the Image's backing buffer with the
+// RGBA→BGRA-premultiplied swizzle Cairo expects (CAIRO_FORMAT_ARGB32
+// stores B,G,R,A in memory order on little-endian). The Image must
+// have been constructed with explicit (width, height) so it has a
+// backing buffer + cairo surface — see `nx_image_new` for the
+// allocation path.
+//
+// Used by switch-web-browser's <video> frame delivery to feed decoded
+// FFmpeg RGBA frames into an Image that can be drawn via the standard
+// drawImage(img, x, y) cairo paint path, sidestepping the second-call
+// putImageData hang we hit during slice 2a. See live-video.ts for the
+// caller side and feedback_nxjs_putimagedata_screen_ctx_hangs_on_second_call
+// for the bug we're avoiding.
+JSValue nx_image_write_rgba(JSContext *ctx, JSValueConst this_val, int argc,
+							JSValueConst *argv) {
+	nx_image_t *image = nx_get_image(ctx, argv[0]);
+	if (!image) {
+		return JS_ThrowTypeError(ctx, "imageWriteRGBA: first arg must be an Image");
+	}
+	if (!image->data || !image->surface) {
+		return JS_ThrowTypeError(
+			ctx,
+			"imageWriteRGBA: image has no backing buffer — construct with new ImageBitmap-ish helper that allocates width/height up-front");
+	}
+
+	// Accept either a raw ArrayBuffer or any TypedArray view onto one.
+	// Try raw ArrayBuffer first (this is what `Switch.VideoDecoder.nextFrame().data`
+	// returns directly, so it's the common case). Fall through to the
+	// TypedArray path for Uint8Array / Uint8ClampedArray callers.
+	size_t src_size = 0;
+	uint8_t *src = JS_GetArrayBuffer(ctx, &src_size, argv[1]);
+	if (!src) {
+		size_t src_offset = 0, src_length = 0, bytes_per_element = 0;
+		JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[1], &src_offset,
+											&src_length, &bytes_per_element);
+		if (JS_IsException(ab)) {
+			// Clear the typed-array exception so we can throw our own
+			// clearer message. JS_GetException returns the thrown value
+			// owned by the caller — free it explicitly.
+			JSValue thrown = JS_GetException(ctx);
+			JS_FreeValue(ctx, thrown);
+			return JS_ThrowTypeError(
+				ctx,
+				"imageWriteRGBA: second arg must be ArrayBuffer or TypedArray");
+		}
+		src = JS_GetArrayBuffer(ctx, &src_size, ab);
+		JS_FreeValue(ctx, ab);
+		if (!src) {
+			return JS_ThrowTypeError(
+				ctx,
+				"imageWriteRGBA: TypedArray's backing ArrayBuffer is unavailable");
+		}
+		src += src_offset;
+		src_size = src_length;
+	}
+
+	size_t expected = (size_t)image->width * image->height * 4;
+	if (src_size < expected) {
+		return JS_ThrowRangeError(
+			ctx, "imageWriteRGBA: buffer size %zu < expected %zu (%ux%u*4)",
+			src_size, expected, image->width, image->height);
+	}
+
+	uint8_t *dst = image->data;
+	size_t pixels = (size_t)image->width * image->height;
+	for (size_t i = 0; i < pixels; i++) {
+		uint8_t r = src[i * 4 + 0];
+		uint8_t g = src[i * 4 + 1];
+		uint8_t b = src[i * 4 + 2];
+		uint8_t a = src[i * 4 + 3];
+		if (a == 0) {
+			dst[i * 4 + 0] = 0;
+			dst[i * 4 + 1] = 0;
+			dst[i * 4 + 2] = 0;
+			dst[i * 4 + 3] = 0;
+		} else if (a == 255) {
+			dst[i * 4 + 0] = b;
+			dst[i * 4 + 1] = g;
+			dst[i * 4 + 2] = r;
+			dst[i * 4 + 3] = a;
+		} else {
+			dst[i * 4 + 0] = (uint8_t)((b * a) / 255);
+			dst[i * 4 + 1] = (uint8_t)((g * a) / 255);
+			dst[i * 4 + 2] = (uint8_t)((r * a) / 255);
+			dst[i * 4 + 3] = a;
+		}
+	}
+
+	cairo_surface_mark_dirty(image->surface);
+	return JS_UNDEFINED;
+}
+
 static void finalizer_image(JSRuntime *rt, JSValue val) {
 	nx_image_t *image = JS_GetOpaque(val, nx_image_class_id);
 	if (image) {
@@ -335,6 +428,7 @@ static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("imageNew", 0, nx_image_new),
 	JS_CFUNC_DEF("imageDecode", 0, nx_image_decode),
 	JS_CFUNC_DEF("imageClose", 0, nx_image_close),
+	JS_CFUNC_DEF("imageWriteRGBA", 2, nx_image_write_rgba),
 };
 
 void nx_init_image(JSContext *ctx, JSValueConst init_obj) {

@@ -719,6 +719,55 @@ JSValue nx_write_file_sync(JSContext *ctx, JSValueConst this_val, int argc,
 	return JS_UNDEFINED;
 }
 
+// Append-only sibling of nx_write_file_sync — opens with mode "a" so the
+// caller can append a single line/chunk in O(line) time instead of
+// re-uploading the whole file. Critical for high-frequency logging where
+// writeFileSync's truncate+rewrite degenerates to O(n^2) over a run.
+JSValue nx_append_file_sync(JSContext *ctx, JSValueConst this_val, int argc,
+							JSValueConst *argv) {
+	errno = 0;
+	const char *filename = JS_ToCString(ctx, argv[0]);
+
+	// Create any parent directories
+	char *dir = dirname(filename);
+	if (dir) {
+		if (createDirectoryRecursively(dir, 0777) == -1) {
+			JS_ThrowTypeError(ctx, "%s: %s", strerror(errno), filename);
+			free(dir);
+			JS_FreeCString(ctx, filename);
+			return JS_EXCEPTION;
+		}
+		free(dir);
+	}
+
+	FILE *file = fopen(filename, "a");
+	if (file == NULL) {
+		JS_ThrowTypeError(ctx, "%s: %s", strerror(errno), filename);
+		JS_FreeCString(ctx, filename);
+		return JS_EXCEPTION;
+	}
+	JS_FreeCString(ctx, filename);
+
+	size_t size;
+	uint8_t *buffer = JS_GetArrayBuffer(ctx, &size, argv[1]);
+	if (buffer == NULL) {
+		fclose(file);
+		return JS_EXCEPTION;
+	}
+
+	size_t result = fwrite(buffer, 1, size, file);
+	fclose(file);
+
+	if (result != size) {
+		JS_ThrowTypeError(ctx,
+						  "Failed to write entire file. Got %lu, expected %lu",
+						  result, size);
+		return JS_EXCEPTION;
+	}
+
+	return JS_UNDEFINED;
+}
+
 void nx_write_file_do(nx_work_t *req) {
 	nx_fs_write_file_async_t *data = (nx_fs_write_file_async_t *)req->data;
 
@@ -1168,6 +1217,7 @@ static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("statSync", 1, nx_stat_sync),
 	JS_CFUNC_DEF("writeFile", 2, nx_write_file),
 	JS_CFUNC_DEF("writeFileSync", 1, nx_write_file_sync),
+	JS_CFUNC_DEF("appendFileSync", 2, nx_append_file_sync),
 };
 
 void nx_init_fs(JSContext *ctx, JSValueConst init_obj) {
