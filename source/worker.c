@@ -29,6 +29,18 @@ typedef struct nx_worker_msg {
 	char *data;
 	size_t len;
 	nx_worker_msg_kind_t kind;
+	/* Pass F: side-channel for postMessage transferable ArrayBuffers.
+	 * Each `transfers[i]` is a process-wide malloc owning the bytes of
+	 * the sender's i-th transferred AB (one memcpy sender→msg). On the
+	 * receiver side, the dispatch path calls JS_NewArrayBuffer with
+	 * `ab_free_func` so receiver's runtime gains ownership and the
+	 * malloc gets freed via GC. After successful hand-off, the receive
+	 * path NULLs the slot so msg destruction doesn't double-free.
+	 * If the worker terminates mid-flight, `free_msg` walks the list
+	 * and free()s any still-owned buffers. */
+	void **transfers;
+	size_t *transfer_sizes;
+	int n_transfers;
 	struct nx_worker_msg *next;
 } nx_worker_msg_t;
 
@@ -84,14 +96,105 @@ static nx_worker_msg_t *make_msg(const char *str, size_t len,
 	m->data[len] = '\0';
 	m->len = len;
 	m->kind = kind;
+	m->transfers = NULL;
+	m->transfer_sizes = NULL;
+	m->n_transfers = 0;
 	m->next = NULL;
 	return m;
+}
+
+/* Snapshot a JS array of ArrayBuffers into the msg's transfer table.
+ * One memcpy per AB (sender's QuickJS heap → process-wide malloc), then
+ * JS_DetachArrayBuffer on each source so the sender can't reuse the
+ * bytes after the call returns (spec-mandated). Returns 0 on success,
+ * non-zero on failure (msg's transfer state is left clean either way).
+ * Caller already validated `transfer_arr` is a JS array. */
+static int msg_attach_transfers(JSContext *ctx, nx_worker_msg_t *m,
+								JSValueConst transfer_arr) {
+	JSValue len_val = JS_GetPropertyStr(ctx, transfer_arr, "length");
+	int32_t n = 0;
+	if (JS_ToInt32(ctx, &n, len_val) < 0) { JS_FreeValue(ctx, len_val); return -1; }
+	JS_FreeValue(ctx, len_val);
+	if (n <= 0) return 0;
+	m->transfers = calloc((size_t)n, sizeof(void *));
+	m->transfer_sizes = calloc((size_t)n, sizeof(size_t));
+	if (!m->transfers || !m->transfer_sizes) {
+		free(m->transfers); free(m->transfer_sizes);
+		m->transfers = NULL; m->transfer_sizes = NULL;
+		return -1;
+	}
+	for (int i = 0; i < n; i++) {
+		JSValue ab = JS_GetPropertyUint32(ctx, transfer_arr, i);
+		size_t ab_len = 0;
+		uint8_t *ab_data = JS_GetArrayBuffer(ctx, &ab_len, ab);
+		if (!ab_data) {
+			JS_FreeValue(ctx, ab);
+			/* free the partials we already grabbed */
+			for (int j = 0; j < i; j++) free(m->transfers[j]);
+			free(m->transfers); free(m->transfer_sizes);
+			m->transfers = NULL; m->transfer_sizes = NULL;
+			return -1;
+		}
+		void *copy = ab_len > 0 ? malloc(ab_len) : malloc(1);
+		if (!copy) {
+			JS_FreeValue(ctx, ab);
+			for (int j = 0; j < i; j++) free(m->transfers[j]);
+			free(m->transfers); free(m->transfer_sizes);
+			m->transfers = NULL; m->transfer_sizes = NULL;
+			return -1;
+		}
+		if (ab_len > 0) memcpy(copy, ab_data, ab_len);
+		m->transfers[i] = copy;
+		m->transfer_sizes[i] = ab_len;
+		JS_DetachArrayBuffer(ctx, ab);
+		JS_FreeValue(ctx, ab);
+	}
+	m->n_transfers = n;
+	return 0;
 }
 
 static void free_msg(nx_worker_msg_t *m) {
 	if (!m) return;
 	free(m->data);
+	if (m->transfers) {
+		for (int i = 0; i < m->n_transfers; i++) {
+			if (m->transfers[i]) free(m->transfers[i]);
+		}
+		free(m->transfers);
+		free(m->transfer_sizes);
+	}
 	free(m);
+}
+
+/* JS_NewArrayBuffer free callback — runs when the receiver-side
+ * ArrayBuffer is GC'd, returning the process-wide malloc to the heap. */
+static void ab_free_func(JSRuntime *rt, void *opaque, void *ptr) {
+	(void)rt; (void)opaque;
+	free(ptr);
+}
+
+/* Build a JS array of ArrayBuffers for the receiver, taking ownership
+ * of msg->transfers[i] (NULL'd after). The new ABs use ab_free_func so
+ * the bytes are freed via receiver's GC, not our queue cleanup.
+ * Returns JS_UNDEFINED when n_transfers is 0 (no allocation). */
+static JSValue msg_build_transfer_array(JSContext *ctx, nx_worker_msg_t *m) {
+	if (m->n_transfers <= 0) return JS_UNDEFINED;
+	JSValue arr = JS_NewArray(ctx);
+	for (int i = 0; i < m->n_transfers; i++) {
+		void *buf = m->transfers[i];
+		size_t sz = m->transfer_sizes[i];
+		JSValue ab;
+		if (buf) {
+			ab = JS_NewArrayBuffer(ctx, (uint8_t *)buf, sz,
+									ab_free_func, NULL, false);
+			m->transfers[i] = NULL; /* ownership handed to AB */
+		} else {
+			/* Already taken or NULL — emit a 0-length AB so indices stay aligned */
+			ab = JS_NewArrayBufferCopy(ctx, (const uint8_t *)"", 0);
+		}
+		JS_SetPropertyUint32(ctx, arr, i, ab);
+	}
+	return arr;
 }
 
 static void enqueue_locked(nx_worker_msg_t **head, nx_worker_msg_t **tail,
@@ -117,18 +220,29 @@ static nx_worker_msg_t *drain_all_locked(nx_worker_msg_t **head,
  * Worker context bootstrap — runs ON the worker thread.
  * ============================================================ */
 
-/* `self.postMessage(str)` — worker-side. */
+/* `__postBytes(ArrayBuffer, transferABs?)` — worker-side outbound. The
+ * worker's bootstrap installs `self.postMessage = (val, transfer) =>
+ * __postBytes(...)` so user code calls postMessage(any, transfer?) and
+ * we shovel the serialised bytes through. Pass A: bytes carried
+ * opaquely. Pass F: optional `transferABs` JS array of ArrayBuffers
+ * gets its bytes attached as a side-channel + detached on the worker
+ * side. */
 static JSValue worker_self_post(JSContext *ctx, JSValueConst this_val,
 								int argc, JSValueConst *argv) {
 	nx_worker_t *w = JS_GetContextOpaque(ctx);
 	if (!w) return JS_ThrowInternalError(ctx, "no worker context");
-	if (argc < 1) return JS_ThrowTypeError(ctx, "postMessage requires 1 argument");
+	if (argc < 1) return JS_ThrowTypeError(ctx, "__postBytes requires ArrayBuffer");
 	size_t len = 0;
-	const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
-	if (!str) return JS_EXCEPTION;
-	nx_worker_msg_t *m = make_msg(str, len, NX_WORKER_MSG_DATA);
-	JS_FreeCString(ctx, str);
+	uint8_t *src = JS_GetArrayBuffer(ctx, &len, argv[0]);
+	if (!src) return JS_ThrowTypeError(ctx, "__postBytes expects an ArrayBuffer");
+	nx_worker_msg_t *m = make_msg((const char *)src, len, NX_WORKER_MSG_DATA);
 	if (!m) return JS_ThrowOutOfMemory(ctx);
+	if (argc >= 2 && JS_IsArray(argv[1])) {
+		if (msg_attach_transfers(ctx, m, argv[1]) != 0) {
+			free_msg(m);
+			return JS_ThrowInternalError(ctx, "__postBytes: failed to attach transfers");
+		}
+	}
 	pthread_mutex_lock(&w->out_lock);
 	enqueue_locked(&w->out_head, &w->out_tail, m);
 	pthread_mutex_unlock(&w->out_lock);
@@ -163,20 +277,71 @@ static JSValue worker_close(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
-/* Install `self`, `globalThis.postMessage`, `globalThis.close`,
- * `globalThis.console.log`, and an empty `globalThis.onmessage`
- * property. Called once before the worker user code is evaluated. */
+/* `__workerReadFile(path)` — worker-side sync file read for
+ * `importScripts`. Tier-1 Pass C: restricted to sdmc:/ + romfs:/
+ * (devkitPro libc has these mounted for direct fopen). http(s):// path
+ * deferred to fetch-proxy (Pass E). Returns the file content as a JS
+ * string (decoded as UTF-8 — caller's problem if the file is binary).
+ * Throws on any I/O failure. */
+static JSValue worker_read_file(JSContext *ctx, JSValueConst this_val,
+								int argc, JSValueConst *argv) {
+	if (argc < 1) return JS_ThrowTypeError(ctx, "__workerReadFile(path)");
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+	if (strncmp(path, "sdmc:/", 6) != 0 && strncmp(path, "romfs:/", 7) != 0) {
+		JSValue err = JS_ThrowTypeError(ctx,
+			"importScripts: only sdmc:/ and romfs:/ paths supported in Tier-1");
+		JS_FreeCString(ctx, path);
+		return err;
+	}
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		JSValue err = JS_ThrowReferenceError(ctx, "importScripts: cannot open %s", path);
+		JS_FreeCString(ctx, path);
+		return err;
+	}
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		JS_FreeCString(ctx, path);
+		return JS_ThrowInternalError(ctx, "importScripts: seek failed");
+	}
+	long size = ftell(f);
+	if (size < 0) {
+		fclose(f);
+		JS_FreeCString(ctx, path);
+		return JS_ThrowInternalError(ctx, "importScripts: ftell failed");
+	}
+	fseek(f, 0, SEEK_SET);
+	char *buf = malloc((size_t)size + 1);
+	if (!buf) {
+		fclose(f);
+		JS_FreeCString(ctx, path);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	size_t got = fread(buf, 1, (size_t)size, f);
+	fclose(f);
+	buf[got] = '\0';
+	JSValue result = JS_NewStringLen(ctx, buf, got);
+	free(buf);
+	JS_FreeCString(ctx, path);
+	return result;
+}
+
+/* Install the C-level worker-side bindings that the JS bootstrap
+ * builds on top of. The JS bootstrap (prepended to user source by
+ * worker.ts) finds `__postBytes` here and wraps it into
+ * `self.postMessage = val => __postBytes(_scSerialize(val))`, then
+ * defines `__handleInbound(rawBuf)` for the C dispatcher to call.
+ * `console.log/warn/error` writes to the per-worker log file; `close`
+ * sets the terminating flag. */
 static void worker_bootstrap_globals(JSContext *ctx) {
 	JSValue global = JS_GetGlobalObject(ctx);
-	/* postMessage */
-	JS_SetPropertyStr(ctx, global, "postMessage",
-					  JS_NewCFunction(ctx, worker_self_post, "postMessage", 1));
-	/* close */
+	JS_SetPropertyStr(ctx, global, "__postBytes",
+					  JS_NewCFunction(ctx, worker_self_post, "__postBytes", 1));
+	JS_SetPropertyStr(ctx, global, "__workerReadFile",
+					  JS_NewCFunction(ctx, worker_read_file, "__workerReadFile", 1));
 	JS_SetPropertyStr(ctx, global, "close",
 					  JS_NewCFunction(ctx, worker_close, "close", 0));
-	/* self === globalThis */
-	JS_SetPropertyStr(ctx, global, "self", JS_DupValue(ctx, global));
-	/* console.log */
 	JSValue console = JS_NewObject(ctx);
 	JS_SetPropertyStr(ctx, console, "log",
 					  JS_NewCFunction(ctx, worker_console_log, "log", 1));
@@ -185,23 +350,28 @@ static void worker_bootstrap_globals(JSContext *ctx) {
 	JS_SetPropertyStr(ctx, console, "warn",
 					  JS_NewCFunction(ctx, worker_console_log, "warn", 1));
 	JS_SetPropertyStr(ctx, global, "console", console);
-	/* onmessage placeholder */
-	JS_SetPropertyStr(ctx, global, "onmessage", JS_NULL);
 	JS_FreeValue(ctx, global);
 }
 
-/* Fire `globalThis.onmessage({ data: str })` if the user installed a
- * handler. Synthesizes a tiny event-like object — no full Event class
- * needed for Tier-0. Exceptions logged to worker log; loop continues. */
-static void worker_dispatch_inbound(JSContext *ctx, const char *data,
-									size_t len) {
+/* Fire `globalThis.__handleInbound(ArrayBuffer, transferABs?)` if the
+ * bootstrap registered one. The bootstrap layer deserialises the bytes
+ * and fires the user's `self.onmessage({ data: value })`. Pass F:
+ * transferred buffers attached to `msg` are wrapped into ArrayBuffers
+ * owned by THIS context (receiver) — `msg->transfers[i]` is NULL'd as
+ * ownership moves to JS, so queue cleanup won't double-free. Exceptions
+ * from either side route to main via an ERROR message on the outbound
+ * queue so `worker.onerror` fires. */
+static void worker_dispatch_inbound(JSContext *ctx, nx_worker_msg_t *msg) {
 	JSValue global = JS_GetGlobalObject(ctx);
-	JSValue handler = JS_GetPropertyStr(ctx, global, "onmessage");
+	JSValue handler = JS_GetPropertyStr(ctx, global, "__handleInbound");
 	if (JS_IsFunction(ctx, handler)) {
-		JSValue evt = JS_NewObject(ctx);
-		JS_SetPropertyStr(ctx, evt, "data", JS_NewStringLen(ctx, data, len));
-		JSValueConst args[1] = {evt};
-		JSValue ret = JS_Call(ctx, handler, global, 1, args);
+		JSValue raw = JS_NewArrayBufferCopy(ctx, (const uint8_t *)msg->data, msg->len);
+		JSValue transfer_arr = msg_build_transfer_array(ctx, msg);
+		JSValueConst args[2] = {raw, transfer_arr};
+		int n_args = JS_IsUndefined(transfer_arr) ? 1 : 2;
+		JSValue ret = JS_Call(ctx, handler, global, n_args, args);
+		JS_FreeValue(ctx, raw);
+		if (!JS_IsUndefined(transfer_arr)) JS_FreeValue(ctx, transfer_arr);
 		if (JS_IsException(ret)) {
 			nx_worker_t *w = JS_GetContextOpaque(ctx);
 			JSValue exc = JS_GetException(ctx);
@@ -211,9 +381,6 @@ static void worker_dispatch_inbound(JSContext *ctx, const char *data,
 					fprintf(w->log_fd, "[worker] onmessage threw: %s\n", s);
 					fflush(w->log_fd);
 				}
-				/* Surface to the main thread as an error event. Routed via
-				 * the outbound queue with kind=ERROR; main dispatcher fires
-				 * `worker.onerror({ message: s })`. */
 				nx_worker_msg_t *errm = make_msg(s, strlen(s),
 												  NX_WORKER_MSG_ERROR);
 				if (errm) {
@@ -226,10 +393,47 @@ static void worker_dispatch_inbound(JSContext *ctx, const char *data,
 			JS_FreeValue(ctx, exc);
 		}
 		JS_FreeValue(ctx, ret);
-		JS_FreeValue(ctx, evt);
 	}
 	JS_FreeValue(ctx, handler);
 	JS_FreeValue(ctx, global);
+}
+
+/* Call the bootstrap-installed `globalThis.__runDueTimers()` which
+ * fires any setTimeout/setInterval callbacks whose deadline has
+ * passed, then returns the number of ms until the next-due timer
+ * (or WORKER_IDLE_WAIT_MS if no timers are queued). The C event loop
+ * uses the returned value as its cond_timedwait duration so workers
+ * with active timers wake on time, while idle workers still sleep
+ * the full 50 ms. */
+static uint64_t worker_call_run_due_timers(JSContext *ctx, nx_worker_t *w) {
+	uint64_t ms = WORKER_IDLE_WAIT_MS;
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue fn = JS_GetPropertyStr(ctx, global, "__runDueTimers");
+	if (JS_IsFunction(ctx, fn)) {
+		JSValue ret = JS_Call(ctx, fn, global, 0, NULL);
+		if (JS_IsException(ret)) {
+			JSValue exc = JS_GetException(ctx);
+			if (w && w->log_fd) {
+				const char *s = JS_ToCString(ctx, exc);
+				if (s) {
+					fprintf(w->log_fd, "[worker] __runDueTimers threw: %s\n", s);
+					fflush(w->log_fd);
+					JS_FreeCString(ctx, s);
+				}
+			}
+			JS_FreeValue(ctx, exc);
+		} else {
+			int32_t r;
+			if (JS_ToInt32(ctx, &r, ret) == 0 && r >= 0) {
+				ms = (uint64_t)r;
+				if (ms > WORKER_IDLE_WAIT_MS) ms = WORKER_IDLE_WAIT_MS;
+			}
+		}
+		JS_FreeValue(ctx, ret);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	return ms;
 }
 
 /* Run all pending microtasks (Promise reactions) on the worker context.
@@ -300,34 +504,25 @@ static void *worker_thread_main(void *arg) {
 	/* Drain any microtasks the initial eval queued. */
 	worker_drain_microtasks(w->ctx, w);
 
-	/* Main worker loop. */
+	/* Main worker loop. Each iteration:
+	 *   1. Drain any inbound message batch + fire onmessage + microtasks
+	 *   2. Run any setTimeout/setInterval callbacks whose deadline passed,
+	 *      get back the ms-until-next-deadline (capped at WORKER_IDLE_WAIT_MS)
+	 *   3. Sleep on the cond var until next message, terminate, or that
+	 *      deadline — whichever comes first */
 	while (!w->terminating) {
-		/* Drain inbound. */
 		pthread_mutex_lock(&w->in_lock);
-		if (!w->in_head && !w->terminating) {
-			/* Wait for either a message or terminate signal. Bounded
-			 * wait so terminate doesn't depend on incoming traffic. */
-			struct timespec ts;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			ts.tv_nsec += (long)WORKER_IDLE_WAIT_MS * 1000000L;
-			if (ts.tv_nsec >= 1000000000L) {
-				ts.tv_sec += ts.tv_nsec / 1000000000L;
-				ts.tv_nsec %= 1000000000L;
-			}
-			pthread_cond_timedwait(&w->in_cond, &w->in_lock, &ts);
-		}
 		nx_worker_msg_t *batch = drain_all_locked(&w->in_head, &w->in_tail);
 		w->in_count = 0;
 		pthread_mutex_unlock(&w->in_lock);
 
 		while (batch) {
 			nx_worker_msg_t *next = batch->next;
-			worker_dispatch_inbound(w->ctx, batch->data, batch->len);
+			worker_dispatch_inbound(w->ctx, batch);
 			worker_drain_microtasks(w->ctx, w);
 			free_msg(batch);
 			batch = next;
 			if (w->terminating) {
-				/* Drop any remaining queued messages on terminate. */
 				while (batch) {
 					nx_worker_msg_t *n2 = batch->next;
 					free_msg(batch);
@@ -336,6 +531,24 @@ static void *worker_thread_main(void *arg) {
 				break;
 			}
 		}
+		if (w->terminating) break;
+
+		uint64_t ms_to_next = worker_call_run_due_timers(w->ctx, w);
+		worker_drain_microtasks(w->ctx, w);
+		if (w->terminating) break;
+
+		pthread_mutex_lock(&w->in_lock);
+		if (!w->in_head && !w->terminating && ms_to_next > 0) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += (long)ms_to_next * 1000000L;
+			if (ts.tv_nsec >= 1000000000L) {
+				ts.tv_sec += ts.tv_nsec / 1000000000L;
+				ts.tv_nsec %= 1000000000L;
+			}
+			pthread_cond_timedwait(&w->in_cond, &w->in_lock, &ts);
+		}
+		pthread_mutex_unlock(&w->in_lock);
 	}
 
 	if (w->log_fd) {
@@ -445,26 +658,33 @@ static JSValue js_worker_spawn(JSContext *ctx, JSValueConst this_val,
 	return JS_NewInt32(ctx, w->handle);
 }
 
-/* `$.workerPostToWorker(handle, str)` → queues a message for the worker. */
+/* `$.workerPostToWorker(handle, ArrayBuffer, transferABs?)` → queues a
+ * serialised structured-clone payload for the worker. The bytes are
+ * opaque to the C layer; the worker bootstrap's `__handleInbound`
+ * deserialises. Pass F: optional `transferABs` array carries main-side
+ * ArrayBuffers whose bytes are attached as a side-channel + detached
+ * on the main side. */
 static JSValue js_worker_post(JSContext *ctx, JSValueConst this_val,
 							  int argc, JSValueConst *argv) {
 	int handle;
-	if (argc < 2) return JS_ThrowTypeError(ctx, "workerPostToWorker(handle, str)");
+	if (argc < 2) return JS_ThrowTypeError(ctx, "workerPostToWorker(handle, ArrayBuffer)");
 	if (JS_ToInt32(ctx, &handle, argv[0])) return JS_EXCEPTION;
 	size_t len = 0;
-	const char *str = JS_ToCStringLen(ctx, &len, argv[1]);
-	if (!str) return JS_EXCEPTION;
+	uint8_t *src = JS_GetArrayBuffer(ctx, &len, argv[1]);
+	if (!src) return JS_ThrowTypeError(ctx, "workerPostToWorker expects ArrayBuffer");
 
 	pthread_mutex_lock(&worker_list_lock);
 	nx_worker_t *w = find_worker_locked(handle);
 	pthread_mutex_unlock(&worker_list_lock);
-	if (!w) {
-		JS_FreeCString(ctx, str);
-		return JS_FALSE; /* silently drop — worker already gone */
-	}
-	nx_worker_msg_t *m = make_msg(str, len, NX_WORKER_MSG_DATA);
-	JS_FreeCString(ctx, str);
+	if (!w) return JS_FALSE; /* silently drop — worker already gone */
+	nx_worker_msg_t *m = make_msg((const char *)src, len, NX_WORKER_MSG_DATA);
 	if (!m) return JS_ThrowOutOfMemory(ctx);
+	if (argc >= 3 && JS_IsArray(argv[2])) {
+		if (msg_attach_transfers(ctx, m, argv[2]) != 0) {
+			free_msg(m);
+			return JS_ThrowInternalError(ctx, "workerPostToWorker: failed to attach transfers");
+		}
+	}
 	pthread_mutex_lock(&w->in_lock);
 	if (w->in_count >= WORKER_INBOUND_MAX) {
 		pthread_mutex_unlock(&w->in_lock);
@@ -506,7 +726,8 @@ static JSValue js_worker_terminate(JSContext *ctx, JSValueConst this_val,
 
 /* `$.workerSetDispatcher(fn)` — installs the JS function that
  * `nx_process_workers` calls per drained message. Signature:
- * `fn(handle: number, data: string): void`. Called once at runtime
+ * `fn(handle: number, value: ArrayBuffer|string, kind: number,
+ *     transferABs?: ArrayBuffer[]): void`. Called once at runtime
  * init from worker.ts. */
 static JSValue js_worker_set_dispatcher(JSContext *ctx, JSValueConst this_val,
 										int argc, JSValueConst *argv) {
@@ -554,15 +775,31 @@ void nx_process_workers(JSContext *ctx) {
 		pthread_mutex_unlock(&w->out_lock);
 		while (batch) {
 			nx_worker_msg_t *next = batch->next;
-			JSValueConst args[3] = {
+			JSValue val;
+			JSValue transfer_arr = JS_UNDEFINED;
+			if (batch->kind == NX_WORKER_MSG_DATA) {
+				/* Carry the structured-clone bytes into JS as an
+				 * ArrayBuffer; worker.ts deserialises before onmessage.
+				 * Pass F: side-channel transfers move ownership of
+				 * msg->transfers[i] into receiver-owned ABs. */
+				val = JS_NewArrayBufferCopy(ctx, (const uint8_t *)batch->data, batch->len);
+				transfer_arr = msg_build_transfer_array(ctx, batch);
+			} else {
+				/* ERROR payload is the exception's toString(); stays
+				 * as a JS string for `worker.onerror({ message })`. */
+				val = JS_NewStringLen(ctx, batch->data, batch->len);
+			}
+			JSValueConst args[4] = {
 				JS_NewInt32(ctx, w->handle),
-				JS_NewStringLen(ctx, batch->data, batch->len),
+				val,
 				JS_NewInt32(ctx, (int)batch->kind),
+				transfer_arr,
 			};
-			JSValue ret = JS_Call(ctx, g_main_dispatch, JS_UNDEFINED, 3, args);
+			JSValue ret = JS_Call(ctx, g_main_dispatch, JS_UNDEFINED, 4, args);
 			JS_FreeValue(ctx, (JSValue)args[0]);
 			JS_FreeValue(ctx, (JSValue)args[1]);
 			JS_FreeValue(ctx, (JSValue)args[2]);
+			if (!JS_IsUndefined(transfer_arr)) JS_FreeValue(ctx, transfer_arr);
 			if (JS_IsException(ret)) nx_emit_error_event(ctx);
 			JS_FreeValue(ctx, ret);
 			free_msg(batch);

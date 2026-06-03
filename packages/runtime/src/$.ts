@@ -606,24 +606,33 @@ export interface Init {
 	 * generates rather than decodes (Oscillator waveforms, createBuffer). */
 	audioAllocPCM(byteLength: number): ArrayBuffer;
 
-	// worker.c — Tier-0 Web Workers (see [[project-swb-web-workers-milestone]])
+	// worker.c — Web Workers (see [[project-swb-web-workers-milestone]])
 	/** Spawn a real OS-thread Web Worker with a fresh JSRuntime+JSContext.
 	 * Returns an integer handle used by the other worker* APIs. Throws
-	 * on `pthread_create` failure. */
+	 * on `pthread_create` failure. The source must include the
+	 * structured-clone bootstrap (worker.ts prepends it automatically). */
 	workerSpawn(source: string): number;
-	/** Post a string into the worker's inbound queue. Returns true on
-	 * success, false if the handle is unknown (worker already terminated).
-	 * Throws if the inbound queue is full (backpressure). */
-	workerPostToWorker(handle: number, str: string): boolean;
+	/** Post a serialised structured-clone payload (ArrayBuffer) into the
+	 * worker's inbound queue. Returns true on success, false if the
+	 * handle is unknown. Throws if the inbound queue is full. Pass F:
+	 * optional `transfers` is a list of ArrayBuffers whose bytes are
+	 * carried via the C-side side-channel and whose sources are detached
+	 * by the C layer after attachment. */
+	workerPostToWorker(handle: number, bytes: ArrayBuffer, transfers?: ArrayBuffer[]): boolean;
 	/** Block until the worker's pthread joins, then free its runtime.
 	 * Returns true if a worker was found+terminated, false otherwise. */
 	workerTerminate(handle: number): boolean;
 	/** Register the JS dispatcher that the C main-loop drain calls
-	 * once per inbound message: `(handle, data, kind) => void` where
-	 * `kind === 0` is a normal data message and `kind === 1` is an
-	 * error event surfaced from a worker-side exception. Installed
-	 * once at runtime init by worker.ts. */
-	workerSetDispatcher(fn: (handle: number, data: string, kind: number) => void): void;
+	 * once per inbound message: `(handle, value, kind, transferABs?) =>
+	 * void`. When `kind === 0` (DATA), `value` is an ArrayBuffer carrying
+	 * a structured-clone payload (worker.ts deserialises before firing
+	 * onmessage); `transferABs`, when present, is a JS array of
+	 * receiver-owned ArrayBuffers built C-side from the Pass F
+	 * side-channel — TAG_TRANSFERRED_AB tags in the payload resolve to
+	 * entries here. When `kind === 1` (ERROR), `value` is the exception's
+	 * `toString()` string and `transferABs` is undefined. Installed once
+	 * at runtime init by worker.ts. */
+	workerSetDispatcher(fn: (handle: number, value: unknown, kind: number, transferABs?: ArrayBuffer[]) => void): void;
 
 	// uint8array.c
 	uint8arrayInit(c: typeof Uint8Array): void;
