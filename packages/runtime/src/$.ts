@@ -338,6 +338,13 @@ export interface Init {
 		img: Image | ImageBitmap,
 		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
 	): void;
+	/** Animation (multi-frame GIF) accessors. `imageFrameCount` returns
+	 * 0 for static images and the frame total otherwise; `imageFrameDelay`
+	 * returns the per-frame display time in milliseconds; `imageSetFrame`
+	 * swaps which frame the cairo surface paints from. */
+	imageFrameCount(img: Image | ImageBitmap): number;
+	imageFrameDelay(img: Image | ImageBitmap, index: number): number;
+	imageSetFrame(img: Image | ImageBitmap, index: number): void;
 
 	// video.c
 	videoDecoderInit(c: any): void;
@@ -353,6 +360,11 @@ export interface Init {
 		pts: number;
 		ended: boolean;
 	} | null;
+	videoDecoderSetMuted(v: any, muted: boolean): void;
+	videoDecoderSetVolume(v: any, volume: number): void;
+	videoDecoderGetAudioLevels(v: any): number[];
+	videoDecoderGetFrequencyData(v: any, out: Float32Array): boolean;
+	videoDecoderGetWaveform(v: any, out: Float32Array): boolean;
 
 	// irs.c
 	irsInit(): () => void;
@@ -391,6 +403,47 @@ export interface Init {
 	// nifm.c
 	nifmInitialize(): () => void;
 	networkInfo(): NetworkInfo;
+
+	// sensors.c
+	sensorsBatteryInfo(): {
+		voltageMv: number;
+		temperatureC: number;
+		agePercent: number;
+		chargePercent: number;
+		charging: boolean;
+		chargerType: number;
+		inputCurrentLimitMa: number;
+		fastChargeCurrentLimitMa: number;
+		chargeVoltageLimitMv: number;
+	};
+	sensorsAudioInfo(): {
+		masterVolume: number | null;
+		devices: string[];
+		headphonesConnected: boolean;
+		primaryDevice: string | null;
+	};
+	sensorsWlanInfo(): {
+		available: boolean;
+		rssi: number | null;
+		state: number | null;
+	};
+	sensorsSixAxisStart(): boolean;
+	sensorsSixAxisRead(): {
+		acceleration: { x: number; y: number; z: number };
+		angularVelocity: { x: number; y: number; z: number };
+		angle: { x: number; y: number; z: number };
+		samplingNumber: bigint;
+		deltaTime: bigint;
+	} | null;
+	sensorsSixAxisStop(): void;
+	sensorsNfpStart(): boolean;
+	sensorsNfpPoll(): {
+		index: number;
+		state: number | null;
+		uuid?: ArrayBuffer;
+		protocol?: number;
+	}[];
+	sensorsNfpStop(): void;
 
 	// ns.c
 	nsInitialize(): () => void;
@@ -546,6 +599,31 @@ export interface Init {
 	audioAllocVoice(): number;
 	audioFreeVoice(voiceId: number): void;
 	audioIsPlaying(voiceId: number): boolean;
+	/** Allocate a page-aligned PCM ArrayBuffer (4KB alignment) suitable
+	 * for passing to `audioPlay`. JS-allocated ArrayBuffers from
+	 * `new Int16Array(n).buffer` are NOT page-aligned and `audrvMemPoolAdd`
+	 * rejects them; use this allocator for any PCM that the runtime
+	 * generates rather than decodes (Oscillator waveforms, createBuffer). */
+	audioAllocPCM(byteLength: number): ArrayBuffer;
+
+	// worker.c — Tier-0 Web Workers (see [[project-swb-web-workers-milestone]])
+	/** Spawn a real OS-thread Web Worker with a fresh JSRuntime+JSContext.
+	 * Returns an integer handle used by the other worker* APIs. Throws
+	 * on `pthread_create` failure. */
+	workerSpawn(source: string): number;
+	/** Post a string into the worker's inbound queue. Returns true on
+	 * success, false if the handle is unknown (worker already terminated).
+	 * Throws if the inbound queue is full (backpressure). */
+	workerPostToWorker(handle: number, str: string): boolean;
+	/** Block until the worker's pthread joins, then free its runtime.
+	 * Returns true if a worker was found+terminated, false otherwise. */
+	workerTerminate(handle: number): boolean;
+	/** Register the JS dispatcher that the C main-loop drain calls
+	 * once per inbound message: `(handle, data, kind) => void` where
+	 * `kind === 0` is a normal data message and `kind === 1` is an
+	 * error event surfaced from a worker-side exception. Installed
+	 * once at runtime init by worker.ts. */
+	workerSetDispatcher(fn: (handle: number, data: string, kind: number) => void): void;
 
 	// uint8array.c
 	uint8arrayInit(c: typeof Uint8Array): void;

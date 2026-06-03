@@ -133,9 +133,13 @@ export interface ImportMeta {
 export declare function queueMicrotask(callback: () => void): void;
 
 import './audio';
+import './web-audio';
 import './web-applet';
+import './worker';
 
 export type * from './audio';
+export type * from './web-audio';
+export type * from './worker';
 
 import './window';
 

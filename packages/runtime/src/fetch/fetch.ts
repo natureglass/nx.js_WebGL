@@ -97,6 +97,19 @@ function createChunkedParseStream() {
 				}
 				buffer = buffer.slice(pos + 2);
 
+				if (size === 0) {
+					// Final chunk per HTTP/1.1 chunked-encoding spec
+					// (RFC 9112 §7.1.2). Terminate so downstream readers
+					// (text/arrayBuffer/json) see end-of-stream. Without
+					// this the controller stays open and the reader hangs
+					// forever when the server uses `Connection: keep-alive`
+					// (the socket itself never closes). Bug surfaced via
+					// Twitch GQL TopStreams response 2026-06-01.
+					controller.terminate();
+					buffer = null;
+					return;
+				}
+
 				if (buffer.length >= size + 2) {
 					// we got a whole chunk
 					const chunkData = buffer.slice(0, size);

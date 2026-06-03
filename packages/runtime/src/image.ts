@@ -24,6 +24,9 @@ const _ = createInternal<Image, ImageInternal>();
  *  - `jpg` - JPEG image data using [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo)
  *  - `png` - PNG image data using [libpng](http://www.libpng.org/pub/png/libpng.html)
  *  - `webp` - WebP image data using [libpng](https://github.com/webmproject/libwebp)
+ *  - `gif` - GIF image data using [gifdec](https://github.com/lecram/gifdec); animated GIFs
+ *    are decoded into a multi-frame array and the host advances frames via
+ *    {@link Image.frameCount}, {@link Image.frameDelay}, {@link Image.setFrame}.
  *
  * @example
  *
@@ -99,11 +102,25 @@ export class Image extends EventTarget {
 			.then(
 				() => {
 					internal.complete = true;
-					this.dispatchEvent(new Event('load'));
+					// `dispatchEvent` has no try/catch around listeners
+					// (see EventTarget impl); a sync throw inside an
+					// `onload` callback escapes here and rejects the
+					// chained promise → unhandled-rejection → text-fatal.
+					// Common trigger: a consumer's `onload` patches a
+					// LiveElement that was already removed from the DOM
+					// between `src` assignment and decode completion
+					// (e.g. `innerHTML = ''` ran in between). The catch
+					// only suppresses the chain bookkeeping; sync
+					// listener throws still propagate at their call site.
+					try {
+						this.dispatchEvent(new Event('load'));
+					} catch (_e) {}
 				},
 				(error) => {
 					internal.complete = false;
-					this.dispatchEvent(new ErrorEvent('error', { error }));
+					try {
+						this.dispatchEvent(new ErrorEvent('error', { error }));
+					} catch (_e) {}
 				},
 			);
 	}
@@ -122,6 +139,33 @@ export class Image extends EventTarget {
 		return null;
 	}
 	setAttribute(name: string, value: string | number) {}
+
+	/**
+	 * Number of frames in a multi-frame image (animated GIF). Returns 0
+	 * for static images (PNG/JPEG/WebP/single-frame GIF). Used together
+	 * with {@link frameDelay} and {@link setFrame} to drive animation
+	 * from JavaScript.
+	 */
+	get frameCount(): number {
+		return $.imageFrameCount(this);
+	}
+
+	/**
+	 * The display time of the frame at `index`, in milliseconds. Throws
+	 * `RangeError` if `index >= frameCount`. Returns 0 for static images.
+	 */
+	frameDelay(index: number): number {
+		return $.imageFrameDelay(this, index);
+	}
+
+	/**
+	 * Switch the cairo surface to render the frame at `index`. The next
+	 * `drawImage(img, ...)` call paints that frame. No-op for static
+	 * images; throws `RangeError` if `index >= frameCount`.
+	 */
+	setFrame(index: number): void {
+		$.imageSetFrame(this, index);
+	}
 }
 $.imageInit(Image);
 def(Image);

@@ -45,6 +45,14 @@ static bool video_audio_slot_in_use[NX_VIDEO_AUDIO_NUM_SLOTS];
 /* Per-voice wave buffer tracking */
 static AudioDriverWaveBuf voice_wavebufs[AUDIO_NUM_VOICES];
 
+/* Per-voice mempool tracking. Records the pool_id returned by
+ * `audrvMemPoolAdd` inside `nx_audio_play`, so `nx_audio_release_voice`
+ * can detach + remove it when the voice is freed. -1 = no pool registered.
+ * Surgical re-add Step 2 (2026-06-03): cleanup ONLY at voice-free time;
+ * `nx_audio_stop` still leaks per the original behavior to avoid the
+ * driver-state corruption regression. */
+static int voice_mempool_id[AUDIO_NUM_VOICES];
+
 /* Slice-2b: serializes every audrv* call site. Recursive so nested
  * acquires (e.g. nx_audio_acquire_voice → audrvVoiceStop after a leak)
  * don't self-deadlock. Initialized via the standard recursive
@@ -275,6 +283,7 @@ bool nx_audio_ensure_initialized(void) {
 
 	memset(voice_in_use, 0, sizeof(voice_in_use));
 	memset(voice_wavebufs, 0, sizeof(voice_wavebufs));
+	for (int i = 0; i < AUDIO_NUM_VOICES; i++) voice_mempool_id[i] = -1;
 	audio_initialized = true;
 	nx_audio_unlock();
 	return true;
@@ -299,6 +308,20 @@ void nx_audio_release_voice(int voice_id) {
 	if (audio_initialized) {
 		audrvVoiceStop(&audio_driver, voice_id);
 		audrvUpdate(&audio_driver);
+		/* Tear down the per-call mempool added by nx_audio_play. Voice
+		 * was just stopped + driver updated, so audrv no longer holds
+		 * wave-buf references into this pool; detach + remove is safe.
+		 * Intermediate audrvUpdate between voiceStop and detach is the
+		 * cautious-extra-step that distinguishes this from the reverted
+		 * 2026-06-02 Tier-1 pattern (which crashed all audio). Cleanup
+		 * is gated to release_voice ONLY — `nx_audio_stop` still leaks
+		 * per HEAD behavior; restoring its detach is Step 4. */
+		if (voice_mempool_id[voice_id] >= 0) {
+			audrvMemPoolDetach(&audio_driver, voice_mempool_id[voice_id]);
+			audrvMemPoolRemove(&audio_driver, voice_mempool_id[voice_id]);
+			voice_mempool_id[voice_id] = -1;
+			audrvUpdate(&audio_driver);
+		}
 	}
 	voice_in_use[voice_id] = false;
 	nx_audio_unlock();
@@ -447,6 +470,7 @@ static JSValue nx_audio_play(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_ThrowInternalError(ctx, "Failed to add audio mempool");
 	}
 	audrvMemPoolAttach(&audio_driver, pool_id);
+	voice_mempool_id[voice_id] = pool_id;
 
 	/* Initialize voice */
 	audrvVoiceInit(&audio_driver, voice_id, channels, PcmFormat_Int16,
@@ -592,6 +616,25 @@ static JSValue nx_audio_is_playing(JSContext *ctx, JSValueConst this_val,
 	return JS_NewBool(ctx, playing);
 }
 
+/* Page-aligned PCM allocator for the Web Audio polyfill. JS-allocated
+ * ArrayBuffers are not 4KB-aligned, which makes audrvMemPoolAdd reject
+ * them. Returns an ArrayBuffer backed by memalign(AUDIO_ALIGN, …) with
+ * `free` as the GC callback. Pure allocator — does NOT touch the audrv
+ * mempool table. Step 1 of the surgical re-add 2026-06-03. */
+static JSValue nx_audio_alloc_pcm(JSContext *ctx, JSValueConst this_val,
+								  int argc, JSValueConst *argv) {
+	int64_t bytes;
+	if (JS_ToInt64(ctx, &bytes, argv[0])) return JS_EXCEPTION;
+	if (bytes <= 0) return JS_ThrowRangeError(ctx, "byteLength must be > 0");
+	size_t aligned_size = ALIGN_UP((size_t)bytes, AUDIO_ALIGN);
+	void *buf = memalign(AUDIO_ALIGN, aligned_size);
+	if (!buf) return JS_ThrowOutOfMemory(ctx);
+	memset(buf, 0, aligned_size);
+	armDCacheFlush(buf, aligned_size);
+	return JS_NewArrayBuffer(ctx, (uint8_t *)buf, aligned_size,
+							 (JSFreeArrayBufferDataFunc *)free, NULL, false);
+}
+
 static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("audioInit", 0, nx_audio_init),
 	JS_CFUNC_DEF("audioExit", 0, nx_audio_exit),
@@ -606,6 +649,7 @@ static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("audioAllocVoice", 0, nx_audio_alloc_voice),
 	JS_CFUNC_DEF("audioFreeVoice", 1, nx_audio_free_voice),
 	JS_CFUNC_DEF("audioIsPlaying", 1, nx_audio_is_playing),
+	JS_CFUNC_DEF("audioAllocPCM", 1, nx_audio_alloc_pcm),
 };
 
 void nx_init_audio(JSContext *ctx, JSValueConst init_obj) {

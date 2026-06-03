@@ -208,14 +208,25 @@ export class WebSocket extends EventTarget {
 			const writer = socket.writable.getWriter();
 			this.#writer = writer;
 
-			// Perform HTTP upgrade handshake
+			// Perform HTTP upgrade handshake. Mirror the headers fetch()
+			// sets — `User-Agent` (some hosts 400 without it) and `Origin`
+			// (most production WebSocket servers reject connections without
+			// an Origin header on cross-origin-style checks). For the
+			// Switch we synthesise Origin from the scheme+host even though
+			// there's no real page origin; the spec recommends this.
 			const key = generateKey();
+			const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+			const userAgent = nav?.userAgent || '@switch-web/runtime';
+			const originScheme = isSecure ? 'https' : 'http';
+			const originHostPort = `${hostname}${port !== (isSecure ? 443 : 80) ? ':' + port : ''}`;
 			let header = `GET ${path} HTTP/1.1\r\n`;
-			header += `Host: ${hostname}${port !== (isSecure ? 443 : 80) ? ':' + port : ''}\r\n`;
+			header += `Host: ${originHostPort}\r\n`;
 			header += `Upgrade: websocket\r\n`;
 			header += `Connection: Upgrade\r\n`;
 			header += `Sec-WebSocket-Key: ${key}\r\n`;
 			header += `Sec-WebSocket-Version: 13\r\n`;
+			header += `Origin: ${originScheme}://${originHostPort}\r\n`;
+			header += `User-Agent: ${userAgent}\r\n`;
 			if (protocols.length > 0) {
 				header += `Sec-WebSocket-Protocol: ${protocols.join(', ')}\r\n`;
 			}
@@ -346,13 +357,21 @@ export class WebSocket extends EventTarget {
 			// Start reading frames
 			this.#readLoop(reader, buffer);
 		} catch (err) {
+			// Capture the underlying error reason. Previously this silently
+			// swallowed the message so consumers got only `code 1006 reason=''`
+			// with zero idea what failed (TLS reject? DNS? handshake parse?).
+			// Now we route it to console.debug (→ nxjs-debug.log) AND surface
+			// it via the CloseEvent.reason field so api-probe / dev fixtures
+			// can show it on screen.
+			const reason = (err as { message?: string })?.message || String(err);
+			try { console.debug('[WebSocket] connect failed for', this.#url, '→', reason); } catch (_) { /* ignore */ }
 			this.#readyState = CLOSED;
 			this.#fireEvent('error', new Event('error'));
 			this.#fireEvent(
 				'close',
 				new CloseEvent('close', {
 					code: 1006,
-					reason: '',
+					reason: reason.slice(0, 123), // CloseEvent.reason capped at 123 bytes per spec
 					wasClean: false,
 				}),
 			);

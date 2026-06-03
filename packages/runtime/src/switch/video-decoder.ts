@@ -95,6 +95,14 @@ export class VideoDecoder {
 	 * {@link setMuted}; setting this calls `audrvVoiceSetVolume(0|1)`
 	 * on the audio voice. Persists across pause/resume + seeks. */
 	declare readonly muted: boolean;
+	/** Slice 2c: linear playback gain 0.0..1.0. Driven by {@link setVolume};
+	 * `muted` overrides to 0 but the stored gain is preserved. */
+	declare readonly volume: number;
+	/** Slice 2c: accurate audio playback position in seconds, from the
+	 * audrv played-sample counter (the A/V-sync master clock). Tracks
+	 * playback for audio-only sources where there are no video-frame PTS to
+	 * advance the cursor. 0 before audio starts / for files with no audio. */
+	declare readonly audioTime: number;
 
 	constructor(url: string, opts?: VideoDecoderOptions) {
 		return proto($.videoDecoderNew(url, opts), VideoDecoder);
@@ -123,6 +131,44 @@ export class VideoDecoder {
 	/** Mute or unmute the audio voice. */
 	setMuted(muted: boolean): void {
 		$.videoDecoderSetMuted(this, muted);
+	}
+
+	/** Set the linear playback gain (0.0..1.0, clamped). */
+	setVolume(volume: number): void {
+		$.videoDecoderSetVolume(this, volume);
+	}
+
+	/**
+	 * Audio-reactive band levels at the current play head, for visualizers.
+	 * Returns an array of per-band RMS magnitudes (~0..1, unsmoothed) — low
+	 * frequencies first. Empty array before audio starts or for sources with
+	 * no audio. The values are sampled at the audrv play head (not the decode
+	 * head, which runs ~one buffer ahead) so they stay in sync with what's
+	 * audible. Apply your own gain/smoothing on top.
+	 */
+	getAudioLevels(): number[] {
+		return $.videoDecoderGetAudioLevels(this);
+	}
+
+	/**
+	 * Fill `out` with the frequency spectrum at the current play head (low →
+	 * high bins, magnitudes ~0..1). Like `AnalyserNode.getByteFrequencyData`
+	 * but float + play-head-synced. Pass a reused `Float32Array` (up to 128
+	 * bins written). Returns `true` when data was written, `false` before
+	 * audio starts / for sources with no audio.
+	 */
+	getFrequencyData(out: Float32Array): boolean {
+		return $.videoDecoderGetFrequencyData(this, out);
+	}
+
+	/**
+	 * Fill `out` with the time-domain waveform at the current play head
+	 * (samples in -1..1). Like `AnalyserNode.getByteTimeDomainData` but float
+	 * + play-head-synced. Pass a reused `Float32Array` (up to 256 samples).
+	 * Returns `true` when data was written, `false` otherwise.
+	 */
+	getWaveform(out: Float32Array): boolean {
+		return $.videoDecoderGetWaveform(this, out);
 	}
 
 	/**

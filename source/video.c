@@ -22,6 +22,7 @@
 #include <malloc.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,31 @@
 #define AUDIO_NUM_WAVE_BUFS  4
 #define AUDIO_TOTAL_BUF_BYTES (AUDIO_NUM_WAVE_BUFS * AUDIO_WAVE_BUF_BYTES)
 #define AUDIO_MEMPOOL_ALIGN 0x1000
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Slice-2c audio-reactive analysis (for the switch-web-browser music
+// visualizer, which ports a Web-Audio-AnalyserNode-based player). The audio
+// thread runs a radix-2 FFT over each decoded chunk for a frequency spectrum
+// AND keeps a downsampled time-domain waveform, recording both into a small
+// ring keyed by the chunk's output-sample position. JS reads them at the
+// audrv PLAY HEAD (not the decode head, which runs ~one buffer ahead) so the
+// visuals stay in sync with what's actually audible. Stands in for the
+// absent Web Audio API: getFrequencyData() ~ AnalyserNode.getByteFrequencyData,
+// getWaveform() ~ getByteTimeDomainData, getAudioLevels() = 8 coarse bands.
+#define AUDIO_NUM_BANDS 8         // coarse bands derived from the spectrum
+#define AUDIO_FFT_N 1024          // FFT window size (power of two)
+#define AUDIO_SPEC_BINS 128       // exposed spectrum bins (512 FFT bins / 4)
+#define AUDIO_WAVE_OUT 256        // exposed time-domain samples per chunk
+#define AUDIO_FEAT_RING 24        // feature frames (> buffered audio depth)
+typedef struct {
+	u64 start_sample;                 // output-sample index (post-anchor epoch)
+	u32 num_samples;                  // chunk length in output sample-frames
+	float spec[AUDIO_SPEC_BINS];      // FFT magnitude, low->high, ~0..1
+	float wave[AUDIO_WAVE_OUT];       // time-domain mono, -1..1
+} nx_audio_feat_t;
 
 // Audio packet queue (demuxer → audio decoder thread). Sized for ~680 ms of
 // audio (32 × 21.33 ms per AAC packet @ 1024 samples/48 kHz). Audio packets
@@ -138,6 +164,10 @@ typedef struct {
 	                                // audrvVoiceSetVolume(0) is called so
 	                                // audio is silenced. Persists across
 	                                // pause/resume and through seeks.
+	float volume;                   // linear playback gain 0.0..1.0 (default
+	                                // 1.0). Applied via audrvVoiceSetVolume;
+	                                // `muted` forces 0 regardless. Set from
+	                                // JS (HTMLMediaElement.volume).
 	bool no_audio;                  // slice-2b followup #6: when true at
 	                                // construction, the audio stream is
 	                                // ignored entirely — no avcodec
@@ -204,6 +234,18 @@ typedef struct {
 	// total of everything played up to that wrap.
 	u64 audio_played_baseline;
 	bool audio_voice_paused;         // mirror of audrvVoiceSetPaused state
+
+	// Slice-2c audio-reactive analysis. The audio thread FFTs each decoded
+	// chunk + keeps a downsampled waveform, recorded into feat_ring keyed by
+	// output-sample position so JS reads them at the play head. All touched
+	// under nx_audio_lock (analysis runs inside decode_packet's locked
+	// section; the JS getters take nx_audio_lock to read).
+	nx_audio_feat_t feat_ring[AUDIO_FEAT_RING];
+	int feat_head;                   // next write index
+	int feat_count;                  // valid entries (<= AUDIO_FEAT_RING)
+	u64 feat_sample_cursor;          // cumulative output samples queued since
+	                                 // the last anchor reset (matches the
+	                                 // played-count epoch used for sync)
 
 	// Audio packet queue (demuxer → audio decoder). Producer = demuxer
 	// (worker) thread; consumer = a_worker thread. Bounded ring of cloned
@@ -387,6 +429,138 @@ static void *nx_video_video_thread(void *arg);
 static bool nx_video_ensure_sws(nx_video_t *v, enum AVPixelFormat src_fmt,
                                 int w, int h);
 
+// --- Radix-2 FFT (real input) for the visualizer spectrum ------------------
+// One-time tables shared by all decoders (read-only after init). The audio
+// thread is the only writer of the per-decoder feat ring; the FFT scratch
+// lives on its stack so multiple decoders don't share mutable FFT state.
+static float g_fft_cos[AUDIO_FFT_N / 2];
+static float g_fft_sin[AUDIO_FFT_N / 2];
+static int g_fft_rev[AUDIO_FFT_N];
+static float g_fft_win[AUDIO_FFT_N];  // Hann window
+static bool g_fft_inited = false;
+static pthread_mutex_t g_fft_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nx_fft_init(void) {
+	pthread_mutex_lock(&g_fft_init_lock);
+	if (g_fft_inited) { pthread_mutex_unlock(&g_fft_init_lock); return; }
+	int n = AUDIO_FFT_N, logn = 0;
+	while ((1 << logn) < n) logn++;
+	for (int i = 0; i < n / 2; i++) {
+		float a = -2.0f * (float)M_PI * (float)i / (float)n;
+		g_fft_cos[i] = cosf(a);
+		g_fft_sin[i] = sinf(a);
+	}
+	for (int i = 0; i < n; i++) {
+		int r = 0, x = i;
+		for (int b = 0; b < logn; b++) { r = (r << 1) | (x & 1); x >>= 1; }
+		g_fft_rev[i] = r;
+	}
+	for (int i = 0; i < n; i++)
+		g_fft_win[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(n - 1)));
+	g_fft_inited = true;
+	pthread_mutex_unlock(&g_fft_init_lock);
+}
+
+// In-place iterative radix-2 Cooley-Tukey FFT. re/im are length AUDIO_FFT_N.
+static void nx_fft(float *re, float *im) {
+	int n = AUDIO_FFT_N;
+	for (int i = 0; i < n; i++) {
+		int j = g_fft_rev[i];
+		if (j > i) {
+			float tr = re[i]; re[i] = re[j]; re[j] = tr;
+			float ti = im[i]; im[i] = im[j]; im[j] = ti;
+		}
+	}
+	for (int len = 2; len <= n; len <<= 1) {
+		int half = len >> 1, step = n / len;
+		for (int i = 0; i < n; i += len) {
+			int k = 0;
+			for (int j = i; j < i + half; j++) {
+				float wr = g_fft_cos[k], wi = g_fft_sin[k];
+				float vr = re[j + half] * wr - im[j + half] * wi;
+				float vi = re[j + half] * wi + im[j + half] * wr;
+				float ur = re[j], ui = im[j];
+				re[j] = ur + vr; im[j] = ui + vi;
+				re[j + half] = ur - vr; im[j + half] = ui - vi;
+				k += step;
+			}
+		}
+	}
+}
+
+// Analyze one decoded chunk (interleaved S16 stereo, `frames` sample-frames):
+// FFT for the frequency spectrum + a downsampled mono waveform, recorded into
+// the feature ring keyed by the chunk's output-sample position. Called from
+// the audio thread with nx_audio_lock held (so the JS getters can't read a
+// torn entry).
+static void nx_video_audio_analyze_chunk(nx_video_t *v, const int16_t *data,
+                                         int frames) {
+	if (frames <= 0) return;
+	nx_audio_feat_t *f = &v->feat_ring[v->feat_head];
+
+	// Time-domain waveform: downsample the chunk to AUDIO_WAVE_OUT mono samples.
+	for (int o = 0; o < AUDIO_WAVE_OUT; o++) {
+		int idx = (int)((int64_t)o * frames / AUDIO_WAVE_OUT);
+		if (idx >= frames) idx = frames - 1;
+		float l = (float)data[2 * idx] * (1.0f / 32768.0f);
+		float r = (float)data[2 * idx + 1] * (1.0f / 32768.0f);
+		f->wave[o] = 0.5f * (l + r);
+	}
+
+	// Frequency spectrum: Hann-windowed FFT over the first AUDIO_FFT_N mono
+	// samples (zero-padded if the chunk is shorter), grouped down to
+	// AUDIO_SPEC_BINS bins.
+	float re[AUDIO_FFT_N], im[AUDIO_FFT_N];
+	int win = frames < AUDIO_FFT_N ? frames : AUDIO_FFT_N;
+	for (int i = 0; i < AUDIO_FFT_N; i++) {
+		if (i < win) {
+			float l = (float)data[2 * i] * (1.0f / 32768.0f);
+			float r = (float)data[2 * i + 1] * (1.0f / 32768.0f);
+			re[i] = 0.5f * (l + r) * g_fft_win[i];
+		} else {
+			re[i] = 0.0f;
+		}
+		im[i] = 0.0f;
+	}
+	nx_fft(re, im);
+	int per = (AUDIO_FFT_N / 2) / AUDIO_SPEC_BINS;  // bins averaged per output
+	float norm = 2.0f / (float)AUDIO_FFT_N;
+	for (int b = 0; b < AUDIO_SPEC_BINS; b++) {
+		float acc = 0.0f;
+		for (int j = 0; j < per; j++) {
+			int bin = b * per + j;
+			acc += sqrtf(re[bin] * re[bin] + im[bin] * im[bin]);
+		}
+		f->spec[b] = (acc / (float)per) * norm;
+	}
+
+	f->start_sample = v->feat_sample_cursor;
+	f->num_samples = (u32)frames;
+	v->feat_head = (v->feat_head + 1) % AUDIO_FEAT_RING;
+	if (v->feat_count < AUDIO_FEAT_RING) v->feat_count++;
+	v->feat_sample_cursor += (u64)frames;
+}
+
+// Find the feature frame at the audrv play head (caller holds nx_audio_lock).
+// Returns NULL when there's nothing to read (no audio / not started / empty).
+static nx_audio_feat_t *nx_video_find_feat_locked(nx_video_t *v) {
+	if (!(v->used_audio && v->audio_clock_started && v->a_voice_id >= 0
+	      && v->feat_count > 0))
+		return NULL;
+	AudioDriver *drv = nx_audio_get_driver();
+	u64 played_raw = audrvVoiceGetPlayedSampleCount(drv, v->a_voice_id);
+	u64 played = played_raw >= v->audio_played_baseline
+	                 ? (played_raw - v->audio_played_baseline) : 0;
+	for (int i = 0; i < v->feat_count; i++) {
+		int idx = (v->feat_head - 1 - i + AUDIO_FEAT_RING * 2) % AUDIO_FEAT_RING;
+		if (played >= v->feat_ring[idx].start_sample)
+			return &v->feat_ring[idx];
+	}
+	// Play head before everything buffered — use the oldest.
+	int idx = (v->feat_head - v->feat_count + AUDIO_FEAT_RING * 2) % AUDIO_FEAT_RING;
+	return &v->feat_ring[idx];
+}
+
 static void nx_video_audio_reset_wave_bufs(nx_video_t *v) {
 	for (int i = 0; i < AUDIO_NUM_WAVE_BUFS; i++) {
 		nx_video_wave_buf_t *slot = &v->wave_bufs[i];
@@ -399,6 +573,13 @@ static void nx_video_audio_reset_wave_bufs(nx_video_t *v) {
 		slot->wb.state = AudioDriverWaveBufState_Free;
 	}
 	v->next_wave_buf = 0;
+	// Reset the analysis epoch: clear the feature ring + sample cursor so
+	// post-seek/loop reads don't return stale sample positions (which would
+	// mis-sync at the play head, since the cursor restarts at 0 alongside the
+	// played-count baseline recapture).
+	v->feat_head = 0;
+	v->feat_count = 0;
+	v->feat_sample_cursor = 0;
 }
 
 static const char *nx_video_audio_open(nx_video_t *v) {
@@ -409,6 +590,7 @@ static const char *nx_video_audio_open(nx_video_t *v) {
 	v->audio_clock_started = false;
 	v->first_audio_pts_sec = 0.0;
 	v->audio_voice_paused = false;
+	nx_fft_init();
 
 	if (v->a_stream_idx < 0 || !v->a_ctx) {
 		return NULL; // no-op: no audio
@@ -487,7 +669,7 @@ static const char *nx_video_audio_open(nx_video_t *v) {
 	audrvVoiceSetMixFactor(drv, v->a_voice_id, 0.0f, 0, 1);
 	audrvVoiceSetMixFactor(drv, v->a_voice_id, 0.0f, 1, 0);
 	audrvVoiceSetMixFactor(drv, v->a_voice_id, 1.0f, 1, 1);
-	audrvVoiceSetVolume(drv, v->a_voice_id, v->muted ? 0.0f : 1.0f);
+	audrvVoiceSetVolume(drv, v->a_voice_id, v->muted ? 0.0f : v->volume);
 	audrvUpdate(drv);
 	nx_audio_unlock();
 
@@ -653,6 +835,13 @@ static int nx_video_audio_decode_packet(nx_video_t *v, AVPacket *pkt,
 			audrvVoiceStart(drv, v->a_voice_id);
 			v->audio_clock_started = true;
 		}
+		// Analyze this chunk for the visualizer band levels. Runs under the
+		// held nx_audio_lock; records per-band RMS keyed by the chunk's
+		// output-sample position (feat_sample_cursor) so JS reads the level
+		// at the play head. Must come AFTER the anchor block so the first
+		// post-anchor chunk is recorded at cursor 0 (matching baseline).
+		nx_video_audio_analyze_chunk(v, (const int16_t *)slot->data,
+		                             out_samples);
 		audrvUpdate(drv);
 		nx_audio_unlock();
 
@@ -1264,8 +1453,22 @@ static void *nx_video_worker(void *arg) {
 			break;
 		}
 		if (rr < 0) {
+			// Transient: network reads (http/https) can return EAGAIN
+			// when the TCP receive buffer is briefly empty, or EINTR
+			// when a signal hits the read syscall. Retrying is correct;
+			// killing the whole video isn't. fopen-backed reads can't
+			// hit either, so the local-file path is unaffected.
+			if (rr == AVERROR(EAGAIN) || rr == AVERROR(EINTR)) {
+				av_packet_unref(pkt);
+				continue;
+			}
+			char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+			av_strerror(rr, errbuf, sizeof(errbuf));
+			char msg[AV_ERROR_MAX_STRING_SIZE + 64];
+			snprintf(msg, sizeof(msg),
+			         "av_read_frame failed: %s (rc=%d)", errbuf, rr);
 			pthread_mutex_lock(&v->lock);
-			nx_video_set_error(v, "av_read_frame error");
+			nx_video_set_error(v, msg);
 			v->stop_requested = true;
 			pthread_mutex_unlock(&v->lock);
 			break;
@@ -1291,25 +1494,57 @@ out:
 
 // --- open / close ----------------------------------------------------------
 
+static bool nx_is_network_url(const char *path) {
+	if (!path) return false;
+	return strncmp(path, "http://", 7) == 0 ||
+	       strncmp(path, "https://", 8) == 0;
+}
+
 static const char *nx_video_open_internal(nx_video_t *v, const char *path,
                                           bool want_hw) {
-	v->src_fp = fopen(path, "rb");
-	if (!v->src_fp) return "fopen failed (file missing?)";
+	// Two input paths:
+	//   - http(s)://: libavformat opens the URL itself via the http/https
+	//     protocols (TLS backend = libnx, enabled in switch-ffmpeg via
+	//     tls.patch + --enable-protocol=https). No custom AVIO wrap.
+	//   - everything else (sdmc:/, romfs:/, absolute disk paths): fopen +
+	//     custom AVIO callbacks — FFmpeg's protocol layer doesn't know
+	//     about sdmc:/romfs:/, so we always wrap.
+	const bool is_network = nx_is_network_url(path);
 
-	v->avio_buf = av_malloc(VIDEO_AVIO_BUF_SIZE);
-	if (!v->avio_buf) return "av_malloc avio buf";
-	v->avio_ctx = avio_alloc_context(v->avio_buf, VIDEO_AVIO_BUF_SIZE, 0,
-	                                 v->src_fp, nx_avio_read, NULL,
-	                                 nx_avio_seek);
-	if (!v->avio_ctx) return "avio_alloc_context";
+	if (!is_network) {
+		v->src_fp = fopen(path, "rb");
+		if (!v->src_fp) return "fopen failed (file missing?)";
+
+		v->avio_buf = av_malloc(VIDEO_AVIO_BUF_SIZE);
+		if (!v->avio_buf) return "av_malloc avio buf";
+		v->avio_ctx = avio_alloc_context(v->avio_buf, VIDEO_AVIO_BUF_SIZE, 0,
+		                                 v->src_fp, nx_avio_read, NULL,
+		                                 nx_avio_seek);
+		if (!v->avio_ctx) return "avio_alloc_context";
+	}
 
 	v->fmt_ctx = avformat_alloc_context();
 	if (!v->fmt_ctx) return "avformat_alloc_context";
-	v->fmt_ctx->pb = v->avio_ctx;
-	v->fmt_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+	if (!is_network) {
+		v->fmt_ctx->pb = v->avio_ctx;
+		v->fmt_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+	}
 
-	int rc = avformat_open_input(&v->fmt_ctx, NULL, NULL, NULL);
-	if (rc < 0) return "avformat_open_input failed";
+	int rc = avformat_open_input(&v->fmt_ctx, is_network ? path : NULL,
+	                             NULL, NULL);
+	if (rc < 0) {
+		if (!is_network) return "avformat_open_input failed";
+		// Network path: surface the actual AVERROR so we can tell
+		// "DNS lookup failed" apart from "TLS handshake" apart from
+		// "HTTP 403" etc. Stored in a static buffer because the open
+		// path returns const char* and runs on the calling thread.
+		static char open_errbuf[AV_ERROR_MAX_STRING_SIZE + 64];
+		char errstr[AV_ERROR_MAX_STRING_SIZE] = {0};
+		av_strerror(rc, errstr, sizeof(errstr));
+		snprintf(open_errbuf, sizeof(open_errbuf),
+		         "avformat_open_input (network): %s (rc=%d)", errstr, rc);
+		return open_errbuf;
+	}
 	rc = avformat_find_stream_info(v->fmt_ctx, NULL);
 	if (rc < 0) return "avformat_find_stream_info failed";
 
@@ -1545,6 +1780,7 @@ static JSValue nx_video_new(JSContext *ctx, JSValueConst this_val, int argc,
 	v->paused = true;     // start paused; JS calls play() to roll
 	v->loop = want_loop;
 	v->muted = want_muted;
+	v->volume = 1.0f;     // full gain until JS sets HTMLMediaElement.volume
 	v->no_audio = want_no_audio;
 	v->a_stream_idx = -1;
 	v->a_voice_id = -1;
@@ -1930,11 +2166,144 @@ static JSValue nx_video_set_muted(JSContext *ctx, JSValueConst this_val,
 	if (v->used_audio && v->a_voice_id >= 0) {
 		nx_audio_lock();
 		AudioDriver *drv = nx_audio_get_driver();
-		audrvVoiceSetVolume(drv, v->a_voice_id, v->muted ? 0.0f : 1.0f);
+		audrvVoiceSetVolume(drv, v->a_voice_id, v->muted ? 0.0f : v->volume);
 		audrvUpdate(drv);
 		nx_audio_unlock();
 	}
 	return JS_UNDEFINED;
+}
+
+// volume getter + setter (slice-2c: HTMLMediaElement.volume). Linear gain
+// 0..1, clamped. `muted` overrides to 0 but the stored gain is preserved so
+// unmuting restores it.
+static JSValue nx_video_get_volume(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+	nx_video_t *v = nx_get_video(ctx, this_val);
+	if (!v) return JS_EXCEPTION;
+	return JS_NewFloat64(ctx, v->volume);
+}
+static JSValue nx_video_set_volume(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+	if (argc < 2) return JS_ThrowTypeError(ctx, "videoDecoderSetVolume(handle, volume)");
+	nx_video_t *v = nx_get_video(ctx, argv[0]);
+	if (!v) return JS_EXCEPTION;
+	double vol;
+	if (JS_ToFloat64(ctx, &vol, argv[1])) return JS_EXCEPTION;
+	if (vol < 0.0) vol = 0.0;
+	if (vol > 1.0) vol = 1.0;
+	v->volume = (float)vol;
+	if (v->used_audio && v->a_voice_id >= 0) {
+		nx_audio_lock();
+		AudioDriver *drv = nx_audio_get_driver();
+		audrvVoiceSetVolume(drv, v->a_voice_id, v->muted ? 0.0f : v->volume);
+		audrvUpdate(drv);
+		nx_audio_unlock();
+	}
+	return JS_UNDEFINED;
+}
+
+// Accurate audio playback position in seconds, derived from the audrv
+// played-sample counter (the same A/V-sync master clock the demuxer uses):
+//   pos = first_audio_pts_sec + (played - baseline) / sample_rate
+// Returns 0 before the audio clock anchors (first wave buf queued) or for
+// files with no audio. This is what lets the seek bar track audio-only
+// playback, where there are no video frame PTS to advance the cursor.
+static JSValue nx_video_get_audio_time(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+	nx_video_t *v = nx_get_video(ctx, this_val);
+	if (!v) return JS_EXCEPTION;
+	double t = 0.0;
+	nx_audio_lock();
+	bool started = v->audio_clock_started;
+	double anchor = v->first_audio_pts_sec;
+	u64 baseline = v->audio_played_baseline;
+	int voice = v->a_voice_id;
+	bool has_audio = v->used_audio;
+	if (has_audio && started && voice >= 0) {
+		AudioDriver *drv = nx_audio_get_driver();
+		u64 played = audrvVoiceGetPlayedSampleCount(drv, voice);
+		u64 delta = played >= baseline ? (played - baseline) : 0;
+		t = anchor + (double)delta / (double)AUDIO_OUT_SAMPLE_RATE;
+	}
+	nx_audio_unlock();
+	return JS_NewFloat64(ctx, t);
+}
+
+// Fill a caller-provided Float32Array with the spectrum/waveform at the PLAY
+// HEAD (writing in place avoids per-frame allocation at 60 fps — the visuals
+// read these every frame). Helper shared by getFrequencyData / getWaveform.
+// `which`: 0 = spectrum (AUDIO_SPEC_BINS), 1 = waveform (AUDIO_WAVE_OUT).
+// Returns JS_TRUE when data was written, JS_FALSE otherwise. Method form:
+// handle is argv[0], the Float32Array is argv[1].
+static JSValue nx_video_fill_audio_array(JSContext *ctx, int argc,
+                                         JSValueConst *argv, int which) {
+	nx_video_t *v = argc > 0 ? nx_get_video(ctx, argv[0]) : NULL;
+	if (!v || argc < 2) return JS_FALSE;
+	size_t off = 0, byte_len = 0, bpe = 0;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[1], &off, &byte_len, &bpe);
+	if (JS_IsException(ab)) { JS_FreeValue(ctx, ab); return JS_FALSE; }
+	size_t ab_size = 0;
+	uint8_t *base = JS_GetArrayBuffer(ctx, &ab_size, ab);
+	JS_FreeValue(ctx, ab);
+	if (!base) return JS_FALSE;
+	float *dst = (float *)(base + off);
+	int cap = (int)(byte_len / sizeof(float));
+	int max = which == 0 ? AUDIO_SPEC_BINS : AUDIO_WAVE_OUT;
+	if (cap > max) cap = max;
+	bool ok = false;
+	nx_audio_lock();
+	nx_audio_feat_t *f = nx_video_find_feat_locked(v);
+	if (f) {
+		const float *src = which == 0 ? f->spec : f->wave;
+		for (int i = 0; i < cap; i++) dst[i] = src[i];
+		ok = true;
+	}
+	nx_audio_unlock();
+	return ok ? JS_TRUE : JS_FALSE;
+}
+
+// getFrequencyData(handle, outFloat32Array) — fills the spectrum (low→high,
+// ~0..1) at the play head. ~AnalyserNode.getByteFrequencyData. Returns bool.
+static JSValue nx_video_get_frequency_data(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+	return nx_video_fill_audio_array(ctx, argc, argv, 0);
+}
+
+// getWaveform(handle, outFloat32Array) — fills the time-domain waveform
+// (-1..1) at the play head. ~AnalyserNode.getByteTimeDomainData. Returns bool.
+static JSValue nx_video_get_waveform(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+	return nx_video_fill_audio_array(ctx, argc, argv, 1);
+}
+
+// getAudioLevels(handle) — 8 coarse bands (spectrum grouped) as a JS Array,
+// at the play head. Kept for the simpler reactivity API; the visualizer uses
+// getFrequencyData/getWaveform.
+static JSValue nx_video_get_audio_levels(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+	JSValue arr = JS_NewArray(ctx);
+	nx_video_t *v = argc > 0 ? nx_get_video(ctx, argv[0]) : NULL;
+	if (!v) return arr;
+	float out[AUDIO_NUM_BANDS];
+	bool have = false;
+	const int per = AUDIO_SPEC_BINS / AUDIO_NUM_BANDS;
+	nx_audio_lock();
+	nx_audio_feat_t *f = nx_video_find_feat_locked(v);
+	if (f) {
+		for (int k = 0; k < AUDIO_NUM_BANDS; k++) {
+			float acc = 0.0f;
+			for (int j = 0; j < per; j++) acc += f->spec[k * per + j];
+			out[k] = acc / (float)per;
+		}
+		have = true;
+	}
+	nx_audio_unlock();
+	if (have) {
+		for (int k = 0; k < AUDIO_NUM_BANDS; k++)
+			JS_SetPropertyUint32(ctx, arr, (uint32_t)k,
+			                     JS_NewFloat64(ctx, (double)out[k]));
+	}
+	return arr;
 }
 static JSValue nx_video_get_audio_error(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv) {
@@ -1970,6 +2339,8 @@ static JSValue nx_video_init_class(JSContext *ctx, JSValueConst this_val,
 	NX_DEF_GET(proto, "usedAudio", nx_video_get_used_audio);
 	NX_DEF_GET(proto, "usedVideo", nx_video_get_used_video);
 	NX_DEF_GET(proto, "muted", nx_video_get_muted);
+	NX_DEF_GET(proto, "volume", nx_video_get_volume);
+	NX_DEF_GET(proto, "audioTime", nx_video_get_audio_time);
 	NX_DEF_GET(proto, "audioError", nx_video_get_audio_error);
 	NX_DEF_GET(proto, "error", nx_video_get_error);
 	JS_FreeValue(ctx, proto);
@@ -1985,6 +2356,10 @@ static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("videoDecoderSeek", 2, nx_video_seek),
 	JS_CFUNC_DEF("videoDecoderNextFrame", 1, nx_video_next_frame),
 	JS_CFUNC_DEF("videoDecoderSetMuted", 2, nx_video_set_muted),
+	JS_CFUNC_DEF("videoDecoderSetVolume", 2, nx_video_set_volume),
+	JS_CFUNC_DEF("videoDecoderGetAudioLevels", 1, nx_video_get_audio_levels),
+	JS_CFUNC_DEF("videoDecoderGetFrequencyData", 2, nx_video_get_frequency_data),
+	JS_CFUNC_DEF("videoDecoderGetWaveform", 2, nx_video_get_waveform),
 };
 
 void nx_init_video(JSContext *ctx, JSValueConst init_obj) {

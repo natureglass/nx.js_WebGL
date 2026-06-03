@@ -114,7 +114,13 @@ static int nx_tls_load_ca_certs(nx_context_t *nx_ctx) {
 	// roots + a curated set of common CAs the system already trusts.
 	// Don't bail on failure — fall through to the bundled Mozilla
 	// bundle instead so HTTPS still works.
-	Result rc = sslInitialize(1);
+	//
+	// Session count = 3: one slot is consumed by this CA-loading pass
+	// (released by sslExit below), the other two are available for
+	// libavformat's tls_libnx backend used by the <video src="https://...">
+	// path. Without ≥2 free slots, simultaneous HTTPS videos would
+	// 0xFA801-fail at sslContextCreateConnection. libnx caps this at 4.
+	Result rc = sslInitialize(3);
 	if (R_SUCCEEDED(rc)) {
 		int total = (int)(sizeof(nx_ca_cert_ids) / sizeof(nx_ca_cert_ids[0]));
 		for (int i = 0; i < total; i++) {
@@ -154,7 +160,13 @@ static int nx_tls_load_ca_certs(nx_context_t *nx_ctx) {
 
 			free(cert_buffer);
 		}
-		sslExit();
+		// Intentionally NOT calling sslExit() here. libavformat's
+		// tls_libnx.c backend (used by the <video src="https://...">
+		// path — see [[reference-swb-ffmpeg-https-rebuild]]) calls
+		// sslCreateContext later in the runtime's lifetime and would
+		// 0xFA801-fail if the SSL service had already been released.
+		// The OS reclaims the service handle automatically on process
+		// exit, so leaving the service initialized is safe.
 	} else {
 		fprintf(stderr, "sslInitialize() failed: 0x%x — skipping system CAs\n", rc);
 	}

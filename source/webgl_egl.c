@@ -4009,15 +4009,29 @@ bool nx_webgl_egl_read_bridge_to_canvas_data(nx_webgl_egl_t *backend,
 				               ((rgba & 0x000000ff) << 16) |
 				               ((rgba >> 16) & 0x000000ff);
 			} else if (a == 0) {
-				*dst_row_p++ = 0;
+				// Fully transparent source — leave the destination pixel
+				// (page content already painted underneath) so a translucent
+				// inline canvas reveals what's behind it (e.g. the audio
+				// visualizer's transparent background showing the card grid).
+				// Was: overwrite with 0 (opaque black).
+				dst_row_p++;
 			} else {
+				// Partially transparent — src-over composite onto the
+				// existing (page) pixel instead of overwriting, so content
+				// behind the canvas shows through. dst is opaque ARGB32
+				// (0xAARRGGBB); src (glReadPixels LE) is 0xAABBGGRR.
 				uint32_t r = rgba & 0xff;
 				uint32_t g = (rgba >> 8) & 0xff;
 				uint32_t b = (rgba >> 16) & 0xff;
-				uint32_t pr = (r * a + 127) / 255;
-				uint32_t pg = (g * a + 127) / 255;
-				uint32_t pb = (b * a + 127) / 255;
-				*dst_row_p++ = (a << 24) | (pr << 16) | (pg << 8) | pb;
+				uint32_t inv = 255 - a;
+				uint32_t d = *dst_row_p;
+				uint32_t dr = (d >> 16) & 0xff;
+				uint32_t dg = (d >> 8) & 0xff;
+				uint32_t db = d & 0xff;
+				uint32_t orr = (r * a + dr * inv + 127) / 255;
+				uint32_t og = (g * a + dg * inv + 127) / 255;
+				uint32_t ob = (b * a + db * inv + 127) / 255;
+				*dst_row_p++ = 0xff000000u | (orr << 16) | (og << 8) | ob;
 			}
 		}
 	}

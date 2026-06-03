@@ -20,6 +20,7 @@ export {
 } from '../udp';
 export * from './album';
 export * from './bitmap';
+export * from './diagnostics';
 export * from './dns';
 export * from './env';
 export * from './file-system';

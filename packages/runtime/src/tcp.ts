@@ -106,6 +106,17 @@ export class Socket {
 		_.set(this, i);
 		this.opened = i.opened.promise;
 		this.closed = i.closed.promise;
+		// Defensive no-op catch: `socket.opened` is exposed for ergonomics
+		// (consumers MAY await it directly), but in practice most go through
+		// `.readable` / `.writable`, whose pull/write callbacks only attach
+		// a `.catch` lazily on first I/O. If `connect` fails fast (TCP pool
+		// exhausted, DNS reject, TLS reject), the rejection from
+		// `i.opened.reject(reason)` below lands on a promise with zero
+		// handlers → unhandled-rejection → the runtime's default handler
+		// flips to text-fatal mode. The catch absorbs that bookkeeping; the
+		// real error still propagates through `readable.pull` / `writable.write`
+		// to the consumer (fetch's await chain → onward to the caller).
+		this.opened.catch(() => {});
 
 		let readBuffer: ArrayBuffer | undefined;
 		this.readable = new ReadableStream({

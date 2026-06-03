@@ -37,7 +37,11 @@ function mimeFromExtension(path: string): string {
 let audioInitialized = false;
 let updateInterval: ReturnType<typeof setInterval> | null = null;
 
-function ensureAudioInit() {
+/** Idempotent native audio renderer init. Exported so the Web Audio
+ * polyfill ([./web-audio]) shares the same audrv driver + voice pool
+ * as `Audio` / `<audio>` — the audren service allows only one driver
+ * per process. */
+export function ensureAudioInit() {
 	if (!audioInitialized) {
 		$.audioInit();
 		audioInitialized = true;
@@ -48,7 +52,9 @@ function ensureAudioInit() {
 	}
 }
 
-function ensureUpdateLoop() {
+/** Idempotent 60Hz `audrvUpdate` heartbeat. Required for any active
+ * voice; safe to call from both `Audio.play()` and `AudioBufferSourceNode.start()`. */
+export function ensureUpdateLoop() {
 	if (!updateInterval) {
 		updateInterval = setInterval(() => {
 			$.audioUpdate();

@@ -29,6 +29,7 @@
 #include "irs.h"
 #include "memory.h"
 #include "nifm.h"
+#include "sensors.h"
 #include "ns.h"
 #include "poll.h"
 #include "service.h"
@@ -45,8 +46,15 @@
 #include "web.h"
 #include "webgl.h"
 #include "window.h"
+#include "worker.h"
 
-#define LOG_FILENAME "nxjs-debug.log"
+/* Centralised log path so all diagnostic output lands beside the
+ * switch-web-browser profile's other logs. NOTE: this hardcodes the
+ * switch-web-browser profile path into the SHARED nxjs runtime — any
+ * other consumer of nxjs.nro will also write its debug log here. If
+ * a different consumer needs its own location, factor this into a
+ * runtime-settable path (e.g. via env or argv). */
+#define LOG_FILENAME "sdmc:/switch/brewser/logs/nxjs-debug.log"
 
 // Defined in runtime.c
 extern const uint32_t qjsc_runtime_size;
@@ -713,6 +721,7 @@ int main(int argc, char *argv[]) {
 	nx_init_irs(ctx, nx_ctx->init_obj);
 	nx_init_memory(ctx, nx_ctx->init_obj);
 	nx_init_nifm(ctx, nx_ctx->init_obj);
+	nx_init_sensors(ctx, nx_ctx->init_obj);
 	nx_init_ns(ctx, nx_ctx->init_obj);
 	nx_init_service(ctx, nx_ctx->init_obj);
 	nx_init_tcp(ctx, nx_ctx->init_obj);
@@ -726,6 +735,7 @@ int main(int argc, char *argv[]) {
 	nx_init_web(ctx, nx_ctx->init_obj);
 	nx_init_webgl(ctx, nx_ctx->init_obj);
 	nx_init_window(ctx, nx_ctx->init_obj);
+	nx_init_worker(ctx, nx_ctx->init_obj);
 	const JSCFunctionListEntry init_function_list[] = {
 		JS_CFUNC_DEF("exit", 0, js_exit),
 		JS_CFUNC_DEF("cwd", 0, js_cwd),
@@ -881,6 +891,13 @@ main_loop:
 		if (!nx_ctx->had_error) {
 			// Check if any thread pool tasks have completed
 			nx_process_async(ctx, nx_ctx);
+		}
+
+		if (!nx_ctx->had_error) {
+			// Drain outbound message queues from any active Web Workers
+			// and dispatch each into the main JS side. Cheap when no
+			// workers exist. See [[project-swb-web-workers-milestone]].
+			nx_process_workers(ctx);
 		}
 
 		if (!nx_ctx->had_error) {
