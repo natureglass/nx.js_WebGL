@@ -46,7 +46,7 @@ import type {
 import type { Server, TlsContextOpaque } from './tcp';
 import type { Algorithm, BufferSource } from './types';
 import type { DatagramSocket } from './udp';
-import type { Memory, MemoryDescriptor } from './wasm';
+import type { Memory, MemoryDescriptor, Table, TableDescriptor } from './wasm';
 import type { Window } from './window';
 
 type ClassOf<T> = {
@@ -393,6 +393,18 @@ export interface Init {
 	onFrame(fn: (plusDown: boolean) => void): void;
 	onExit(fn: () => void): void;
 	framebufferInit(screen: Screen): void;
+	// Cursor overlay (engine-side composite, see `composite_cursor_overlay`
+	// in source/main.c). The cursor visual lives in `display_buffer`, NOT
+	// in canvas->data, so it can never corrupt page pixels.
+	setCursorOverlay(
+		x: number,
+		y: number,
+		rgba: ArrayBuffer | ArrayBufferView,
+		w: number,
+		h: number,
+	): void;
+	setCursorOverlayPosition(x: number, y: number): void;
+	clearCursorOverlay(): void;
 	hidInitializeTouchScreen(): void;
 	hidGetTouchScreenStates(): Touch[] | undefined;
 	hidInitializeKeyboard(): void;
@@ -553,7 +565,10 @@ export interface Init {
 	// wasm.c
 	wasmCallFunc(f: any, ...args: unknown[]): unknown;
 	wasmMemNew(descriptor: MemoryDescriptor): Memory;
+	wasmTableNew(descriptor: TableDescriptor): Table;
 	wasmTableGet(t: any, i: number): Memory;
+	wasmTableSet(t: any, i: number, v: any): void;
+	wasmTableGrow(t: any, delta: number): number;
 	wasmInitMemory(c: any): void;
 	wasmInitTable(c: any): void;
 	wasmNewModule(b: ArrayBuffer): WasmModuleOpaque;

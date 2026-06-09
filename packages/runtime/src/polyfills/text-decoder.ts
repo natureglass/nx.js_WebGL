@@ -23,14 +23,15 @@ export class TextDecoder implements globalThis.TextDecoder {
 		encoding?: string,
 		options?: { fatal?: boolean; ignoreBOM?: boolean },
 	) {
-		if (
-			typeof encoding === 'string' &&
-			encoding !== 'utf-8' &&
-			encoding !== 'utf8'
-		) {
-			throw new TypeError('Only "utf-8" decoding is supported');
-		}
-		this.encoding = 'utf-8';
+		// Spec strictly requires throwing RangeError for unknown encodings,
+		// but engines like Cocos Creator construct decoders defensively for
+		// asset header detection and treat the throw as fatal. Accept any
+		// encoding name; decode bytes as utf-8 regardless. The `encoding`
+		// property still reports the requested encoding so spec-style
+		// detection (e.g. `dec.encoding === 'utf-16le'`) keeps working —
+		// only the actual byte decoding is utf-8. Real non-utf-8 decode
+		// may produce garbage output but doesn't throw.
+		this.encoding = typeof encoding === 'string' ? encoding.toLowerCase() : 'utf-8';
 		this.fatal = options?.fatal ?? false;
 		this.ignoreBOM = options?.ignoreBOM ?? false;
 	}

@@ -36,6 +36,10 @@ function mimeFromExtension(path: string): string {
 
 let audioInitialized = false;
 let updateInterval: ReturnType<typeof setInterval> | null = null;
+/** 2026-06-08 ROUND 27: minimal entry-point counter for Audio.play diagnostics.
+ * Module-local (not globalThis) to avoid the heap-pressure regression observed
+ * in round 23 when probes wrote to globalThis. */
+let _audioPlayProbeN = 0;
 
 /** Idempotent native audio renderer init. Exported so the Web Audio
  * polyfill ([./web-audio]) shares the same audrv driver + voice pool
@@ -147,7 +151,28 @@ export class Audio extends EventTarget {
 	}
 
 	set loop(val: boolean) {
+		const prev = this.#loop;
 		this.#loop = val;
+		// 2026-06-08 ROUND 32: propagate loop change to active audrv voice.
+		// Without this, an engine that sets `audio.loop = true` AFTER
+		// `audio.play()` started doesn't loop. Pvzge does this for its
+		// background music: AudioSource.play() fires before _syncStates
+		// sets player.loop. The native voice's wavebuf->is_looping is set
+		// once at audrvVoiceAddWaveBuf; to flip it we restart the voice
+		// with new loop setting. Restart only if currently playing AND
+		// value actually changed AND we have decoded PCM.
+		if (prev !== val && this.#voiceId >= 0 && !this.#paused && this.#decoded) {
+			$.audioStop(this.#voiceId);
+			$.audioPlay(
+				this.#decoded.pcmData,
+				this.#voiceId,
+				this.#volume,
+				this.#loop,
+				this.#decoded.sampleRate,
+				this.#decoded.channels,
+				this.#decoded.samples,
+			);
+		}
 	}
 
 	get paused(): boolean {
@@ -239,7 +264,17 @@ export class Audio extends EventTarget {
 		this.#currentSrc = url.href;
 		const mime = mimeFromExtension(url.pathname);
 
-		fetch(url)
+		// 2026-06-08 ROUND 31: use globalThis.fetch (which may be a wrapped
+		// page-script fetch supporting custom schemes like brewser://) rather
+		// than the lexically-imported internal fetch. Real browsers' HTMLAudio
+		// resolves audio URLs via the page's fetch, so this is spec-correct.
+		// Falls back to the imported fetch if globalThis.fetch isn't set.
+		const _fetchFn = (typeof globalThis !== 'undefined' &&
+			typeof (globalThis as { fetch?: typeof fetch }).fetch === 'function'
+				? (globalThis as { fetch: typeof fetch }).fetch
+				: fetch);
+
+		_fetchFn(url)
 			.then((res) => {
 				if (!res.ok) {
 					throw new Error(`Failed to load audio: ${res.status}`);
@@ -262,6 +297,15 @@ export class Audio extends EventTarget {
 	}
 
 	async play(): Promise<void> {
+		// 2026-06-08 ROUND 27: minimal entry-point trace. Cocos's autoplay
+		// workaround calls Audio.play() and retries on touchend if rejected;
+		// we need to see if play() is reached AND whether #decoded was set.
+		// Module-local counter only (round 23 regressed splash with globalThis
+		// state writes — module-local should be safe).
+		_audioPlayProbeN++;
+		if (_audioPlayProbeN <= 20 || _audioPlayProbeN % 10 === 0) {
+			console.debug('[audio] htmlAudio.play entry n=' + _audioPlayProbeN + ' decoded=' + (this.#decoded ? '1' : '0'));
+		}
 		if (!this.#decoded) {
 			throw new DOMException('No audio source loaded', 'InvalidStateError');
 		}

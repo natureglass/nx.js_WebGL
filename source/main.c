@@ -60,6 +60,62 @@
 extern const uint32_t qjsc_runtime_size;
 extern const uint8_t qjsc_runtime[];
 
+// 2026-06-07 ROUND 6: QuickJS interrupt-handler-based JS execution watchdog.
+// The pvzge inGameScene freeze is in pure-JS code that doesn't call any
+// of the methods we wrap from the page side, so JS-side instrumentation
+// can't see what's running. This C-side handler is called by QuickJS
+// every ~10000 bytecode opcodes during JS execution. Throttled to log
+// once per ~1 second of wall time. Pulls `__pvzge_lastWrappedCall` from
+// JS globals (a string updated by the page-side freeze-hooks wraps on
+// every entry) to surface the most recent named JS activity. Pattern:
+//   - counter still growing across log lines => JS is in a tight bytecode
+//     loop, lastCall names the most recent wrapped fn entered before it
+//   - counter stops growing => JS is blocked in native code (less likely)
+//   - lastCall string === '(none)' or stale => the hung code never enters
+//     any wrapped fn; expand wraps or accept that JS bytecode is the hang
+static uint64_t nx_js_int_counter = 0;
+static u64 nx_js_int_last_log_ns = 0;
+static int nx_js_int_in_handler = 0;
+static int nx_js_interrupt_handler(JSRuntime *rt, void *opaque) {
+	(void)rt;
+	if (nx_js_int_in_handler) return 0; // re-entry guard
+	nx_js_int_counter++;
+	// Cheap throttle: only check wall time every 256 interrupts (was 4096
+	// in round 6 — too coarse, missed activity right before the freeze).
+	if ((nx_js_int_counter & 0xFF) != 0) return 0;
+	u64 now_ns = armTicksToNs(armGetSystemTick());
+	if (nx_js_int_last_log_ns == 0) {
+		nx_js_int_last_log_ns = now_ns;
+		return 0;
+	}
+	u64 delta_ns = now_ns - nx_js_int_last_log_ns;
+	// 2026-06-08 ROUND 45: raised from 50ms → 5s now that the freeze
+	// investigation is closed and pvzge runs full gameplay. Keep the
+	// probe as a low-cost liveness signal (so we can still detect a
+	// hang in future games) but stop spamming the log 20×/sec.
+	if (delta_ns < 5000ULL * 1000 * 1000) return 0; // < 5s
+	nx_js_int_in_handler = 1;
+	JSContext *ctx = (JSContext *)opaque;
+	const char *last_call_str = NULL;
+	JSValue glob = JS_GetGlobalObject(ctx);
+	JSValue v = JS_GetPropertyStr(ctx, glob, "__pvzge_lastWrappedCall");
+	if (JS_IsString(v)) {
+		last_call_str = JS_ToCString(ctx, v);
+	}
+	fprintf(stderr,
+			"[nxjs:js-interrupt] count=%llu wall_delta_ms=%llu lastCall=%s\n",
+			(unsigned long long)nx_js_int_counter,
+			(unsigned long long)(delta_ns / 1000000ULL),
+			last_call_str ? last_call_str : "<unset>");
+	fflush(stderr);
+	if (last_call_str) JS_FreeCString(ctx, last_call_str);
+	JS_FreeValue(ctx, v);
+	JS_FreeValue(ctx, glob);
+	nx_js_int_last_log_ns = now_ns;
+	nx_js_int_in_handler = 0;
+	return 0;
+}
+
 // Text renderer
 static PrintConsole *print_console = NULL;
 
@@ -69,6 +125,29 @@ static Framebuffer *framebuffer = NULL;
 static uint8_t *js_framebuffer = NULL;
 static u32 js_fb_width = 0;
 static u32 js_fb_height = 0;
+
+// Display buffer: page pixels with the cursor overlay composited on top.
+// The Switch framebuffer memcpy reads from THIS buffer, not directly from
+// `js_framebuffer` (= canvas->data). This keeps the cursor from ever
+// landing in canvas->data — fixing the "ImageData save/restore corrupts
+// page pixels" class of bug the JS-side dirty-rect approach hit. When
+// no cursor is enabled the buffer is unused and we memcpy js_framebuffer
+// directly. Sized to match js_framebuffer in `nx_framebuffer_init`.
+static uint8_t *display_buffer = NULL;
+static size_t display_buffer_size = 0;
+
+// Cursor overlay state. JS sets the bitmap once (or whenever sprite size
+// changes) and just updates x/y per cursor tick. The C-side memcpy step
+// reads this every frame.
+static bool cursor_overlay_enabled = false;
+static int cursor_overlay_x = 0;
+static int cursor_overlay_y = 0;
+static int cursor_overlay_w = 0;
+static int cursor_overlay_h = 0;
+// Non-premultiplied RGBA8 bitmap, sized cursor_overlay_w * cursor_overlay_h * 4.
+// Owned by C; (re)allocated whenever bitmap dimensions change.
+static uint8_t *cursor_overlay_rgba = NULL;
+static size_t cursor_overlay_rgba_size = 0;
 
 void nx_console_init(nx_context_t *nx_ctx) {
 	nx_ctx->rendering_mode = NX_RENDERING_MODE_CONSOLE;
@@ -105,6 +184,15 @@ static JSValue nx_framebuffer_init(JSContext *ctx, JSValueConst this_val,
 	js_framebuffer = canvas->data;
 	js_fb_width = width;
 	js_fb_height = height;
+	// Allocate / resize the display buffer alongside the page framebuffer
+	// so the per-frame composite step always has a destination sized to
+	// match js_framebuffer.
+	size_t needed = (size_t)width * (size_t)height * 4;
+	if (needed != display_buffer_size) {
+		free(display_buffer);
+		display_buffer = malloc(needed);
+		display_buffer_size = display_buffer ? needed : 0;
+	}
 	framebuffer = malloc(sizeof(Framebuffer));
 	framebufferCreate(framebuffer, win, width, height, PIXEL_FORMAT_BGRA_8888,
 					  2);
@@ -119,6 +207,210 @@ void nx_framebuffer_exit() {
 		free(framebuffer);
 		framebuffer = NULL;
 		js_framebuffer = NULL;
+	}
+	if (display_buffer != NULL) {
+		free(display_buffer);
+		display_buffer = NULL;
+		display_buffer_size = 0;
+	}
+	if (cursor_overlay_rgba != NULL) {
+		free(cursor_overlay_rgba);
+		cursor_overlay_rgba = NULL;
+		cursor_overlay_rgba_size = 0;
+	}
+	cursor_overlay_enabled = false;
+	cursor_overlay_w = 0;
+	cursor_overlay_h = 0;
+}
+
+// ---- Cursor overlay -------------------------------------------------
+//
+// The cursor is composited into `display_buffer` at present time, NOT
+// painted into canvas->data. This is the C-side replacement for the JS
+// dirty-rect save/restore approach, which corrupted page pixels when the
+// underlying surface was partially transparent (premultiplied 0 → memcpy
+// → opaque black on the Switch framebuffer).
+//
+// JS hands us a non-premultiplied RGBA bitmap once (and re-sends it
+// whenever the sprite changes shape). Position-only updates use the
+// cheaper `setCursorOverlayPosition` to avoid copying the bitmap each
+// time the joycon stick moves the cursor by one pixel.
+//
+// The composite math: src is non-premult RGBA; dst is premult ARGB32 in
+// little-endian byte order (BGRA in memory) since cairo image surfaces
+// match that layout on the Switch's LE arch. We src-over composite onto
+// dst, producing premult BGRA — same format the screen FB expects.
+
+static JSValue nx_set_cursor_overlay(JSContext *ctx, JSValueConst this_val,
+									 int argc, JSValueConst *argv) {
+	if (argc < 5) {
+		fprintf(stderr, "[nxjs:cursor] setCursorOverlay BAD argc=%d\n", argc);
+		return JS_ThrowTypeError(ctx,
+			"setCursorOverlay: expected (x, y, rgbaArrayBuffer, w, h)");
+	}
+	int x, y, w, h;
+	if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]) ||
+		JS_ToInt32(ctx, &w, argv[3]) || JS_ToInt32(ctx, &h, argv[4])) {
+		fprintf(stderr, "[nxjs:cursor] setCursorOverlay BAD int args\n");
+		return JS_EXCEPTION;
+	}
+	if (w <= 0 || h <= 0) {
+		// Treat zero-sized as a disable.
+		fprintf(stderr, "[nxjs:cursor] setCursorOverlay disable (w=%d h=%d)\n", w, h);
+		cursor_overlay_enabled = false;
+		return JS_UNDEFINED;
+	}
+
+	// Resolve the bitmap source. Prefer the TypedArray path first because
+	// ImageData.data is a Uint8ClampedArray (a TypedArray, not a raw
+	// ArrayBuffer) — `JS_GetArrayBuffer(view)` returns NULL on a
+	// TypedArray, but it's clearer to ask for the typed-array buffer
+	// directly when the caller hands us a view. Falls back to direct
+	// ArrayBuffer when the caller passes one already.
+	size_t src_offset = 0, src_size = 0;
+	uint8_t *src = NULL;
+	size_t bpe = 0;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[2], &src_offset,
+	                                    &src_size, &bpe);
+	if (!JS_IsException(ab)) {
+		size_t ab_size = 0;
+		uint8_t *ab_ptr = JS_GetArrayBuffer(ctx, &ab_size, ab);
+		JS_FreeValue(ctx, ab);
+		if (ab_ptr) {
+			src = ab_ptr + src_offset;
+		}
+	} else {
+		// Not a TypedArray; clear the pending exception and try ArrayBuffer.
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		src = JS_GetArrayBuffer(ctx, &src_size, argv[2]);
+		src_offset = 0;
+	}
+	if (!src) {
+		fprintf(stderr, "[nxjs:cursor] setCursorOverlay rgba arg is not a Uint8Array/ArrayBuffer\n");
+		return JS_ThrowTypeError(ctx,
+			"setCursorOverlay: rgba arg is not a Uint8Array/ArrayBuffer");
+	}
+	size_t needed = (size_t)w * (size_t)h * 4;
+	if (src_size < needed) {
+		fprintf(stderr, "[nxjs:cursor] setCursorOverlay rgba too small needed=%zu got=%zu\n",
+		        needed, src_size);
+		return JS_ThrowRangeError(ctx,
+			"setCursorOverlay: rgba buffer too small (need %zu, have %zu)",
+			needed, src_size);
+	}
+
+	if (needed != cursor_overlay_rgba_size) {
+		uint8_t *new_buf = realloc(cursor_overlay_rgba, needed);
+		if (!new_buf) {
+			return JS_ThrowOutOfMemory(ctx);
+		}
+		cursor_overlay_rgba = new_buf;
+		cursor_overlay_rgba_size = needed;
+	}
+	memcpy(cursor_overlay_rgba, src, needed);
+	cursor_overlay_x = x;
+	cursor_overlay_y = y;
+	cursor_overlay_w = w;
+	cursor_overlay_h = h;
+	cursor_overlay_enabled = true;
+	// Sample a non-corner pixel so we can confirm the bitmap arrived
+	// non-empty (default arrow pixel at ~(5,8) should be white-ish).
+	{
+		static int n = 0;
+		++n;
+		if (n <= 4) {
+			size_t i = (size_t)8 * (size_t)w * 4 + 5 * 4;
+			if (i + 3 < needed) {
+				fprintf(stderr, "[nxjs:cursor] setCursorOverlay ok n=%d xy=(%d,%d) wh=%dx%d "
+				        "sample[5,8]=(%u,%u,%u,%u)\n",
+				        n, x, y, w, h,
+				        cursor_overlay_rgba[i], cursor_overlay_rgba[i+1],
+				        cursor_overlay_rgba[i+2], cursor_overlay_rgba[i+3]);
+			}
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_set_cursor_overlay_position(JSContext *ctx,
+											  JSValueConst this_val,
+											  int argc, JSValueConst *argv) {
+	if (argc < 2) {
+		return JS_ThrowTypeError(ctx,
+			"setCursorOverlayPosition: expected (x, y)");
+	}
+	int x, y;
+	if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1])) {
+		return JS_EXCEPTION;
+	}
+	cursor_overlay_x = x;
+	cursor_overlay_y = y;
+	{
+		static int n = 0;
+		++n;
+		if (n <= 4 || (n % 60) == 0) {
+			fprintf(stderr, "[nxjs:cursor] setCursorOverlayPosition n=%d xy=(%d,%d) enabled=%d\n",
+			        n, x, y, (int)cursor_overlay_enabled);
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_clear_cursor_overlay(JSContext *ctx, JSValueConst this_val,
+									   int argc, JSValueConst *argv) {
+	cursor_overlay_enabled = false;
+	return JS_UNDEFINED;
+}
+
+// Composites the cursor bitmap onto `display_buffer` at (cursor_overlay_x,
+// cursor_overlay_y), clamped to the framebuffer. Assumes
+// `display_buffer` already holds a fresh copy of `js_framebuffer`.
+static void composite_cursor_overlay(void) {
+	if (!cursor_overlay_enabled || !cursor_overlay_rgba ||
+		cursor_overlay_w <= 0 || cursor_overlay_h <= 0) {
+		return;
+	}
+	int x0 = cursor_overlay_x;
+	int y0 = cursor_overlay_y;
+	int w = cursor_overlay_w;
+	int h = cursor_overlay_h;
+	int src_off_x = 0;
+	int src_off_y = 0;
+	if (x0 < 0) { src_off_x = -x0; w += x0; x0 = 0; }
+	if (y0 < 0) { src_off_y = -y0; h += y0; y0 = 0; }
+	if (x0 + w > (int)js_fb_width) w = (int)js_fb_width - x0;
+	if (y0 + h > (int)js_fb_height) h = (int)js_fb_height - y0;
+	if (w <= 0 || h <= 0) return;
+
+	const int src_stride = cursor_overlay_w * 4;
+	const int dst_stride = (int)js_fb_width * 4;
+	for (int row = 0; row < h; row++) {
+		const uint8_t *s = cursor_overlay_rgba +
+		                   (src_off_y + row) * src_stride +
+		                   src_off_x * 4;
+		uint8_t *d = display_buffer + (y0 + row) * dst_stride + x0 * 4;
+		for (int col = 0; col < w; col++) {
+			uint8_t sr = s[0], sg = s[1], sb = s[2], sa = s[3];
+			if (sa == 0) {
+				// transparent — keep destination
+			} else if (sa == 255) {
+				// opaque — overwrite. dst is BGRA in memory.
+				d[0] = sb;
+				d[1] = sg;
+				d[2] = sr;
+				d[3] = 255;
+			} else {
+				// src-over: out = src*sa + dst*(1-sa). dst is premult BGRA.
+				uint32_t inv = 255 - sa;
+				uint32_t db = d[0], dg = d[1], dr = d[2], da = d[3];
+				d[0] = (uint8_t)((sb * sa + db * inv + 127) / 255);
+				d[1] = (uint8_t)((sg * sa + dg * inv + 127) / 255);
+				d[2] = (uint8_t)((sr * sa + dr * inv + 127) / 255);
+				d[3] = (uint8_t)((255u * sa + da * inv + 127) / 255);
+			}
+			s += 4;
+			d += 4;
+		}
 	}
 }
 
@@ -568,6 +860,41 @@ void nx_render_loading_image(nx_context_t *nx_ctx, const char *nro_path) {
 			free(temp_loading_image_path);
 		}
 	}
+	if (loading_image == NULL) {
+		// 2026-06-07: no loading.jpg shipped. Without this, the first frame
+		// presented after framebuffer-create shows uninit Tegra GPU memory
+		// (commonly leftover red from a previous app's buffers, easily
+		// confused for an engine bug). Allocate the framebuffer just long
+		// enough to push a single solid-black frame, then tear it down so
+		// the normal init path can take ownership cleanly.
+		win = nwindowGetDefault();
+		int blank_width = 1280;
+		int blank_height = 720;
+		framebuffer = malloc(sizeof(Framebuffer));
+		if (framebuffer) {
+			framebufferCreate(framebuffer, win, blank_width, blank_height,
+			                  PIXEL_FORMAT_BGRA_8888, 2);
+			framebufferMakeLinear(framebuffer);
+			// Switch framebufferCreate sets up a double-buffer swapchain.
+			// A single present leaves the OTHER buffer holding uninit Tegra
+			// GPU memory (leftover red from a previous app), which surfaces
+			// on the next vsync after the JS runtime initializes its own
+			// framebuffer. Present TWO cleared frames so BOTH back-buffers
+			// are zeroed before tearing down.
+			for (int i = 0; i < 2; i++) {
+				u32 stride;
+				u8 *framebuf = (u8 *)framebufferBegin(framebuffer, &stride);
+				if (framebuf) {
+					memset(framebuf, 0, (size_t)blank_height * stride);
+				}
+				framebufferEnd(framebuffer);
+			}
+			framebufferClose(framebuffer);
+			free(framebuffer);
+			framebuffer = NULL;
+		}
+		return;
+	}
 	if (loading_image != NULL) {
 		win = nwindowGetDefault();
 		int width = 1280;
@@ -639,6 +966,13 @@ int main(int argc, char *argv[]) {
 
 	JSRuntime *rt = JS_NewRuntime();
 	JSContext *ctx = JS_NewContext(rt);
+
+	// 2026-06-07 ROUND 6: install JS execution watchdog (see nx_js_interrupt_handler
+	// near top of this file for full docs). Logs `[nxjs:js-interrupt]` lines to
+	// nxjs-debug.log once per ~1s while JS bytecode is executing, so the pvzge
+	// inGameScene freeze becomes observable from C side even when no JS-side
+	// wrap fires.
+	JS_SetInterruptHandler(rt, nx_js_interrupt_handler, ctx);
 
 	nx_ctx->rendering_mode = NX_RENDERING_MODE_INIT;
 	nx_ctx->thpool = thpool_init(4);
@@ -760,6 +1094,13 @@ int main(int argc, char *argv[]) {
 
 		// framebuffer renderer
 		JS_CFUNC_DEF("framebufferInit", 1, nx_framebuffer_init),
+
+		// cursor overlay (composited into the display buffer at present
+		// time so the cursor visual never lands in canvas->data — see
+		// `composite_cursor_overlay`).
+		JS_CFUNC_DEF("setCursorOverlay", 5, nx_set_cursor_overlay),
+		JS_CFUNC_DEF("setCursorOverlayPosition", 2, nx_set_cursor_overlay_position),
+		JS_CFUNC_DEF("clearCursorOverlay", 0, nx_clear_cursor_overlay),
 
 		// hid
 		JS_CFUNC_DEF("hidInitializeKeyboard", 0, js_hid_initialize_keyboard),
@@ -946,10 +1287,44 @@ main_loop:
 			// Update the console, sending a new frame to the display
 			consoleUpdate(print_console);
 		} else if (nx_ctx->rendering_mode == NX_RENDERING_MODE_CANVAS) {
-			// Copy the JS framebuffer to the current Switch buffer
+			// Copy the JS framebuffer to the current Switch buffer.
+			// When a cursor overlay is registered, composite it through
+			// `display_buffer` so the cursor visual never persists into
+			// canvas->data.
 			u32 stride;
 			u8 *framebuf = (u8 *)framebufferBegin(framebuffer, &stride);
-			memcpy(framebuf, js_framebuffer, js_fb_width * js_fb_height * 4);
+			size_t total = (size_t)js_fb_width * (size_t)js_fb_height * 4;
+			static int present_n = 0;
+			++present_n;
+			bool composited = false;
+			if (cursor_overlay_enabled && display_buffer &&
+				display_buffer_size >= total) {
+				memcpy(display_buffer, js_framebuffer, total);
+				composite_cursor_overlay();
+				memcpy(framebuf, display_buffer, total);
+				composited = true;
+			} else {
+				memcpy(framebuf, js_framebuffer, total);
+			}
+			// Sample a pixel near the cursor so we can prove the composite
+			// actually wrote something to the FB at the cursor location.
+			if (present_n <= 6 || (present_n % 240) == 0) {
+				int sx = cursor_overlay_x;
+				int sy = cursor_overlay_y + 8;
+				int sxc = sx + 5;
+				if (sx >= 0 && sy >= 0 &&
+				    sx < (int)js_fb_width && sy < (int)js_fb_height) {
+					u8 *p = framebuf + (size_t)sy * (size_t)js_fb_width * 4 +
+					        (size_t)sxc * 4;
+					fprintf(stderr,
+					        "[nxjs:cursor] present n=%d composited=%d enabled=%d "
+					        "xy=(%d,%d) wh=%dx%d fb[%d,%d]=(%u,%u,%u,%u)\n",
+					        present_n, (int)composited, (int)cursor_overlay_enabled,
+					        cursor_overlay_x, cursor_overlay_y,
+					        cursor_overlay_w, cursor_overlay_h,
+					        sxc, sy, p[0], p[1], p[2], p[3]);
+				}
+			}
 			framebufferEnd(framebuffer);
 		}
 	}

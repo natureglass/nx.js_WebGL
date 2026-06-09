@@ -205,6 +205,42 @@ export class Screen extends EventTarget implements globalThis.Screen {
 		stub();
 	}
 
+	/**
+	 * Register a cursor bitmap that the engine composites onto the
+	 * display buffer at present time. The cursor visual NEVER lands in
+	 * the page's canvas->data — this is the engine-side replacement for
+	 * the JS dirty-rect save/restore approach.
+	 *
+	 * @param x cursor top-left x in framebuffer pixels.
+	 * @param y cursor top-left y in framebuffer pixels.
+	 * @param rgba Non-premultiplied RGBA8 bitmap, w*h*4 bytes. Standard
+	 *   `ImageData.data` layout. Passing a smaller buffer throws.
+	 * @param w bitmap width in pixels.
+	 * @param h bitmap height in pixels.
+	 */
+	setCursorOverlay(
+		x: number,
+		y: number,
+		rgba: ArrayBuffer | ArrayBufferView,
+		w: number,
+		h: number,
+	): void {
+		$.setCursorOverlay(x, y, rgba, w, h);
+	}
+
+	/**
+	 * Cheap position-only update for the cursor overlay. Avoids re-copying
+	 * the bitmap when the user has only moved the cursor by a pixel.
+	 */
+	setCursorOverlayPosition(x: number, y: number): void {
+		$.setCursorOverlayPosition(x, y);
+	}
+
+	/** Disable the cursor overlay until the next `setCursorOverlay` call. */
+	clearCursorOverlay(): void {
+		$.clearCursorOverlay();
+	}
+
 	// Compat with HTML DOM interface
 	className = '';
 	get nodeType() {

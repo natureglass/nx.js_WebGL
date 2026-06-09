@@ -92,6 +92,48 @@ static const AudioRendererConfig arConfig = {
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
+/* 2026-06-08 ROUND 34/35: live-PCM-bytes accounting + budget cap with
+ * silent-buffer fallback.
+ *
+ * Cocos (and Web Audio engines generally) pre-decode large mp3 banks
+ * during scene transitions. Pvzge's gameplay-scene load decodes ~650
+ * SFX mp3s; round 33 logs showed cumulative decoded PCM reaching
+ * ~195 MB held in JS arraybuffer heap — enough to OOM or crash the
+ * Switch app process. This budget caps the LIVE (not cumulative) PCM
+ * memory: when total alive aligned PCM bytes would exceed the budget,
+ * the decode returns a TINY SILENT buffer instead of the real PCM.
+ *
+ * Round 35 changed semantics from JS-error rejection to silent-buffer
+ * fallback. Round 34 (32 MB + reject) made Cocos's loading scene hang
+ * at 50% because the loader treats decodeAudioData rejection as a
+ * fatal asset error and stalls the scene-load promise. Returning a
+ * tiny silent buffer (one 4 KB page = ~46 ms of mono silence) makes
+ * Cocos's AudioClip "succeed" → AssetManager promise resolves → scene
+ * progresses. The SFX is silent for that one cue but gameplay
+ * proceeds.
+ *
+ * `pcm_in_flight_bytes` is decremented by `pcm_arraybuffer_free`,
+ * which is the GC finalizer registered on every real PCM-bearing
+ * ArrayBuffer. All access is single-threaded (JS thread + GC, both
+ * serialized by QuickJS). Decode WORK runs on a thread pool but the
+ * memory accounting + budget check happens in
+ * `decode_audio_after_work` which is on the JS thread.
+ *
+ * 96 MB chosen as a generous cap: well above the ~32 MB peak observed
+ * in round 34 loading-scene attempt, well below the 195 MB that
+ * crashed gameplay load in round 32. Expect zero silent fallbacks for
+ * splash/UI, very few during gameplay scene load. */
+#define PCM_BUDGET_BYTES (96ULL * 1024 * 1024)
+static size_t pcm_in_flight_bytes = 0;
+
+static void pcm_arraybuffer_free(JSRuntime *rt, void *opaque, void *ptr) {
+	(void)rt;
+	size_t sz = (size_t)(uintptr_t)opaque;
+	if (pcm_in_flight_bytes >= sz) pcm_in_flight_bytes -= sz;
+	else pcm_in_flight_bytes = 0;
+	free(ptr);
+}
+
 /* ── Decode async data ── */
 
 typedef struct {
@@ -175,6 +217,15 @@ static JSValue decode_audio_after_work(JSContext *ctx, nx_work_t *req) {
 	JS_FreeValue(ctx, data->buffer_val);
 	JS_FreeCString(ctx, data->mime_type);
 
+	/* Keep ERROR log only — successful decodes happen 600+ times during
+	 * gameplay scene load and don't need per-call logging now that the
+	 * PCM budget is fielded. */
+	if (data->err_str) {
+		fprintf(stderr, "[nxjs:audio-decode-done] FAIL err=%s\n",
+				data->err_str);
+		fflush(stderr);
+	}
+
 	if (data->err_str) {
 		JSValue err = JS_NewError(ctx);
 		JS_DefinePropertyValueStr(ctx, err, "message",
@@ -189,6 +240,60 @@ static JSValue decode_audio_after_work(JSContext *ctx, nx_work_t *req) {
 
 	/* Allocate page-aligned memory for audren mempool compatibility */
 	size_t aligned_size = ALIGN_UP(pcm_byte_size, AUDIO_ALIGN);
+
+	/* 2026-06-08 ROUND 34/35: enforce live-PCM budget with silent-buffer
+	 * fallback. If granting this decode would push alive aligned PCM past
+	 * PCM_BUDGET_BYTES, return a tiny 4 KB silent buffer instead of the
+	 * real decoded PCM. Cocos's decodeAudioData promise resolves with a
+	 * valid (but silent) AudioBuffer; AssetManager treats the AudioClip
+	 * load as successful; the scene proceeds. The one affected SFX cue is
+	 * silent. Round 34 rejected with JS error → Cocos's loader stalled
+	 * the loading scene at 50%; silent fallback avoids that stall. */
+	if (pcm_in_flight_bytes + aligned_size > PCM_BUDGET_BYTES) {
+		fprintf(stderr,
+				"[nxjs:audio-budget-silent] in_flight_mb=%.2f wanted_size=%zu budget_mb=%.2f sr=%u ch=%u\n",
+				(double)pcm_in_flight_bytes / (1024.0 * 1024.0),
+				aligned_size,
+				(double)PCM_BUDGET_BYTES / (1024.0 * 1024.0),
+				(unsigned)data->sample_rate, (unsigned)data->channels);
+		fflush(stderr);
+		if (data->pcm_data) free(data->pcm_data);
+
+		/* Tiny silent buffer: one 4 KB page = 2048 int16 samples. At the
+		 * original sample_rate/channels Cocos sees a brief (~40 ms mono)
+		 * AudioBuffer. We do NOT count this against pcm_in_flight_bytes;
+		 * if budget pressure is high, many small silent buffers staying
+		 * unaccounted is acceptable (~4 KB each, hundreds before any
+		 * meaningful pressure). Uses bare free as finalizer so it's not
+		 * tracked. */
+		void *silent_buf = memalign(AUDIO_ALIGN, AUDIO_ALIGN);
+		if (!silent_buf) {
+			return JS_ThrowInternalError(ctx, "OOM on silent fallback buffer");
+		}
+		memset(silent_buf, 0, AUDIO_ALIGN);
+		armDCacheFlush(silent_buf, AUDIO_ALIGN);
+
+		uint32_t safe_sr = data->sample_rate > 0 ? data->sample_rate : 44100;
+		uint32_t safe_ch = data->channels > 0 ? data->channels : 1;
+		uint64_t silent_samples = AUDIO_ALIGN / (sizeof(int16_t) * safe_ch);
+
+		JSValue silent_ab = JS_NewArrayBuffer(
+			ctx, (uint8_t *)silent_buf, AUDIO_ALIGN,
+			(JSFreeArrayBufferDataFunc *)free, NULL, false);
+
+		JSValue silent_result = JS_NewObject(ctx);
+		JS_SetPropertyStr(ctx, silent_result, "pcmData", silent_ab);
+		JS_SetPropertyStr(ctx, silent_result, "sampleRate",
+						  JS_NewUint32(ctx, safe_sr));
+		JS_SetPropertyStr(ctx, silent_result, "channels",
+						  JS_NewUint32(ctx, safe_ch));
+		JS_SetPropertyStr(ctx, silent_result, "samples",
+						  JS_NewFloat64(ctx, (double)silent_samples));
+		JS_SetPropertyStr(ctx, silent_result, "byteLength",
+						  JS_NewFloat64(ctx, (double)AUDIO_ALIGN));
+		return silent_result;
+	}
+
 	void *aligned_buf = memalign(AUDIO_ALIGN, aligned_size);
 	if (!aligned_buf) {
 		if (data->pcm_data) free(data->pcm_data);
@@ -199,11 +304,33 @@ static JSValue decode_audio_after_work(JSContext *ctx, nx_work_t *req) {
 		   aligned_size - pcm_byte_size);
 	armDCacheFlush(aligned_buf, aligned_size);
 
+	pcm_in_flight_bytes += aligned_size;
+
+	/* 2026-06-08 ROUND 33: cumulative decoded-PCM memory accounting +
+	 * round-34 live in_flight metric. Cumulative is monotonic (sums
+	 * every decode ever); in_flight subtracts on GC, so it reflects
+	 * real memory pressure. */
+	{
+		static uint64_t total_dec_bytes = 0;
+		static uint64_t total_dec_count = 0;
+		total_dec_bytes += aligned_size;
+		total_dec_count++;
+		if (total_dec_count <= 5 || total_dec_count % 50 == 0) {
+			fprintf(stderr,
+					"[nxjs:audio-pcm-mem] n=%llu bytes_this=%zu cumulative_mb=%.2f in_flight_mb=%.2f\n",
+					(unsigned long long)total_dec_count,
+					aligned_size,
+					(double)total_dec_bytes / (1024.0 * 1024.0),
+					(double)pcm_in_flight_bytes / (1024.0 * 1024.0));
+			fflush(stderr);
+		}
+	}
+
 	if (data->pcm_data) free(data->pcm_data);
 
 	JSValue ab = JS_NewArrayBuffer(
 		ctx, (uint8_t *)aligned_buf, aligned_size,
-		(JSFreeArrayBufferDataFunc *)free, NULL, false);
+		pcm_arraybuffer_free, (void *)(uintptr_t)aligned_size, false);
 
 	JSValue result = JS_NewObject(ctx);
 	JS_SetPropertyStr(ctx, result, "pcmData", ab);
@@ -461,10 +588,39 @@ static JSValue nx_audio_play(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_EXCEPTION;
 	total_samples = (uint64_t)samples_dbl;
 
+	/* 2026-06-08 ROUND 26: probe every audio play. Logs voice, format,
+	   loop, volume so we can correlate which audio source actually reaches
+	   audrv. Pvzge user reports background music silent / SFX work — this
+	   probe + nx_audio_alloc_voice probe pinpoints where music fails. */
+	{
+		static uint64_t play_n = 0;
+		play_n++;
+		fprintf(stderr,
+				"[nxjs:audio-play] n=%llu voice=%d vol=%.3f loop=%d sr=%d "
+				"ch=%d samples=%llu pcm_size=%zu\n",
+				(unsigned long long)play_n, voice_id, volume, loop,
+				(int)sample_rate, (int)channels,
+				(unsigned long long)total_samples, pcm_size);
+		fflush(stderr);
+	}
+
 	nx_audio_lock();
 	/* Add the PCM buffer as a mempool */
 	size_t aligned_size = ALIGN_UP(pcm_size, AUDIO_ALIGN);
 	int pool_id = audrvMemPoolAdd(&audio_driver, pcm_data, aligned_size);
+	/* 2026-06-08 ROUND 33: probe audrv mempool exhaustion. Logs return value
+	 * + count of voices still holding mempool slots. Pvzge crash during
+	 * gameplay scene load may be audio-mempool-exhaust related. */
+	{
+		int active_mempools = 0;
+		for (int i = 0; i < AUDIO_NUM_VOICES; i++) {
+			if (voice_mempool_id[i] >= 0) active_mempools++;
+		}
+		fprintf(stderr,
+				"[nxjs:audio-mempool] add ret=%d active_voices_with_mp=%d pcm_bytes=%zu\n",
+				pool_id, active_mempools, aligned_size);
+		fflush(stderr);
+	}
 	if (pool_id < 0) {
 		nx_audio_unlock();
 		return JS_ThrowInternalError(ctx, "Failed to add audio mempool");
@@ -590,6 +746,17 @@ static JSValue nx_audio_get_played_samples(JSContext *ctx,
 static JSValue nx_audio_alloc_voice(JSContext *ctx, JSValueConst this_val,
 									int argc, JSValueConst *argv) {
 	int v = nx_audio_acquire_voice();
+	/* 2026-06-08 ROUND 26: probe voice allocation. If music never gets a
+	   voice, allocator is exhausted. Throttled to first 100 + every 25th. */
+	{
+		static uint64_t alloc_n = 0;
+		alloc_n++;
+		if (alloc_n <= 100 || (alloc_n % 25) == 0) {
+			fprintf(stderr, "[nxjs:audio-alloc-voice] n=%llu voice=%d\n",
+					(unsigned long long)alloc_n, v);
+			fflush(stderr);
+		}
+	}
 	if (v < 0) return JS_ThrowInternalError(ctx, "No free audio voices");
 	return JS_NewInt32(ctx, v);
 }

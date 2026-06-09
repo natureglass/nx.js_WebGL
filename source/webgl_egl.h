@@ -350,7 +350,16 @@ bool nx_webgl_egl_draw_passthrough(
 	bool depth_enabled,
 	bool cull_enabled,
 	uint32_t cull_face_mode,
-	uint32_t front_face);
+	uint32_t front_face,
+	/* 2026-06-08 ROUND 22: stencil + color-mask forwarding. Previously
+	   `gl.stencilFunc / stencilOp / stencilMask / colorMask` were stored
+	   on the JS context but never reached native GL, so cc.Mask's stencil
+	   clip never worked (overflow rendered outside the mask shape). */
+	bool stencil_enabled,
+	uint32_t stencil_func, int32_t stencil_ref, uint32_t stencil_value_mask,
+	uint32_t stencil_fail, uint32_t stencil_zfail, uint32_t stencil_zpass,
+	uint32_t stencil_mask,
+	const bool *color_mask /* 4 bools: R,G,B,A */);
 
 bool nx_webgl_egl_has_instancing(nx_webgl_egl_t *backend);
 
@@ -547,6 +556,14 @@ bool nx_webgl_egl_tex_sub_image_3d(nx_webgl_egl_t *backend,
 bool nx_webgl_egl_copy_tex_sub_image_3d(nx_webgl_egl_t *backend,
                                          uint32_t target, int level,
                                          int xoff, int yoff, int zoff,
+                                         int x, int y, int w, int h);
+bool nx_webgl_egl_copy_tex_image_2d(nx_webgl_egl_t *backend,
+                                     uint32_t target, int level,
+                                     uint32_t internalformat,
+                                     int x, int y, int w, int h, int border);
+bool nx_webgl_egl_copy_tex_sub_image_2d(nx_webgl_egl_t *backend,
+                                         uint32_t target, int level,
+                                         int xoff, int yoff,
                                          int x, int y, int w, int h);
 bool nx_webgl_egl_compressed_tex_image_3d(nx_webgl_egl_t *backend,
                                            uint32_t target, int level,

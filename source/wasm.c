@@ -120,9 +120,17 @@ static JSValue nx_wasm_memory_new_(JSContext *ctx) {
 
 static JSClassID nx_wasm_table_class_id;
 
+/* `owned` distinguishes user-constructed tables (where the wrapper
+ * holds its own malloc'd backing storage that the finalizer must
+ * release) from module-exported tables (where `table` + `table_size`
+ * point into the wasm3 module's own memory and the finalizer must
+ * leave them alone). itch.io compat: Godot 4 + many Emscripten
+ * builds construct a Table from JS to pass as a WASM import, so
+ * the user-constructor path matters. */
 typedef struct {
 	IM3Function *table;
 	u32 *table_size;
+	bool owned;
 } nx_wasm_table_t;
 
 static nx_wasm_table_t *nx_wasm_table_get(JSContext *ctx, JSValueConst obj) {
@@ -132,6 +140,10 @@ static nx_wasm_table_t *nx_wasm_table_get(JSContext *ctx, JSValueConst obj) {
 static void finalizer_wasm_table(JSRuntime *rt, JSValue val) {
 	nx_wasm_table_t *data = JS_GetOpaque(val, nx_wasm_table_class_id);
 	if (data) {
+		if (data->owned) {
+			if (data->table) js_free_rt(rt, data->table);
+			if (data->table_size) js_free_rt(rt, data->table_size);
+		}
 		js_free_rt(rt, data);
 	}
 }
@@ -151,6 +163,15 @@ static JSClassID nx_wasm_exported_func_class_id;
 
 typedef struct {
 	IM3Function function;
+	// Duplicated JSValue reference to the Instance JS object so that the
+	// Instance (and therefore its underlying runtime/module/functions[]) cannot
+	// be GC'd while any export wrapper is still reachable. Without this, the
+	// Instance can be collected while JS code still holds a bound export
+	// function, leaving `function` as a dangling pointer into freed memory.
+	// Initialized to JS_UNDEFINED for the Table.get path that doesn't carry an
+	// instance reference; in that case the table's lifecycle is managed
+	// separately by the Table JS object.
+	JSValue instance;
 } nx_wasm_exported_func_t;
 
 static nx_wasm_exported_func_t *nx_wasm_exported_func_get(JSContext *ctx,
@@ -162,11 +183,13 @@ static void finalizer_wasm_exported_func(JSRuntime *rt, JSValue val) {
 	nx_wasm_exported_func_t *data =
 		JS_GetOpaque(val, nx_wasm_exported_func_class_id);
 	if (data) {
+		JS_FreeValueRT(rt, data->instance);
 		js_free_rt(rt, data);
 	}
 }
 
-static JSValue nx_wasm_exported_func_new(JSContext *ctx, IM3Function func) {
+static JSValue nx_wasm_exported_func_new(JSContext *ctx, IM3Function func,
+										 JSValueConst instance) {
 	JSValue obj = JS_NewObjectClass(ctx, nx_wasm_exported_func_class_id);
 	nx_wasm_exported_func_t *data =
 		js_mallocz(ctx, sizeof(nx_wasm_exported_func_t));
@@ -175,6 +198,7 @@ static JSValue nx_wasm_exported_func_new(JSContext *ctx, IM3Function func) {
 		return JS_EXCEPTION;
 	}
 	data->function = func;
+	data->instance = JS_DupValue(ctx, instance);
 	JS_SetOpaque(obj, data);
 	return obj;
 }
@@ -196,6 +220,10 @@ static void finalizer_wasm_module(JSRuntime *rt, JSValue val) {
 	if (m) {
 		if (m->module)
 			m3_FreeModule(m->module);
+		// m->data is now an owned copy (see nx_wasm_new_module). Free it AFTER
+		// m3_FreeModule since the M3Module's wasmStart/etc. pointers reference it.
+		if (m->data)
+			js_free_rt(rt, m->data);
 		js_free_rt(rt, m);
 	}
 }
@@ -289,6 +317,14 @@ typedef struct {
 	bool loaded;
 	nx_wasm_imported_func_t **imported_funcs;
 	size_t num_imported_funcs;
+	// v15 lifecycle fix: hold a strong JS ref to the parent Module JS value so
+	// the Module (and therefore its owned m->data byte buffer) cannot be GC'd
+	// while this Instance is still alive. Without this, JS code that drops the
+	// Module reference (e.g. `const { instance } = WebAssembly.instantiate(...)`)
+	// lets the Module finalizer run, frees m->data, and dangles every wasm
+	// pointer in instance->module's functions[] — next lazy compile reads what
+	// is now allocator free-list metadata.
+	JSValue module_value;
 } nx_wasm_instance_t;
 
 // static nx_wasm_instance_t *nx_wasm_instance_get(JSContext *ctx, JSValueConst
@@ -319,6 +355,9 @@ static void finalizer_wasm_instance(JSRuntime *rt, JSValue val) {
 		}
 		if (i->runtime)
 			m3_FreeRuntime(i->runtime);
+		// Release the strong ref to the parent Module JS value (v15). Safe to
+		// call on JS_UNDEFINED (the init value when construction failed early).
+		JS_FreeValueRT(rt, i->module_value);
 		js_free_rt(rt, i);
 	}
 }
@@ -345,13 +384,28 @@ static JSValue nx_wasm_new_module(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 	}
 
-	M3Result r = m3_ParseModule(nx_ctx->wasm_env, &m->module, buf, size);
+	// Own a private copy of the bytes. m3_ParseModule does NOT copy — it stores
+	// raw pointers into the buffer (module->wasmStart + each function's
+	// func->wasm/wasmEnd) and re-reads them lazily during function-body compile.
+	// JS-side ArrayBuffer mutation between parse and lazy compile (Cocos
+	// Creator's bullet/spine loaders reuse/zero the buffer post-instantiation)
+	// would otherwise corrupt what wasm3 reads.
+	uint8_t *owned = js_malloc(ctx, size);
+	if (!owned) {
+		JS_FreeValue(ctx, obj);
+		JS_ThrowOutOfMemory(ctx);
+		return JS_EXCEPTION;
+	}
+	memcpy(owned, buf, size);
+
+	M3Result r = m3_ParseModule(nx_ctx->wasm_env, &m->module, owned, size);
 	if (r) {
+		js_free(ctx, owned);
 		JS_FreeValue(ctx, obj);
 		return nx_throw_wasm_error(ctx, "CompileError", r);
 	}
 
-	m->data = buf;
+	m->data = owned;
 	m->size = size;
 
 	return obj;
@@ -438,10 +492,19 @@ static JSValue nx_wasm_new_instance(JSContext *ctx, JSValueConst this_val,
 		JS_ThrowOutOfMemory(ctx);
 		return JS_EXCEPTION;
 	}
+	// Init JS-value-typed fields so the finalizer can free safely if any of the
+	// fallible setup below bails. js_mallocz gives zeroed bytes which decode as
+	// JS_MKVAL(JS_TAG_INT, 0) — safe to JS_FreeValue but not semantically right.
+	instance->module_value = JS_UNDEFINED;
 
 	JS_SetOpaque(opaque, instance);
 
 	nx_wasm_module_t *m = nx_wasm_module_get(ctx, argv[0]);
+	// v15 lifecycle fix: keep the Module JS value reachable for as long as this
+	// Instance is alive. Module owns m->data (the wasm bytes); instance->module
+	// stores raw pointers into that buffer via wasmStart/wasmEnd + per-function
+	// wasm/wasmEnd, and re-reads them lazily during function-body compile.
+	instance->module_value = JS_DupValue(ctx, argv[0]);
 
 	M3Result r =
 		m3_ParseModule(nx_ctx->wasm_env, &instance->module, m->data, m->size);
@@ -578,8 +641,10 @@ static JSValue nx_wasm_new_instance(JSContext *ctx, JSValueConst this_val,
 			JS_FreeValue(ctx, v);
 			JS_FreeValue(ctx, matching_import);
 		} else if (f->export_name) {
-			// Exported `Function`
-			JSValue val = nx_wasm_exported_func_new(ctx, f);
+			// Exported `Function` — pass the Instance opaque so the JS handle
+			// keeps the Instance (and therefore its runtime / module /
+			// functions[]) alive for as long as the export wrapper is reachable.
+			JSValue val = nx_wasm_exported_func_new(ctx, f, opaque);
 			if (JS_IsException(val)) {
 				JS_FreeValue(ctx, exports_array);
 				JS_FreeValue(ctx, opaque);
@@ -854,8 +919,9 @@ static JSValue nx_wasm_module_exports(JSContext *ctx, JSValueConst this_val,
 static JSValue nx_wasm_call_func(JSContext *ctx, JSValueConst this_val,
 								 int argc, JSValueConst *argv) {
 	nx_wasm_exported_func_t *data = nx_wasm_exported_func_get(ctx, argv[0]);
-	if (!data)
+	if (!data) {
 		return JS_EXCEPTION;
+	}
 
 	IM3Function func = data->function;
 	if (!func) {
@@ -953,7 +1019,7 @@ static JSValue nx_wasm_memory_new(JSContext *ctx, JSValueConst this_val,
 	mem->numPages = initial;
 	mem->maxPages = maxPages ? maxPages : 65536;
 
-	size_t numBytes = d_m3MemPageSize * initial;
+	size_t numBytes = d_m3DefaultMemPageSize * initial;
 	size_t numPreviousBytes = 0;
 	void *newMem = m3_Realloc("Wasm Linear Memory", mem->mallocated, numBytes,
 							  numPreviousBytes);
@@ -1059,7 +1125,7 @@ static JSValue nx_wasm_memory_grow(JSContext *ctx, JSValueConst this_val,
 		} else {
 			// Standalone Memory (not bound to an instance) — grow directly
 			size_t numPreviousBytes = mallocated->length;
-			size_t numBytes = d_m3MemPageSize * requiredPages;
+			size_t numBytes = d_m3DefaultMemPageSize * requiredPages;
 			void *newMem = m3_Realloc("Wasm Linear Memory", mallocated,
 									  numBytes, numPreviousBytes);
 			if (!newMem) {
@@ -1101,7 +1167,13 @@ static JSValue nx_wasm_table_get_fn(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 
-	return nx_wasm_exported_func_new(ctx, func);
+	// TODO(lifecycle): the Table JS object doesn't currently hold an Instance
+	// reference, so we have no way to keep the underlying module alive from
+	// here. Passing JS_UNDEFINED preserves prior behavior. A future fix should
+	// make nx_wasm_table_t hold a JS reference to the Instance, then pass that
+	// here so wrapped Table.get'd functions don't dangle when the Instance is
+	// GC'd while still in use.
+	return nx_wasm_exported_func_new(ctx, func, JS_UNDEFINED);
 }
 
 // `Table#length` getter function
@@ -1118,6 +1190,156 @@ static JSValue nx_wasm_table_length_get(JSContext *ctx, JSValueConst this_val,
 	}
 
 	return JS_NewUint32(ctx, *data->table_size);
+}
+
+/* `new WebAssembly.Table(descriptor)` — JS-side constructor binding.
+ * Allocates owned backing storage (array of `initial` NULL function
+ * pointers + a u32 size cell), wraps them in a Table JSValue, and
+ * returns it. JS wrapper sets the prototype via `proto()` so
+ * `instanceof Table` works + prototype methods are reachable. */
+static JSValue nx_wasm_table_new(JSContext *ctx, JSValueConst this_val,
+								 int argc, JSValueConst *argv) {
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_ThrowTypeError(
+			ctx, "WebAssembly.Table(): descriptor must be an object");
+	}
+
+	/* descriptor.element — must be 'anyfunc' (legacy) or 'funcref'
+	 * (modern) — accept both spellings since the spec aliases them.
+	 * Other reference types (externref) are Tier-2 / not supported. */
+	JSValue elem_val = JS_GetPropertyStr(ctx, argv[0], "element");
+	if (JS_IsString(elem_val)) {
+		const char *elem = JS_ToCString(ctx, elem_val);
+		bool ok = elem &&
+				  (strcmp(elem, "anyfunc") == 0 || strcmp(elem, "funcref") == 0);
+		if (elem) JS_FreeCString(ctx, elem);
+		if (!ok) {
+			JS_FreeValue(ctx, elem_val);
+			return JS_ThrowTypeError(
+				ctx,
+				"WebAssembly.Table(): only 'anyfunc' / 'funcref' element types "
+				"are supported");
+		}
+	} else if (!JS_IsUndefined(elem_val)) {
+		JS_FreeValue(ctx, elem_val);
+		return JS_ThrowTypeError(
+			ctx, "WebAssembly.Table(): descriptor.element must be a string");
+	}
+	JS_FreeValue(ctx, elem_val);
+
+	/* descriptor.initial — required u32 */
+	JSValue initial_val = JS_GetPropertyStr(ctx, argv[0], "initial");
+	if (JS_IsUndefined(initial_val)) {
+		JS_FreeValue(ctx, initial_val);
+		return JS_ThrowTypeError(
+			ctx, "WebAssembly.Table(): descriptor.initial is required");
+	}
+	u32 initial;
+	int rc = JS_ToUint32(ctx, &initial, initial_val);
+	JS_FreeValue(ctx, initial_val);
+	if (rc) return JS_EXCEPTION;
+
+	/* descriptor.maximum is accepted but not enforced in Tier-1 (we
+	 * don't cap growth). Real itch.io games that pass a maximum just
+	 * use it as guidance; the spec only requires checks if grow would
+	 * exceed it. Defer enforcement to Tier-2 if a game actually needs it. */
+
+	JSValue obj = nx_wasm_table_new_(ctx);
+	if (JS_IsException(obj)) return JS_EXCEPTION;
+	nx_wasm_table_t *data = nx_wasm_table_get(ctx, obj);
+	if (!data) {
+		JS_FreeValue(ctx, obj);
+		return JS_EXCEPTION;
+	}
+
+	/* Use a 1-slot floor for the malloc so `initial == 0` doesn't trip
+	 * js_mallocz's "0 bytes -> NULL is success" edge — we want to
+	 * distinguish allocation failure from a legitimately empty table. */
+	u32 alloc_count = initial > 0 ? initial : 1;
+	data->table = js_mallocz(ctx, alloc_count * sizeof(IM3Function));
+	data->table_size = js_mallocz(ctx, sizeof(u32));
+	if (!data->table || !data->table_size) {
+		/* Finalizer cleans up partial alloc once owned=true is set. */
+		data->owned = true;
+		JS_FreeValue(ctx, obj);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	*data->table_size = initial;
+	data->owned = true;
+	return obj;
+}
+
+/* `Table#set(index, value)` — assign a function ref at index.
+ * Tier-1 accepts `null` (clears slot) or an exported function (the
+ * usual case when wiring imports). A user-supplied JS function would
+ * need a trampoline to bridge into wasm3 — defer to Tier-2 if a real
+ * game requires it. */
+static JSValue nx_wasm_table_set_fn(JSContext *ctx, JSValueConst this_val,
+									int argc, JSValueConst *argv) {
+	nx_wasm_table_t *data = nx_wasm_table_get(ctx, argv[0]);
+	if (!data) return JS_EXCEPTION;
+
+	u32 index;
+	if (JS_ToUint32(ctx, &index, argv[1])) return JS_EXCEPTION;
+
+	if (index >= *data->table_size) {
+		JS_ThrowRangeError(ctx,
+						   "WebAssembly.Table.set(): index %u out of range for "
+						   "table of size %u",
+						   index, *data->table_size);
+		return JS_EXCEPTION;
+	}
+
+	if (JS_IsNull(argv[2]) || JS_IsUndefined(argv[2])) {
+		data->table[index] = NULL;
+		return JS_UNDEFINED;
+	}
+
+	nx_wasm_exported_func_t *func_data =
+		JS_GetOpaque2(ctx, argv[2], nx_wasm_exported_func_class_id);
+	if (!func_data) {
+		return JS_ThrowTypeError(
+			ctx,
+			"WebAssembly.Table.set(): value must be null or an exported "
+			"function");
+	}
+	data->table[index] = func_data->function;
+	return JS_UNDEFINED;
+}
+
+/* `Table#grow(delta)` — extend size. Returns the previous size per
+ * spec. Only user-owned tables can grow — module-exported tables
+ * share storage with wasm3 and growing would invalidate pointers
+ * the runtime holds. */
+static JSValue nx_wasm_table_grow_fn(JSContext *ctx, JSValueConst this_val,
+									 int argc, JSValueConst *argv) {
+	nx_wasm_table_t *data = nx_wasm_table_get(ctx, argv[0]);
+	if (!data) return JS_EXCEPTION;
+
+	if (!data->owned) {
+		return JS_ThrowTypeError(
+			ctx, "WebAssembly.Table.grow(): cannot grow a module-owned table");
+	}
+
+	u32 delta;
+	if (JS_ToUint32(ctx, &delta, argv[1])) return JS_EXCEPTION;
+
+	u32 old_size = *data->table_size;
+	u32 new_size = old_size + delta;
+	if (new_size < old_size) {
+		return JS_ThrowRangeError(ctx,
+								  "WebAssembly.Table.grow(): size overflow");
+	}
+
+	if (new_size > 0) {
+		IM3Function *new_table =
+			js_realloc(ctx, data->table, new_size * sizeof(IM3Function));
+		if (!new_table) return JS_ThrowOutOfMemory(ctx);
+		for (u32 i = old_size; i < new_size; i++) new_table[i] = NULL;
+		data->table = new_table;
+	}
+	*data->table_size = new_size;
+	return JS_NewUint32(ctx, old_size);
 }
 
 /* Initialize the `Memory` class */
@@ -1170,7 +1392,10 @@ static JSValue nx_wasm_validate(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry init_function_list[] = {
 	JS_CFUNC_DEF("wasmCallFunc", 1, nx_wasm_call_func),
 	JS_CFUNC_DEF("wasmMemNew", 1, nx_wasm_memory_new),
+	JS_CFUNC_DEF("wasmTableNew", 1, nx_wasm_table_new),
 	JS_CFUNC_DEF("wasmTableGet", 2, nx_wasm_table_get_fn),
+	JS_CFUNC_DEF("wasmTableSet", 3, nx_wasm_table_set_fn),
+	JS_CFUNC_DEF("wasmTableGrow", 2, nx_wasm_table_grow_fn),
 	JS_CFUNC_DEF("wasmInitMemory", 1, nx_wasm_init_memory_class),
 	JS_CFUNC_DEF("wasmInitTable", 1, nx_wasm_init_table_class),
 

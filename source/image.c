@@ -833,6 +833,28 @@ fail:
 
 void nx_decode_image_do(nx_work_t *req) {
 	nx_decode_image_async_t *data = (nx_decode_image_async_t *)req->data;
+	// 2026-06-07 pvzge texture-upload investigation: log every decode
+	// with input buffer size + first 8 magic bytes + the format the
+	// identifier picked + dimensions after decode. This narrows whether
+	// (a) input bytes never arrived (size=0), (b) decoder didn't
+	// recognize the magic (format=UNKNOWN), or (c) decoder recognized
+	// but produced 0x0 dims (decoder rejected the body). Throttle: first
+	// 10 + every 25th to keep log volume sane across the ~75 pvzge image
+	// loads per launch.
+	static int decodeN = 0;
+	++decodeN;
+	bool should_log = (decodeN <= 10) || (decodeN % 25 == 0);
+	if (should_log) {
+		const uint8_t *p = (const uint8_t *)data->input;
+		uint8_t b[8] = {0};
+		size_t blen = data->input_size < 8 ? data->input_size : 8;
+		if (p)
+			memcpy(b, p, blen);
+		fprintf(stderr,
+			"[nxjs:decode-in] n=%d size=%zu magic=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+			decodeN, data->input_size,
+			b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+	}
 	data->image->format = identify_image_format(data->input, data->input_size);
 	if (data->image->format == FORMAT_PNG) {
 		data->image->data =
@@ -843,6 +865,9 @@ void nx_decode_image_do(nx_work_t *req) {
 						(int *)&data->image->width,
 						(int *)&data->image->height)) {
 			data->err_str = tjGetErrorStr();
+			if (should_log)
+				fprintf(stderr, "[nxjs:decode-out] n=%d FAIL jpeg err=%s\n",
+					decodeN, data->err_str);
 			return;
 		}
 	} else if (data->image->format == FORMAT_WEBP) {
@@ -855,6 +880,8 @@ void nx_decode_image_do(nx_work_t *req) {
 		 * build path untouched. */
 		if (decode_gif(data->input, data->input_size, data->image) != 0) {
 			data->err_str = "Failed to decode GIF";
+			if (should_log)
+				fprintf(stderr, "[nxjs:decode-out] n=%d FAIL gif\n", decodeN);
 			return;
 		}
 	} else if (data->image->format == FORMAT_ICO) {
@@ -867,12 +894,24 @@ void nx_decode_image_do(nx_work_t *req) {
 					   &data->image->height);
 	} else {
 		data->err_str = "Unsupported image format";
+		if (should_log)
+			fprintf(stderr, "[nxjs:decode-out] n=%d FAIL unsupported format=%d\n",
+				decodeN, (int)data->image->format);
 		return;
 	}
 	if (data->image->data == NULL) {
 		data->err_str = "Image decode was not initialized";
+		if (should_log)
+			fprintf(stderr, "[nxjs:decode-out] n=%d FAIL data=NULL format=%d w=%u h=%u\n",
+				decodeN, (int)data->image->format,
+				data->image->width, data->image->height);
 		return;
 	}
+	if (should_log)
+		fprintf(stderr,
+			"[nxjs:decode-out] n=%d OK format=%d w=%u h=%u\n",
+			decodeN, (int)data->image->format,
+			data->image->width, data->image->height);
 	data->image->surface = cairo_image_surface_create_for_data(
 		data->image->data, CAIRO_FORMAT_ARGB32, data->image->width,
 		data->image->height, data->image->width * 4);

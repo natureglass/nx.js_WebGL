@@ -88,9 +88,18 @@ export function gamepadNew(index: number) {
 	const g = proto($.gamepadNew(index), Gamepad);
 	// @ts-expect-error Readonly prop
 	g.mapping = 'standard';
+	// Extended button layout. The Web Gamepad "standard" mapping has
+	// 17 buttons; nxjs exposes 22 to include the Switch-specific
+	// side-joycon SL/SR buttons (indices 16-19) and the Capture /
+	// HOME system buttons (20-21). Pages assuming standard-only
+	// mapping will simply not iterate past their expected count;
+	// pages that care about the extras can index them directly. See
+	// `nxjs-source/source/gamepad.c standard_button_masks` for the
+	// per-index mapping (source of truth).
+	const NX_BUTTON_COUNT = 22;
 	// @ts-expect-error Readonly prop
-	g.buttons = Array(16);
-	for (let i = 0; i < 16; i++) {
+	g.buttons = Array(NX_BUTTON_COUNT);
+	for (let i = 0; i < NX_BUTTON_COUNT; i++) {
 		// @ts-expect-error Readonly array
 		g.buttons[i] = proto($.gamepadButtonNew(g, i), GamepadButton);
 	}

@@ -40,9 +40,9 @@ LIBTURBOJPEG_VERSION := $(shell $(DEVKITPRO)/pacman/bin/pacman -Q switch-libjpeg
 
 TARGET		:=	nxjs
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source source/wasm3
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	include source/wasm3
 EXEFS_SRC	:=	exefs_src
 ROMFS		:=	romfs
 CONFIG_JSON	:=	npdm.json
@@ -64,7 +64,7 @@ CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=${DEVKITPRO}/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:=  -pthread -lmbedtls -lmbedx509 -lmbedcrypto -lharfbuzz `aarch64-none-elf-pkg-config freetype2 cairo --libs` -lturbojpeg -lwebp -lqjs -lm3 -lm -lzstd \
+LIBS	:=  -pthread -lmbedtls -lmbedx509 -lmbedcrypto -lharfbuzz `aarch64-none-elf-pkg-config freetype2 cairo --libs` -lturbojpeg -lwebp -lqjs -lm -lzstd \
 		-Wl,--start-group `aarch64-none-elf-pkg-config libavformat libavcodec libswscale libswresample libavutil --libs` -lbz2 -lnx -Wl,--end-group
 
 #---------------------------------------------------------------------------------
@@ -188,9 +188,15 @@ endif
 #---------------------------------------------------------------------------------
 all: $(BUILD)
 
-$(SOURCES)/runtime.c: packages/runtime/runtime.js
-	@qjsc -o $(SOURCES)/runtime.c -n "romfs:/runtime.js" packages/runtime/runtime.js
-	@echo "compiled '$(SOURCES)/runtime.c' with qjsc"
+# Use a hardcoded `source/runtime.c` here, NOT `$(SOURCES)/runtime.c`. When
+# wasm3 was vendored, SOURCES became multi-valued (`source source/wasm3`),
+# which broke this rule by expanding the target into two whitespace-separated
+# paths instead of one valid Make target. Anything depending on runtime.c
+# (i.e. all builds where packages/runtime/runtime.js has been updated) silently
+# stops regenerating it.
+source/runtime.c: packages/runtime/runtime.js
+	@qjsc -o source/runtime.c -n "romfs:/runtime.js" packages/runtime/runtime.js
+	@echo "compiled 'source/runtime.c' with qjsc"
 
 $(ROMFS)/runtime.js.map: packages/runtime/runtime.js.map
 	@mkdir -p $(ROMFS)

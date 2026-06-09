@@ -1267,6 +1267,17 @@ static JSValue nx_canvas_context_2d_fill_text(JSContext *ctx,
 	double scale = 1.;
 	double font_size = context->state->font_size;
 
+	// hb_font and ft_face are SHARED across canvases that use the same
+	// font family (nx_get_font_face returns the same nx_font_face_t).
+	// Any other canvas that called set_font on this family may have left
+	// HB's scale + FT's character size pointing at a different size than
+	// this context expects. Re-apply our size before any text op so the
+	// shared state matches what we intend. Without this, advances computed
+	// here are at whatever scale was last set globally — Cocos's bake
+	// canvas (sized for the right advance) clips when the wrong-scale
+	// advance lays glyphs outside its bounds.
+	set_font_size(context, font_size);
+
 	if (argc >= 4 && JS_IsNumber(argv[3])) {
 		double max_width;
 		if (JS_ToFloat64(ctx, &max_width, argv[3]))
@@ -1314,6 +1325,25 @@ static JSValue nx_canvas_context_2d_fill_text(JSContext *ctx,
 		alignment_offset = -x;
 	} else if (context->state->text_align == TEXT_ALIGN_CENTER) {
 		alignment_offset = -x / 2.0;
+	}
+
+	// Shift the draw right by the first glyph's negative left side bearing
+	// so its leftmost ink lands at supplied_x instead of supplied_x +
+	// bearing (which would be outside a tightly-fit canvas). Mirrors the
+	// padding `measureText` adds to its returned `width` so a Cocos-style
+	// bake canvas (`new canvas(measureText(text).width, ...)`) has room
+	// for the leftmost stroke. Only first-glyph negative bearings are
+	// adjusted — positive bearings already render inside the canvas, and
+	// non-first glyphs are positioned by accumulated advances which the
+	// HB shaping already handles.
+	if (glyph_count > 0) {
+		hb_glyph_extents_t fg_ext;
+		if (hb_font_get_glyph_extents(context->state->hb_font,
+		                              glyph_info[0].codepoint, &fg_ext)) {
+			double fg_x_bearing = fg_ext.x_bearing / 64.0;
+			if (fg_x_bearing < 0)
+				alignment_offset += -fg_x_bearing;
+		}
 	}
 
 	double baseline_offset = 0; // TEXT_BASELINE_ALPHABETIC
@@ -1390,6 +1420,10 @@ static JSValue nx_canvas_context_2d_stroke_text(JSContext *ctx,
 
 	double scale = 1.;
 	double font_size = context->state->font_size;
+
+	// Re-sync shared HB/FT scale to this context's font_size. See
+	// fillText sibling for the why.
+	set_font_size(context, font_size);
 
 	if (argc >= 4 && JS_IsNumber(argv[3])) {
 		double max_width;
@@ -1525,6 +1559,10 @@ static JSValue nx_canvas_context_2d_measure_text(JSContext *ctx,
 
 	const char *text = JS_ToCString(ctx, argv[0]);
 
+	// Re-sync shared HB/FT scale to this context's font_size. See
+	// fillText sibling for the why.
+	set_font_size(context, context->state->font_size);
+
 	// Create HarfBuzz buffer
 	hb_buffer_t *buf = hb_buffer_create();
 
@@ -1547,17 +1585,60 @@ static JSValue nx_canvas_context_2d_measure_text(JSContext *ctx,
 		width += glyph_pos[i].x_advance / 64.0;
 	}
 
+	// Compute glyph-ink extents (left side bearing of first glyph, right
+	// ink past advance of last glyph) so callers that size a bake canvas
+	// from measureText.width have room for glyphs whose ink extends past
+	// their typographic advance. Decorative fonts (Cocos Creator's
+	// pvzge Label fonts: FBUSV8C5EI_LABEL "Play" button, etc.) clip
+	// otherwise — measureText returns just the advance sum, Cocos sizes
+	// the bake canvas exactly to that, and ink overhangs get cut off.
+	double left_overhang = 0;
+	double right_overhang = 0;
+	if (glyph_count > 0) {
+		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, NULL);
+		hb_glyph_extents_t extents;
+		// First glyph: negative bearing means ink starts left of origin.
+		if (hb_font_get_glyph_extents(context->state->hb_font,
+		                              glyph_info[0].codepoint, &extents)) {
+			double first_x_bearing = extents.x_bearing / 64.0;
+			if (first_x_bearing < 0)
+				left_overhang = -first_x_bearing;
+		}
+		// Last glyph: ink_right vs advance.
+		unsigned int last_i = glyph_count - 1;
+		if (hb_font_get_glyph_extents(context->state->hb_font,
+		                              glyph_info[last_i].codepoint,
+		                              &extents)) {
+			double last_x_bearing = extents.x_bearing / 64.0;
+			double last_ink_width = extents.width / 64.0; // signed in HB
+			double last_ink_right = last_x_bearing + last_ink_width;
+			double last_advance = glyph_pos[last_i].x_advance / 64.0;
+			if (last_ink_right > last_advance)
+				right_overhang = last_ink_right - last_advance;
+		}
+	}
+
+	// Pad width to cover any glyph overhang. This is non-spec-strict
+	// (spec width is exact advance) but pragmatic: every consumer that
+	// uses width for layout is fine with a slightly larger value, and
+	// engines that size a bake canvas from it stop clipping.
+	double padded_width = width + left_overhang + right_overhang;
+
 	// Create the TextMetrics object
 	JSValue metrics = JS_NewObject(ctx);
 
 	// Set the width property
-	JS_SetPropertyStr(ctx, metrics, "width", JS_NewFloat64(ctx, width));
+	JS_SetPropertyStr(ctx, metrics, "width",
+	                  JS_NewFloat64(ctx, padded_width));
 
-	// Set the rest of the properties to 0 for now
+	// Spec-compliant ink-extent fields. `Left` is the distance from text
+	// origin (x=0) to the leftmost glyph ink (positive if ink starts left
+	// of origin). `Right` is from origin to rightmost ink. Engines that
+	// honor these (Three.js / unstyled DOM text) can lay out exactly.
 	JS_SetPropertyStr(ctx, metrics, "actualBoundingBoxLeft",
-					  JS_NewFloat64(ctx, 0));
+					  JS_NewFloat64(ctx, left_overhang));
 	JS_SetPropertyStr(ctx, metrics, "actualBoundingBoxRight",
-					  JS_NewFloat64(ctx, 0));
+					  JS_NewFloat64(ctx, width + right_overhang));
 	JS_SetPropertyStr(ctx, metrics, "fontBoundingBoxAscent",
 					  JS_NewFloat64(ctx, 0));
 	JS_SetPropertyStr(ctx, metrics, "fontBoundingBoxDescent",

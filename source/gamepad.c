@@ -3,14 +3,70 @@
 static JSClassID nx_gamepad_class_id;
 static JSClassID nx_gamepad_button_class_id;
 
+/* Sentinel mask for buttons whose state isn't carried by padGetButtons —
+ * specifically the Capture button (delivered via applet messages) and
+ * the HOME button (typically intercepted by hbmenu / the OS). The
+ * gamepad-button getter checks for this sentinel and dispatches to
+ * the per-button "transient pressed" flag instead of masking
+ * padGetButtons. */
+#define NX_BTN_MASK_NONE ((u64)-1)
+
+/* Button layout exposed to JS via gamepad.buttons[i]. Indices 0-15 are
+ * the standard Web Gamepad layout; 16-19 add the sideways/single-joycon
+ * SL/SR buttons (libnx delivers them through padGetButtons, so they
+ * use real masks); 20 is the Capture button (delivered via
+ * `AppletHookType_OnCaptureButtonShortPressed`); 21 is reserved for
+ * the HOME button (intercepted by hbmenu in NRO context — exposed but
+ * always reads as released). */
 static u64 standard_button_masks[] = {
-	HidNpadButton_B,     HidNpadButton_A,      HidNpadButton_Y,
-	HidNpadButton_X,     HidNpadButton_L,      HidNpadButton_R,
-	HidNpadButton_ZL,    HidNpadButton_ZR,     HidNpadButton_Minus,
-	HidNpadButton_Plus,  HidNpadButton_StickL, HidNpadButton_StickR,
-	HidNpadButton_Up,    HidNpadButton_Down,   HidNpadButton_Left,
+	HidNpadButton_B,       HidNpadButton_A,       HidNpadButton_Y,
+	HidNpadButton_X,       HidNpadButton_L,       HidNpadButton_R,
+	HidNpadButton_ZL,      HidNpadButton_ZR,      HidNpadButton_Minus,
+	HidNpadButton_Plus,    HidNpadButton_StickL,  HidNpadButton_StickR,
+	HidNpadButton_Up,      HidNpadButton_Down,    HidNpadButton_Left,
 	HidNpadButton_Right,
+	/* 16-19: side-joycon SL/SR (used in sideways / single-joycon mode) */
+	HidNpadButton_LeftSL,  HidNpadButton_LeftSR,
+	HidNpadButton_RightSL, HidNpadButton_RightSR,
+	/* 20: Capture button — sentinel; serviced by capture_just_pressed */
+	NX_BTN_MASK_NONE,
+	/* 21: HOME button — sentinel; reserved (never fires under hbmenu) */
+	NX_BTN_MASK_NONE,
 };
+
+#define NX_GAMEPAD_BUTTON_COUNT \
+	((int)(sizeof(standard_button_masks) / sizeof(standard_button_masks[0])))
+
+/* --- Capture button plumbing ---------------------------------------
+ *
+ * libnx exposes the Capture button via the applet message system
+ * (`AppletHookType_OnCaptureButtonShortPressed`) rather than through
+ * padGetButtons — the button is a system-level shortcut, not a
+ * standard HID pad bit. We register a hook at gamepad-init time; the
+ * callback raises a transient flag that the gamepad-button getter
+ * reads and clears. Net effect from JS: pressing Capture causes
+ * `gamepad.buttons[20].pressed` to return true on the FIRST read
+ * after the press, then false again — which lines up with the
+ * rising-edge detection both the mouse forwarder and the shell
+ * shortcut router use.
+ *
+ * HOME is NOT plumbed today because hbmenu / HBL typically intercepts
+ * it to return to the homebrew menu before our hook would run. Index
+ * 21 stays exposed as a sentinel so JS code reading
+ * `buttons.length === 22` doesn't trip up; it just always reads
+ * false. A future wiring path would call
+ * `hidsysAcquireHomeButtonEventHandle` and listen on a thread, with
+ * fallback if the OS denies the handle. */
+static bool capture_just_pressed = false;
+static AppletHookCookie capture_hook_cookie;
+static bool capture_hook_registered = false;
+
+static void nx_gamepad_applet_hook(AppletHookType hook, void *param) {
+	(void)param;
+	if (hook == AppletHookType_OnCaptureButtonShortPressed) {
+		capture_just_pressed = true;
+	}
+}
 
 nx_gamepad_t *nx_get_gamepad(JSContext *ctx, JSValueConst obj) {
 	return JS_GetOpaque2(ctx, obj, nx_gamepad_class_id);
@@ -67,6 +123,11 @@ static JSValue nx_gamepad_button_new(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &index, argv[1])) {
 		return JS_EXCEPTION;
 	}
+	if ((int)index >= NX_GAMEPAD_BUTTON_COUNT) {
+		return JS_ThrowRangeError(ctx,
+			"gamepad button index %u out of range (max %d)",
+			index, NX_GAMEPAD_BUTTON_COUNT - 1);
+	}
 
 	nx_gamepad_button_t *gamepad_button =
 		js_mallocz(ctx, sizeof(nx_gamepad_button_t));
@@ -76,6 +137,7 @@ static JSValue nx_gamepad_button_new(JSContext *ctx, JSValueConst this_val,
 
 	gamepad_button->gamepad = gamepad;
 	gamepad_button->mask = standard_button_masks[index];
+	gamepad_button->idx = (int)index;
 
 	JSValue obj = JS_NewObjectClass(ctx, nx_gamepad_button_class_id);
 	JS_SetOpaque(obj, gamepad_button);
@@ -135,31 +197,45 @@ static JSValue nx_gamepad_get_connected(JSContext *ctx, JSValueConst this_val,
 	return JS_NewBool(ctx, padIsConnected(gamepad->pad));
 }
 
+/* Resolve the "is this button currently pressed?" state for one
+ * gamepad button. Honours the sentinel mask used by Capture (idx 20)
+ * and HOME (idx 21): for those, padGetButtons doesn't carry the bit
+ * and we read the applet-hook-backed transient flag instead. The
+ * Capture read is destructive — once consumed, the flag clears, so
+ * the rising-edge detection in JS only fires once per physical press. */
+static bool nx_gamepad_button_resolve_pressed(nx_gamepad_button_t *gb) {
+	if (gb->mask == NX_BTN_MASK_NONE) {
+		if (gb->idx == 20) {
+			bool was = capture_just_pressed;
+			capture_just_pressed = false;
+			return was;
+		}
+		/* idx 21 = HOME — not currently wired (hbmenu intercepts). */
+		return false;
+	}
+	u64 kDown = padGetButtons(gb->gamepad->pad);
+	return (kDown & gb->mask) != 0;
+}
+
 static JSValue nx_gamepad_button_get_pressed(JSContext *ctx,
 											 JSValueConst this_val, int argc,
 											 JSValueConst *argv) {
 	nx_gamepad_button_t *gamepad_button = nx_get_gamepad_button(ctx, this_val);
-	u64 kDown = padGetButtons(gamepad_button->gamepad->pad);
-	bool pressed = (kDown & gamepad_button->mask) != 0;
-	return JS_NewBool(ctx, pressed);
+	return JS_NewBool(ctx, nx_gamepad_button_resolve_pressed(gamepad_button));
 }
 
 static JSValue nx_gamepad_button_get_touched(JSContext *ctx,
 											 JSValueConst this_val, int argc,
 											 JSValueConst *argv) {
 	nx_gamepad_button_t *gamepad_button = nx_get_gamepad_button(ctx, this_val);
-	u64 kDown = padGetButtons(gamepad_button->gamepad->pad);
-	bool pressed = (kDown & gamepad_button->mask) != 0;
-	return JS_NewBool(ctx, pressed);
+	return JS_NewBool(ctx, nx_gamepad_button_resolve_pressed(gamepad_button));
 }
 
 static JSValue nx_gamepad_button_get_value(JSContext *ctx,
 										   JSValueConst this_val, int argc,
 										   JSValueConst *argv) {
 	nx_gamepad_button_t *gamepad_button = nx_get_gamepad_button(ctx, this_val);
-	u64 kDown = padGetButtons(gamepad_button->gamepad->pad);
-	bool pressed = (kDown & gamepad_button->mask) != 0;
-	return JS_NewUint32(ctx, pressed ? 1 : 0);
+	return JS_NewUint32(ctx, nx_gamepad_button_resolve_pressed(gamepad_button) ? 1 : 0);
 }
 
 static JSValue nx_gamepad_init_class(JSContext *ctx, JSValueConst this_val,
@@ -218,4 +294,15 @@ void nx_init_gamepad(JSContext *ctx, JSValueConst init_obj) {
 
 	JS_SetPropertyFunctionList(ctx, init_obj, function_list,
 							   countof(function_list));
+
+	/* Subscribe to applet messages so the Capture button (index 20)
+	 * propagates into the gamepad-button state. Idempotent — guarded
+	 * by `capture_hook_registered`. The hook is process-wide and
+	 * survives across contexts; we never unsubscribe (the cookie is
+	 * static).
+	 */
+	if (!capture_hook_registered) {
+		appletHook(&capture_hook_cookie, nx_gamepad_applet_hook, NULL);
+		capture_hook_registered = true;
+	}
 }

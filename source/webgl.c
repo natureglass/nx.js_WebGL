@@ -58,6 +58,12 @@
 #define GL_STENCIL_PASS_DEPTH_FAIL 0x0B95
 #define GL_STENCIL_PASS_DEPTH_PASS 0x0B96
 #define GL_KEEP 0x1E00
+#define GL_REPLACE 0x1E01
+#define GL_INCR 0x1E02
+#define GL_DECR 0x1E03
+#define GL_INVERT 0x150A
+#define GL_INCR_WRAP 0x8507
+#define GL_DECR_WRAP 0x8508
 #define GL_SCISSOR_BOX 0x0C10
 #define GL_VIEWPORT 0x0BA2
 #define GL_ALIASED_POINT_SIZE_RANGE 0x846D
@@ -319,6 +325,14 @@ typedef struct {
 	nx_webgl_vertex_attrib_t vertex_attribs[NX_WEBGL_MAX_VERTEX_ATTRIBS];
 	nx_webgl_egl_t *egl;
 	bool bridge_clear_pending;
+	/* 2026-06-08 ROUND 45: multi-camera-no-RT heuristic state. Tracks
+	 * whether a draw has happened to the default framebuffer since the
+	 * last successful color clear. If so, the next color clear is
+	 * silently downgraded to depth/stencil-only (COLOR bit stripped).
+	 * Reset to false at frame boundary (copyBridgeToCanvas), so the
+	 * first clear of each frame still wipes color normally.
+	 * See [[reference-pvzge-clearflag-color-strip]] for why. */
+	bool drawn_to_default_since_color_clear;
 	uint32_t next_texture_id;
 	uint32_t error;
 	// gl.hint() pname state. Currently the only pname we accept is
@@ -792,7 +806,9 @@ static bool is_front_face_mode(uint32_t mode) {
 }
 
 static bool is_stencil_op(uint32_t op) {
-	return op == GL_KEEP || op == GL_ZERO;
+	return op == GL_KEEP || op == GL_ZERO || op == GL_REPLACE ||
+	       op == GL_INCR || op == GL_DECR || op == GL_INVERT ||
+	       op == GL_INCR_WRAP || op == GL_DECR_WRAP;
 }
 
 static bool is_texture_binding_target(uint32_t target) {
@@ -1148,6 +1164,7 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	context->texture_2d_array_binding = JS_UNDEFINED;
 	context->framebuffer_binding = JS_UNDEFINED;
 	context->renderbuffer_binding = JS_UNDEFINED;
+	context->drawn_to_default_since_color_clear = false;
 	context->active_texture = GL_TEXTURE0;
 	context->next_texture_id = 1;
 	context->hint_fragment_shader_derivative = GL_DONT_CARE;
@@ -1466,6 +1483,29 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 	if (!name)
 		return JS_EXCEPTION;
 
+	/* Issue A audit: deduplicated log of getExtension queries. Cocos's
+	 * gfx layer feature-detects via getExtension; if it asks for an
+	 * extension we don't stub and silently falls back to no-RT mode,
+	 * the missing extension is the likely cause. Capped at first 60
+	 * unique names total to keep volume bounded. */
+	{
+		#define EXT_DEDUP_MAX 60
+		static const char *seen[EXT_DEDUP_MAX];
+		static int seen_n = 0;
+		bool dup = false;
+		for (int i = 0; i < seen_n; i++) {
+			if (strcmp(seen[i], name) == 0) { dup = true; break; }
+		}
+		if (!dup && seen_n < EXT_DEDUP_MAX) {
+			seen[seen_n++] = strdup(name);
+		}
+		#undef EXT_DEDUP_MAX
+		if (!dup) {
+			fprintf(stderr, "[nxjs:getExt-audit] '%s'\n", name);
+			fflush(stderr);
+		}
+	}
+
 	// ANGLE_instanced_arrays — return an object with the three extension
 	// methods bound to this gl context plus the VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE
 	// constant. Only advertise it when the driver actually loaded the native
@@ -1726,9 +1766,48 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 	if (mask == 0)
 		return JS_UNDEFINED;
 
+	/* 2026-06-08 ROUND 45: multi-camera-no-RT heuristic. If the current
+	 * draw target is the default framebuffer (bridge), AND a draw has
+	 * already happened to it since the last successful color clear, strip
+	 * the COLOR bit from this clear's mask. Cocos / Babylon / other
+	 * multi-camera engines on platforms without working RT compositing
+	 * (where each camera's clearFlag=COLOR|DEPTH|STENCIL would wipe earlier
+	 * cameras' draws) get correct accumulated output. The flag is reset on
+	 * each frame end (copyBridgeToCanvas) so the first clear of every
+	 * frame still wipes color as the spec intends.
+	 *
+	 * Only applies when the user has NOT bound a custom FBO — user FBO
+	 * clears are isolated and ought to clear color when asked. This
+	 * heuristic is deliberately non-spec-compliant for the default FB
+	 * case; pages that need spec behavior would have working RT support
+	 * (which doesn't hit this branch). See
+	 * [[reference-pvzge-clearflag-color-strip]] for the diagnostic story. */
+	bool at_default_fb = JS_IsUndefined(context->framebuffer_binding) ||
+	                      JS_IsNull(context->framebuffer_binding);
+	if (at_default_fb &&
+	    context->drawn_to_default_since_color_clear &&
+	    (mask & GL_COLOR_BUFFER_BIT)) {
+		static int suppress_n = 0;
+		if (suppress_n < 30 || (suppress_n & 0xFF) == 0) {
+			fprintf(stderr,
+				"[nxjs:clear-color-suppress] n=%d mask=0x%x → 0x%x (multi-cam-no-RT heuristic)\n",
+				++suppress_n, mask, mask & ~GL_COLOR_BUFFER_BIT);
+			fflush(stderr);
+		}
+		mask &= ~GL_COLOR_BUFFER_BIT;
+		if (mask == 0) return JS_UNDEFINED;
+	}
+
 	nx_canvas_t *canvas = context->canvas;
 	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
 		return JS_UNDEFINED;
+
+	/* Track for next-clear heuristic. After a successful COLOR clear,
+	 * reset the flag so the next draw starts a fresh "any drawn since
+	 * color clear?" cycle. */
+	if (at_default_fb && (mask & GL_COLOR_BUFFER_BIT)) {
+		context->drawn_to_default_since_color_clear = false;
+	}
 
 	if (nx_webgl_egl_is_bridge_enabled(context->egl)) {
 		// Reset per-frame dispatch-debug log. Each draw will append a
@@ -1866,6 +1945,27 @@ static JSValue nx_webgl_shader_source(JSContext *ctx, JSValueConst this_val,
 	const char *source = JS_ToCString(ctx, argv[1]);
 	if (!source)
 		return JS_EXCEPTION;
+	{
+		static int n = 0;
+		if (n++ < 10) {
+			const char *type =
+				(shader->type == GL_VERTEX_SHADER) ? "vs" : "fs";
+			int len = (int)strlen(source);
+			fprintf(stderr,
+				"[nxjs:shader-src] n=%d type=%s len=%d BEGIN\n",
+				n, type, len);
+			const int CHUNK = 800;
+			for (int off = 0; off < len; off += CHUNK) {
+				int rem = len - off;
+				int take = rem < CHUNK ? rem : CHUNK;
+				fprintf(stderr,
+					"[nxjs:shader-chunk] n=%d off=%d take=%d \"%.*s\"\n",
+					n, off, take, take, source + off);
+			}
+			fprintf(stderr,
+				"[nxjs:shader-src] n=%d type=%s END\n", n, type);
+		}
+	}
 	replace_string(ctx, &shader->source, source);
 	shader->compile_status = false;
 	replace_string(ctx, &shader->info_log, "");
@@ -1931,23 +2031,72 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 	//     `bridge_texture_program`, `bridge_lit_program`, `bridge_sprite_program`)
 	//     become fallback for hand-rolled non-Three.js WebGL only.
 	//     See [[swb-passthrough-pivot]] (2026-05-22 strategic pivot).
+	//   - `#define CC_DEVICE_` — emitted by Cocos Creator's shader compiler
+	//     into every shader's preamble (cc_DEVICE_SUPPORT_FLOAT_TEXTURE,
+	//     cc_DEVICE_MAX_VERTEX_UNIFORM_VECTORS, etc.). Promotes all Cocos
+	//     shaders to passthrough; otherwise their custom uniform names
+	//     (`cc_matViewProj`, `cc_mainTexture`, etc.) don't match the bridge's
+	//     name-based recognition and every draw falls into `program_color`'s
+	//     placeholder cyan fallback. See pvzge investigation 2026-06-07.
 	shader->raw_passthrough =
 		strstr(shader->source, "#pragma raw_passthrough") != NULL ||
 		strstr(shader->source, "#define USE_SHADOWMAP") != NULL ||
 		strstr(shader->source, "#define DEPTH_PACKING") != NULL ||
 		strstr(shader->source, "#define USE_MORPHTARGETS") != NULL ||
-		strstr(shader->source, "#define SHADER_NAME ") != NULL;
+		strstr(shader->source, "#define SHADER_NAME ") != NULL ||
+		strstr(shader->source, "#define CC_DEVICE_") != NULL;
 
 	char gles_log[2048];
 	bool gles_status = false;
-	if (nx_webgl_egl_compile_shader(context->egl, context->canvas, shader->type,
-									shader->source, &shader->gles_handle,
-									&gles_status, gles_log,
-									sizeof(gles_log))) {
-		shader->gles_compile_attempted = true;
-		shader->compile_status = gles_status;
-		replace_string(ctx, &shader->info_log, gles_log);
-		return JS_UNDEFINED;
+	// 2026-06-07 FREEZE DIAGNOSTIC: bracket the GLES compile call with
+	// flushed entry/exit logs so we can pinpoint where the JS event loop
+	// seizes during pvzge inGameScene init. If we see compile-enter without
+	// compile-exit for some N, that N-th compile is hanging in the GLES
+	// driver. Dump first 200 chars of the source so the suspect shader is
+	// identifiable.
+	{
+		static int hang_diag_n = 0;
+		int my_n = ++hang_diag_n;
+		// Cap volume at first 80 compiles to keep boot fast. Bridge
+		// bootstrap eats some early calls; pvzge's per-shader Cocos chain
+		// (~10 compiles per scene transition) lands well within 80.
+		bool log_this = my_n <= 80;
+		const char *type_str =
+			(shader->type == GL_VERTEX_SHADER) ? "vs" : "fs";
+		if (log_this) {
+			int src_len = (int)strlen(shader->source);
+			fprintf(stderr,
+				"[nxjs:compile-enter] n=%d type=%s rawpass=%d len=%d src200=\"%.200s\"\n",
+				my_n, type_str, (int)shader->raw_passthrough, src_len,
+				shader->source);
+			fflush(stderr);
+		}
+		bool ok = nx_webgl_egl_compile_shader(context->egl, context->canvas, shader->type,
+										shader->source, &shader->gles_handle,
+										&gles_status, gles_log,
+										sizeof(gles_log));
+		if (log_this) {
+			fprintf(stderr,
+				"[nxjs:compile-exit] n=%d type=%s ok=%d gles_status=%d handle=%u\n",
+				my_n, type_str, (int)ok, (int)gles_status, shader->gles_handle);
+			fflush(stderr);
+		}
+		if (ok) {
+			shader->gles_compile_attempted = true;
+			shader->compile_status = gles_status;
+			replace_string(ctx, &shader->info_log, gles_log);
+			{
+				static int diag_n = 0;
+				if (shader->raw_passthrough && diag_n++ < 30) {
+					fprintf(stderr,
+						"[nxjs:gles-compile] n=%d type=%s status=%d handle=%u log=\"%.500s\"\n",
+						diag_n, type_str, (int)gles_status, shader->gles_handle,
+						gles_log);
+					fflush(stderr);
+				}
+			}
+			return JS_UNDEFINED;
+		}
 	}
 
 	shader->compile_status = true;
@@ -2127,6 +2276,29 @@ static JSValue nx_webgl_attach_shader(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static JSValue nx_webgl_detach_shader(JSContext *ctx, JSValueConst this_val,
+									  int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+
+	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
+	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[1]);
+	if (!program || !shader || program->deleted) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+
+	JSValue *target = shader->type == GL_VERTEX_SHADER
+						  ? &program->vertex_shader
+						  : &program->fragment_shader;
+	if (!JS_IsUndefined(*target)) {
+		JS_FreeValue(ctx, *target);
+		*target = JS_UNDEFINED;
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue nx_webgl_bind_attrib_location(JSContext *ctx,
 											  JSValueConst this_val, int argc,
 											  JSValueConst *argv) {
@@ -2214,13 +2386,34 @@ static JSValue nx_webgl_link_program(JSContext *ctx, JSValueConst this_val,
 			bindings[i].location = program->attrib_bindings[i].location;
 			bindings[i].name = program->attrib_bindings[i].name;
 		}
-		if (nx_webgl_egl_link_program(context->egl, context->canvas,
+		// 2026-06-07 FREEZE DIAGNOSTIC: probe linkProgram for inGameScene
+		// hang. Compile-pair completes cleanly for all 12 shaders; next
+		// suspect is glLinkProgram which can hang the GLES driver on
+		// problematic shader pairs.
+		static int link_diag_n = 0;
+		int my_link_n = ++link_diag_n;
+		bool link_log = my_link_n <= 80;
+		if (link_log) {
+			fprintf(stderr,
+				"[nxjs:link-enter] n=%d vs_handle=%u fs_handle=%u attribs=%d rawpass=%d\n",
+				my_link_n, vertex->gles_handle, fragment->gles_handle,
+				program->attrib_binding_count, (int)program->raw_passthrough);
+			fflush(stderr);
+		}
+		bool link_ok = nx_webgl_egl_link_program(context->egl, context->canvas,
 									  vertex->gles_handle,
 									  fragment->gles_handle,
 									  bindings,
 									  program->attrib_binding_count,
 									  &program->gles_handle, &gles_status,
-									  gles_log, sizeof(gles_log))) {
+									  gles_log, sizeof(gles_log));
+		if (link_log) {
+			fprintf(stderr,
+				"[nxjs:link-exit] n=%d ok=%d gles_status=%d prog_handle=%u\n",
+				my_link_n, (int)link_ok, (int)gles_status, program->gles_handle);
+			fflush(stderr);
+		}
+		if (link_ok) {
 			program->gles_link_attempted = true;
 			program->link_status = gles_status;
 			replace_string(ctx, &program->info_log, gles_log);
@@ -2292,6 +2485,21 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 	if (JS_ToUint32(ctx, &pname, argv[1]))
 		return JS_EXCEPTION;
 
+	// 2026-06-07 FREEZE DIAGNOSTIC: post-link probe set. Compile+link
+	// chain completes; Cocos's next phase is shader reflection. Probe
+	// each shader-reflection entry point with cap=200 so we see which
+	// is the LAST call before the JS event loop freezes.
+	{
+		static int gpp_diag_n = 0;
+		int my_n = ++gpp_diag_n;
+		if (my_n <= 200) {
+			fprintf(stderr,
+				"[nxjs:getProgramParameter] n=%d pname=0x%x prog=%u\n",
+				my_n, pname, program->gles_handle);
+			fflush(stderr);
+		}
+	}
+
 	switch (pname) {
 	case GL_LINK_STATUS:
 		return JS_NewBool(ctx, program->link_status);
@@ -2330,6 +2538,24 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 				return JS_NewUint32(ctx, (uint32_t)n);
 		}
 		return JS_NewUint32(ctx, countof(active_attributes));
+	// WebGL 2 pnames forwarded straight to native GLES. Cocos Creator's
+	// WebGL2 GFX backend queries ACTIVE_UNIFORM_BLOCKS during shader
+	// reflection to drive its descriptor-binding loop; returning null here
+	// makes Cocos think the program has zero UBO blocks → no descriptors
+	// → no bindBufferBase calls → shader runs with unbound UBOs → vertex
+	// shader output collapses to origin → invisible draws. See pvzge
+	// investigation 2026-06-07.
+	case 0x8A36 /* GL_ACTIVE_UNIFORM_BLOCKS */:
+	case 0x8C7F /* GL_TRANSFORM_FEEDBACK_BUFFER_MODE */:
+	case 0x8C83 /* GL_TRANSFORM_FEEDBACK_VARYINGS */:
+		if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
+			program->gles_handle) {
+			int n = 0;
+			if (nx_webgl_egl_get_program_iv(context->egl, program->gles_handle,
+											pname, &n))
+				return JS_NewUint32(ctx, (uint32_t)n);
+		}
+		return JS_NewUint32(ctx, 0);
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
@@ -2348,6 +2574,15 @@ static JSValue nx_webgl_get_program_info_log(JSContext *ctx,
 		context->error = GL_INVALID_VALUE;
 		return JS_NULL;
 	}
+	{
+		static int gpil_diag_n = 0;
+		int my_n = ++gpil_diag_n;
+		if (my_n <= 200 || (my_n % 100) == 0) {
+			fprintf(stderr, "[nxjs:getProgramInfoLog] n=%d prog=%u\n",
+				my_n, program->gles_handle);
+			fflush(stderr);
+		}
+	}
 
 	return JS_NewString(ctx, program->info_log ? program->info_log : "");
 }
@@ -2358,6 +2593,15 @@ static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+
+	{
+		static int gaa_diag_n = 0;
+		int my_n = ++gaa_diag_n;
+		if (my_n <= 200 || (my_n % 100) == 0) {
+			fprintf(stderr, "[nxjs:getActiveAttrib] n=%d argc=%d\n", my_n, argc);
+			fflush(stderr);
+		}
+	}
 
 	// Stub for the "program is null/deleted/unlinked" cases — Three.js's
 	// WebGLProgram.onFirstUse() unconditionally calls `new WebGLUniforms(
@@ -2435,6 +2679,16 @@ static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
 	uint32_t index;
 	if (JS_ToUint32(ctx, &index, argv[1]))
 		return JS_EXCEPTION;
+	{
+		static int gau_diag_n = 0;
+		int my_n = ++gau_diag_n;
+		if (my_n <= 200) {
+			fprintf(stderr,
+				"[nxjs:getActiveUniform] n=%d prog=%u idx=%u\n",
+				my_n, program->gles_handle, index);
+			fflush(stderr);
+		}
+	}
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
 		char name[256] = {0};
@@ -2534,6 +2788,13 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 	buffer->target = target;
 	JS_FreeValue(ctx, *binding);
 	*binding = JS_DupValue(ctx, argv[1]);
+	if (target == 0x8A11 /* UNIFORM_BUFFER */) {
+		static int diag_n = 0;
+		if (diag_n++ < 30)
+			fprintf(stderr,
+				"[nxjs:bindBuffer-UBO] n=%d handle=%u\n",
+				diag_n, buffer->gles_handle);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -2645,6 +2906,13 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 											size > 0 ? buffer->data : NULL,
 											usage);
 		}
+	}
+	if (target == 0x8A11 /* UNIFORM_BUFFER */) {
+		static int diag_n = 0;
+		if (diag_n++ < 30)
+			fprintf(stderr,
+				"[nxjs:bufferData-UBO] n=%d handle=%u size=%zu usage=0x%x\n",
+				diag_n, buffer->gles_handle, size, usage);
 	}
 	return JS_UNDEFINED;
 }
@@ -3050,6 +3318,7 @@ static bool nx_webgl_extract_image_source(JSContext *ctx,
 	int32_t w = 0, h = 0;
 	const uint8_t *src_data = NULL;
 	nx_image_t *image = nx_get_image(ctx, src);
+	nx_canvas_t *canvas = NULL;
 	if (image && image->data && image->width > 0 && image->height > 0) {
 		w = (int32_t)image->width;
 		h = (int32_t)image->height;
@@ -3060,7 +3329,27 @@ static bool nx_webgl_extract_image_source(JSContext *ctx,
 		// if nothing's been drawn yet it'll be NULL and we treat that
 		// as "not a usable source" (consistent with browsers: an
 		// untouched canvas would upload as transparent black).
-		nx_canvas_t *canvas = nx_get_canvas(ctx, src);
+		canvas = nx_get_canvas(ctx, src);
+		if (!canvas && JS_IsObject(src)) {
+			// Try unwrapping a swb LiveElement (HTMLCanvasElement-shaped
+			// wrapper) that holds an `nx_canvas_t` in its `.offscreen`
+			// field. Cocos Creator's Label render pipeline bakes per-letter
+			// text into a `document.createElement("canvas")` (returns a
+			// LiveElement), then passes the LiveElement directly to
+			// `gl.texImage2D(..., liveEl)`. Without this unwrap the
+			// extractor sees src as neither nxjs Image nor nxjs Canvas,
+			// upload silently becomes a zero-source — sprite samples a
+			// black/transparent texture and Label text never appears
+			// on-screen despite fillText firing into the inner canvas.
+			// Guarded on JS_IsObject so a null/undefined/primitive src
+			// (already handled as unsupported by callers) doesn't trigger
+			// a QuickJS TypeError on the property read.
+			JSValue offscreen = JS_GetPropertyStr(ctx, src, "offscreen");
+			if (!JS_IsUndefined(offscreen) && !JS_IsNull(offscreen)) {
+				canvas = nx_get_canvas(ctx, offscreen);
+			}
+			JS_FreeValue(ctx, offscreen);
+		}
 		if (canvas && canvas->data &&
 		    canvas->width > 0 && canvas->height > 0) {
 			w = (int32_t)canvas->width;
@@ -3117,6 +3406,15 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	if (!context)
 		return JS_EXCEPTION;
 
+	{
+		static int ti2d_diag_n = 0;
+		int my_n = ++ti2d_diag_n;
+		if (my_n <= 200 || (my_n % 100) == 0) {
+			fprintf(stderr, "[nxjs:texImage2D] n=%d argc=%d\n", my_n, argc);
+			fflush(stderr);
+		}
+	}
+
 	uint32_t target;
 	int32_t level;
 	uint32_t internal_format;
@@ -3162,6 +3460,13 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// 2026-06-07 pvzge investigation: log every texImage2D call.
+	static int teximgN = 0;
+	++teximgN;
+	if (teximgN <= 20 || (teximgN % 50) == 0)
+		fprintf(stderr,
+			"[nxjs:tex-image2d] n=%d argc=%d target=0x%x level=%d intl=0x%x w=%d h=%d format=0x%x type=0x%x\n",
+			teximgN, argc, target, level, internal_format, width, height, format, type);
 	// Try to extract an HTMLImageElement-like source. If successful, the
 	// image's natural dimensions override any width/height the caller
 	// supplied (per WebGL spec for the image-source form), and the source
@@ -3383,11 +3688,35 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 			context->error = GL_OUT_OF_MEMORY;
 			return JS_UNDEFINED;
 		}
-		if (!nx_webgl_egl_persistent_texture_image_2d(
+		// 2026-06-07 pvzge investigation: GLES spec says texture contents
+		// are undefined when `data` is NULL, and Tegra reportedly leaves
+		// the texture image with garbage that reads back as the editor-
+		// default teal 0x44d7b6 (R=68, G=215, B=182). When Cocos's
+		// custom-pipeline tone-mapping pass uses an FBO-attached render
+		// target that the scene pass never wrote into, that garbage gets
+		// sampled and stamped on the bridge, producing the uniform-cyan
+		// screen pvzge shows post-mainScene. Allocate a zero-filled
+		// buffer and pass it as the source so the underlying glTexImage2D
+		// gets deterministic black contents. Cost: ~width*height*bpp
+		// memory per NULL-source allocation, freed immediately after the
+		// upload returns (the persistent texture owns the GLES copy).
+		size_t zero_bytes = (size_t)width * (size_t)height *
+		                    bytes_per_channel * channels;
+		uint8_t *zero_buf = NULL;
+		if (zero_bytes > 0) {
+			zero_buf = js_mallocz(ctx, zero_bytes);
+			if (!zero_buf) {
+				context->error = GL_OUT_OF_MEMORY;
+				return JS_UNDEFINED;
+			}
+		}
+		bool ok = nx_webgl_egl_persistent_texture_image_2d(
 		        context->egl, texture->gles_handle, width, height,
-		        internal_format, format, type, NULL,
+		        internal_format, format, type, zero_buf,
 		        texture->min_filter, texture->mag_filter,
-		        texture->wrap_s, texture->wrap_t)) {
+		        texture->wrap_s, texture->wrap_t);
+		js_free(ctx, zero_buf);
+		if (!ok) {
 			context->error = GL_INVALID_OPERATION;
 			return JS_UNDEFINED;
 		}
@@ -3830,6 +4159,17 @@ static JSValue nx_webgl_get_uniform_location(JSContext *ctx,
 	const char *name = JS_ToCString(ctx, argv[1]);
 	if (!name)
 		return JS_EXCEPTION;
+
+	{
+		static int gul_diag_n = 0;
+		int my_n = ++gul_diag_n;
+		if (my_n <= 200) {
+			fprintf(stderr,
+				"[nxjs:getUniformLocation] n=%d prog=%u name=\"%.80s\"\n",
+				my_n, program->gles_handle, name);
+			fflush(stderr);
+		}
+	}
 
 	nx_webgl_uniform_kind_t kind = uniform_kind_for_name(name);
 
@@ -4715,6 +5055,16 @@ static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
 	if (!name)
 		return JS_EXCEPTION;
 
+	{
+		static int gal_diag_n = 0;
+		int my_n = ++gal_diag_n;
+		if (my_n <= 200 || (my_n % 100) == 0) {
+			fprintf(stderr, "[nxjs:getAttribLocation] n=%d prog=%u name=\"%.80s\"\n",
+				my_n, program->gles_handle, name);
+			fflush(stderr);
+		}
+	}
+
 	int32_t location = -1;
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
@@ -5051,6 +5401,22 @@ static nx_webgl_vec2_t transform_position3(nx_webgl_program_t *program,
 }
 
 static uint32_t program_color(nx_webgl_program_t *program) {
+	{
+		static int placeholder_hits = 0;
+		static int real_hits = 0;
+		if (program->has_color) {
+			if (++real_hits <= 5 || real_hits % 10000 == 0)
+				fprintf(stderr,
+					"[nxjs:prog-color] REAL hit=%d c=(%.3f,%.3f,%.3f,%.3f)\n",
+					real_hits, program->color[0], program->color[1],
+					program->color[2], program->color[3]);
+		} else {
+			if (++placeholder_hits <= 5 || placeholder_hits % 10000 == 0)
+				fprintf(stderr,
+					"[nxjs:prog-color] PLACEHOLDER hit=%d (cyan fallback)\n",
+					placeholder_hits);
+		}
+	}
 	float *color = program->has_color ? program->color : (float[4]){
 		68.f / 255.f,
 		215.f / 255.f,
@@ -7198,6 +7564,21 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 								  uint32_t element_offset,
 								  uint32_t element_buffer_handle,
 								  int32_t instance_count) {
+	{
+		static int gate_n = 0;
+		if (gate_n++ < 30) {
+			fprintf(stderr,
+				"[nxjs:passthrough-gate] n=%d prog=%p gles_handle=%u raw=%d "
+				"egl=%d bridge=%d instance=%d\n",
+				gate_n, (void *)program,
+				program ? program->gles_handle : 0u,
+				program ? (int)program->raw_passthrough : -1,
+				context->egl ? 1 : 0,
+				(context->egl && nx_webgl_egl_is_bridge_enabled(context->egl))
+					? 1 : 0,
+				instance_count);
+		}
+	}
 	if (!program || !program->gles_handle)
 		return false;
 	if (!context->egl || !nx_webgl_egl_is_bridge_enabled(context->egl))
@@ -7211,10 +7592,20 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 			break;
 		}
 	}
-	// Gate: explicit pragma, explicit instanced draw, or sticky divisor on
-	// any enabled attrib (Three.js's instancing pattern).
-	if (!program->raw_passthrough && instance_count <= 0 && !any_divisor)
-		return false;
+	bool stencil_enabled = (context->enabled_caps & GL_CAP_STENCIL_TEST) != 0;
+	// 2026-06-08 ROUND 39: GATE DROPPED. Previously only draws using a
+	// `#pragma raw_passthrough` shader, instanced/divisor draws, or
+	// stencil-enabled draws went to native GL; everything else routed to
+	// the software-triangle bridge. The bridge's rasterizers don't run
+	// arbitrary fragment shaders, so any engine with a custom render
+	// pipeline (pvzge's `Forward`, Cocos custom pipelines in general,
+	// Three.js post-processing, Babylon's stuff) renders BLACK through
+	// the bridge. The Switch has a GPU; routing every draw to native
+	// GLES gives correct shader output. Sibling fixes
+	// ([[reference-nxjs-stencil-colormask-passthrough]]) already forward
+	// stencil/colorMask/etc state to native GL so behavior parity holds.
+	// The unconditional commit IS the engine-correct production shape.
+	(void)any_divisor; /* stencil_enabled still forwarded below */
 
 	// We're committed to native dispatch. Promote any CPU-data 2D texture
 	// to a persistent GLES handle so passthrough sampling actually reaches
@@ -7240,7 +7631,7 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 	bool scissor_enabled = (context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0;
 	bool depth_enabled = (context->enabled_caps & GL_CAP_DEPTH_TEST) != 0;
 	bool cull_enabled = (context->enabled_caps & GL_CAP_CULL_FACE) != 0;
-
+	/* stencil_enabled declared earlier in this function (used by gate). */
 	bool ok = nx_webgl_egl_draw_passthrough(
 		context->egl, context->canvas, program->gles_handle, mode,
 		indexed, first, count, element_type, element_offset,
@@ -7249,7 +7640,24 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 		context->blend_src, context->blend_dst,
 		context->blend_src_alpha, context->blend_dst_alpha,
 		scissor_enabled, context->scissor_box, depth_enabled,
-		cull_enabled, context->cull_face, context->front_face);
+		cull_enabled, context->cull_face, context->front_face,
+		/* round 22: stencil + color mask state forwarded */
+		stencil_enabled,
+		context->stencil_func, context->stencil_ref,
+		context->stencil_value_mask, context->stencil_fail,
+		context->stencil_zfail, context->stencil_zpass,
+		context->stencil_mask,
+		context->color_mask);
+	{
+		static int ok_n = 0;
+		if (ok_n++ < 20) {
+			fprintf(stderr,
+				"[nxjs:passthrough-dispatch] n=%d gles=%u mode=0x%x indexed=%d "
+				"count=%d ok=%d\n",
+				ok_n, program->gles_handle, mode, (int)indexed, count,
+				(int)ok);
+		}
+	}
 	// An instanced draw that failed setup (e.g. missing native instancing
 	// fn pointers) should propagate up so the JS caller can set INVALID_OP.
 	// The non-instanced fallback case still returns "dispatched" because the
@@ -7272,6 +7680,13 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &mode, argv[0]) || JS_ToInt32(ctx, &first, argv[1]) ||
 		JS_ToInt32(ctx, &count, argv[2]))
 		return JS_EXCEPTION;
+
+	/* 2026-06-08 ROUND 45: track draw-since-last-color-clear for the
+	 * multi-cam-no-RT heuristic. See nx_webgl_clear. */
+	if (JS_IsUndefined(context->framebuffer_binding) ||
+	    JS_IsNull(context->framebuffer_binding)) {
+		context->drawn_to_default_since_color_clear = true;
+	}
 
 	// Accept all 7 GLES2 primitive modes. The bridge's hardcoded software
 	// paths assume independent triangles (count % 3 == 0), so they'll
@@ -7637,6 +8052,13 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &type, argv[2]) || JS_ToInt32(ctx, &offset, argv[3]))
 		return JS_EXCEPTION;
 
+	/* 2026-06-08 ROUND 45: track draw-since-last-color-clear for the
+	 * multi-cam-no-RT heuristic. See nx_webgl_clear. */
+	if (JS_IsUndefined(context->framebuffer_binding) ||
+	    JS_IsNull(context->framebuffer_binding)) {
+		context->drawn_to_default_since_color_clear = true;
+	}
+
 	// See nx_webgl_draw_arrays for rationale on the widened mode list.
 	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
@@ -7942,6 +8364,16 @@ static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
 		JS_ToInt32(ctx, &instance_count, argv[3]))
 		return JS_EXCEPTION;
 
+	// 2026-06-08 ROUND 12c: log every call, fflush every 16th (see drawArrays).
+	{
+		static uint64_t __nx_dai_count = 0;
+		__nx_dai_count++;
+		fprintf(stderr,
+				"[nxjs:drawArraysInstanced] n=%llu BEGIN mode=0x%x first=%d count=%d instances=%d\n",
+				(unsigned long long)__nx_dai_count, mode, first, count, instance_count);
+		if ((__nx_dai_count & 0xF) == 0) fflush(stderr);
+	}
+
 	// See nx_webgl_draw_arrays for rationale on the widened mode list.
 	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
@@ -7995,6 +8427,7 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 		JS_ToInt32(ctx, &instance_count, argv[4]))
 		return JS_EXCEPTION;
 
+	// 2026-06-08 ROUND 12c: log every call, fflush every 16th (see drawArrays).
 	// See nx_webgl_draw_arrays for rationale on the widened mode list.
 	if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP &&
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
@@ -8164,6 +8597,26 @@ static JSValue nx_webgl_blend_equation(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+static JSValue nx_webgl_blend_equation_separate(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t mode_rgb;
+	uint32_t mode_alpha;
+	if (JS_ToUint32(ctx, &mode_rgb, argv[0]) ||
+	    JS_ToUint32(ctx, &mode_alpha, argv[1]))
+		return JS_EXCEPTION;
+	if (!is_blend_equation(mode_rgb) || !is_blend_equation(mode_alpha)) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	context->blend_equation_rgb = mode_rgb;
+	context->blend_equation_alpha = mode_alpha;
+	return JS_UNDEFINED;
+}
+
 static JSValue nx_webgl_blend_func_separate(JSContext *ctx,
 											JSValueConst this_val, int argc,
 											JSValueConst *argv) {
@@ -8301,6 +8754,77 @@ static JSValue nx_webgl_stencil_op(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+// WebGL `stencilMaskSeparate(face, mask)` — same JS-side state cache
+// as `stencilMask`; not pushed to native EGL here (the renderer applies
+// stencil state at draw time). Cocos's RasterizerState wires
+// front+back identically in the common case so a unified slot is
+// correct; if a game later needs distinct front/back masks the C
+// struct would gain `stencil_mask_back` etc.
+static JSValue nx_webgl_stencil_mask_separate(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t face;
+	uint32_t mask;
+	if (JS_ToUint32(ctx, &face, argv[0]) || JS_ToUint32(ctx, &mask, argv[1]))
+		return JS_EXCEPTION;
+	if (!is_cull_face_mode(face)) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	context->stencil_mask = mask;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_stencil_func_separate(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t face;
+	uint32_t func;
+	uint32_t mask;
+	int32_t ref;
+	if (JS_ToUint32(ctx, &face, argv[0]) || JS_ToUint32(ctx, &func, argv[1]) ||
+	    JS_ToInt32(ctx, &ref, argv[2]) || JS_ToUint32(ctx, &mask, argv[3]))
+		return JS_EXCEPTION;
+	if (!is_cull_face_mode(face) || !is_depth_func(func)) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	context->stencil_func = func;
+	context->stencil_ref = ref;
+	context->stencil_value_mask = mask;
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_stencil_op_separate(JSContext *ctx,
+                                            JSValueConst this_val,
+                                            int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	uint32_t face;
+	uint32_t fail;
+	uint32_t zfail;
+	uint32_t zpass;
+	if (JS_ToUint32(ctx, &face, argv[0]) || JS_ToUint32(ctx, &fail, argv[1]) ||
+	    JS_ToUint32(ctx, &zfail, argv[2]) || JS_ToUint32(ctx, &zpass, argv[3]))
+		return JS_EXCEPTION;
+	if (!is_cull_face_mode(face) || !is_stencil_op(fail) ||
+	    !is_stencil_op(zfail) || !is_stencil_op(zpass)) {
+		context->error = GL_INVALID_ENUM;
+		return JS_UNDEFINED;
+	}
+	context->stencil_fail = fail;
+	context->stencil_zfail = zfail;
+	context->stencil_zpass = zpass;
+	return JS_UNDEFINED;
+}
+
 static JSValue nx_webgl_create_framebuffer(JSContext *ctx,
                                             JSValueConst this_val, int argc,
                                             JSValueConst *argv) {
@@ -8322,6 +8846,20 @@ static JSValue nx_webgl_create_framebuffer(JSContext *ctx,
 	fb->stencil_attachment = JS_UNDEFINED;
 	fb->handle = nx_webgl_egl_create_native_framebuffer(context->egl,
 	                                                    context->canvas);
+	/* 2026-06-08 ROUND 44: track every framebuffer creation. Cocos's gfx
+	 * layer reports 3 createFramebuffer calls but page-side glhook saw
+	 * createFB=1 — so 2 may fail at egl level. Capped at 20. */
+	{
+		static int cfb_n = 0;
+		if (cfb_n < 20) {
+			cfb_n++;
+			fprintf(stderr,
+				"[nxjs:createFramebuffer] n=%d handle=%u %s\n",
+				cfb_n, (unsigned)fb->handle,
+				fb->handle == 0 ? "FAIL_OOM" : "OK");
+			fflush(stderr);
+		}
+	}
 	if (fb->handle == 0) {
 		js_free(ctx, fb);
 		JS_FreeValue(ctx, obj);
@@ -8377,6 +8915,24 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 	uint32_t target;
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
+	/* 2026-06-08 ROUND 44: FBO probe for the multi-camera/RT investigation.
+	 * Pvzge log shows Cocos gfx layer creates 3 framebuffers but only 1
+	 * reaches WebGL — find out which ones get bound and what their state
+	 * is. Capped at first 60 binds to keep log volume bounded. */
+	{
+		static int fb_bind_n = 0;
+		if (fb_bind_n < 60) {
+			fb_bind_n++;
+			int h = -1;
+			if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+				nx_webgl_framebuffer_t *_fb = nx_get_webgl_framebuffer(argv[1]);
+				h = _fb ? (int)_fb->handle : -2;
+			} else { h = 0; }
+			fprintf(stderr, "[nxjs:bindFramebuffer] n=%d target=0x%x handle=%d\n",
+				fb_bind_n, target, h);
+			fflush(stderr);
+		}
+	}
 	// WebGL 2 introduces DRAW_FRAMEBUFFER (0x8CA9) and READ_FRAMEBUFFER
 	// (0x8CA8) — Three.js's WebGL 2 path uses them in
 	// `WebGLState.bindFramebuffer` (binds both aliases) and the multisampled
@@ -8428,6 +8984,23 @@ static JSValue nx_webgl_check_framebuffer_status(JSContext *ctx,
 	}
 	uint32_t status = nx_webgl_egl_check_framebuffer_status(context->egl,
 	                                                         fb->handle);
+	/* 2026-06-08 ROUND 44: log FBO completeness. Pvzge / Cocos abandons
+	 * RTs if completeness check fails. 0x8CD5 = COMPLETE. Capped at 30. */
+	{
+		static int chk_n = 0;
+		if (chk_n < 30) {
+			chk_n++;
+			fprintf(stderr,
+				"[nxjs:checkFB] n=%d handle=%u status=0x%x (%s) w=%d h=%d color0=%s depth=%s stencil=%s\n",
+				chk_n, (unsigned)fb->handle, (unsigned)status,
+				(status == GL_FRAMEBUFFER_COMPLETE) ? "COMPLETE" : "INCOMPLETE",
+				fb->width, fb->height,
+				(JS_IsUndefined(fb->color_attachments[0]) ? "none" : "set"),
+				(JS_IsUndefined(fb->depth_attachment) ? "none" : "set"),
+				(JS_IsUndefined(fb->stencil_attachment) ? "none" : "set"));
+			fflush(stderr);
+		}
+	}
 	return JS_NewUint32(ctx, status);
 }
 
@@ -8445,6 +9018,28 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	    JS_ToUint32(ctx, &textarget, argv[2]) ||
 	    JS_ToInt32(ctx, &level, argv[4]))
 		return JS_EXCEPTION;
+	/* 2026-06-08 ROUND 44: framebuffer attachment probe. Logs every
+	 * texture attachment to an FBO so we can see WHICH textures Cocos
+	 * is using as render-target color/depth/stencil buffers. Capped 40. */
+	{
+		static int ft_n = 0;
+		if (ft_n < 40) {
+			ft_n++;
+			int tex_handle = -1;
+			bool detach = JS_IsNull(argv[3]) || JS_IsUndefined(argv[3]);
+			if (!detach) {
+				nx_webgl_texture_t *_t = nx_get_webgl_texture(argv[3]);
+				tex_handle = _t ? (int)_t->gles_handle : -2;
+			} else { tex_handle = 0; }
+			nx_webgl_framebuffer_t *_fb_now =
+				nx_get_webgl_framebuffer(context->framebuffer_binding);
+			fprintf(stderr,
+				"[nxjs:framebufferTex2D] n=%d fbo=%d attachment=0x%x textarget=0x%x texHandle=%d level=%d\n",
+				ft_n, _fb_now ? (int)_fb_now->handle : 0,
+				attachment, textarget, tex_handle, level);
+			fflush(stderr);
+		}
+	}
 	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
@@ -8923,6 +9518,28 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	uint32_t pname;
 	if (JS_ToUint32(ctx, &pname, argv[0]))
 		return JS_EXCEPTION;
+
+	/* Issue A audit: deduplicated log of getParameter pnames. Cocos's
+	 * gfx layer queries MAX_* limits + caps to decide its pipeline
+	 * shape; mismatched values vs a real browser may make Cocos fall
+	 * back to no-RT mode. Capped at first 80 unique pnames. */
+	{
+		#define PNAME_DEDUP_MAX 80
+		static uint32_t seen[PNAME_DEDUP_MAX];
+		static int seen_n = 0;
+		bool dup = false;
+		for (int i = 0; i < seen_n; i++) {
+			if (seen[i] == pname) { dup = true; break; }
+		}
+		if (!dup && seen_n < PNAME_DEDUP_MAX) {
+			seen[seen_n++] = pname;
+		}
+		#undef PNAME_DEDUP_MAX
+		if (!dup) {
+			fprintf(stderr, "[nxjs:getParam-audit] pname=0x%x\n", pname);
+			fflush(stderr);
+		}
+	}
 
 	// On a WebGL 2 context, ensure the EGL backend has finished its probe
 	// before any of the WebGL 2 pnames below dispatch to native glGet*
@@ -9419,6 +10036,10 @@ static JSValue nx_webgl_copy_bridge_to_canvas(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+	/* 2026-06-08 ROUND 45: frame boundary — reset the multi-cam-no-RT
+	 * heuristic so the first clear of the next frame still wipes color
+	 * normally. copyBridgeToCanvas is the canonical present point. */
+	context->drawn_to_default_since_color_clear = false;
 	if (argc < 7)
 		return JS_NewBool(ctx, false);
 	int32_t src_x, src_y, src_w, src_h, dst_x, dst_y;
@@ -10563,6 +11184,90 @@ static JSValue nx_webgl_copy_tex_sub_image_3d(JSContext *ctx,
 	return JS_UNDEFINED;
 }
 
+/* 2026-06-08 ROUND 38: WebGL2 copyTexImage2D + copyTexSubImage2D. Core
+ * GLES2 functions previously missing from nxjs (only 3D variants were
+ * exposed). Cocos's multi-camera RT composition path uses these to
+ * copy framebuffer pixels into a 2D texture for compositing — without
+ * them pvzge's gameplay area rendered black. */
+static JSValue nx_webgl_copy_tex_image_2d(JSContext *ctx,
+                                           JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context) return JS_EXCEPTION;
+	uint32_t target, internalformat;
+	int32_t level, x, y, w, h, border;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToUint32(ctx, &internalformat, argv[2]) ||
+		JS_ToInt32(ctx, &x, argv[3]) || JS_ToInt32(ctx, &y, argv[4]) ||
+		JS_ToInt32(ctx, &w, argv[5]) || JS_ToInt32(ctx, &h, argv[6]) ||
+		JS_ToInt32(ctx, &border, argv[7]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_copy_tex_image_2d(context->egl, target, level,
+	                                     internalformat, x, y, w, h, border)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_copy_tex_sub_image_2d(JSContext *ctx,
+                                               JSValueConst this_val,
+                                               int argc, JSValueConst *argv) {
+	(void)argc;
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context) return JS_EXCEPTION;
+	uint32_t target;
+	int32_t level, xoff, yoff, x, y, w, h;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+		JS_ToInt32(ctx, &level, argv[1]) ||
+		JS_ToInt32(ctx, &xoff, argv[2]) || JS_ToInt32(ctx, &yoff, argv[3]) ||
+		JS_ToInt32(ctx, &x, argv[4]) || JS_ToInt32(ctx, &y, argv[5]) ||
+		JS_ToInt32(ctx, &w, argv[6]) || JS_ToInt32(ctx, &h, argv[7]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_copy_tex_sub_image_2d(context->egl, target, level,
+	                                         xoff, yoff, x, y, w, h)) {
+		context->error = GL_INVALID_OPERATION;
+	}
+	return JS_UNDEFINED;
+}
+
+// 2026-06-07 FREEZE DIAGNOSTIC + missing-method stubs. nxjs only registered
+// compressedTexImage3D/SubImage3D — the 2D variants were never exposed. If
+// Cocos calls gl.compressedTexImage2D for an ASTC texture, JS hits
+// "undefined is not a function" and either throws (caught by onerror, which
+// we observe is silent) or Cocos catches internally and silently fails. These
+// stubs log every call without doing any GL work — minimum-risk diagnostic
+// that also avoids the TypeError-throw cascade if missing-method was the
+// cause of the inGameScene freeze.
+static JSValue nx_webgl_compressed_tex_image_2d_stub(JSContext *ctx,
+                                                       JSValueConst this_val,
+                                                       int argc,
+                                                       JSValueConst *argv) {
+	(void)ctx; (void)this_val; (void)argv;
+	static int cti2d_diag_n = 0;
+	int my_n = ++cti2d_diag_n;
+	if (my_n <= 200 || (my_n % 100) == 0) {
+		fprintf(stderr, "[nxjs:compressedTexImage2D] n=%d argc=%d\n", my_n, argc);
+		fflush(stderr);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue nx_webgl_compressed_tex_sub_image_2d_stub(JSContext *ctx,
+                                                           JSValueConst this_val,
+                                                           int argc,
+                                                           JSValueConst *argv) {
+	(void)ctx; (void)this_val; (void)argv;
+	static int ctsi2d_diag_n = 0;
+	int my_n = ++ctsi2d_diag_n;
+	if (my_n <= 200 || (my_n % 100) == 0) {
+		fprintf(stderr, "[nxjs:compressedTexSubImage2D] n=%d argc=%d\n", my_n, argc);
+		fflush(stderr);
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue nx_webgl_compressed_tex_image_3d(JSContext *ctx,
                                                   JSValueConst this_val,
                                                   int argc,
@@ -10915,6 +11620,16 @@ static JSValue nx_webgl_bind_buffer_range(JSContext *ctx, JSValueConst this_val,
 	}
 	nx_webgl_egl_bind_buffer_range(context->egl, target, index, buffer,
 	                                 (size_t)offset, (size_t)size);
+	{
+		static int diag_n = 0;
+		diag_n++;
+		if (diag_n <= 30 || diag_n % 1000 == 0)
+			fprintf(stderr,
+				"[nxjs:bindBufferRange] n=%d target=0x%x index=%u buffer=%u "
+				"offset=%lld size=%lld\n",
+				diag_n, target, index, buffer,
+				(long long)offset, (long long)size);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -11033,6 +11748,16 @@ static JSValue nx_webgl_get_active_uniform_block_parameter(
 	if (JS_ToUint32(ctx, &block_index, argv[1]) ||
 		JS_ToUint32(ctx, &pname, argv[2]))
 		return JS_EXCEPTION;
+	{
+		static int gaubp_diag_n = 0;
+		int my_n = ++gaubp_diag_n;
+		if (my_n <= 200) {
+			fprintf(stderr,
+				"[nxjs:getActiveUniformBlockParameter] n=%d prog=%u block=%u pname=0x%x\n",
+				my_n, program ? program->gles_handle : 0, block_index, pname);
+			fflush(stderr);
+		}
+	}
 	if (!program || !program->link_status) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_NULL;
@@ -11084,6 +11809,16 @@ static JSValue nx_webgl_get_active_uniform_block_name(JSContext *ctx,
 	uint32_t block_index;
 	if (JS_ToUint32(ctx, &block_index, argv[1]))
 		return JS_EXCEPTION;
+	{
+		static int gaubn_diag_n = 0;
+		int my_n = ++gaubn_diag_n;
+		if (my_n <= 200) {
+			fprintf(stderr,
+				"[nxjs:getActiveUniformBlockName] n=%d prog=%u block=%u\n",
+				my_n, program ? program->gles_handle : 0, block_index);
+			fflush(stderr);
+		}
+	}
 	if (!program || !program->link_status) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_NULL;
@@ -11115,6 +11850,14 @@ static JSValue nx_webgl_uniform_block_binding(JSContext *ctx,
 	}
 	nx_webgl_egl_uniform_block_binding(context->egl, program->gles_handle,
 	                                    block_index, binding);
+	{
+		static int diag_n = 0;
+		diag_n++;
+		if (diag_n <= 30 || diag_n % 1000 == 0)
+			fprintf(stderr,
+				"[nxjs:uniformBlockBinding] n=%d prog=%u block_index=%u binding=%u\n",
+				diag_n, program->gles_handle, block_index, binding);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -11718,6 +12461,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "deleteShader", nx_webgl_delete_shader, 1);
 	NX_DEF_FUNC(proto, "createProgram", nx_webgl_create_program, 0);
 	NX_DEF_FUNC(proto, "attachShader", nx_webgl_attach_shader, 2);
+	NX_DEF_FUNC(proto, "detachShader", nx_webgl_detach_shader, 2);
 	NX_DEF_FUNC(proto, "bindAttribLocation", nx_webgl_bind_attrib_location, 3);
 	NX_DEF_FUNC(proto, "linkProgram", nx_webgl_link_program, 1);
 	NX_DEF_FUNC(proto, "useProgram", nx_webgl_use_program, 1);
@@ -11778,6 +12522,7 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "depthMask", nx_webgl_depth_mask, 1);
 	NX_DEF_FUNC(proto, "colorMask", nx_webgl_color_mask, 4);
 	NX_DEF_FUNC(proto, "blendEquation", nx_webgl_blend_equation, 1);
+	NX_DEF_FUNC(proto, "blendEquationSeparate", nx_webgl_blend_equation_separate, 2);
 	NX_DEF_FUNC(proto, "blendFunc", nx_webgl_blend_func, 2);
 	NX_DEF_FUNC(proto, "blendFuncSeparate", nx_webgl_blend_func_separate, 4);
 	NX_DEF_FUNC(proto, "blendColor", nx_webgl_blend_color, 4);
@@ -11787,6 +12532,9 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "stencilMask", nx_webgl_stencil_mask, 1);
 	NX_DEF_FUNC(proto, "stencilFunc", nx_webgl_stencil_func, 3);
 	NX_DEF_FUNC(proto, "stencilOp", nx_webgl_stencil_op, 3);
+	NX_DEF_FUNC(proto, "stencilMaskSeparate", nx_webgl_stencil_mask_separate, 2);
+	NX_DEF_FUNC(proto, "stencilFuncSeparate", nx_webgl_stencil_func_separate, 4);
+	NX_DEF_FUNC(proto, "stencilOpSeparate", nx_webgl_stencil_op_separate, 4);
 	NX_DEF_FUNC(proto, "bindFramebuffer", nx_webgl_bind_framebuffer, 2);
 	NX_DEF_FUNC(proto, "createFramebuffer", nx_webgl_create_framebuffer, 0);
 	NX_DEF_FUNC(proto, "deleteFramebuffer", nx_webgl_delete_framebuffer, 1);
@@ -12161,6 +12909,12 @@ static JSValue nx_webgl2_context_init_class(JSContext *ctx,
 	NX_DEF_FUNC(proto, "texImage3D", nx_webgl_tex_image_3d, 10);
 	NX_DEF_FUNC(proto, "texSubImage3D", nx_webgl_tex_sub_image_3d, 11);
 	NX_DEF_FUNC(proto, "copyTexSubImage3D", nx_webgl_copy_tex_sub_image_3d, 9);
+	NX_DEF_FUNC(proto, "copyTexImage2D", nx_webgl_copy_tex_image_2d, 8);
+	NX_DEF_FUNC(proto, "copyTexSubImage2D", nx_webgl_copy_tex_sub_image_2d, 8);
+	NX_DEF_FUNC(proto, "compressedTexImage2D",
+	            nx_webgl_compressed_tex_image_2d_stub, 7);
+	NX_DEF_FUNC(proto, "compressedTexSubImage2D",
+	            nx_webgl_compressed_tex_sub_image_2d_stub, 8);
 	NX_DEF_FUNC(proto, "compressedTexImage3D",
 	            nx_webgl_compressed_tex_image_3d, 8);
 	NX_DEF_FUNC(proto, "compressedTexSubImage3D",

@@ -91,6 +91,17 @@ export async function createImageBitmap(
 		await $.imageDecode(img, buf);
 		return img;
 	}
+	// Canvas duck-type: any source with a spec-style `convertToBlob` (nxjs
+	// OffscreenCanvas, swb LiveElement canvas, HTMLCanvasElement) is encoded
+	// to a Blob first, then decoded via the Blob path. Tier-1 — no native
+	// canvas→ImageBitmap fast path yet; cost is one PNG encode + decode.
+	if (image && typeof (image as { convertToBlob?: unknown }).convertToBlob === 'function') {
+		const blob = await (image as { convertToBlob: () => Promise<Blob> }).convertToBlob();
+		const buf = await blob.arrayBuffer();
+		const img = proto($.imageNew(), ImageBitmap);
+		await $.imageDecode(img, buf);
+		return img;
+	}
 	throw new Error(`Unsupported image source: ${image.constructor.name}`);
 }
 def(createImageBitmap);

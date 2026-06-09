@@ -281,6 +281,20 @@ export class AudioBufferSourceNode extends AudioNode {
 	}
 
 	start(when = 0, offset = 0, _duration?: number): void {
+		// 2026-06-08 ROUND 28: minimal entry-point trace. Module-local
+		// counter (no globalThis) — same pattern as Audio.play probe that
+		// shipped clean in round 27. Logs buffer presence + ch/sr/loop so
+		// we can tell which (if any) sources are music vs SFX.
+		_bufStartProbeN++;
+		if (_bufStartProbeN <= 30 || _bufStartProbeN % 10 === 0) {
+			const buf = this.buffer;
+			console.debug('[audio] BufSrc.start n=' + _bufStartProbeN
+				+ ' loop=' + (this.loop ? 1 : 0)
+				+ ' buf=' + (buf ? 1 : 0)
+				+ (buf
+					? ' sr=' + buf.sampleRate + ' ch=' + buf.numberOfChannels + ' len=' + buf.length
+					: ''));
+		}
 		if (this.#started) {
 			throw new DOMException('source already started', 'InvalidStateError');
 		}
@@ -438,6 +452,14 @@ export class OscillatorNode extends AudioNode {
 
 let currentContext: AudioContext | null = null;
 
+/** 2026-06-08 ROUND 28: module-local probe counter for AudioBufferSourceNode.start.
+ * Same pattern as round 27 Audio.play probe (which shipped clean). */
+let _bufStartProbeN = 0;
+
+/** 2026-06-08 ROUND 29: module-local probe counter for AudioContext.createBufferSource. */
+let _createBufSrcProbeN = 0;
+let _decodeCbProbeN = 0;
+
 export class AudioContext extends EventTarget {
 	readonly destination: AudioDestinationNode;
 	readonly sampleRate: number = NATIVE_SAMPLE_RATE;
@@ -482,7 +504,14 @@ export class AudioContext extends EventTarget {
 		});
 	}
 
-	createBufferSource(): AudioBufferSourceNode { return new AudioBufferSourceNode(this); }
+	createBufferSource(): AudioBufferSourceNode {
+		// 2026-06-08 ROUND 29: count source creations. Module-local counter.
+		_createBufSrcProbeN++;
+		if (_createBufSrcProbeN <= 30 || _createBufSrcProbeN % 25 === 0) {
+			console.debug('[audio] ctx.createBufferSource n=' + _createBufSrcProbeN);
+		}
+		return new AudioBufferSourceNode(this);
+	}
 	createGain(): GainNode { return new GainNode(this); }
 	createOscillator(): OscillatorNode { return new OscillatorNode(this); }
 
@@ -509,6 +538,15 @@ export class AudioContext extends EventTarget {
 				numberOfChannels: decoded.channels,
 				pcmInt16: decoded.pcmData,
 			});
+			// 2026-06-08 ROUND 29: count successCallback invocations to verify
+			// Cocos receives the decoded buffer.
+			_decodeCbProbeN++;
+			if (_decodeCbProbeN <= 30 || _decodeCbProbeN % 50 === 0) {
+				console.debug('[audio] decodeCB n=' + _decodeCbProbeN
+					+ ' hasCb=' + (successCallback ? 1 : 0)
+					+ ' ch=' + decoded.channels
+					+ ' sr=' + decoded.sampleRate);
+			}
 			if (successCallback) try { successCallback(ab); } catch (_) {}
 			return ab;
 		}, (err) => {

@@ -5,6 +5,7 @@ import './polyfills/blob';
 import './polyfills/file';
 import './polyfills/text-decoder';
 import './polyfills/text-encoder';
+import './polyfills/html-element-stubs';
 import './polyfills/abort-controller';
 import './polyfills/streams';
 import './polyfills/form-data';

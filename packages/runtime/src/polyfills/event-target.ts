@@ -115,8 +115,19 @@ export class EventTarget implements globalThis.EventTarget {
 			if (cb.options?.once) {
 				self.removeEventListener(event.type, cb.cb);
 			}
+			// Per Web spec (EventTarget § 2.10), a listener function is
+			// invoked with `this === currentTarget`. Previously this code
+			// invoked the callback without a receiver, so a listener
+			// authored as `function () { this.naturalWidth }` saw `this`
+			// as undefined/globalThis instead of the EventTarget — which
+			// broke any Web-style listener pattern that reads target
+			// state via `this`. Cocos Creator's image-load handlers use
+			// this pattern; with the bug, their texture upload pulled
+			// `naturalWidth = 0` and uploaded empty texture data, which
+			// surfaced as the Cocos #44d7b6 placeholder rendering pvzge
+			// blank-cyan on real Switch hardware (2026-06-07).
 			if (typeof cb.cb === 'function') {
-				cb.cb(event);
+				cb.cb.call(cb.target, event);
 			} else {
 				cb.cb.handleEvent(event);
 			}

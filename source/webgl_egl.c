@@ -583,15 +583,24 @@ static bool ensure_bridge_resources(nx_webgl_egl_t *backend, int width,
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
 				 GL_UNSIGNED_BYTE, NULL);
 
+	// 2026-06-08 ROUND 25: bridge FBO now uses DEPTH24_STENCIL8 (was
+	// DEPTH_COMPONENT16). Without a stencil attachment, `gl.enable(STENCIL_TEST)`
+	// + stencilFunc/Op/Mask have no buffer to operate on — Cocos cc.Mask,
+	// Three.js clipping planes, and any portal/stencil-shadow engine produce
+	// no clipping. Real browsers provide stencil by default. The depth
+	// portion is still 24-bit (more precision than the prior 16-bit) at the
+	// cost of 1 extra byte per pixel for stencil.
 	glGenRenderbuffers(1, &backend->bridge_depth_renderbuffer);
 	glBindRenderbuffer(GL_RENDERBUFFER, backend->bridge_depth_renderbuffer);
-	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+	glRenderbufferStorage(GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */,
+						  width, height);
 
 	glGenFramebuffers(1, &backend->bridge_framebuffer);
 	glBindFramebuffer(GL_FRAMEBUFFER, backend->bridge_framebuffer);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 						   GL_TEXTURE_2D, backend->bridge_texture, 0);
-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER,
+							  0x821A /* GL_DEPTH_STENCIL_ATTACHMENT */,
 							  GL_RENDERBUFFER,
 							  backend->bridge_depth_renderbuffer);
 	GLenum framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -602,6 +611,14 @@ static bool ensure_bridge_resources(nx_webgl_egl_t *backend, int width,
 		destroy_bridge_resources(backend);
 		return false;
 	}
+
+	// Initialize the bridge color attachment to transparent black so the
+	// first frame doesn't flash Tegra's uninitialized GPU-memory contents
+	// (commonly a leftover red from previous framebuffer recycling). After
+	// this clear, the bridge is empty until the page's first gl.clear() /
+	// draw runs. See pvzge 2026-06-07 red-flash request.
+	glClearColor(0.f, 0.f, 0.f, 0.f);
+	glClear(GL_COLOR_BUFFER_BIT);
 
 	backend->bridge_width = width;
 	backend->bridge_height = height;
@@ -2680,7 +2697,12 @@ bool nx_webgl_egl_draw_passthrough(
 	bool depth_enabled,
 	bool cull_enabled,
 	uint32_t cull_face_mode,
-	uint32_t front_face) {
+	uint32_t front_face,
+	bool stencil_enabled,
+	uint32_t stencil_func, int32_t stencil_ref, uint32_t stencil_value_mask,
+	uint32_t stencil_fail, uint32_t stencil_zfail, uint32_t stencil_zpass,
+	uint32_t stencil_mask,
+	const bool *color_mask) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend; (void)canvas; (void)program_handle; (void)mode;
 	(void)indexed; (void)first; (void)count; (void)element_type;
@@ -2689,7 +2711,10 @@ bool nx_webgl_egl_draw_passthrough(
 	(void)blend_src; (void)blend_dst; (void)blend_src_alpha;
 	(void)blend_dst_alpha; (void)scissor_enabled; (void)scissor_box;
 	(void)depth_enabled; (void)cull_enabled; (void)cull_face_mode;
-	(void)front_face;
+	(void)front_face; (void)stencil_enabled; (void)stencil_func;
+	(void)stencil_ref; (void)stencil_value_mask; (void)stencil_fail;
+	(void)stencil_zfail; (void)stencil_zpass; (void)stencil_mask;
+	(void)color_mask;
 	return false;
 #else
 	// Function pointer typedefs for the runtime-loaded instancing entry
@@ -2896,7 +2921,85 @@ bool nx_webgl_egl_draw_passthrough(
 	if (front_face == 0x0900u) gl_front = GL_CW;
 	glFrontFace(gl_front);
 
+	// 2026-06-08 ROUND 22: stencil + color-mask state. Without this
+	// cc.Mask's stencil clipping doesn't work (text overflowing popups
+	// stays visible). The stencil_* and color_mask values come from the
+	// JS-side state cached in nx_webgl_context_t by gl.stencilFunc /
+	// stencilOp / stencilMask / colorMask.
+	if (stencil_enabled) {
+		glEnable(GL_STENCIL_TEST);
+		glStencilFunc((GLenum)stencil_func, stencil_ref, stencil_value_mask);
+		glStencilOp((GLenum)stencil_fail, (GLenum)stencil_zfail,
+					(GLenum)stencil_zpass);
+		glStencilMask(stencil_mask);
+	} else {
+		glDisable(GL_STENCIL_TEST);
+	}
+	if (color_mask) {
+		glColorMask(color_mask[0] ? GL_TRUE : GL_FALSE,
+					color_mask[1] ? GL_TRUE : GL_FALSE,
+					color_mask[2] ? GL_TRUE : GL_FALSE,
+					color_mask[3] ? GL_TRUE : GL_FALSE);
+	} else {
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	}
+
 	(void)glGetError();  // drain stale errors
+
+	{
+		static int pre_n = 0;
+		if (pre_n++ < 10) {
+			GLint num_blocks = 0;
+			GLint num_attribs = 0;
+			GLint num_uniforms = 0;
+			glGetProgramiv((GLuint)program_handle,
+			               0x8A36 /* ACTIVE_UNIFORM_BLOCKS */, &num_blocks);
+			glGetProgramiv((GLuint)program_handle, GL_ACTIVE_ATTRIBUTES,
+			               &num_attribs);
+			glGetProgramiv((GLuint)program_handle, GL_ACTIVE_UNIFORMS,
+			               &num_uniforms);
+			int bound_ubos = 0;
+			char ubo_list[256] = {0};
+			int written = 0;
+			for (int i = 0; i < NX_WEBGL_MAX_UBO_BINDINGS; i++) {
+				if (backend->ubo_indexed_bindings[i] != 0) {
+					bound_ubos++;
+					if (written < (int)sizeof(ubo_list) - 16) {
+						written += snprintf(ubo_list + written,
+						                     sizeof(ubo_list) - written,
+						                     "%d:%u,", i,
+						                     backend->ubo_indexed_bindings[i]);
+					}
+				}
+			}
+			int enabled_attribs = 0;
+			char attr_list[256] = {0};
+			int aw = 0;
+			for (int i = 0; i < attrib_count; i++) {
+				if (attribs[i].enabled) {
+					enabled_attribs++;
+					if (aw < (int)sizeof(attr_list) - 32) {
+						aw += snprintf(attr_list + aw,
+						                sizeof(attr_list) - aw,
+						                "%d:buf%u/sz%d/of%d/st%d ",
+						                i, attribs[i].buffer_handle,
+						                attribs[i].size,
+						                (int)attribs[i].offset,
+						                attribs[i].stride);
+					}
+				}
+			}
+			fprintf(stderr,
+				"[nxjs:pre-draw] n=%d prog=%u active_blocks=%d active_attrs=%d "
+				"active_uniforms=%d bound_ubos=%d user_vao=%u\n"
+				"  ubo_slots=%s\n"
+				"  enabled_attrs(%d)=%s\n",
+				pre_n, program_handle, num_blocks, num_attribs, num_uniforms,
+				bound_ubos, backend->current_user_vao, ubo_list,
+				enabled_attribs, attr_list);
+			(void)glGetError();
+		}
+	}
 
 	// Re-apply tracked UBO slot bindings + program block bindings right
 	// before every draw. Mesa Nouveau on Citron has a deep driver bug
@@ -2978,6 +3081,58 @@ bool nx_webgl_egl_draw_passthrough(
 	}
 	GLenum error = glGetError();
 	backend->bridge_last_draw_gl_error = error;
+
+	{
+		static int probe_n = 0;
+		if (!target.is_user_fbo && probe_n++ < 10) {
+			GLint cur_vp[4] = {0, 0, 0, 0};
+			GLint cur_fb_draw = 0;
+			GLint cur_fb_read = 0;
+			(void)glGetError();
+			glGetIntegerv(GL_VIEWPORT, cur_vp);
+			glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &cur_fb_draw);
+			glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &cur_fb_read);
+			(void)glGetError();
+			// Find min/max RGBA across a 5x5 grid by scanning the FBO.
+			uint8_t mn[4] = {255, 255, 255, 255};
+			uint8_t mx[4] = {0, 0, 0, 0};
+			int positions[5][2] = {
+				{16, 16},
+				{target.width / 4, target.height / 4},
+				{target.width / 2, target.height / 2},
+				{(3 * target.width) / 4, (3 * target.height) / 4},
+				{target.width - 16, target.height - 16},
+			};
+			char sampled[128] = {0};
+			int written = 0;
+			for (int i = 0; i < 5; i++) {
+				uint8_t px[4] = {0, 0, 0, 0};
+				glReadPixels(positions[i][0], positions[i][1], 1, 1, GL_RGBA,
+				             GL_UNSIGNED_BYTE, px);
+				for (int c = 0; c < 4; c++) {
+					if (px[c] < mn[c]) mn[c] = px[c];
+					if (px[c] > mx[c]) mx[c] = px[c];
+				}
+				if (written < (int)sizeof(sampled) - 24) {
+					written += snprintf(sampled + written,
+					                     sizeof(sampled) - written,
+					                     "[%u,%u,%u,%u]", px[0], px[1], px[2],
+					                     px[3]);
+				}
+			}
+			GLenum perr = glGetError();
+			fprintf(stderr,
+				"[nxjs:post-draw-pixel] n=%d fbo=%u w=%d h=%d "
+				"cur_fb_draw=%d cur_fb_read=%d vp=[%d,%d,%d,%d] "
+				"min=(%u,%u,%u,%u) max=(%u,%u,%u,%u) samples=%s "
+				"draw_err=0x%x rp_err=0x%x\n",
+				probe_n, target.fbo, target.width, target.height,
+				cur_fb_draw, cur_fb_read,
+				cur_vp[0], cur_vp[1], cur_vp[2], cur_vp[3],
+				mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
+				sampled, error, perr);
+		}
+	}
 
 	// Clean up: leave the bridge's own state mostly untouched. The bridge
 	// dispatch re-binds its own attribs/buffers/program before each draw,
@@ -3535,6 +3690,18 @@ void nx_webgl_egl_set_user_framebuffer(nx_webgl_egl_t *backend,
 			glFinish();
 		}
 	}
+	// 2026-06-07 pvzge investigation: log every user-FBO switch so we
+	// can see whether Cocos's render passes bind an intermediate FBO
+	// around the cyan transition. handle=0 means "back to bridge default".
+	{
+		static int fbN = 0;
+		++fbN;
+		GLuint prev = backend->current_user_framebuffer;
+		if (fbN <= 20 || (fbN % 200) == 0 || (prev == 0) != (handle == 0))
+			fprintf(stderr,
+				"[nxjs:set-user-fb] n=%d prev=%u next=%u size=%dx%d\n",
+				fbN, (unsigned)prev, (unsigned)handle, width, height);
+	}
 	backend->current_user_framebuffer = (GLuint)handle;
 	backend->current_user_framebuffer_width = width;
 	backend->current_user_framebuffer_height = height;
@@ -3969,6 +4136,24 @@ bool nx_webgl_egl_read_bridge_to_canvas_data(nx_webgl_egl_t *backend,
 		         "GPU bridge readToCanvas readPixels failed: 0x%x", err);
 		return false;
 	}
+	// 2026-06-07 pvzge investigation: log what C actually saw in the
+	// bridge framebuffer at copyBridgeToCanvas time. JS-side readPixels
+	// reports cyan (68,215,182) from frame ~1561 onward; if the C-side
+	// readback agrees, the bridge FBO truly holds cyan (rules out
+	// JS-side gl context divergence). If it differs, there's a JS vs C
+	// FBO disagreement we need to chase.
+	{
+		static int readN = 0;
+		++readN;
+		if (readN <= 10 || (readN % 240) == 0) {
+			const uint8_t *p = backend->bridge_readback;
+			fprintf(stderr,
+				"[nxjs:bridge-read] n=%d fbo=%u src=(%d,%d %dx%d) dst=(%d,%d) px[0,0]=(%u,%u,%u,%u)\n",
+				readN, (unsigned)backend->bridge_framebuffer,
+				clip_x, clip_y, clip_w, clip_h, final_dst_x, final_dst_y,
+				(unsigned)p[0], (unsigned)p[1], (unsigned)p[2], (unsigned)p[3]);
+		}
+	}
 
 	// Y-flip + RGBA→ARGB32(premul) swizzle while copying into dst.
 	// Source rows are in GL bottom-up order; we map row r in dst to
@@ -4078,6 +4263,28 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 		return false;
 	int width = target.width;
 	int height = target.height;
+	// 2026-06-07 pvzge investigation: trace which FBO each JS gl.clear()
+	// hits, with the actual clear_color the backend will write. JS-side
+	// instrumentation in pvzge proves Cocos only ever submitted RED + a
+	// dark pipeline-bg via `gl.clearColor`, but the bridge readback turns
+	// CYAN (0x44d7b6) at frame ~1561 and stays cyan. If the cyan never
+	// appears here either, the clear path is innocent and the cyan must
+	// come from shader output / fragment writes. If a user FBO ID
+	// becomes the predominant clear target around that point, the
+	// page's draws+clears are landing on an intermediate FBO and the
+	// bridge FBO's stale contents are what we keep reading.
+	{
+		static int clearN = 0;
+		++clearN;
+		if (clearN <= 10 || (clearN % 240) == 0)
+			fprintf(stderr,
+				"[nxjs:bridge-clear] n=%d mask=0x%x fbo=%u user=%d color=(%.3f,%.3f,%.3f,%.3f) depth=%.3f stencil=%d scissor=%d size=%dx%d\n",
+				clearN, mask, (unsigned)target.fbo, target.is_user_fbo ? 1 : 0,
+				backend->clear_color[0], backend->clear_color[1],
+				backend->clear_color[2], backend->clear_color[3],
+				depth_value, stencil_value, scissor_enabled ? 1 : 0,
+				width, height);
+	}
 
 	(void)depth_enabled;
 	glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
@@ -7115,6 +7322,44 @@ bool nx_webgl_egl_copy_tex_sub_image_3d(nx_webgl_egl_t *backend,
 #else
 	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
 	(void)zoff; (void)x; (void)y; (void)w; (void)h;
+	return false;
+#endif
+}
+
+/* 2026-06-08 ROUND 38: copyTexImage2D + copyTexSubImage2D — core GLES2
+ * (no eglGetProcAddress needed). Were missing from nxjs WebGL; Cocos's
+ * multi-camera render-target pipeline (CameraLawn_RT → CameraLawn
+ * composition) silently no-op'd the RT-to-texture copy → pvzge gameplay
+ * area rendered black. Generic Web API behavior, every WebGL2 engine
+ * using render targets needs these. */
+bool nx_webgl_egl_copy_tex_image_2d(nx_webgl_egl_t *backend,
+                                     uint32_t target, int level,
+                                     uint32_t internalformat,
+                                     int x, int y, int w, int h, int border) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend)) return false;
+	glCopyTexImage2D((GLenum)target, level, (GLenum)internalformat,
+	                  x, y, (GLsizei)w, (GLsizei)h, border);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)internalformat;
+	(void)x; (void)y; (void)w; (void)h; (void)border;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_copy_tex_sub_image_2d(nx_webgl_egl_t *backend,
+                                         uint32_t target, int level,
+                                         int xoff, int yoff,
+                                         int x, int y, int w, int h) {
+#if NXJS_HAS_EGL_GLES
+	if (!webgl2_make_current(backend)) return false;
+	glCopyTexSubImage2D((GLenum)target, level, xoff, yoff,
+	                     x, y, (GLsizei)w, (GLsizei)h);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
+	(void)x; (void)y; (void)w; (void)h;
 	return false;
 #endif
 }
