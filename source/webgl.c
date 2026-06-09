@@ -9964,7 +9964,7 @@ static JSValue nx_webgl_enable_gpu_bridge_prototype(JSContext *ctx,
 // gl.setBridgeAutoFlush(bool) — disable the automatic bridge→canvas
 // readback that fires on `gl.clear` when there's a pending bridge draw.
 // Clients that drive readback themselves via `gl.readPixels` (e.g.
-// switch-web-browser's inline-canvas WebGL canvas-runner) should call
+// brewser's inline-canvas WebGL canvas-runner) should call
 // this with `false` once after enabling the bridge — saves a 1280×720
 // glReadPixels per frame and avoids a visible flash on the first
 // auto-flush.
@@ -9989,7 +9989,7 @@ static JSValue nx_webgl_set_bridge_auto_flush(JSContext *ctx,
 // interpolator coherency bug ([[threejs-cube-white-face]]) — but the
 // current implementation does NOT actually fix the bug because
 // midpoint-in-NDC subdivision produces uniform sub-triangle patterns
-// the rasterizer still trips on. switch-web-browser does NOT call
+// the rasterizer still trips on. brewser does NOT call
 // this; it uses JS-side `BoxGeometry(w,h,d,8,8,8)` tessellation
 // instead, which is the only working approach today. The API and
 // underlying scaffolding (recursion helper, scratch buffer, hooks in
@@ -10022,7 +10022,7 @@ static JSValue nx_webgl_set_tessellation_fix(JSContext *ctx,
 //
 // Takes the canvas directly (not a 2D context) because 2D contexts are
 // commonly Proxy-wrapped (e.g. by `installBrowserShim` in
-// `switch-web-runtime` for CSS color normalisation) and the Proxy's
+// `brewser-runtime` for CSS color normalisation) and the Proxy's
 // class id no longer matches nx.js's canvas-context class id, so
 // `JS_GetOpaque` can't reach the underlying C struct. Canvas objects
 // aren't wrapped — `nxScreen()` returns the raw Screen.

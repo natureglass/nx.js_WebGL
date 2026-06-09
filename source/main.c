@@ -49,8 +49,8 @@
 #include "worker.h"
 
 /* Centralised log path so all diagnostic output lands beside the
- * switch-web-browser profile's other logs. NOTE: this hardcodes the
- * switch-web-browser profile path into the SHARED nxjs runtime — any
+ * brewser profile's other logs. NOTE: this hardcodes the
+ * brewser profile path into the SHARED nxjs runtime — any
  * other consumer of nxjs.nro will also write its debug log here. If
  * a different consumer needs its own location, factor this into a
  * runtime-settable path (e.g. via env or argv). */

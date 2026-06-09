@@ -1,6 +1,6 @@
 // video.c — Switch.VideoDecoder (slice 2b: video + audio + AV sync).
 //
-// Backs the switch-web-browser <video> element. Opens an mp4 (or any
+// Backs the brewser <video> element. Opens an mp4 (or any
 // FFmpeg-supported container), decodes the video stream via libavcodec
 // with NVTEGRA hardware acceleration when available, downloads frames to
 // NV12 via av_hwframe_transfer_data, scales to RGBA via libswscale, and
@@ -67,7 +67,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Slice-2c audio-reactive analysis (for the switch-web-browser music
+// Slice-2c audio-reactive analysis (for the brewser music
 // visualizer, which ports a Web-Audio-AnalyserNode-based player). The audio
 // thread runs a radix-2 FFT over each decoded chunk for a frequency spectrum
 // AND keeps a downsampled time-domain waveform, recording both into a small

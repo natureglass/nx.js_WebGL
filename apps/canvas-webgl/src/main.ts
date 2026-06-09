@@ -1,6 +1,6 @@
 // nx.js standalone WebGL 1 demo — Moonlit Ocean Cube.
 //
-// Direct port of switch-web-browser's inline `nxjs-webgl-demo` page
+// Direct port of brewser's inline `nxjs-webgl-demo` page
 // (romfs/pages/nxjs-webgl-demo/assets/main.js). Source of truth lives
 // there; this app is a wholesale clean port adapted only for the
 // standalone nx.js runtime (screen-canvas acquisition, romfs asset

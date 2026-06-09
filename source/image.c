@@ -1006,7 +1006,7 @@ JSValue nx_image_close(JSContext *ctx, JSValueConst this_val, int argc,
 // backing buffer + cairo surface — see `nx_image_new` for the
 // allocation path.
 //
-// Used by switch-web-browser's <video> frame delivery to feed decoded
+// Used by brewser's <video> frame delivery to feed decoded
 // FFmpeg RGBA frames into an Image that can be drawn via the standard
 // drawImage(img, x, y) cairo paint path, sidestepping the second-call
 // putImageData hang we hit during slice 2a. See live-video.ts for the

@@ -176,7 +176,7 @@ GLuint bridge_color_program;
 	// When false, suppress the automatic `flush_bridge_present` that
 	// normally fires on `gl.clear` if pending=true. Clients that drive
 	// readback explicitly via `gl.readPixels` (inline-canvas WebGL, the
-	// canvas-runner in switch-web-browser) don't need it — the auto-
+	// canvas-runner in brewser) don't need it — the auto-
 	// flush would do a redundant 1280×720 readback + write-to-screen
 	// every frame, slow and visibly flashing on the first frame before
 	// the page paint covers it. Defaults to true for back-compat with
@@ -4018,7 +4018,7 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 // `nx_canvas_t` (e.g., the screen canvas) at (dst_x, dst_y) with the
 // usual Y-flip + RGBA→cairo-ARGB32 swizzle, marking the destination
 // surface dirty. Skips the JS-visible Uint8ClampedArray buffer + a
-// putImageData hop + a drawImage overlay — for switch-web-browser's
+// putImageData hop + a drawImage overlay — for brewser's
 // animated inline-canvas WebGL path (Three.js cube), this collapses
 // the per-frame readPixels + putImageData + drawImage(offscreen)
 // chain into one glReadPixels + one C-level row copy.
@@ -4408,7 +4408,7 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
  *
  * Operational state:
  *   - `tessellation_fix_enabled` defaults to `false` (see backend init).
- *   - switch-web-browser does NOT call `gl.setTessellationFix` — it
+ *   - brewser does NOT call `gl.setTessellationFix` — it
  *     uses JS-side `BoxGeometry(w,h,d,8,8,8)` tessellation instead,
  *     which is the only thing currently known to work.
  *   - The `gl.setTessellationFix(bool)` JS API is still exposed so a

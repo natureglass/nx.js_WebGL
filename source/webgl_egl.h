@@ -25,7 +25,7 @@ bool nx_webgl_egl_get_auto_flush(nx_webgl_egl_t *backend);
  * uniform sub-triangle pattern that still triggers the rasterizer
  * artifact. JS-side manual tessellation
  * (`THREE.BoxGeometry(w,h,d,8,8,8)`) is what currently fixes the bug
- * in switch-web-browser demos. See the big STATE comment block in
+ * in brewser demos. See the big STATE comment block in
  * `webgl_egl.c` (above `tessellate_one_triangle`) for the
  * investigation and the clip-space-correct approach that would
  * actually work. The scaffolding is intentionally kept dormant for a
