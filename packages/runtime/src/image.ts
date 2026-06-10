@@ -87,11 +87,27 @@ export class Image extends EventTarget {
 	}
 
 	set src(val: string) {
-		const url = new URL(val, $.entrypoint);
+		// Base URL: prefer the current page URL (set per page-nav by the
+		// swb shell on globalThis.location.href; e.g.
+		// `brewser://apps/community/<app>/index.html`) so relative `src`
+		// resolves against the document, matching real browsers. Falls
+		// back to `$.entrypoint` (the nxjs runtime's main.js URL) for
+		// standalone nxjs runs that have no page concept.
+		const base = (typeof globalThis !== 'undefined' &&
+			(globalThis as { location?: { href?: string } }).location?.href)
+				|| $.entrypoint;
+		const url = new URL(val, base);
 		const internal = _(this);
 		internal.src = url;
 		internal.complete = false;
-		fetch(url)
+		// Prefer `globalThis.fetch` (which may be a page-script wrapper
+		// supporting custom schemes like `brewser://`) over the lexically
+		// imported internal fetch. Mirrors the Audio.load fix.
+		const _fetchFn = (typeof globalThis !== 'undefined' &&
+			typeof (globalThis as { fetch?: typeof fetch }).fetch === 'function'
+				? (globalThis as { fetch: typeof fetch }).fetch
+				: fetch);
+		_fetchFn(url)
 			.then((res) => {
 				if (!res.ok) {
 					throw new Error(`Failed to load image: ${res.status}`);

@@ -260,7 +260,15 @@ export class Audio extends EventTarget {
 		this.#readyState = HAVE_NOTHING;
 		this.#decoded = null;
 
-		const url = new URL(this.#src, $.entrypoint);
+		// Base URL: prefer the current page URL (set per page-nav by the
+		// swb shell on globalThis.location.href; e.g.
+		// `brewser://apps/community/<app>/index.html`) so relative audio
+		// src resolves against the document, matching real browsers.
+		// Falls back to `$.entrypoint` for standalone nxjs runs.
+		const base = (typeof globalThis !== 'undefined' &&
+			(globalThis as { location?: { href?: string } }).location?.href)
+				|| $.entrypoint;
+		const url = new URL(this.#src, base);
 		this.#currentSrc = url.href;
 		const mime = mimeFromExtension(url.pathname);
 
