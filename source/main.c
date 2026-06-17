@@ -116,6 +116,21 @@ static int nx_js_interrupt_handler(JSRuntime *rt, void *opaque) {
 	return 0;
 }
 
+// 2026-06-17 boot-hang investigation (Citron intermittent black-screen-before-
+// splash). Wall-clock-from-entry probe so we can bisect WHICH stage between
+// libnx services init, JS bytecode load, JS module evaluation, and first
+// framebufferInit hangs on the emulator. Cheap (fprintf+fflush per stage
+// boundary; ~20 lines total per boot) so safe to leave in until the
+// repro is understood. Macro logs ms since first call.
+static u64 nx_boot_t0 = 0;
+#define NX_BOOT_LOG(label) do { \
+	u64 _t = armTicksToNs(armGetSystemTick()); \
+	if (nx_boot_t0 == 0) nx_boot_t0 = _t; \
+	fprintf(stderr, "[nxjs:boot] +%6llums %s\n", \
+			(unsigned long long)((_t - nx_boot_t0) / 1000000ULL), label); \
+	fflush(stderr); \
+} while (0)
+
 // Text renderer
 static PrintConsole *print_console = NULL;
 
@@ -125,6 +140,19 @@ static Framebuffer *framebuffer = NULL;
 static uint8_t *js_framebuffer = NULL;
 static u32 js_fb_width = 0;
 static u32 js_fb_height = 0;
+
+// 2026-06-17 Citron splash continuity: the decoded loading.jpg bytes are
+// kept alive past `nx_render_loading_image` so `nx_framebuffer_init` can
+// blit them into the new canvas->data buffer when the JS side first
+// allocates a canvas. Without this, the first main-loop present after
+// JS init copies canvas->data (zero-filled = black) into the FB,
+// flashing away the C-side splash within a frame or two on warm-cache
+// boots. Owned by C, allocated via tjAlloc (must use tjFree), one-shot
+// (consumed + freed on first framebuffer_init that finds a non-null
+// pointer). BGRA, no row padding (stride = w*4).
+static uint8_t *s_loading_splash_bgra = NULL;
+static int s_loading_splash_w = 0;
+static int s_loading_splash_h = 0;
 
 // Display buffer: page pixels with the cursor overlay composited on top.
 // The Switch framebuffer memcpy reads from THIS buffer, not directly from
@@ -165,6 +193,7 @@ void nx_console_exit() {
 
 static JSValue nx_framebuffer_init(JSContext *ctx, JSValueConst this_val,
 								   int argc, JSValueConst *argv) {
+	NX_BOOT_LOG("nx_framebuffer_init enter");
 	nx_context_t *nx_ctx = JS_GetContextOpaque(ctx);
 	nx_console_exit();
 	if (win == NULL) {
@@ -184,6 +213,39 @@ static JSValue nx_framebuffer_init(JSContext *ctx, JSValueConst this_val,
 	js_framebuffer = canvas->data;
 	js_fb_width = width;
 	js_fb_height = height;
+	// Continue the C-side splash: if `nx_render_loading_image` stashed a
+	// decoded loading.jpg, blit it into canvas->data with center/letterbox
+	// so the first main-loop present after this call shows the splash
+	// instead of zeroed-black canvas backing. One-shot — consumed + freed
+	// here so subsequent canvas resizes don't re-paint the splash.
+	if (s_loading_splash_bgra && canvas->data) {
+		const int fb_w = (int)width;
+		const int fb_h = (int)height;
+		const int img_w = s_loading_splash_w;
+		const int img_h = s_loading_splash_h;
+		const int copy_w = img_w < fb_w ? img_w : fb_w;
+		const int copy_h = img_h < fb_h ? img_h : fb_h;
+		const int off_x = (fb_w - copy_w) / 2;
+		const int off_y = (fb_h - copy_h) / 2;
+		const int src_off_x = img_w > fb_w ? (img_w - fb_w) / 2 : 0;
+		const int src_off_y = img_h > fb_h ? (img_h - fb_h) / 2 : 0;
+		const int src_stride = img_w * 4;
+		const int dst_stride = fb_w * 4;
+		uint8_t *dst = canvas->data;
+		// canvas->data was just js_mallocz'd → already zero (black border).
+		for (int y = 0; y < copy_h; y++) {
+			const uint8_t *src_row = s_loading_splash_bgra +
+				(size_t)(y + src_off_y) * src_stride + (size_t)src_off_x * 4;
+			uint8_t *dst_row = dst +
+				(size_t)(y + off_y) * dst_stride + (size_t)off_x * 4;
+			memcpy(dst_row, src_row, (size_t)copy_w * 4);
+		}
+		tjFree(s_loading_splash_bgra);
+		s_loading_splash_bgra = NULL;
+		s_loading_splash_w = 0;
+		s_loading_splash_h = 0;
+		NX_BOOT_LOG("nx_framebuffer_init: splash blitted into canvas->data");
+	}
 	// Allocate / resize the display buffer alongside the page framebuffer
 	// so the per-frame composite step always has a destination sized to
 	// match js_framebuffer.
@@ -193,10 +255,12 @@ static JSValue nx_framebuffer_init(JSContext *ctx, JSValueConst this_val,
 		display_buffer = malloc(needed);
 		display_buffer_size = display_buffer ? needed : 0;
 	}
+	NX_BOOT_LOG("nx_framebuffer_init: framebufferCreate pre");
 	framebuffer = malloc(sizeof(Framebuffer));
 	framebufferCreate(framebuffer, win, width, height, PIXEL_FORMAT_BGRA_8888,
 					  2);
 	framebufferMakeLinear(framebuffer);
+	NX_BOOT_LOG("nx_framebuffer_init exit ok");
 	nx_ctx->rendering_mode = NX_RENDERING_MODE_CANVAS;
 	return JS_UNDEFINED;
 }
@@ -485,6 +549,65 @@ static JSValue js_exit(JSContext *ctx, JSValueConst this_val, int argc,
 // Function to cleanly exit the main event loop (for use by other modules)
 void nx_exit_event_loop(void) {
 	is_running = 0;
+}
+
+static SocketInitConfig const s_socketInitConfig = {
+	.tcp_tx_buf_size = 1 * 1024 * 1024,
+	.tcp_rx_buf_size = 1 * 1024 * 1024,
+	.tcp_tx_buf_max_size = 4 * 1024 * 1024,
+	.tcp_rx_buf_max_size = 4 * 1024 * 1024,
+
+	.udp_tx_buf_size = 0x2400,
+	.udp_rx_buf_size = 0xA500,
+
+	.sb_efficiency = 8,
+
+	.num_bsd_sessions = 3,
+	.bsd_service_type = BsdServiceType_Auto,
+};
+
+// 2026-06-17 lazy `socketInitialize` (Citron boot-hang fix).
+// `socketInitialize` was previously called eagerly from `main()` BEFORE
+// `freopen` of the log file. On Citron the BSD service emulation
+// intermittently stalls during the buffer reservation (10MB + sb_efficiency=8
+// + 3 sessions), leaving boot frozen on a black-frame "splash" that
+// `nx_render_loading_image` had just presented. Launching a lighter NRO
+// first warmed up Citron's BSD path so the brewser relaunch found the
+// service primed — a workaround, not a fix.
+//
+// Lazy approach: the home page is local (`brewser://`), the constructor
+// wires up loaders but doesn't fire any network requests, and
+// `probeNetwork()` is explicitly fire-and-forget. So we can defer
+// `socketInitialize` until the first JS-side BSD entry point
+// (`tcp.connect`, `tcp.tcpServerInit/New`, `udp.udpInit/New`,
+// `dns.dnsResolve`). On real HW the call returns in <1ms; on Citron the
+// stall — if it still happens — now happens AFTER the brewser-logo
+// splash has painted, so the user sees a splash with a brief delay
+// rather than a black screen of unknown duration.
+//
+// Idempotent. Returns true on success / when already initialized;
+// false if `socketInitialize` failed (and stamps an `[nxjs:net]` line
+// in the debug log). Call sites should JS_ThrowInternalError on false.
+static bool s_socket_initialized = false;
+bool nx_ensure_socket_initialized(void) {
+	if (s_socket_initialized) return true;
+	u64 _t_pre = armTicksToNs(armGetSystemTick());
+	fprintf(stderr, "[nxjs:net] socketInitialize pre (lazy)\n");
+	fflush(stderr);
+	Result rc = socketInitialize(&s_socketInitConfig);
+	u64 _t_post = armTicksToNs(armGetSystemTick());
+	if (R_FAILED(rc)) {
+		fprintf(stderr,
+		        "[nxjs:net] socketInitialize FAILED rc=0x%x after %llums\n",
+		        rc, (unsigned long long)((_t_post - _t_pre) / 1000000ULL));
+		fflush(stderr);
+		return false;
+	}
+	fprintf(stderr, "[nxjs:net] socketInitialize ok in %llums\n",
+	        (unsigned long long)((_t_post - _t_pre) / 1000000ULL));
+	fflush(stderr);
+	s_socket_initialized = true;
+	return true;
 }
 
 static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc,
@@ -846,9 +969,11 @@ void nx_process_pending_jobs(JSContext *ctx, nx_context_t *nx_ctx,
 
 void nx_render_loading_image(nx_context_t *nx_ctx, const char *nro_path) {
 	// Check if there is a `loading.jpg` file on the RomFS
-	// and render that to the screen if present.
+	// and render that to the screen if present. Path is the brewser-shell
+	// assets directory (moved from romfs root 2026-06-17 to keep
+	// shell-owned assets co-located).
 	size_t loading_image_size;
-	const char *loading_image_path = "romfs:/loading.jpg";
+	const char *loading_image_path = "romfs:/shell/assets/loading.jpg";
 	uint8_t *loading_image = (uint8_t *)read_file(loading_image_path, &loading_image_size);
 	if (!loading_image && nro_path) {
 		// RomFS loading_image image not found.
@@ -867,14 +992,17 @@ void nx_render_loading_image(nx_context_t *nx_ctx, const char *nro_path) {
 		// confused for an engine bug). Allocate the framebuffer just long
 		// enough to push a single solid-black frame, then tear it down so
 		// the normal init path can take ownership cleanly.
+		NX_BOOT_LOG("loading_image NULL path: nwindowGetDefault");
 		win = nwindowGetDefault();
 		int blank_width = 1280;
 		int blank_height = 720;
+		NX_BOOT_LOG("loading_image NULL path: framebufferCreate pre");
 		framebuffer = malloc(sizeof(Framebuffer));
 		if (framebuffer) {
 			framebufferCreate(framebuffer, win, blank_width, blank_height,
 			                  PIXEL_FORMAT_BGRA_8888, 2);
 			framebufferMakeLinear(framebuffer);
+			NX_BOOT_LOG("loading_image NULL path: framebufferCreate ok");
 			// Switch framebufferCreate sets up a double-buffer swapchain.
 			// A single present leaves the OTHER buffer holding uninit Tegra
 			// GPU memory (leftover red from a previous app), which surfaces
@@ -888,34 +1016,79 @@ void nx_render_loading_image(nx_context_t *nx_ctx, const char *nro_path) {
 					memset(framebuf, 0, (size_t)blank_height * stride);
 				}
 				framebufferEnd(framebuffer);
+				if (i == 0) NX_BOOT_LOG("loading_image NULL path: present 1");
+				else NX_BOOT_LOG("loading_image NULL path: present 2");
 			}
+			NX_BOOT_LOG("loading_image NULL path: framebufferClose pre");
 			framebufferClose(framebuffer);
 			free(framebuffer);
 			framebuffer = NULL;
+			NX_BOOT_LOG("loading_image NULL path: framebufferClose ok");
 		}
 		return;
 	}
 	if (loading_image != NULL) {
+		NX_BOOT_LOG("nx_render_loading_image: jpeg decode + present");
 		win = nwindowGetDefault();
-		int width = 1280;
-		int height = 720;
+		const int fb_w = 1280;
+		const int fb_h = 720;
+		int img_w = fb_w;
+		int img_h = fb_h;
 		js_framebuffer = NULL;
 		framebuffer = malloc(sizeof(Framebuffer));
-		framebufferCreate(framebuffer, win, width, height, PIXEL_FORMAT_BGRA_8888,
-						2);
+		framebufferCreate(framebuffer, win, fb_w, fb_h, PIXEL_FORMAT_BGRA_8888, 2);
 		framebufferMakeLinear(framebuffer);
 
-		if (decode_jpeg(loading_image, loading_image_size, &js_framebuffer, &width, &height) == 0 &&
-			js_framebuffer != NULL) {
+		if (decode_jpeg(loading_image, loading_image_size, &js_framebuffer,
+		                &img_w, &img_h) == 0 && js_framebuffer != NULL) {
+			// Center + letterbox the decoded image into the 1280×720 FB,
+			// honouring stride. The original code `memcpy`'d the entire
+			// decoded buffer flat into the FB, which sheared any image
+			// that wasn't exactly 1280×720 (row width ≠ stride width).
 			u32 stride;
 			u8 *framebuf = (u8 *)framebufferBegin(framebuffer, &stride);
-			memcpy(framebuf, js_framebuffer, width * height * 4);
+			if (framebuf) {
+				// Black background fill (one row at a time so stride padding
+				// stays black even when the image is smaller).
+				memset(framebuf, 0, (size_t)fb_h * stride);
+				// Clip image dims to FB and center.
+				int copy_w = img_w < fb_w ? img_w : fb_w;
+				int copy_h = img_h < fb_h ? img_h : fb_h;
+				int off_x = (fb_w - copy_w) / 2;
+				int off_y = (fb_h - copy_h) / 2;
+				// Source side may be wider than the FB; advance into the
+				// source row by the left-side crop offset (negative letterbox
+				// case = image bigger than FB on a dimension).
+				int src_off_x = img_w > fb_w ? (img_w - fb_w) / 2 : 0;
+				int src_off_y = img_h > fb_h ? (img_h - fb_h) / 2 : 0;
+				const int src_stride = img_w * 4;
+				for (int y = 0; y < copy_h; y++) {
+					const u8 *src_row =
+						js_framebuffer + (size_t)(y + src_off_y) * src_stride +
+						(size_t)src_off_x * 4;
+					u8 *dst_row =
+						framebuf + (size_t)(y + off_y) * stride +
+						(size_t)off_x * 4;
+					memcpy(dst_row, src_row, (size_t)copy_w * 4);
+				}
+			}
 			framebufferEnd(framebuffer);
+			NX_BOOT_LOG("nx_render_loading_image: present ok");
+			// Stash the decoded splash so `nx_framebuffer_init` can
+			// pre-fill the JS canvas backing buffer with the same image
+			// — otherwise the first main-loop present after JS init
+			// flashes black over the splash on warm-cache boots.
+			s_loading_splash_bgra = js_framebuffer;
+			s_loading_splash_w = img_w;
+			s_loading_splash_h = img_h;
+			js_framebuffer = NULL;  // ownership transferred to s_loading_splash_*
+		} else {
+			NX_BOOT_LOG("nx_render_loading_image: decode failed (skipped)");
+			tjFree(js_framebuffer);
+			js_framebuffer = NULL;
 		}
 
-		tjFree(js_framebuffer);
 		free(loading_image);
-		js_framebuffer = NULL;
 
 		framebufferClose(framebuffer);
 		free(framebuffer);
@@ -923,49 +1096,52 @@ void nx_render_loading_image(nx_context_t *nx_ctx, const char *nro_path) {
 	}
 }
 
-static SocketInitConfig const s_socketInitConfig = {
-	.tcp_tx_buf_size = 1 * 1024 * 1024,
-	.tcp_rx_buf_size = 1 * 1024 * 1024,
-	.tcp_tx_buf_max_size = 4 * 1024 * 1024,
-	.tcp_rx_buf_max_size = 4 * 1024 * 1024,
-
-	.udp_tx_buf_size = 0x2400,
-	.udp_rx_buf_size = 0xA500,
-
-	.sb_efficiency = 8,
-
-	.num_bsd_sessions = 3,
-	.bsd_service_type = BsdServiceType_Auto,
-};
-
 // Main program entrypoint
 int main(int argc, char *argv[]) {
 	Result rc;
 
+	// 2026-06-17 boot-hang investigation: open the log FIRST so the boot
+	// probes captured below survive a hang in any of the libnx init steps
+	// (romfs / socket / pl). Existing call site (after plInitialize) moved
+	// here so NX_BOOT_LOG output lands in the file from `+0ms` onward.
+	// Original semantics preserved: same path, same "w" mode, same fd kept
+	// for `fclose` at shutdown.
+	FILE *debug_fd = freopen(LOG_FILENAME, "w", stderr);
+	NX_BOOT_LOG("entry");
+
 	nx_context_t *nx_ctx = malloc(sizeof(nx_context_t));
 	memset(nx_ctx, 0, sizeof(nx_context_t));
 
+	NX_BOOT_LOG("romfsInit pre");
 	rc = romfsInit();
 	if (R_FAILED(rc)) {
 		diagAbortWithResult(rc);
 	}
+	NX_BOOT_LOG("romfsInit ok");
 
+	NX_BOOT_LOG("nx_render_loading_image pre");
 	nx_render_loading_image(nx_ctx, argc > 0 ? argv[0] : NULL);
+	NX_BOOT_LOG("nx_render_loading_image ok");
 
-	rc = socketInitialize(&s_socketInitConfig);
-	if (R_FAILED(rc)) {
-		diagAbortWithResult(rc);
-	}
+	// 2026-06-17: `socketInitialize` is now lazy (see
+	// `nx_ensure_socket_initialized` above). On Citron the eager call
+	// here intermittently hung during BSD service buffer reservation,
+	// freezing boot on a black-frame placeholder before the brewser-logo
+	// splash painted. JS-side network entry points (tcp.connect, udp.*,
+	// dns.dnsResolve) gate on the lazy ensure helper.
+	NX_BOOT_LOG("socketInitialize: deferred to first network use");
 
+	NX_BOOT_LOG("plInitialize pre");
 	rc = plInitialize(PlServiceType_User);
 	if (R_FAILED(rc)) {
 		diagAbortWithResult(rc);
 	}
+	NX_BOOT_LOG("plInitialize ok");
 
-	FILE *debug_fd = freopen(LOG_FILENAME, "w", stderr);
-
+	NX_BOOT_LOG("JS_NewRuntime pre");
 	JSRuntime *rt = JS_NewRuntime();
 	JSContext *ctx = JS_NewContext(rt);
+	NX_BOOT_LOG("JS_NewRuntime+JS_NewContext ok");
 
 	// 2026-06-07 ROUND 6: install JS execution watchdog (see nx_js_interrupt_handler
 	// near top of this file for full docs). Logs `[nxjs:js-interrupt]` lines to
@@ -1002,7 +1178,14 @@ int main(int argc, char *argv[]) {
 	bool user_path_needs_free = false;
 	bool user_code_is_bytecode = true;
 	char *user_code_path = "romfs:/main.jsc";
+	NX_BOOT_LOG("read_file(romfs:/main.jsc) pre");
 	char *user_code = (char *)read_file(user_code_path, &user_code_size);
+	{
+		char _msg[96];
+		snprintf(_msg, sizeof(_msg), "read_file(romfs:/main.jsc) ok size=%zu",
+				 user_code ? user_code_size : 0);
+		NX_BOOT_LOG(_msg);
+	}
 
 	if (user_code == NULL && errno == ENOENT) {
 		// If no `main.jsc`, then try the `main.js` file on the RomFS
@@ -1034,6 +1217,7 @@ int main(int argc, char *argv[]) {
 
 	// The internal `$` object contains native functions that are wrapped in the
 	// JS runtime
+	NX_BOOT_LOG("nx_init_* block pre");
 	JSValue global_obj = JS_GetGlobalObject(ctx);
 	nx_ctx->init_obj = JS_NewObject(ctx);
 	nx_init_account(ctx, nx_ctx->init_obj);
@@ -1111,6 +1295,7 @@ int main(int argc, char *argv[]) {
 	};
 	JS_SetPropertyFunctionList(ctx, nx_ctx->init_obj, init_function_list,
 							   countof(init_function_list));
+	NX_BOOT_LOG("nx_init_* block ok");
 
 	// `Switch.version`
 	JSAtom atom;
@@ -1168,6 +1353,7 @@ int main(int argc, char *argv[]) {
 	JS_SetPropertyStr(ctx, global_obj, "$", nx_ctx->init_obj);
 
 	// Initialize runtime
+	NX_BOOT_LOG("qjsc_runtime eval pre");
 	JSValue runtime_init_func, runtime_init_result;
 	runtime_init_func = JS_ReadObject(ctx, qjsc_runtime, qjsc_runtime_size,
 									  JS_READ_OBJ_BYTECODE);
@@ -1185,8 +1371,10 @@ int main(int argc, char *argv[]) {
 		goto main_loop;
 	}
 	JS_FreeValue(ctx, runtime_init_result);
+	NX_BOOT_LOG("qjsc_runtime eval ok");
 
 	// Run the user code
+	NX_BOOT_LOG("main.jsc eval pre");
 	JSValue user_code_result;
 	if (user_code_is_bytecode) {
 		user_code_result = JS_ReadObject(ctx, (const u8 *)user_code,
@@ -1221,8 +1409,10 @@ int main(int argc, char *argv[]) {
 	if (user_path_needs_free) {
 		free(user_code_path);
 	}
+	NX_BOOT_LOG("main.jsc eval ok");
 
 main_loop:
+	NX_BOOT_LOG("main_loop enter");
 	while (appletMainLoop()) {
 		if (!nx_ctx->had_error) {
 			// Check if any file descriptors have reported activity
@@ -1296,6 +1486,7 @@ main_loop:
 			size_t total = (size_t)js_fb_width * (size_t)js_fb_height * 4;
 			static int present_n = 0;
 			++present_n;
+			if (present_n == 1) NX_BOOT_LOG("CANVAS-mode present 1 (post splash)");
 			bool composited = false;
 			if (cursor_overlay_enabled && display_buffer &&
 				display_buffer_size >= total) {
@@ -1376,7 +1567,8 @@ main_loop:
 
 	plExit();
 	romfsExit();
-	socketExit();
+	// Match lazy init — only call socketExit when we actually initialized.
+	if (s_socket_initialized) socketExit();
 
 	fflush(leaks_fd);
 	fclose(leaks_fd);

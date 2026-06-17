@@ -7,6 +7,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// Lazy BSD init — see main.c.
+extern bool nx_ensure_socket_initialized(void);
+
 // ---- DatagramSocket class ----
 
 static JSClassID nx_dgram_class_id;
@@ -75,6 +78,10 @@ void nx_on_recvfrom(nx_poll_t *p, nx_recvfrom_t *req) {
 // $.udpNew(ip, port, onRecvCallback) -> DatagramSocket opaque object
 static JSValue nx_js_udp_new(JSContext *ctx, JSValueConst this_val, int argc,
 							 JSValueConst *argv) {
+	if (!nx_ensure_socket_initialized()) {
+		return JS_ThrowInternalError(ctx,
+			"udpNew: socketInitialize failed (see [nxjs:net] log)");
+	}
 	const char *ip = JS_ToCString(ctx, argv[0]);
 	int port;
 	if (!ip || JS_ToInt32(ctx, &port, argv[1])) {

@@ -6,6 +6,9 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 
+// Lazy BSD init — see main.c.
+extern bool nx_ensure_socket_initialized(void);
+
 void nx_on_connect(nx_poll_t *p, nx_connect_t *req) {
 	nx_js_callback_t *req_cb = (nx_js_callback_t *)req->opaque;
 	JSContext *ctx = req_cb->context;
@@ -34,6 +37,10 @@ void nx_on_connect(nx_poll_t *p, nx_connect_t *req) {
 
 JSValue nx_js_tcp_connect(JSContext *ctx, JSValueConst this_val, int argc,
 						  JSValueConst *argv) {
+	if (!nx_ensure_socket_initialized()) {
+		return JS_ThrowInternalError(ctx,
+			"tcp.connect: socketInitialize failed (see [nxjs:net] log)");
+	}
 	int port;
 	const char *ip = JS_ToCString(ctx, argv[1]);
 	if (!ip || JS_ToInt32(ctx, &port, argv[2])) {
@@ -231,6 +238,10 @@ void nx_on_accept(nx_poll_t *p, nx_server_t *req, int client_fd) {
 
 JSValue nx_js_tcp_server_new(JSContext *ctx, JSValueConst this_val, int argc,
 							 JSValueConst *argv) {
+	if (!nx_ensure_socket_initialized()) {
+		return JS_ThrowInternalError(ctx,
+			"tcpServerNew: socketInitialize failed (see [nxjs:net] log)");
+	}
 	const char *ip = JS_ToCString(ctx, argv[0]);
 	int port;
 	if (!ip || JS_ToInt32(ctx, &port, argv[1])) {

@@ -7,6 +7,9 @@
 #include <string.h>
 #include <sys/socket.h>
 
+// Lazy BSD init — see main.c.
+extern bool nx_ensure_socket_initialized(void);
+
 typedef struct {
 	int err;
 	const char *hostname;
@@ -92,6 +95,10 @@ JSValue nx_dns_resolve_cb(JSContext *ctx, nx_work_t *req) {
 
 JSValue nx_dns_resolve(JSContext *ctx, JSValueConst this_val, int argc,
 					   JSValueConst *argv) {
+	if (!nx_ensure_socket_initialized()) {
+		return JS_ThrowInternalError(ctx,
+			"dnsResolve: socketInitialize failed (see [nxjs:net] log)");
+	}
 	NX_INIT_WORK_T(nx_dns_resolve_t);
 	data->hostname = JS_ToCString(ctx, argv[0]);
 	return nx_queue_async(ctx, req, nx_dns_resolve_do, nx_dns_resolve_cb);
