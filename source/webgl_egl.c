@@ -7317,60 +7317,170 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 				int n_j = 0;
 				if (shader_type == 0x8B30 /* GL_FRAGMENT_SHADER */ &&
 				    strstr(patched_owned, "PMREMGGXConvolution") != NULL) {
-					static const char minimal_fs[] =
-						"#version 300 es\n"
-						"precision highp float;\n"
-						"precision highp sampler2D;\n"
-						"in vec3 vOutputDirection;\n"
-						"layout(location = 0) out highp vec4 pc_fragColor;\n"
-						"uniform sampler2D envMap;\n"
-						"uniform float mipInt;\n"
-						"#define cubeUV_minMipLevel 4.0\n"
-						"#define cubeUV_minTileSize 16.0\n"
-						"#define CUBEUV_TEXEL_WIDTH (1.0/1536.0)\n"
-						"#define CUBEUV_TEXEL_HEIGHT (1.0/2048.0)\n"
-						"#define CUBEUV_MAX_MIP 8.0\n"
-						"float getFace(vec3 d) {\n"
-						"  vec3 a = abs(d);\n"
-						"  if (a.x > a.z) {\n"
-						"    if (a.x > a.y) return d.x > 0.0 ? 0.0 : 3.0;\n"
-						"    return d.y > 0.0 ? 1.0 : 4.0;\n"
-						"  }\n"
-						"  if (a.z > a.y) return d.z > 0.0 ? 2.0 : 5.0;\n"
-						"  return d.y > 0.0 ? 1.0 : 4.0;\n"
-						"}\n"
-						"vec2 getUV(vec3 d, float f) {\n"
-						"  vec2 uv;\n"
-						"  if (f == 0.0) uv = vec2(d.z, d.y) / abs(d.x);\n"
-						"  else if (f == 1.0) uv = vec2(-d.x, -d.z) / abs(d.y);\n"
-						"  else if (f == 2.0) uv = vec2(-d.x, d.y) / abs(d.z);\n"
-						"  else if (f == 3.0) uv = vec2(-d.z, d.y) / abs(d.x);\n"
-						"  else if (f == 4.0) uv = vec2(-d.x, d.z) / abs(d.y);\n"
-						"  else uv = vec2(d.x, d.y) / abs(d.z);\n"
-						"  return 0.5 * (uv + 1.0);\n"
-						"}\n"
-						"void main() {\n"
-						"  vec3 N = normalize(vOutputDirection);\n"
-						"  float mi = mipInt;\n"
-						"  float face = getFace(N);\n"
-						"  float filterInt = max(cubeUV_minMipLevel - mi, 0.0);\n"
-						"  mi = max(mi, cubeUV_minMipLevel);\n"
-						"  float faceSize = exp2(mi);\n"
-						"  vec2 uv = getUV(N, face) * (faceSize - 2.0) + 1.0;\n"
-						"  if (face > 2.0) { uv.y += faceSize; face -= 3.0; }\n"
-						"  uv.x += face * faceSize;\n"
-						"  uv.x += filterInt * 3.0 * cubeUV_minTileSize;\n"
-						"  uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - faceSize);\n"
-						"  uv.x *= CUBEUV_TEXEL_WIDTH;\n"
-						"  uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
-						"  pc_fragColor = vec4(texture(envMap, uv).rgb, 1.0);\n"
-						"}\n";
-					free(patched_owned);
-					patched_owned = (char *)malloc(sizeof(minimal_fs));
-					if (patched_owned) {
-						memcpy(patched_owned, minimal_fs, sizeof(minimal_fs));
-						patched_source = patched_owned;
-						n_j = 1;
+					/* PMREMGGXConvolution replacement. Iterations 1-3
+					 * (loop / unrolled blur) all crashed Mesa Nouveau at
+					 * the first prefilter draw despite compile+link
+					 * reporting OK. Probe data (see [nxjs:pmrem-probe:*]
+					 * sentries in webgl.c) confirmed crash is at the
+					 * actual glDrawElements after uniform set, not at
+					 * compile/link/useProgram/uniformSet.
+					 *
+					 * Root cause identified: hardcoded CUBEUV_MAX_MIP /
+					 * CUBEUV_TEXEL_WIDTH / CUBEUV_TEXEL_HEIGHT in our
+					 * replacement only matched cubeSize=256 (lodMax=8,
+					 * 768x1024 layout). For cubeSize=512 (lodMax=9, the
+					 * size Three.js picks for a 2048-px-wide source
+					 * equirect via cubeSize = width/4), our MAX_MIP=8
+					 * makes `4.0 * (exp2(MAX_MIP) - faceSize)` go
+					 * negative when mipInt=9, so every cubeUV fetch
+					 * lands outside the texture. Iteration 0 (1 sample
+					 * per pixel) accidentally tolerated this; iteration
+					 * 3 (5 samples per pixel) overwhelmed the driver.
+					 *
+					 * Fix: parse the three `#define`s from the source
+					 * Three.js actually emits, and inject them into our
+					 * replacement FS. The replacement still does a
+					 * Fibonacci-spiral hemisphere integration without
+					 * uint/bitwise (the original Mesa Nouveau trigger
+					 * from radicalInverse_VdC), but UVs land in the
+					 * texture regardless of cubeSize. */
+					double max_mip = 8.0;
+					double texel_w = 1.0 / 1536.0;
+					double texel_h = 1.0 / 2048.0;
+					{
+						const char *p;
+						p = strstr(patched_owned, "#define CUBEUV_MAX_MIP ");
+						if (p) { p += strlen("#define CUBEUV_MAX_MIP "); max_mip = strtod(p, NULL); }
+						p = strstr(patched_owned, "#define CUBEUV_TEXEL_WIDTH ");
+						if (p) { p += strlen("#define CUBEUV_TEXEL_WIDTH "); texel_w = strtod(p, NULL); }
+						p = strstr(patched_owned, "#define CUBEUV_TEXEL_HEIGHT ");
+						if (p) { p += strlen("#define CUBEUV_TEXEL_HEIGHT "); texel_h = strtod(p, NULL); }
+					}
+					fprintf(stderr,
+						"[nxjs:pmrem-fix:constants] max_mip=%.4f texel_w=%.10f texel_h=%.10f\n",
+						max_mip, texel_w, texel_h);
+					fflush(stderr);
+
+					/* Iteration 8: add `uniform float roughness;` back
+					 * (iter 7 worked without it). Blur radius scales with
+					 * roughness so high-roughness passes (the diffuse-
+					 * irradiance mip) cover much wider hemisphere area.
+					 * Still no conditional / no function — those are
+					 * still suspects from iter 5. If iter 8 works, the
+					 * iter-5 crash trigger was the early-return
+					 * conditional. */
+					char *built = (char *)malloc(16384);
+					if (built) {
+						int written = snprintf(built, 16384,
+							"#version 300 es\n"
+							"precision highp float;\n"
+							"precision highp sampler2D;\n"
+							"in vec3 vOutputDirection;\n"
+							"layout(location = 0) out highp vec4 pc_fragColor;\n"
+							"uniform sampler2D envMap;\n"
+							"uniform float roughness;\n"
+							"uniform float mipInt;\n"
+							"#define cubeUV_minMipLevel 4.0\n"
+							"#define cubeUV_minTileSize 16.0\n"
+							"#define CUBEUV_TEXEL_WIDTH %.10f\n"
+							"#define CUBEUV_TEXEL_HEIGHT %.10f\n"
+							"#define CUBEUV_MAX_MIP %.4f\n"
+							"float getFace(vec3 d) {\n"
+							"  vec3 a = abs(d);\n"
+							"  if (a.x > a.z) {\n"
+							"    if (a.x > a.y) return d.x > 0.0 ? 0.0 : 3.0;\n"
+							"    return d.y > 0.0 ? 1.0 : 4.0;\n"
+							"  }\n"
+							"  if (a.z > a.y) return d.z > 0.0 ? 2.0 : 5.0;\n"
+							"  return d.y > 0.0 ? 1.0 : 4.0;\n"
+							"}\n"
+							"vec2 getUV(vec3 d, float f) {\n"
+							"  vec2 uv;\n"
+							"  if (f == 0.0) uv = vec2(d.z, d.y) / abs(d.x);\n"
+							"  else if (f == 1.0) uv = vec2(-d.x, -d.z) / abs(d.y);\n"
+							"  else if (f == 2.0) uv = vec2(-d.x, d.y) / abs(d.z);\n"
+							"  else if (f == 3.0) uv = vec2(-d.z, d.y) / abs(d.x);\n"
+							"  else if (f == 4.0) uv = vec2(-d.x, d.z) / abs(d.y);\n"
+							"  else uv = vec2(d.x, d.y) / abs(d.z);\n"
+							"  return 0.5 * (uv + 1.0);\n"
+							"}\n"
+							"void main() {\n"
+							"  vec3 N = normalize(vOutputDirection);\n"
+							"  vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);\n"
+							"  vec3 T = normalize(cross(up, N));\n"
+							"  vec3 B = cross(N, T);\n"
+							"  float blur = roughness * 5.0;\n"
+							"  vec3 D0 = N;\n"
+							"  vec3 D1 = normalize(N + T * blur);\n"
+							"  vec3 D2 = normalize(N - T * blur);\n"
+							"  vec3 D3 = normalize(N + B * blur);\n"
+							"  vec3 D4 = normalize(N - B * blur);\n"
+							"  vec3 acc = vec3(0.0);\n"
+							"  /* Sample 0 (N) — inline cube_uv math. */\n"
+							"  { vec3 d = D0; float mi = mipInt; float face = getFace(d);\n"
+							"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+							"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+							"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+							"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+							"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+							"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+							"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+							"    acc += texture(envMap, uv).rgb; }\n"
+							"  /* Sample 1 (D1). */\n"
+							"  { vec3 d = D1; float mi = mipInt; float face = getFace(d);\n"
+							"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+							"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+							"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+							"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+							"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+							"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+							"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+							"    acc += texture(envMap, uv).rgb; }\n"
+							"  /* Sample 2 (D2). */\n"
+							"  { vec3 d = D2; float mi = mipInt; float face = getFace(d);\n"
+							"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+							"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+							"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+							"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+							"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+							"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+							"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+							"    acc += texture(envMap, uv).rgb; }\n"
+							"  /* Sample 3 (D3). */\n"
+							"  { vec3 d = D3; float mi = mipInt; float face = getFace(d);\n"
+							"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+							"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+							"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+							"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+							"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+							"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+							"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+							"    acc += texture(envMap, uv).rgb; }\n"
+							"  /* Sample 4 (D4). */\n"
+							"  { vec3 d = D4; float mi = mipInt; float face = getFace(d);\n"
+							"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+							"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+							"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+							"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+							"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+							"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+							"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+							"    acc += texture(envMap, uv).rgb; }\n"
+							"  pc_fragColor = vec4(acc * 0.2, 1.0);\n"
+							"}\n",
+							texel_w, texel_h, max_mip);
+						fprintf(stderr,
+							"[nxjs:pmrem-fix:snprintf] written=%d (cap=16384)\n",
+							written);
+						fflush(stderr);
+						if (written > 0 && written < 16384) {
+							free(patched_owned);
+							patched_owned = built;
+							patched_source = patched_owned;
+							n_j = 1;
+						} else {
+							free(built);
+						}
 					}
 				}
 				fprintf(stderr,

@@ -2542,7 +2542,21 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 	// user program's uniform table.
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
+		/* PMREM crash diagnostic: log every useProgram so we can see
+		 * which program was active when an async GPU fault surfaces. */
+		static int useprog_cap = 0;
+		if (useprog_cap < 40) {
+			fprintf(stderr, "[nxjs:pmrem-probe:useProgram-pre] gles_handle=%u\n",
+				(unsigned)program->gles_handle);
+			fflush(stderr);
+		}
 		nx_webgl_egl_use_native_program(context->egl, program->gles_handle);
+		if (useprog_cap < 40) {
+			fprintf(stderr, "[nxjs:pmrem-probe:useProgram-post] gles_handle=%u\n",
+				(unsigned)program->gles_handle);
+			fflush(stderr);
+			useprog_cap++;
+		}
 	}
 	return JS_UNDEFINED;
 }
@@ -3648,6 +3662,21 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	                     (type == GL_FLOAT ||
 	                      type == GL_HALF_FLOAT_OES ||
 	                      type == 0x140B /* GL_HALF_FLOAT */));
+	// 2026-06-24 dfgLUT crash fix: Three.js r184's MeshStandardMaterial
+	// + PMREM IBL split-sum approximation uses a precomputed RG16F lookup
+	// texture (DFGLUTData.js) bound via the `dfgLUT` uniform. Without
+	// this accept-list path, the dfgLUT texImage2D call returned
+	// INVALID_ENUM, the texture stayed at gles_handle=0, sampling
+	// returned vec4(0), and the BRDF integration zeroed both diffuse
+	// AND specular IBL contributions → fully-black torus. GL_RG=0x8227,
+	// GL_RG16F=0x822F, GL_RG32F=0x8230.
+	bool is_float_rg = ((internal_format == 0x8227 /* GL_RG */ ||
+	                     internal_format == 0x822F /* GL_RG16F */ ||
+	                     internal_format == 0x8230 /* GL_RG32F */) &&
+	                    format == 0x8227 /* GL_RG */ &&
+	                    (type == GL_FLOAT ||
+	                     type == GL_HALF_FLOAT_OES ||
+	                     type == 0x140B /* GL_HALF_FLOAT */));
 	// Accept both unsized (GL_DEPTH_COMPONENT) and sized
 	// (GL_DEPTH_COMPONENT16/24/32F) internalformats with format =
 	// GL_DEPTH_COMPONENT. Three.js's WebGLTextures always passes the
@@ -3667,7 +3696,7 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	                         format == GL_DEPTH_STENCIL &&
 	                         type == GL_UNSIGNED_INT_24_8_WEBGL);
 	if (!is_rgba_unorm && !is_rgb_unorm && !is_float_rgba && !is_float_rgb &&
-	    !is_depth && !is_depth_stencil) {
+	    !is_float_rg && !is_depth && !is_depth_stencil) {
 		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
@@ -3718,6 +3747,7 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	else if (type == GL_UNSIGNED_INT_24_8_WEBGL) bytes_per_channel = 4;
 	size_t channels = 4;
 	if (format == GL_RGB) channels = 3;
+	else if (format == 0x8227 /* GL_RG */) channels = 2;
 	else if (format == GL_DEPTH_COMPONENT) channels = 1;
 	else if (format == GL_DEPTH_STENCIL) channels = 1; // packed in 4 bytes via UI_24_8
 	size_t expected = (size_t)width * (size_t)height * bytes_per_channel * channels;
@@ -3985,7 +4015,18 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	    (format == GL_RGB && (type == GL_UNSIGNED_BYTE ||
 	                          type == GL_FLOAT ||
 	                          type == GL_HALF_FLOAT_OES ||
-	                          type == 0x140B));
+	                          type == 0x140B)) ||
+	    /* 2026-06-24 dfgLUT upload fix: Three.js r184's MeshStandardMaterial
+	     * uploads a 16x16 RG16F lookup texture via texSubImage2D with
+	     * format=GL_RG (0x8227). Without RG in this accept-list the upload
+	     * was rejected with INVALID_ENUM, the texture storage stayed
+	     * uninitialized (zeros), sampling returned vec4(0), and the BRDF
+	     * split-sum integration zeroed both IBL contributions \xe2\x86\x92 black
+	     * torus. Companion to is_float_rg in texImage2D. */
+	    (format == 0x8227 /* GL_RG */ && (type == GL_UNSIGNED_BYTE ||
+	                                       type == GL_FLOAT ||
+	                                       type == GL_HALF_FLOAT_OES ||
+	                                       type == 0x140B));
 	if (!format_ok) {
 		if (from_image) js_free(ctx, image_buffer);
 		context->error = GL_INVALID_ENUM;
@@ -4016,7 +4057,9 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	// always uses immutable storage on WebGL 2.
 	if (!texture->data && texture->gles_handle) {
 		size_t bytes_per_pixel = 4; // RGBA UBYTE default
-		size_t channels = (format == GL_RGB) ? 3 : 4;
+		size_t channels = 4;
+		if (format == GL_RGB) channels = 3;
+		else if (format == 0x8227 /* GL_RG */) channels = 2;
 		size_t bytes_per_channel = 1;
 		if (type == GL_FLOAT) bytes_per_channel = 4;
 		else if (type == GL_HALF_FLOAT_OES || type == 0x140B) bytes_per_channel = 2;
@@ -4432,7 +4475,20 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle && location->location >= 0) {
+		/* PMREM crash diagnostic. */
+		static int u1f_cap = 0;
+		if (u1f_cap < 30) {
+			fprintf(stderr, "[nxjs:pmrem-probe:uniform1f-pre] prog=%u loc=%d val=%f\n",
+				(unsigned)program->gles_handle, location->location, (float)value);
+			fflush(stderr);
+		}
 		nx_webgl_egl_uniform1f(context->egl, location->location, (float)value);
+		if (u1f_cap < 30) {
+			fprintf(stderr, "[nxjs:pmrem-probe:uniform1f-post] prog=%u loc=%d\n",
+				(unsigned)program->gles_handle, location->location);
+			fflush(stderr);
+			u1f_cap++;
+		}
 	}
 	if (location->kind == NX_WEBGL_UNIFORM_OPACITY) {
 		program->color[3] = (float)clamp01(value);
@@ -4793,7 +4849,20 @@ static JSValue nx_webgl_uniform1i(JSContext *ctx, JSValueConst this_val,
 	// See [[nxjs-uniform1i-fix]] memory for the milestone-#20 backstory.
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle && location->location >= 0) {
+		/* PMREM crash diagnostic. */
+		static int u1i_cap = 0;
+		if (u1i_cap < 30) {
+			fprintf(stderr, "[nxjs:pmrem-probe:uniform1i-pre] prog=%u loc=%d val=%d\n",
+				(unsigned)program->gles_handle, location->location, value);
+			fflush(stderr);
+		}
 		nx_webgl_egl_uniform1i(context->egl, location->location, value);
+		if (u1i_cap < 30) {
+			fprintf(stderr, "[nxjs:pmrem-probe:uniform1i-post] prog=%u loc=%d\n",
+				(unsigned)program->gles_handle, location->location);
+			fflush(stderr);
+			u1i_cap++;
+		}
 	}
 
 	// Bridge-mode legacy stashing: only the bridge's hardcoded sampler at
