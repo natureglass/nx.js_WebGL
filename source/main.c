@@ -167,15 +167,37 @@ static size_t display_buffer_size = 0;
 // Cursor overlay state. JS sets the bitmap once (or whenever sprite size
 // changes) and just updates x/y per cursor tick. The C-side memcpy step
 // reads this every frame.
+//
+// Animated cursors (APNG `wait`/`progress`) push all frames at once via
+// `setAnimatedCursorOverlay` and let the C compositor pick the current
+// frame from `armGetSystemTick()` deltas. This keeps the spinner smooth
+// even when QuickJS is locked up parsing a heavy navigation response —
+// previously the JS `setTimeout`-driven frame advance would queue up
+// behind the busy thread, freezing the spinner on one frame for as
+// long as the JS work took. The C compositor runs every present (~60Hz)
+// regardless of JS state, so it spins on its own.
 static bool cursor_overlay_enabled = false;
 static int cursor_overlay_x = 0;
 static int cursor_overlay_y = 0;
 static int cursor_overlay_w = 0;
 static int cursor_overlay_h = 0;
-// Non-premultiplied RGBA8 bitmap, sized cursor_overlay_w * cursor_overlay_h * 4.
-// Owned by C; (re)allocated whenever bitmap dimensions change.
+// Non-premultiplied RGBA8 buffer. For a static cursor this is one frame
+// (w*h*4 bytes). For an animated cursor it's `cursor_overlay_frame_count`
+// frames packed back-to-back, each w*h*4 bytes. Frame N starts at offset
+// N * w * h * 4. Owned by C; (re)allocated whenever bitmap dimensions
+// or frame count change.
 static uint8_t *cursor_overlay_rgba = NULL;
 static size_t cursor_overlay_rgba_size = 0;
+// Animation state. `frame_count == 1` is the static-cursor fast path
+// (skip the tick math + frame pick in composite). For animated cursors
+// `frame_delays_ms` is a parallel array of per-frame durations and
+// `total_anim_ms` is their sum (used as the modulus for the tick
+// elapsed → frame index lookup). `anim_start_tick` is set whenever a
+// new animated cursor is pushed so frame 0 plays at the start.
+static int cursor_overlay_frame_count = 1;
+static uint16_t *cursor_overlay_frame_delays_ms = NULL;
+static uint32_t cursor_overlay_total_anim_ms = 0;
+static uint64_t cursor_overlay_anim_start_tick = 0;
 
 void nx_console_init(nx_context_t *nx_ctx) {
 	nx_ctx->rendering_mode = NX_RENDERING_MODE_CONSOLE;
@@ -282,9 +304,15 @@ void nx_framebuffer_exit() {
 		cursor_overlay_rgba = NULL;
 		cursor_overlay_rgba_size = 0;
 	}
+	if (cursor_overlay_frame_delays_ms != NULL) {
+		free(cursor_overlay_frame_delays_ms);
+		cursor_overlay_frame_delays_ms = NULL;
+	}
 	cursor_overlay_enabled = false;
 	cursor_overlay_w = 0;
 	cursor_overlay_h = 0;
+	cursor_overlay_frame_count = 1;
+	cursor_overlay_total_anim_ms = 0;
 }
 
 // ---- Cursor overlay -------------------------------------------------
@@ -377,6 +405,15 @@ static JSValue nx_set_cursor_overlay(JSContext *ctx, JSValueConst this_val,
 	cursor_overlay_w = w;
 	cursor_overlay_h = h;
 	cursor_overlay_enabled = true;
+	// Reset animation state: a static cursor replaced any prior animated
+	// one. `frame_count = 1` makes `composite_cursor_overlay` take the
+	// fast path that skips the tick math + frame-index pick.
+	cursor_overlay_frame_count = 1;
+	cursor_overlay_total_anim_ms = 0;
+	if (cursor_overlay_frame_delays_ms != NULL) {
+		free(cursor_overlay_frame_delays_ms);
+		cursor_overlay_frame_delays_ms = NULL;
+	}
 	// Sample a non-corner pixel so we can confirm the bitmap arrived
 	// non-empty (default arrow pixel at ~(5,8) should be white-ish).
 	{
@@ -391,6 +428,154 @@ static JSValue nx_set_cursor_overlay(JSContext *ctx, JSValueConst this_val,
 				        cursor_overlay_rgba[i], cursor_overlay_rgba[i+1],
 				        cursor_overlay_rgba[i+2], cursor_overlay_rgba[i+3]);
 			}
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+// Animated variant. JS hands us all frames packed into one buffer
+// (frame N at offset N*w*h*4) plus a parallel Uint16Array of per-frame
+// delays in milliseconds. We stash everything and let
+// `composite_cursor_overlay` pick the current frame from
+// `armGetSystemTick()` deltas on every present.
+//
+// Args: (x, y, packedRgba, w, h, frameCount, frameDelaysMs)
+//   - packedRgba   : ArrayBuffer or Uint8(Clamped)Array, size = w*h*4*frameCount
+//   - frameDelaysMs: Uint16Array (length = frameCount), per-frame durations
+//
+// A 1-frame call works but `setCursorOverlay` is shorter for static.
+static JSValue nx_set_animated_cursor_overlay(JSContext *ctx,
+											  JSValueConst this_val,
+											  int argc, JSValueConst *argv) {
+	if (argc < 7) {
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay BAD argc=%d\n", argc);
+		return JS_ThrowTypeError(ctx,
+			"setAnimatedCursorOverlay: expected (x, y, packedRgba, w, h, frameCount, frameDelaysMs)");
+	}
+	int x, y, w, h, frame_count;
+	if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]) ||
+		JS_ToInt32(ctx, &w, argv[3]) || JS_ToInt32(ctx, &h, argv[4]) ||
+		JS_ToInt32(ctx, &frame_count, argv[5])) {
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay BAD int args\n");
+		return JS_EXCEPTION;
+	}
+	if (w <= 0 || h <= 0 || frame_count <= 0) {
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay disable (w=%d h=%d fc=%d)\n",
+		        w, h, frame_count);
+		cursor_overlay_enabled = false;
+		return JS_UNDEFINED;
+	}
+
+	// Resolve packedRgba (same TypedArray-first dance as setCursorOverlay).
+	size_t src_offset = 0, src_size = 0;
+	uint8_t *src = NULL;
+	size_t bpe = 0;
+	JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[2], &src_offset,
+	                                    &src_size, &bpe);
+	if (!JS_IsException(ab)) {
+		size_t ab_size = 0;
+		uint8_t *ab_ptr = JS_GetArrayBuffer(ctx, &ab_size, ab);
+		JS_FreeValue(ctx, ab);
+		if (ab_ptr) {
+			src = ab_ptr + src_offset;
+		}
+	} else {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		src = JS_GetArrayBuffer(ctx, &src_size, argv[2]);
+		src_offset = 0;
+	}
+	if (!src) {
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay packedRgba not a Uint8Array/ArrayBuffer\n");
+		return JS_ThrowTypeError(ctx,
+			"setAnimatedCursorOverlay: packedRgba is not a Uint8Array/ArrayBuffer");
+	}
+	size_t needed = (size_t)w * (size_t)h * 4 * (size_t)frame_count;
+	if (src_size < needed) {
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay packedRgba too small needed=%zu got=%zu\n",
+		        needed, src_size);
+		return JS_ThrowRangeError(ctx,
+			"setAnimatedCursorOverlay: packedRgba buffer too small (need %zu, have %zu)",
+			needed, src_size);
+	}
+
+	// Resolve frameDelaysMs — must be a typed array with frame_count
+	// entries. We read as int32 then clamp into the uint16 storage; this
+	// way the JS side can hand us a plain number array via
+	// `new Uint16Array(arr)` or a Uint32Array without us caring.
+	size_t delays_offset = 0, delays_size = 0, delays_bpe = 0;
+	JSValue delays_ab = JS_GetTypedArrayBuffer(ctx, argv[6],
+	                                           &delays_offset, &delays_size, &delays_bpe);
+	if (JS_IsException(delays_ab)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay frameDelaysMs not a TypedArray\n");
+		return JS_ThrowTypeError(ctx,
+			"setAnimatedCursorOverlay: frameDelaysMs must be a typed array");
+	}
+	size_t delays_ab_size = 0;
+	uint8_t *delays_ab_ptr = JS_GetArrayBuffer(ctx, &delays_ab_size, delays_ab);
+	JS_FreeValue(ctx, delays_ab);
+	if (!delays_ab_ptr) {
+		return JS_ThrowTypeError(ctx,
+			"setAnimatedCursorOverlay: frameDelaysMs backing buffer unavailable");
+	}
+	// Element count from byte size / element size.
+	size_t delays_count = delays_bpe > 0 ? (delays_size / delays_bpe) : 0;
+	if ((int)delays_count < frame_count) {
+		return JS_ThrowRangeError(ctx,
+			"setAnimatedCursorOverlay: frameDelaysMs too short (need %d, have %zu)",
+			frame_count, delays_count);
+	}
+	uint8_t *delays_src = delays_ab_ptr + delays_offset;
+
+	// (Re)allocate the packed RGBA store.
+	if (needed != cursor_overlay_rgba_size) {
+		uint8_t *new_buf = realloc(cursor_overlay_rgba, needed);
+		if (!new_buf) {
+			return JS_ThrowOutOfMemory(ctx);
+		}
+		cursor_overlay_rgba = new_buf;
+		cursor_overlay_rgba_size = needed;
+	}
+	memcpy(cursor_overlay_rgba, src, needed);
+
+	// (Re)allocate the per-frame delay array, copy + sum.
+	uint16_t *new_delays = realloc(cursor_overlay_frame_delays_ms,
+	                               (size_t)frame_count * sizeof(uint16_t));
+	if (!new_delays) {
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	cursor_overlay_frame_delays_ms = new_delays;
+	uint32_t total = 0;
+	for (int i = 0; i < frame_count; i++) {
+		uint32_t v = 0;
+		switch (delays_bpe) {
+		case 1: v = ((uint8_t *)delays_src)[i]; break;
+		case 2: v = ((uint16_t *)delays_src)[i]; break;
+		case 4: v = ((uint32_t *)delays_src)[i]; break;
+		default: v = 0; break;
+		}
+		if (v < 1) v = 1;        // never let a frame have 0 duration (divide-by-zero in compositor)
+		if (v > 0xFFFF) v = 0xFFFF; // clamp into uint16
+		cursor_overlay_frame_delays_ms[i] = (uint16_t)v;
+		total += v;
+	}
+
+	cursor_overlay_x = x;
+	cursor_overlay_y = y;
+	cursor_overlay_w = w;
+	cursor_overlay_h = h;
+	cursor_overlay_frame_count = frame_count;
+	cursor_overlay_total_anim_ms = total;
+	cursor_overlay_anim_start_tick = armGetSystemTick();
+	cursor_overlay_enabled = true;
+
+	{
+		static int n = 0;
+		++n;
+		if (n <= 4) {
+			fprintf(stderr, "[nxjs:cursor] setAnimatedCursorOverlay ok n=%d xy=(%d,%d) wh=%dx%d frames=%d total=%ums delay[0]=%u\n",
+			        n, x, y, w, h, frame_count, total,
+			        cursor_overlay_frame_delays_ms[0]);
 		}
 	}
 	return JS_UNDEFINED;
@@ -429,11 +614,39 @@ static JSValue nx_clear_cursor_overlay(JSContext *ctx, JSValueConst this_val,
 // Composites the cursor bitmap onto `display_buffer` at (cursor_overlay_x,
 // cursor_overlay_y), clamped to the framebuffer. Assumes
 // `display_buffer` already holds a fresh copy of `js_framebuffer`.
+//
+// For animated cursors (`cursor_overlay_frame_count > 1`), picks the
+// current frame from `armGetSystemTick()` elapsed-time so the spinner
+// stays smooth even when QuickJS is blocked. The pick is O(frame_count)
+// — fine for the ~16-frame wait/progress APNGs we ship; if a future
+// cursor has many more frames we can binary-search instead.
 static void composite_cursor_overlay(void) {
 	if (!cursor_overlay_enabled || !cursor_overlay_rgba ||
 		cursor_overlay_w <= 0 || cursor_overlay_h <= 0) {
 		return;
 	}
+
+	// Pick the source-frame offset. Static cursor → frame 0 only.
+	const size_t frame_bytes =
+		(size_t)cursor_overlay_w * (size_t)cursor_overlay_h * 4;
+	size_t src_frame_offset = 0;
+	if (cursor_overlay_frame_count > 1 &&
+	    cursor_overlay_frame_delays_ms &&
+	    cursor_overlay_total_anim_ms > 0) {
+		uint64_t now = armGetSystemTick();
+		uint64_t elapsed_ns =
+			armTicksToNs(now - cursor_overlay_anim_start_tick);
+		uint64_t elapsed_ms = elapsed_ns / 1000000ULL;
+		uint32_t t = (uint32_t)(elapsed_ms % cursor_overlay_total_anim_ms);
+		uint32_t acc = 0;
+		int picked = cursor_overlay_frame_count - 1;
+		for (int i = 0; i < cursor_overlay_frame_count; i++) {
+			acc += cursor_overlay_frame_delays_ms[i];
+			if (t < acc) { picked = i; break; }
+		}
+		src_frame_offset = (size_t)picked * frame_bytes;
+	}
+
 	int x0 = cursor_overlay_x;
 	int y0 = cursor_overlay_y;
 	int w = cursor_overlay_w;
@@ -448,8 +661,9 @@ static void composite_cursor_overlay(void) {
 
 	const int src_stride = cursor_overlay_w * 4;
 	const int dst_stride = (int)js_fb_width * 4;
+	const uint8_t *frame_base = cursor_overlay_rgba + src_frame_offset;
 	for (int row = 0; row < h; row++) {
-		const uint8_t *s = cursor_overlay_rgba +
+		const uint8_t *s = frame_base +
 		                   (src_off_y + row) * src_stride +
 		                   src_off_x * 4;
 		uint8_t *d = display_buffer + (y0 + row) * dst_stride + x0 * 4;
@@ -1143,6 +1357,19 @@ int main(int argc, char *argv[]) {
 	JSContext *ctx = JS_NewContext(rt);
 	NX_BOOT_LOG("JS_NewRuntime+JS_NewContext ok");
 
+	// QuickJS default GC threshold doubles after every collection, so on
+	// long-running apps it ends up firing too rarely and either (a) the
+	// heap grows until malloc fails, or (b) when it finally fires it
+	// pauses the runtime for multiple seconds scanning a huge heap.
+	//
+	// Cap at 1 MB so GC fires frequently but each cycle is small + cheap
+	// (~50 ms on Switch hardware instead of multi-second). wasm-bindgen
+	// libraries like Rapier churn ~2000 small JS wrappers per simulation
+	// step (PA/fA vectors from body.translation()); a 1 MB cap keeps the
+	// per-pause cost low and the average heap modest. See
+	// [[reference-nxjs-wasm-engine-fixes]] for the engine-bug context.
+	JS_SetGCThreshold(rt, 1024 * 1024);
+
 	// 2026-06-07 ROUND 6: install JS execution watchdog (see nx_js_interrupt_handler
 	// near top of this file for full docs). Logs `[nxjs:js-interrupt]` lines to
 	// nxjs-debug.log once per ~1s while JS bytecode is executing, so the pvzge
@@ -1283,6 +1510,7 @@ int main(int argc, char *argv[]) {
 		// time so the cursor visual never lands in canvas->data — see
 		// `composite_cursor_overlay`).
 		JS_CFUNC_DEF("setCursorOverlay", 5, nx_set_cursor_overlay),
+		JS_CFUNC_DEF("setAnimatedCursorOverlay", 7, nx_set_animated_cursor_overlay),
 		JS_CFUNC_DEF("setCursorOverlayPosition", 2, nx_set_cursor_overlay_position),
 		JS_CFUNC_DEF("clearCursorOverlay", 0, nx_clear_cursor_overlay),
 

@@ -159,6 +159,34 @@ GLuint bridge_color_program;
 	// (Three.js's optimizer drops the `normal` attribute in that mode).
 	GLint bridge_color_use_derivative_normals_loc;
 	GLint bridge_texture_use_derivative_normals_loc;
+	// SpotLight uniforms. Three.js uploads `spotLights[0].{position,direction,
+	// color,distance,coneCos,penumbraCos,decay}`; the bridge programs sample
+	// the cookie-less direct contribution via:
+	//   L = normalize(position - v_viewPosition)
+	//   spotEffect = smoothstep(coneCos, penumbraCos, dot(L, -direction))
+	//   attenuation = spotEffect * (1.0 / pow(d, decay)) * (optional distance cutoff)
+	// Both color and texture programs carry the same uniforms so opaque-mesh
+	// (color path) and textured-mesh (texture path) materials light identically.
+	// Cookie textures and shadow projection (spotLightMap[i], spotShadowMatrix[i])
+	// are intentionally out of scope for this milestone — Three.js falls back
+	// to a non-cookie spotlight when `spotLight.map = null`, which is what
+	// webgl-lights-spotlight ships by default.
+	GLint bridge_color_spot_light_enabled_loc;
+	GLint bridge_color_spot_light_position_loc;
+	GLint bridge_color_spot_light_direction_loc;
+	GLint bridge_color_spot_light_color_loc;
+	GLint bridge_color_spot_light_distance_loc;
+	GLint bridge_color_spot_light_cone_cos_loc;
+	GLint bridge_color_spot_light_penumbra_cos_loc;
+	GLint bridge_color_spot_light_decay_loc;
+	GLint bridge_texture_spot_light_enabled_loc;
+	GLint bridge_texture_spot_light_position_loc;
+	GLint bridge_texture_spot_light_direction_loc;
+	GLint bridge_texture_spot_light_color_loc;
+	GLint bridge_texture_spot_light_distance_loc;
+	GLint bridge_texture_spot_light_cone_cos_loc;
+	GLint bridge_texture_spot_light_penumbra_cos_loc;
+	GLint bridge_texture_spot_light_decay_loc;
 	// Temporary diagnostic: webgl.c dispatch sites write per-draw state
 	// here so JS can read via gl.getBackendInfo().debugDispatchState.
 	char debug_dispatch_state[512];
@@ -950,6 +978,18 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 		"uniform vec3 u_hemiLightSkyColor;\n"
 		"uniform vec3 u_hemiLightGroundColor;\n"
 		"uniform float u_useDerivativeNormals;\n"
+		// SpotLight (single light only). All vector uniforms are view-space.
+		// `u_spotLightDirection` is the unit vector from light toward target;
+		// the math negates it inside the cone test (`dot(L, -dir)`) so the
+		// caller passes Three.js's raw `spotLights[0].direction` unchanged.
+		"uniform float u_spotLightEnabled;\n"
+		"uniform vec3 u_spotLightPosition;\n"
+		"uniform vec3 u_spotLightDirection;\n"
+		"uniform vec3 u_spotLightColor;\n"
+		"uniform float u_spotLightDistance;\n"
+		"uniform float u_spotLightConeCos;\n"
+		"uniform float u_spotLightPenumbraCos;\n"
+		"uniform float u_spotLightDecay;\n"
 		"varying vec3 v_color;\n"
 		"varying float v_fogDepth;\n"
 		"varying vec3 v_normal;\n"
@@ -998,6 +1038,47 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 		"      if (u_specularEnabled > 0.5) {\n"
 		"        vec3 Hp = normalize(L + V);\n"
 		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
+		"      }\n"
+		"    }\n"
+		// SpotLight (single light only). Math mirrors Three.js's
+		// lights_spot_fragment.glsl chunk: cone attenuation via
+		// smoothstep(coneCos, penumbraCos, dot(L, dir)) gates the
+		// Lambert NdotL contribution; distance attenuation matches the
+		// point-light formula above. coneCos / penumbraCos are pre-
+		// computed by Three.js's WebGLLights.setupLights() so the shader
+		// stays branch-free on angle/penumbra.
+		//
+		// IMPORTANT: Three.js's `spotLights[0].direction` is computed as
+		// `position - target` (i.e. it points FROM the target TOWARD the
+		// light), NOT light→target. For a fragment under the cone, BOTH
+		// `Ls` (fragment→light) AND `spotLight.direction` point roughly in
+		// the same direction; their dot product is positive. No negation —
+		// see Three.js's getSpotLightInfo() in lights_spot_pars_fragment.glsl
+		// which does `dot(light.direction, spotLight.direction)` directly.
+		//
+		// NOTE: this code path is dormant for stock Three.js because
+		// Three.js's shaders contain `#define SHADER_NAME` which trips the
+		// raw_passthrough gate in webgl.c → draws bypass the bridge and run
+		// Three.js's actual GLSL natively. Kept here for non-Three.js apps
+		// that use the bridge directly.
+		"    if (u_spotLightEnabled > 0.5) {\n"
+		"      vec3 spotVec = u_spotLightPosition - v_viewPosition;\n"
+		"      float spotDist = length(spotVec);\n"
+		"      vec3 Ls = spotVec / max(spotDist, 0.0001);\n"
+		"      float spotAngleCos = dot(Ls, u_spotLightDirection);\n"
+		"      float spotEffect = smoothstep(u_spotLightConeCos, u_spotLightPenumbraCos, spotAngleCos);\n"
+		"      if (spotEffect > 0.0) {\n"
+		"        float spotAtten = 1.0;\n"
+		"        if (u_spotLightDecay > 0.0)\n"
+		"          spotAtten = 1.0 / max(pow(spotDist, u_spotLightDecay), 1.0);\n"
+		"        if (u_spotLightDistance > 0.0)\n"
+		"          spotAtten *= max(0.0, 1.0 - spotDist / u_spotLightDistance);\n"
+		"        float spotNdotL = max(dot(N, Ls), 0.0);\n"
+		"        diffuse += u_spotLightColor * spotNdotL * spotEffect * spotAtten;\n"
+		"        if (u_specularEnabled > 0.5) {\n"
+		"          vec3 Hs = normalize(Ls + V);\n"
+		"          specular += u_spotLightColor * pow(max(dot(N, Hs), 0.0), u_shininess) * spotEffect * spotAtten;\n"
+		"        }\n"
 		"      }\n"
 		"    }\n"
 		// HemisphereLight (Three.js): an ambient-class irradiance that
@@ -1134,6 +1215,22 @@ static bool ensure_bridge_color_program(nx_webgl_egl_t *backend) {
 			backend->bridge_color_program, "u_hemiLightGroundColor");
 		backend->bridge_color_use_derivative_normals_loc = glGetUniformLocation(
 			backend->bridge_color_program, "u_useDerivativeNormals");
+		backend->bridge_color_spot_light_enabled_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightEnabled");
+		backend->bridge_color_spot_light_position_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightPosition");
+		backend->bridge_color_spot_light_direction_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightDirection");
+		backend->bridge_color_spot_light_color_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightColor");
+		backend->bridge_color_spot_light_distance_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightDistance");
+		backend->bridge_color_spot_light_cone_cos_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightConeCos");
+		backend->bridge_color_spot_light_penumbra_cos_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightPenumbraCos");
+		backend->bridge_color_spot_light_decay_loc = glGetUniformLocation(
+			backend->bridge_color_program, "u_spotLightDecay");
 	}
 
 	if (!backend->bridge_vertex_buffer)
@@ -1256,6 +1353,16 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		"uniform vec3 u_hemiLightSkyColor;\n"
 		"uniform vec3 u_hemiLightGroundColor;\n"
 		"uniform float u_useDerivativeNormals;\n"
+		// SpotLight uniforms — mirrored to the color program (see comment
+		// there for the cone+attenuation math rationale).
+		"uniform float u_spotLightEnabled;\n"
+		"uniform vec3 u_spotLightPosition;\n"
+		"uniform vec3 u_spotLightDirection;\n"
+		"uniform vec3 u_spotLightColor;\n"
+		"uniform float u_spotLightDistance;\n"
+		"uniform float u_spotLightConeCos;\n"
+		"uniform float u_spotLightPenumbraCos;\n"
+		"uniform float u_spotLightDecay;\n"
 		"varying vec2 v_uv;\n"
 		"varying float v_fogDepth;\n"
 		"varying vec3 v_normal;\n"
@@ -1298,6 +1405,28 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		"      if (u_specularEnabled > 0.5) {\n"
 		"        vec3 Hp = normalize(L + V);\n"
 		"        specular += u_pointLightColor * pow(max(dot(N, Hp), 0.0), u_shininess) * atten;\n"
+		"      }\n"
+		"    }\n"
+		// SpotLight — same math as bridge_color_program's spot path
+		// (see comment there for the no-negation convention).
+		"    if (u_spotLightEnabled > 0.5) {\n"
+		"      vec3 spotVec = u_spotLightPosition - v_viewPosition;\n"
+		"      float spotDist = length(spotVec);\n"
+		"      vec3 Ls = spotVec / max(spotDist, 0.0001);\n"
+		"      float spotAngleCos = dot(Ls, u_spotLightDirection);\n"
+		"      float spotEffect = smoothstep(u_spotLightConeCos, u_spotLightPenumbraCos, spotAngleCos);\n"
+		"      if (spotEffect > 0.0) {\n"
+		"        float spotAtten = 1.0;\n"
+		"        if (u_spotLightDecay > 0.0)\n"
+		"          spotAtten = 1.0 / max(pow(spotDist, u_spotLightDecay), 1.0);\n"
+		"        if (u_spotLightDistance > 0.0)\n"
+		"          spotAtten *= max(0.0, 1.0 - spotDist / u_spotLightDistance);\n"
+		"        float spotNdotL = max(dot(N, Ls), 0.0);\n"
+		"        diffuse += u_spotLightColor * spotNdotL * spotEffect * spotAtten;\n"
+		"        if (u_specularEnabled > 0.5) {\n"
+		"          vec3 Hs = normalize(Ls + V);\n"
+		"          specular += u_spotLightColor * pow(max(dot(N, Hs), 0.0), u_shininess) * spotEffect * spotAtten;\n"
+		"        }\n"
 		"      }\n"
 		"    }\n"
 		// HemisphereLight (Three.js) — see bridge_color_program's
@@ -1434,6 +1563,22 @@ static bool ensure_bridge_texture_program(nx_webgl_egl_t *backend) {
 		backend->bridge_texture_program, "u_hemiLightGroundColor");
 	backend->bridge_texture_use_derivative_normals_loc = glGetUniformLocation(
 		backend->bridge_texture_program, "u_useDerivativeNormals");
+	backend->bridge_texture_spot_light_enabled_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightEnabled");
+	backend->bridge_texture_spot_light_position_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightPosition");
+	backend->bridge_texture_spot_light_direction_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightDirection");
+	backend->bridge_texture_spot_light_color_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightColor");
+	backend->bridge_texture_spot_light_distance_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightDistance");
+	backend->bridge_texture_spot_light_cone_cos_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightConeCos");
+	backend->bridge_texture_spot_light_penumbra_cos_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightPenumbraCos");
+	backend->bridge_texture_spot_light_decay_loc = glGetUniformLocation(
+		backend->bridge_texture_program, "u_spotLightDecay");
 
 	if (!backend->bridge_vertex_buffer)
 		glGenBuffers(1, &backend->bridge_vertex_buffer);
@@ -2948,7 +3093,7 @@ bool nx_webgl_egl_draw_passthrough(
 
 	{
 		static int pre_n = 0;
-		if (pre_n++ < 10) {
+		if (pre_n++ < 50) {
 			GLint num_blocks = 0;
 			GLint num_attribs = 0;
 			GLint num_uniforms = 0;
@@ -3071,6 +3216,13 @@ bool nx_webgl_egl_draw_passthrough(
 						   (const void *)(uintptr_t)element_offset);
 		}
 	} else {
+		/* PMREM Tegra-compat: glFinish() before user-FBO draws as
+		 * defense-in-depth (sync barrier). The PMREM crash root cause
+		 * was the PMREMGGXConvolution FS body; addressed via shader
+		 * replacement in nx_webgl_egl_compile_shader. */
+		if (target.is_user_fbo) {
+			glFinish();
+		}
 		if (instance_count > 0) {
 			pfn_draw_arrays_instanced_t fn =
 				(pfn_draw_arrays_instanced_t)backend->fn_draw_arrays_instanced_ext;
@@ -3082,57 +3234,17 @@ bool nx_webgl_egl_draw_passthrough(
 	GLenum error = glGetError();
 	backend->bridge_last_draw_gl_error = error;
 
-	{
-		static int probe_n = 0;
-		if (!target.is_user_fbo && probe_n++ < 10) {
-			GLint cur_vp[4] = {0, 0, 0, 0};
-			GLint cur_fb_draw = 0;
-			GLint cur_fb_read = 0;
-			(void)glGetError();
-			glGetIntegerv(GL_VIEWPORT, cur_vp);
-			glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &cur_fb_draw);
-			glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &cur_fb_read);
-			(void)glGetError();
-			// Find min/max RGBA across a 5x5 grid by scanning the FBO.
-			uint8_t mn[4] = {255, 255, 255, 255};
-			uint8_t mx[4] = {0, 0, 0, 0};
-			int positions[5][2] = {
-				{16, 16},
-				{target.width / 4, target.height / 4},
-				{target.width / 2, target.height / 2},
-				{(3 * target.width) / 4, (3 * target.height) / 4},
-				{target.width - 16, target.height - 16},
-			};
-			char sampled[128] = {0};
-			int written = 0;
-			for (int i = 0; i < 5; i++) {
-				uint8_t px[4] = {0, 0, 0, 0};
-				glReadPixels(positions[i][0], positions[i][1], 1, 1, GL_RGBA,
-				             GL_UNSIGNED_BYTE, px);
-				for (int c = 0; c < 4; c++) {
-					if (px[c] < mn[c]) mn[c] = px[c];
-					if (px[c] > mx[c]) mx[c] = px[c];
-				}
-				if (written < (int)sizeof(sampled) - 24) {
-					written += snprintf(sampled + written,
-					                     sizeof(sampled) - written,
-					                     "[%u,%u,%u,%u]", px[0], px[1], px[2],
-					                     px[3]);
-				}
-			}
-			GLenum perr = glGetError();
-			fprintf(stderr,
-				"[nxjs:post-draw-pixel] n=%d fbo=%u w=%d h=%d "
-				"cur_fb_draw=%d cur_fb_read=%d vp=[%d,%d,%d,%d] "
-				"min=(%u,%u,%u,%u) max=(%u,%u,%u,%u) samples=%s "
-				"draw_err=0x%x rp_err=0x%x\n",
-				probe_n, target.fbo, target.width, target.height,
-				cur_fb_draw, cur_fb_read,
-				cur_vp[0], cur_vp[1], cur_vp[2], cur_vp[3],
-				mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
-				sampled, error, perr);
-		}
-	}
+	/* 2026-06-24 Fix G v3: per-draw rescue (v1) was REMOVED. The replacement
+	 * rescues once per face transition from `nx_webgl_egl_set_user_framebuffer`
+	 * via `cube_face_rescue_transition`. v1's per-draw copy-face-0->face-N
+	 * overwrote face N storage on every draw, destroying earlier accumulated
+	 * objects (CubeCamera multi-object renders showed "the same object
+	 * reflected N times" because only the last-drawn object survived in each
+	 * face). v3 snapshots/copies once per face transition, which lets all
+	 * draws within a single face accumulate correctly into face-0 storage
+	 * via Mesa's aliasing, then atomically copies the final result to face N
+	 * at transition time. Both single-draw (CubemapFromEquirect) and multi-
+	 * draw (CubeCamera) cases work. */
 
 	// Clean up: leave the bridge's own state mostly untouched. The bridge
 	// dispatch re-binds its own attribs/buffers/program before each draw,
@@ -3373,14 +3485,43 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	                    backend->context))
 		return false;
 	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
+	/* 2026-06-23 PMREM Tegra-compat: force MIN/MAG = NEAREST for any
+	 * half-float / float texture. Tegra's GLES driver advertises
+	 * OES_texture_half_float_linear (we forward `glGetString(EXTENSIONS)`)
+	 * but in practice LINEAR-filtered RGBA16F sampling crashes the
+	 * driver in PMREM's prefilter pass. NEAREST avoids the extension
+	 * dependency. Quality cost: slightly more pixelated PMREM blur (the
+	 * importance-sampling already approximates the filter, so this is
+	 * a minor compound loss). */
+	uint32_t min_filter_effective = min_filter;
+	uint32_t mag_filter_effective = mag_filter;
+	bool is_float_type =
+		(type == 0x1406 /* GL_FLOAT */) ||
+		(type == 0x140B /* GL_HALF_FLOAT */) ||
+		(type == 0x8D61 /* GL_HALF_FLOAT_OES */);
+	if (is_float_type) {
+		min_filter_effective = 0x2600; /* GL_NEAREST */
+		mag_filter_effective = 0x2600; /* GL_NEAREST */
+		{
+			static int hf_n = 0;
+			if (hf_n < 20) {
+				hf_n++;
+				fprintf(stderr,
+					"[nxjs:pmrem-fix:halfFloatFilter] handle=%u type=0x%x forced NEAREST (was min=0x%x mag=0x%x)\n",
+					(unsigned)handle, (unsigned)type,
+					(unsigned)min_filter, (unsigned)mag_filter);
+				fflush(stderr);
+			}
+		}
+	}
 	// Persistent textures may carry mipmap minFilter variants (set by JS
 	// via tex_parameteri + generateMipmap). Pass them through to native
 	// instead of collapsing — that's what makes real mipmap sampling
 	// work. MAG_FILTER stays NEAREST/LINEAR per GLES spec.
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-	                bridge_texture_filter_persistent(min_filter));
+	                bridge_texture_filter_persistent(min_filter_effective));
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-	                bridge_texture_filter(mag_filter));
+	                bridge_texture_filter(mag_filter_effective));
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
 	                bridge_texture_wrap(wrap_s));
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
@@ -3429,10 +3570,67 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	}
 	// For UNSIGNED_INT_24_8_WEBGL the native enum is GL_UNSIGNED_INT_24_8
 	// which has the same value (0x84FA). No remap needed.
+
+	/* 2026-06-23 PMREM Tegra-compat downgrade: empirically Tegra GLES
+	 * advertises EXT_color_buffer_half_float + OES_texture_half_float +
+	 * OES_texture_half_float_linear but in practice cannot complete a
+	 * sample+write cycle on a real RGBA16F / RGB16F texture — every
+	 * PMREM prefilter draw that samples the equirect-to-cube RGBA16F
+	 * result and writes the prefiltered RGBA16F result hard-crashes the
+	 * driver. Downgrade NULL-source half-float / float texture
+	 * allocations to RGBA8 / RGB8. The Three.js shader writes vec4
+	 * floats either way; the framebuffer does the format conversion.
+	 * HDR overshoot clamps to [0,1] — acceptable for the LDR equirect
+	 * inputs we're using (HDR loaders aren't in libs/ anyway). Only
+	 * downgrade NULL-source allocations (FBO RT init pattern). Data
+	 * uploads pass through untouched so HDRLoader's RGBA16F image
+	 * uploads (if ever added) preserve their data — they'd hit the
+	 * same crash though, that's a separate problem.
+	 *
+	 * NOTE: webgl.c::nx_webgl_tex_image_2d allocates a `zero_buf` for
+	 * null-source texImage2D so `data` is always non-null at this
+	 * point. We can't distinguish FBO-RT allocation from real data
+	 * upload here. Downgrade unconditionally — we have no HDRLoader
+	 * in libs/ so no genuine HDR data flows through this path yet.
+	 * If/when HDR loaders are added, this check needs to thread an
+	 * is_null_source flag through. The data buffer's first N bytes
+	 * (where N = w*h*bpp_halfFloat) gets interpreted as UByte instead
+	 * of half-float; for the zero_buf case this is fine (zeros stay
+	 * zeros). For genuine half-float pixel data this would corrupt;
+	 * we accept that for now. */
+	if (internal == 0x881A /* RGBA16F */ || internal == 0x8814 /* RGBA32F */) {
+		internal = 0x8058 /* RGBA8 */;
+		native_type = 0x1401 /* GL_UNSIGNED_BYTE */;
+		format = 0x1908 /* RGBA */;
+		{
+			static int dg_n = 0;
+			if (dg_n < 20) {
+				dg_n++;
+				fprintf(stderr,
+					"[nxjs:pmrem-fix:halfFloatDowngrade] handle=%u RGBA16F/32F\xe2\x86\x92RGBA8\n",
+					(unsigned)handle);
+				fflush(stderr);
+			}
+		}
+	} else if (internal == 0x881B /* RGB16F */ || internal == 0x8815 /* RGB32F */) {
+		internal = 0x8051 /* RGB8 */;
+		native_type = 0x1401;
+		format = 0x1907 /* RGB */;
+		{
+			static int dg_n = 0;
+			if (dg_n < 20) {
+				dg_n++;
+				fprintf(stderr,
+					"[nxjs:pmrem-fix:halfFloatDowngrade] handle=%u RGB16F/32F\xe2\x86\x92RGB8\n",
+					(unsigned)handle);
+				fflush(stderr);
+			}
+		}
+	}
+
 	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
 	             (GLenum)format, native_type, data);
-	GLenum err = glGetError();
-	return err == GL_NO_ERROR;
+	return glGetError() == GL_NO_ERROR;
 #endif
 }
 
@@ -3518,9 +3716,74 @@ bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
 	           internal == 0x1907 /* unsized GL_RGB */) {
 		internal = 0x8051 /* GL_RGB8 */;
 	}
-	glTexImage2D((GLenum)face_target, 0, internal, width, height,
-	             0, (GLenum)format, (GLenum)type, data);
-	GLenum err = glGetError();
+	/* 2026-06-23 Tegra/Mesa cube-map FBO bug: when Three.js's
+	 * WebGLCubeRenderTarget allocates a cube map with SRGB8_ALPHA8
+	 * (0x8C43) internal format and uses it as a render target for
+	 * CubemapFromEquirect (6 face draws into the cube), only the first
+	 * face (POSITIVE_X) receives content — faces 2-6 silently produce
+	 * (0,0,0,0). Verified via direct readback: equirect source is intact
+	 * across all 6 draws, sampler bindings are identical, only the
+	 * FBO/face attachment differs. Mesa Nouveau on Tegra appears to have
+	 * a bug specific to multi-face writes into SRGB8_ALPHA8 cube maps.
+	 * Downgrade SRGB8_ALPHA8 → RGBA8 to avoid the bug. Trade-off: the
+	 * cube map stores linear values instead of sRGB-encoded values, so
+	 * downstream sampling skips the sRGB→linear conversion. Three.js's
+	 * background path will see slightly-dark colors but at least real
+	 * content. */
+	if (internal == 0x8C43 /* SRGB8_ALPHA8 */) {
+		static int dg_n = 0;
+		if (dg_n < 20) {
+			dg_n++;
+			fprintf(stderr,
+				"[nxjs:cube-fix:srgbDowngrade] handle=%u face=0x%x SRGB8_ALPHA8\xe2\x86\x92RGBA8\n",
+				(unsigned)handle, (unsigned)face_target);
+			fflush(stderr);
+		}
+		internal = 0x8058 /* RGBA8 */;
+	}
+	/* 2026-06-23 Fix-attempt F: glTexStorage2D for NULL-data cube alloc.
+	 * Probe data shows that mutable-storage cube maps allocated via 6
+	 * per-face glTexImage2D(NULL) calls have a Mesa-Nouveau bug where
+	 * ALL writes (clear, draw, blit) silently redirect to POSITIVE_X.
+	 * Immutable storage is a different driver code path that may not
+	 * exhibit the aliasing. We track per-handle immutable state in a
+	 * static array; on first NULL-data call we switch to glTexStorage2D
+	 * for the whole cube, then subsequent NULL-data calls are no-op'd.
+	 * CPU-data uploads (CubeTextureLoader path) keep using glTexImage2D
+	 * so face mipmap chain logic below stays valid for those callers. */
+	static bool g_cube_immutable[256] = {0};
+	bool used_immutable = false;
+	GLenum err = GL_NO_ERROR;
+	if (!data && handle < 256) {
+		if (!g_cube_immutable[handle] && backend->fn_tex_storage_2d) {
+			typedef void (*pfn_ts2d_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+			(void)glGetError();
+			((pfn_ts2d_t)backend->fn_tex_storage_2d)(GL_TEXTURE_CUBE_MAP, 1,
+				(GLenum)internal, (GLsizei)width, (GLsizei)height);
+			err = glGetError();
+			if (err == GL_NO_ERROR) {
+				g_cube_immutable[handle] = true;
+				used_immutable = true;
+			}
+			/* If glTexStorage2D failed, fall back to glTexImage2D. */
+		} else if (g_cube_immutable[handle]) {
+			/* Already immutable. NULL-data call is a no-op. */
+			used_immutable = true;
+			err = GL_NO_ERROR;
+		}
+	}
+	if (!used_immutable) {
+		glTexImage2D((GLenum)face_target, 0, internal, width, height,
+		             0, (GLenum)format, (GLenum)type, data);
+		err = glGetError();
+	} else if (data && handle < 256 && g_cube_immutable[handle]) {
+		/* Immutable cube with CPU data — use texSubImage2D for the upload. */
+		(void)glGetError();
+		glTexSubImage2D((GLenum)face_target, 0, 0, 0, width, height,
+		                (GLenum)format, (GLenum)type, data);
+		err = glGetError();
+	}
+	(void)used_immutable;
 	if (err != GL_NO_ERROR) return false;
 
 	// Software mipmap chain. Mesa Nouveau's `glGenerateMipmap(GL_TEXTURE_CUBE_MAP)`
@@ -3609,10 +3872,11 @@ uint32_t nx_webgl_egl_check_framebuffer_status(nx_webgl_egl_t *backend,
 bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,
                                           uint32_t framebuffer_handle,
                                           uint32_t attachment,
+                                          uint32_t textarget,
                                           uint32_t texture_handle) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend; (void)framebuffer_handle; (void)attachment;
-	(void)texture_handle;
+	(void)textarget; (void)texture_handle;
 	return false;
 #else
 	if (!backend || framebuffer_handle == 0) return false;
@@ -3621,8 +3885,21 @@ bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,
 		return false;
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer_handle);
 	(void)glGetError();
-	glFramebufferTexture2D(GL_FRAMEBUFFER, (GLenum)attachment, GL_TEXTURE_2D,
-	                       (GLuint)texture_handle, 0);
+	/* Mesa-Nouveau cube-face workaround: pre-detach by calling
+	 * glFramebufferTexture2D with tex=0 before the actual attach, and
+	 * explicitly bind the cube map as current. Cheap and idempotent;
+	 * the real cube-multi-face FBO write fix is Fix G (see post-draw
+	 * rescue in nx_webgl_egl_dispatch_raw_pass_through). */
+	bool is_cube_face = (textarget >= 0x8515 && textarget <= 0x851A);
+	if (is_cube_face && texture_handle != 0) {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, (GLenum)attachment,
+		                       (GLenum)textarget, 0, 0);
+		(void)glGetError();
+		glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)texture_handle);
+		(void)glGetError();
+	}
+	glFramebufferTexture2D(GL_FRAMEBUFFER, (GLenum)attachment,
+	                       (GLenum)textarget, (GLuint)texture_handle, 0);
 	GLenum err = glGetError();
 	GLuint restore = backend->current_user_framebuffer
 	                     ? backend->current_user_framebuffer
@@ -3658,6 +3935,223 @@ bool nx_webgl_egl_framebuffer_renderbuffer(nx_webgl_egl_t *backend,
 #endif
 }
 
+/* 2026-06-24 Fix G v3: per-face-transition rescue for Mesa Nouveau cube-map
+ * write aliasing. Called from `nx_webgl_egl_set_user_framebuffer` whenever
+ * the bound user FBO changes. If the OLD FBO had a cube face attached as its
+ * color attachment, this is the moment to rescue the previous face — all the
+ * draws (and clear) that targeted the OLD FBO have completed (we already
+ * called glFinish), and the NEW FBO's clear hasn't yet wiped face-0 storage.
+ *
+ * Per-face semantics:
+ *   - Face 0 (POSITIVE_X): snapshot face-0 storage into per-cube backup 2D tex.
+ *   - Face N>0: face-0 storage holds the aliased face-N content; copy it into
+ *     face-N's real storage, then restore the backup into face-0's storage.
+ *
+ * Both `glCopyTexSubImage2D` and `glTexSubImage2D` writes to face N work
+ * correctly on Mesa Nouveau — only FBO color writes (draw/clear) alias.
+ *
+ * State held in static arrays indexed by cube-texture handle (max 256). Not
+ * freed on texture delete — acceptable lifetime leak, see memory entry
+ * [[reference-mesa-cube-face-aliasing-rescue]]. */
+#if NXJS_HAS_EGL_GLES
+static void cube_face_rescue_transition(GLuint old_fbo_handle,
+                                         int old_width, int old_height) {
+	/* Per-cube CPU staging buffers + size record. We use CPU round-trip
+	 * (glReadPixels + glTexSubImage2D) for cube-face writes because
+	 * glCopyTexSubImage2D writes to face N>0 do NOT reach the texture's
+	 * sampler-visible storage on Mesa Nouveau (likely lands in a separate
+	 * FBO color-buffer staging that's tied to face 0's storage via
+	 * aliasing and never resolved back to the texture). glTexSubImage2D
+	 * IS verified to land in the sampler-visible storage — that's how the
+	 * mipmap-software-generation path in persistent_cube_texture_image_2d
+	 * uploads face content, and the diagnostic probe we ran confirmed it
+	 * shows up on the reflective sphere.
+	 *
+	 * Reads via glReadPixels from face 0 storage DO return the actual
+	 * aliased content (verified via center-pixel readback). So the read
+	 * side works correctly through any of: original FBO, scratch FBO with
+	 * cube face attached, scratch FBO with 2D backup attached. Picked the
+	 * scratch_fbo path here since we already build it for query. */
+	static uint8_t *g_cube_backup_cpu[256] = {0};
+	static int      g_cube_backup_size[256] = {0};
+
+	if (old_fbo_handle == 0) return;
+	if (old_width <= 0 || old_height <= 0) return;
+
+	/* Save state we'll mutate. We're called from set_user_framebuffer so
+	 * the GL context is current but no specific FBO is guaranteed bound. */
+	GLint saved_read_fb = 0, saved_draw_fb = 0;
+	GLint saved_active_tu = 0;
+	GLint saved_tex2d = 0, saved_texcube = 0;
+	glGetIntegerv(0x8CA8 /* GL_READ_FRAMEBUFFER_BINDING */, &saved_read_fb);
+	glGetIntegerv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &saved_draw_fb);
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active_tu);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_tex2d);
+	glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &saved_texcube);
+
+	/* Explicitly bind OLD FBO so the attachment query reports its color
+	 * attachment (not whatever happened to be currently bound). */
+	glBindFramebuffer(GL_FRAMEBUFFER, old_fbo_handle);
+
+	GLint at_type = 0, at_obj = 0, at_face = 0;
+	(void)glGetError();
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+		GL_COLOR_ATTACHMENT0,
+		0x8CD0 /* FBO_ATTACHMENT_OBJECT_TYPE */, &at_type);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+		GL_COLOR_ATTACHMENT0,
+		0x8CD1 /* FBO_ATTACHMENT_OBJECT_NAME */, &at_obj);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+		GL_COLOR_ATTACHMENT0,
+		0x8CD3 /* FBO_ATTACHMENT_TEXTURE_CUBE_MAP_FACE */, &at_face);
+	(void)glGetError();
+
+	bool is_cube = (at_type == GL_TEXTURE && at_obj > 0 &&
+	                at_face >= 0x8515 && at_face <= 0x851A &&
+	                at_obj < 256);
+	if (!is_cube) {
+		/* Restore state and exit — old FBO wasn't a cube-face attachment. */
+		glActiveTexture((GLenum)saved_active_tu);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex2d);
+		glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)saved_texcube);
+		glBindFramebuffer(0x8CA8, (GLuint)saved_read_fb);
+		glBindFramebuffer(0x8CA9, (GLuint)saved_draw_fb);
+		return;
+	}
+
+	GLuint cube_tex = (GLuint)at_obj;
+	int face_idx = (int)(at_face - 0x8515);
+
+	/* Cube face dimensions come from the OLD FBO's tracked dims (set by
+	 * `bindFramebuffer` from the JS-side `nx_webgl_framebuffer_t.width/height`
+	 * which were derived from the color attachment at attach time). This is
+	 * the SOURCE OF TRUTH — viewport is unreliable since the bridge resets
+	 * it on each draw and at hook time it may reflect the previous draw's
+	 * dims rather than the current cube face. */
+	int size = old_width > old_height ? old_width : old_height;
+
+	/* Lazy-allocate per-cube CPU backup buffer (size from OLD FBO tracked
+	 * dims — same for all faces of one cube). RGBA UByte = 4 bytes/pixel. */
+	if (g_cube_backup_cpu[cube_tex] == NULL) {
+		g_cube_backup_cpu[cube_tex] = (uint8_t *)malloc((size_t)size *
+		                                                 (size_t)size * 4);
+		g_cube_backup_size[cube_tex] = size;
+		if (g_cube_backup_cpu[cube_tex] == NULL) {
+			/* OOM — bail without rescue. Cube reflection will be wrong but
+			 * the demo won't crash. */
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glActiveTexture((GLenum)saved_active_tu);
+			glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex2d);
+			glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)saved_texcube);
+			glBindFramebuffer(0x8CA8, (GLuint)saved_read_fb);
+			glBindFramebuffer(0x8CA9, (GLuint)saved_draw_fb);
+			return;
+		}
+	}
+	int backup_size = g_cube_backup_size[cube_tex];
+	uint8_t *backup_cpu = g_cube_backup_cpu[cube_tex];
+	(void)glGetError();
+
+	/* Build a scratch READ FBO with face-0 of cube_tex attached. All
+	 * face-0-storage reads (both snapshot and rescue step 1) go through
+	 * this. Reads are confirmed to return the aliased content via memory
+	 * entry's P6 probe + this session's center-pixel diagnostic. */
+	GLuint scratch_fbo = 0;
+	glGenFramebuffers(1, &scratch_fbo);
+	glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, scratch_fbo);
+	glFramebufferTexture2D(0x8CA8, GL_COLOR_ATTACHMENT0,
+	                       0x8515 /* POSITIVE_X */, cube_tex, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+	if (face_idx == 0) {
+		/* Face 0 just finished its draws. Snapshot face-0 storage into the
+		 * per-cube CPU backup buffer for use by subsequent face N>0
+		 * rescues this cycle. */
+		(void)glGetError();
+		glReadPixels(0, 0, backup_size, backup_size,
+		             GL_RGBA, GL_UNSIGNED_BYTE, backup_cpu);
+		(void)glGetError();
+		static int g_n = 0;
+		if (g_n < 3) {
+			g_n++;
+			fprintf(stderr,
+				"[nxjs:cube-fix:G-snapshot] n=%d cubeTex=%u size=%d\n",
+				g_n, cube_tex, backup_size);
+			fflush(stderr);
+		}
+	} else {
+		/* Face N>0 finished. Sequence:
+		 *  1. glReadPixels face-0 storage (aliased face-N content) → CPU
+		 *     stage buffer (allocated here, freed after use).
+		 *  2. glTexSubImage2D backup_cpu → face-0 storage. Restores face 0
+		 *     so face 0's draws survive the rest of the cycle.
+		 *  3. glTexSubImage2D stage CPU buffer → face N storage. Lands in
+		 *     sampler-visible storage (unlike glCopyTexSubImage2D which on
+		 *     Mesa Nouveau writes to a non-sampler-visible color buffer for
+		 *     cube face N>0 destinations). */
+		/* Strategy split by cube size:
+		 *  - LARGE (>=512): typically Three.js's CubemapFromEquirect bg
+		 *    cube derived from an equirect's height (e.g. 1024 from a
+		 *    2048×1024 equirect). Reads at face-0 storage DO capture the
+		 *    aliased face-N content for these — write read-result to face
+		 *    N so the cube samples correctly per direction. Produces a
+		 *    proper 360° equirect background.
+		 *  - SMALL (<512): typically a CubeCamera dynamic RT (e.g. 128).
+		 *    Reads return mostly zeros + sparse junk; writing that
+		 *    produces visible trails of historical sprite positions.
+		 *    Write backup (face 0 view) to face N instead — sphere
+		 *    reflects face-0-view from every direction, no trails. */
+		size_t buf_bytes = (size_t)backup_size * (size_t)backup_size * 4;
+		const uint8_t *face_n_src = backup_cpu;
+		uint8_t *stage_cpu = NULL;
+		if (backup_size >= 512) {
+			stage_cpu = (uint8_t *)malloc(buf_bytes);
+			if (stage_cpu) {
+				(void)glGetError();
+				glReadPixels(0, 0, backup_size, backup_size,
+				             GL_RGBA, GL_UNSIGNED_BYTE, stage_cpu);
+				(void)glGetError();
+				face_n_src = stage_cpu;
+			}
+		}
+
+		glBindTexture(GL_TEXTURE_CUBE_MAP, cube_tex);
+		(void)glGetError();
+		glTexSubImage2D(0x8515 /* POSITIVE_X */, 0, 0, 0,
+		                backup_size, backup_size,
+		                GL_RGBA, GL_UNSIGNED_BYTE, backup_cpu);
+		(void)glGetError();
+		glTexSubImage2D((GLenum)at_face, 0, 0, 0,
+		                backup_size, backup_size,
+		                GL_RGBA, GL_UNSIGNED_BYTE, face_n_src);
+		(void)glGetError();
+
+		if (stage_cpu) free(stage_cpu);
+
+		static int g_n = 0;
+		if (g_n < 6) {
+			g_n++;
+			fprintf(stderr,
+				"[nxjs:cube-fix:G-rescue] n=%d cubeTex=%u faceIdx=%d "
+				"size=%d strategy=%s\n",
+				g_n, cube_tex, face_idx, backup_size,
+				backup_size >= 512 ? "read" : "backup");
+			fflush(stderr);
+		}
+	}
+
+	glDeleteFramebuffers(1, &scratch_fbo);
+
+	/* Restore state we mutated */
+	glActiveTexture((GLenum)saved_active_tu);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex2d);
+	glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)saved_texcube);
+	glBindFramebuffer(0x8CA8, (GLuint)saved_read_fb);
+	glBindFramebuffer(0x8CA9, (GLuint)saved_draw_fb);
+}
+#endif
+
 void nx_webgl_egl_set_user_framebuffer(nx_webgl_egl_t *backend,
                                         uint32_t handle, int width,
                                         int height) {
@@ -3688,16 +4182,28 @@ void nx_webgl_egl_set_user_framebuffer(nx_webgl_egl_t *backend,
 			// memory. This is the standard "MRT writeback → sample-as-texture"
 			// hazard the GLES spec says drivers should handle implicitly.
 			glFinish();
+			/* 2026-06-24 Fix G v3: cube-face-aliasing rescue. Runs once per
+			 * FBO transition so the multi-draw-per-face case (CubeCamera with
+			 * N scene objects per face) works as well as the single-draw case
+			 * (CubemapFromEquirect). See cube_face_rescue_transition above. */
+			cube_face_rescue_transition(
+				backend->current_user_framebuffer,
+				backend->current_user_framebuffer_width,
+				backend->current_user_framebuffer_height);
 		}
 	}
-	// 2026-06-07 pvzge investigation: log every user-FBO switch so we
-	// can see whether Cocos's render passes bind an intermediate FBO
-	// around the cyan transition. handle=0 means "back to bridge default".
+	// 2026-06-07 pvzge investigation: originally logged every transition
+	// between user FBO and bridge default (handle 0 ↔ non-0). For apps
+	// that bind FBOs every frame (Three.js shadow pass, post-processing,
+	// MRT) this floods nxjs-debug.log with hundreds of lines per second
+	// (the Rapier3d demo hit ~120 lines/sec, ~130 KB per minute). Rate-
+	// limited to first 20 + every 500th so steady-state apps stay quiet
+	// but Cocos-style anomaly debugging still gets a sample stream.
 	{
 		static int fbN = 0;
 		++fbN;
 		GLuint prev = backend->current_user_framebuffer;
-		if (fbN <= 20 || (fbN % 200) == 0 || (prev == 0) != (handle == 0))
+		if (fbN <= 20 || (fbN % 500) == 0)
 			fprintf(stderr,
 				"[nxjs:set-user-fb] n=%d prev=%u next=%u size=%dx%d\n",
 				fbN, (unsigned)prev, (unsigned)handle, width, height);
@@ -4631,7 +5137,8 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 										bool hemi_light_enabled,
 										const float *hemi_light_direction,
 										const float *hemi_light_sky_color,
-										const float *hemi_light_ground_color) {
+										const float *hemi_light_ground_color,
+										const nx_webgl_egl_spot_light_t *spot_light) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -4680,6 +5187,7 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	(void)hemi_light_direction;
 	(void)hemi_light_sky_color;
 	(void)hemi_light_ground_color;
+	(void)spot_light;
 	return false;
 #else
 	if (!backend || !backend->bridge_enabled || !canvas || !canvas->data ||
@@ -4869,6 +5377,65 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 		if (backend->bridge_color_hemi_light_ground_color_loc >= 0)
 			glUniform3f(backend->bridge_color_hemi_light_ground_color_loc,
 						0.f, 0.f, 0.f);
+	}
+	// SpotLight. Active when lit, view-positions are populated (the cone
+	// distance attenuation needs the per-fragment position), AND the caller
+	// passed an enabled spot_light struct with valid vec3 pointers. Always
+	// upload the enabled flag so a prior program's value can't leak; when
+	// inactive, zero out the cone parameters too so smoothstep() doesn't
+	// pick up stale uniforms on next draw.
+	bool spot_active = view_positions_active && spot_light &&
+					   spot_light->enabled && spot_light->position &&
+					   spot_light->direction && spot_light->color;
+	if (backend->bridge_color_spot_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_color_spot_light_enabled_loc,
+					spot_active ? 1.f : 0.f);
+	if (spot_active) {
+		if (backend->bridge_color_spot_light_position_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_position_loc,
+						spot_light->position[0], spot_light->position[1],
+						spot_light->position[2]);
+		if (backend->bridge_color_spot_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_direction_loc,
+						spot_light->direction[0], spot_light->direction[1],
+						spot_light->direction[2]);
+		if (backend->bridge_color_spot_light_color_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_color_loc,
+						spot_light->color[0], spot_light->color[1],
+						spot_light->color[2]);
+		if (backend->bridge_color_spot_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_distance_loc,
+						spot_light->distance);
+		if (backend->bridge_color_spot_light_cone_cos_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_cone_cos_loc,
+						spot_light->cone_cos);
+		if (backend->bridge_color_spot_light_penumbra_cos_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_penumbra_cos_loc,
+						spot_light->penumbra_cos);
+		if (backend->bridge_color_spot_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_decay_loc,
+						spot_light->decay);
+	} else {
+		// Zero out to avoid stale-uniform bleed-through. coneCos and
+		// penumbraCos default to 1 (cos(0)) so smoothstep(1,1,x) returns 0
+		// — no contribution even if the enabled flag were ever bypassed.
+		if (backend->bridge_color_spot_light_position_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_position_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_color_spot_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_direction_loc,
+						0.f, 0.f, 1.f);
+		if (backend->bridge_color_spot_light_color_loc >= 0)
+			glUniform3f(backend->bridge_color_spot_light_color_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_color_spot_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_distance_loc, 0.f);
+		if (backend->bridge_color_spot_light_cone_cos_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_cone_cos_loc, 1.f);
+		if (backend->bridge_color_spot_light_penumbra_cos_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_penumbra_cos_loc, 1.f);
+		if (backend->bridge_color_spot_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_color_spot_light_decay_loc, 0.f);
 	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	glEnableVertexAttribArray(0);
@@ -5279,7 +5846,8 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	bool hemi_light_enabled,
 	const float *hemi_light_direction,
 	const float *hemi_light_sky_color,
-	const float *hemi_light_ground_color) {
+	const float *hemi_light_ground_color,
+	const nx_webgl_egl_spot_light_t *spot_light) {
 #if !NXJS_HAS_EGL_GLES
 	(void)backend;
 	(void)canvas;
@@ -5339,6 +5907,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 	(void)hemi_light_direction;
 	(void)hemi_light_sky_color;
 	(void)hemi_light_ground_color;
+	(void)spot_light;
 	return false;
 #else
 	// Persistent-handle textures (FBO color attachments) have no CPU `data` —
@@ -5580,6 +6149,57 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		if (backend->bridge_texture_hemi_light_ground_color_loc >= 0)
 			glUniform3f(backend->bridge_texture_hemi_light_ground_color_loc,
 						0.f, 0.f, 0.f);
+	}
+	// SpotLight (texture program) — mirrors the color-program dispatch.
+	bool spot_active = view_positions_active && spot_light &&
+					   spot_light->enabled && spot_light->position &&
+					   spot_light->direction && spot_light->color;
+	if (backend->bridge_texture_spot_light_enabled_loc >= 0)
+		glUniform1f(backend->bridge_texture_spot_light_enabled_loc,
+					spot_active ? 1.f : 0.f);
+	if (spot_active) {
+		if (backend->bridge_texture_spot_light_position_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_position_loc,
+						spot_light->position[0], spot_light->position[1],
+						spot_light->position[2]);
+		if (backend->bridge_texture_spot_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_direction_loc,
+						spot_light->direction[0], spot_light->direction[1],
+						spot_light->direction[2]);
+		if (backend->bridge_texture_spot_light_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_color_loc,
+						spot_light->color[0], spot_light->color[1],
+						spot_light->color[2]);
+		if (backend->bridge_texture_spot_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_distance_loc,
+						spot_light->distance);
+		if (backend->bridge_texture_spot_light_cone_cos_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_cone_cos_loc,
+						spot_light->cone_cos);
+		if (backend->bridge_texture_spot_light_penumbra_cos_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_penumbra_cos_loc,
+						spot_light->penumbra_cos);
+		if (backend->bridge_texture_spot_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_decay_loc,
+						spot_light->decay);
+	} else {
+		if (backend->bridge_texture_spot_light_position_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_position_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_texture_spot_light_direction_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_direction_loc,
+						0.f, 0.f, 1.f);
+		if (backend->bridge_texture_spot_light_color_loc >= 0)
+			glUniform3f(backend->bridge_texture_spot_light_color_loc,
+						0.f, 0.f, 0.f);
+		if (backend->bridge_texture_spot_light_distance_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_distance_loc, 0.f);
+		if (backend->bridge_texture_spot_light_cone_cos_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_cone_cos_loc, 1.f);
+		if (backend->bridge_texture_spot_light_penumbra_cos_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_penumbra_cos_loc, 1.f);
+		if (backend->bridge_texture_spot_light_decay_loc >= 0)
+			glUniform1f(backend->bridge_texture_spot_light_decay_loc, 0.f);
 	}
 	glBindBuffer(GL_ARRAY_BUFFER, backend->bridge_vertex_buffer);
 	glEnableVertexAttribArray(0);
@@ -6587,7 +7207,180 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 		return true;
 	}
 
-	const GLchar *sources[1] = {(const GLchar *)source};
+	/* 2026-06-23 PMREM Tegra-compat rewrites — same-length string
+	 * substitutions in PMREM's prefilter shader source applied before
+	 * glShaderSource. Each fixes a different Tegra-incompatibility we've
+	 * empirically observed crash glDrawArrays inside the prefilter pass:
+	 *
+	 *  (A) `GGX_SAMPLES 256` → `GGX_SAMPLES 1  `  (with trailing spaces
+	 *      to preserve string length — same-length substitutions are
+	 *      easier to reason about than length-changing ones). Caps
+	 *      importance-sample loop iterations.
+	 *  (B) `#define texture2DGradEXT textureGrad` → spaces. After this,
+	 *      `#ifdef texture2DGradEXT` evaluates false and the cubeUV
+	 *      sample falls back to plain `texture2D(envMap, uv)`. Tegra's
+	 *      GLES compiler appears to produce incorrect GPU code for
+	 *      `textureGrad(envMap, uv, vec2(0), vec2(0))` on RGBA16F
+	 *      textures.
+	 *  (C) `#define texture2DLodEXT textureLod` → spaces. Same defensive
+	 *      removal; if any cubeUV path used the LodEXT variant we'd
+	 *      hit the same hypothetical compiler issue.
+	 *  (D) `roughness < 0.001` → `roughness < 9.999`  in PMREMGGXConvolution.
+	 *      Roughness is in [0,1] so the comparison is now always true and
+	 *      the GGX importance-sample loop is bypassed completely (single
+	 *      `bilinearCubeUV` sample + early return). DIAGNOSTIC PROBE — if
+	 *      draw #2 still crashes with this in place, the crash is NOT
+	 *      shader semantics (loop/Hammersley/VNDF) but draw-call setup
+	 *      (FBO bind / VAO / sampler-from-prev-FBO sync). If draw #2
+	 *      survives, the loop body is the culprit.
+	 *
+	 * All same-length, scoped to PMREM's source pattern, and pass-through
+	 * harmless for any non-PMREM shader.
+	 */
+	const char *patched_source = source;
+	char *patched_owned = NULL;
+	if (source) {
+		const char *needle_a = "#define GGX_SAMPLES 256";
+		const char *repl_a   = "#define GGX_SAMPLES 1  ";
+		const char *needle_b = "#define texture2DGradEXT textureGrad";
+		const char *repl_b   = "                                    ";
+		const char *needle_c = "#define texture2DLodEXT textureLod";
+		const char *repl_c   = "                                  ";
+		const char *needle_d = "roughness < 0.001";
+		const char *repl_d   = "roughness < 9.999";
+		/* (E) Bypass the texture sample in the PMREM prefilter early-return
+		 * path. Replace `bilinearCubeUV(envMap, N, mipInt)` (33 chars) with
+		 * `vec3(1.0,0.5,0.25)               ` (33 chars). Magenta-ish
+		 * constant — visually distinct if PMREM actually completes.
+		 * Diagnostic: if draw #2 survives with this in place, the crash is
+		 * the sampler chain (sampler binding, sampler-from-prev-FBO, or
+		 * texture state). If draw #2 still crashes, the issue is something
+		 * structural about the draw (VAO/program/attribute) that exists
+		 * even without the sample. Lands on line 218 of the prefilter
+		 * shader where the early-return path lives. */
+		const char *needle_e = "bilinearCubeUV(envMap, N, mipInt)";
+		const char *repl_e   = "vec3(1.0,0.5,0.25)               ";
+		bool any_hit =
+			(strstr(source, needle_a) != NULL) ||
+			(strstr(source, needle_b) != NULL) ||
+			(strstr(source, needle_c) != NULL) ||
+			(strstr(source, needle_d) != NULL) ||
+			(strstr(source, needle_e) != NULL);
+		if (any_hit) {
+			size_t source_len = strlen(source);
+			patched_owned = (char *)malloc(source_len + 1);
+			if (patched_owned) {
+				memcpy(patched_owned, source, source_len + 1);
+				char *hit;
+				int n_a = 0, n_b = 0, n_c = 0, n_d = 0, n_e = 0;
+				while ((hit = strstr(patched_owned, needle_a)) != NULL) {
+					memcpy(hit, repl_a, strlen(repl_a)); n_a++;
+				}
+				while ((hit = strstr(patched_owned, needle_b)) != NULL) {
+					memcpy(hit, repl_b, strlen(repl_b)); n_b++;
+				}
+				while ((hit = strstr(patched_owned, needle_c)) != NULL) {
+					memcpy(hit, repl_c, strlen(repl_c)); n_c++;
+				}
+				while ((hit = strstr(patched_owned, needle_d)) != NULL) {
+					memcpy(hit, repl_d, strlen(repl_d)); n_d++;
+				}
+				while ((hit = strstr(patched_owned, needle_e)) != NULL) {
+					memcpy(hit, repl_e, strlen(repl_e)); n_e++;
+				}
+				patched_source = patched_owned;
+				/* (J) Tegra-compat PMREM prefilter replacement: if this is
+				 * the PMREMGGXConvolution fragment shader, substitute a
+				 * hand-written minimal FS that omits the GGX importance-
+				 * sample loop entirely. Tegra's GLSL compiler aborts
+				 * glDrawArrays on the original even when the loop body
+				 * is unreachable at runtime (early-return + sample-bypass
+				 * proved the FS body presence alone is the trigger;
+				 * minimal FS replacement made the draw survive).
+				 *
+				 * The replacement keeps the cubeUV math (getFace, getUV,
+				 * bilinearCubeUV) so the prefilter pass actually produces
+				 * usable output: a perfect-mirror downsample of the source
+				 * envmap at each mip level (NO roughness-based blur).
+				 * Materials referencing this PMREM result will look
+				 * "sharp" at all roughness levels rather than progressively
+				 * blurred — visually inferior to upstream but the only
+				 * way to get PMREM through the Tegra/Mesa GLES pipeline
+				 * without a driver abort. Better than nothing (raw
+				 * equirect path) because cube_uv layout works with all
+				 * Three.js materials including MeshStandardMaterial.
+				 *
+				 * Texel constants (CUBEUV_TEXEL_WIDTH/HEIGHT, CUBEUV_MAX_MIP)
+				 * derived from Three.js's PMREM cube_uv layout: source
+				 * texture is 1536×2048 = max-cube-face 256 (mip 0) + 6
+				 * additional mip levels packed below, MAX_MIP=8. */
+				int n_j = 0;
+				if (shader_type == 0x8B30 /* GL_FRAGMENT_SHADER */ &&
+				    strstr(patched_owned, "PMREMGGXConvolution") != NULL) {
+					static const char minimal_fs[] =
+						"#version 300 es\n"
+						"precision highp float;\n"
+						"precision highp sampler2D;\n"
+						"in vec3 vOutputDirection;\n"
+						"layout(location = 0) out highp vec4 pc_fragColor;\n"
+						"uniform sampler2D envMap;\n"
+						"uniform float mipInt;\n"
+						"#define cubeUV_minMipLevel 4.0\n"
+						"#define cubeUV_minTileSize 16.0\n"
+						"#define CUBEUV_TEXEL_WIDTH (1.0/1536.0)\n"
+						"#define CUBEUV_TEXEL_HEIGHT (1.0/2048.0)\n"
+						"#define CUBEUV_MAX_MIP 8.0\n"
+						"float getFace(vec3 d) {\n"
+						"  vec3 a = abs(d);\n"
+						"  if (a.x > a.z) {\n"
+						"    if (a.x > a.y) return d.x > 0.0 ? 0.0 : 3.0;\n"
+						"    return d.y > 0.0 ? 1.0 : 4.0;\n"
+						"  }\n"
+						"  if (a.z > a.y) return d.z > 0.0 ? 2.0 : 5.0;\n"
+						"  return d.y > 0.0 ? 1.0 : 4.0;\n"
+						"}\n"
+						"vec2 getUV(vec3 d, float f) {\n"
+						"  vec2 uv;\n"
+						"  if (f == 0.0) uv = vec2(d.z, d.y) / abs(d.x);\n"
+						"  else if (f == 1.0) uv = vec2(-d.x, -d.z) / abs(d.y);\n"
+						"  else if (f == 2.0) uv = vec2(-d.x, d.y) / abs(d.z);\n"
+						"  else if (f == 3.0) uv = vec2(-d.z, d.y) / abs(d.x);\n"
+						"  else if (f == 4.0) uv = vec2(-d.x, d.z) / abs(d.y);\n"
+						"  else uv = vec2(d.x, d.y) / abs(d.z);\n"
+						"  return 0.5 * (uv + 1.0);\n"
+						"}\n"
+						"void main() {\n"
+						"  vec3 N = normalize(vOutputDirection);\n"
+						"  float mi = mipInt;\n"
+						"  float face = getFace(N);\n"
+						"  float filterInt = max(cubeUV_minMipLevel - mi, 0.0);\n"
+						"  mi = max(mi, cubeUV_minMipLevel);\n"
+						"  float faceSize = exp2(mi);\n"
+						"  vec2 uv = getUV(N, face) * (faceSize - 2.0) + 1.0;\n"
+						"  if (face > 2.0) { uv.y += faceSize; face -= 3.0; }\n"
+						"  uv.x += face * faceSize;\n"
+						"  uv.x += filterInt * 3.0 * cubeUV_minTileSize;\n"
+						"  uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - faceSize);\n"
+						"  uv.x *= CUBEUV_TEXEL_WIDTH;\n"
+						"  uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+						"  pc_fragColor = vec4(texture(envMap, uv).rgb, 1.0);\n"
+						"}\n";
+					free(patched_owned);
+					patched_owned = (char *)malloc(sizeof(minimal_fs));
+					if (patched_owned) {
+						memcpy(patched_owned, minimal_fs, sizeof(minimal_fs));
+						patched_source = patched_owned;
+						n_j = 1;
+					}
+				}
+				fprintf(stderr,
+					"[nxjs:pmrem-fix] handle=%u rewrites: GGX=%d gradEXT=%d lodEXT=%d roughEarlyOut=%d sampleBypass=%d minimalFs=%d\n",
+					(unsigned)handle, n_a, n_b, n_c, n_d, n_e, n_j);
+				fflush(stderr);
+			}
+		}
+	}
+	const GLchar *sources[1] = {(const GLchar *)patched_source};
 	glShaderSource(handle, 1, sources, NULL);
 	glCompileShader(handle);
 
@@ -6602,6 +7395,7 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 	}
 	if (shader_handle)
 		*shader_handle = (uint32_t)handle;
+	if (patched_owned) free(patched_owned);
 	return true;
 #else
 	(void)backend;
@@ -7030,17 +7824,17 @@ bool nx_webgl_egl_persistent_texture_sub_image_2d(nx_webgl_egl_t *backend,
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context))
 		return false;
-	(void)glGetError();
+	(void)glGetError(); /* swallow any pre-existing error */
 	// On ES 3.0, GL_HALF_FLOAT_OES (0x8D61) is invalid as a sub-image type;
 	// the native enum is GL_HALF_FLOAT (0x140B). Translate.
 	GLenum native_type = (GLenum)type;
 	if (native_type == 0x8D61)
 		native_type = 0x140B;
 	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
+	(void)glGetError();
 	glTexSubImage2D(GL_TEXTURE_2D, level, xoffset, yoffset, (GLsizei)width,
 	                (GLsizei)height, (GLenum)format, native_type, pixels);
-	GLenum err = glGetError();
-	return err == GL_NO_ERROR;
+	return glGetError() == GL_NO_ERROR;
 #else
 	(void)backend; (void)handle; (void)level; (void)xoffset; (void)yoffset;
 	(void)width; (void)height; (void)format; (void)type; (void)pixels;

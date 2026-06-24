@@ -8,6 +8,7 @@
 #include <string.h>
 #include <switch.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static JSClassID nx_file_class_id;
 static JSClassID nx_dir_class_id;
@@ -707,6 +708,20 @@ JSValue nx_write_file_sync(JSContext *ctx, JSValueConst this_val, int argc,
 	}
 
 	size_t result = fwrite(buffer, 1, size, file);
+	// Force the stdio buffer + the underlying fd to commit BEFORE
+	// close, so a `readFileSync` of the same path immediately after
+	// this call observes the new bytes. Without the fflush+fsync pair
+	// libnx's filesystem layer can hand back the previous version on
+	// hot read-after-write (the kernel buffer hasn't been told the
+	// data is "the truth" yet). Symptom: page code that does
+	// `writeFileSync(p, ...); readFileSync(p)` reads the OLD contents
+	// the FIRST time and only sees the new value on the next pick
+	// (the cache drained between events). Pre-fclose is the cheapest
+	// fix — `fclose` would do the flush anyway, but fsync wouldn't
+	// fire after the fd is closed.
+	fflush(file);
+	int fd = fileno(file);
+	if (fd >= 0) fsync(fd);
 	fclose(file);
 
 	if (result != size) {

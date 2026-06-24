@@ -229,6 +229,34 @@ export class Screen extends EventTarget implements globalThis.Screen {
 	}
 
 	/**
+	 * Animated cursor variant. Pushes all frames + per-frame delays at
+	 * once; the C compositor picks the current frame from
+	 * `armGetSystemTick()` deltas on every present, so the spinner keeps
+	 * animating at the screen refresh rate independent of QuickJS state
+	 * (heavy navigation no longer freezes the spinner mid-spin).
+	 *
+	 * @param x top-left x in framebuffer pixels
+	 * @param y top-left y in framebuffer pixels
+	 * @param packedRgba non-premultiplied RGBA8, w*h*4*frameCount bytes;
+	 *   frame N starts at offset N*w*h*4
+	 * @param w frame width in pixels (same for every frame)
+	 * @param h frame height in pixels (same for every frame)
+	 * @param frameCount number of frames in `packedRgba`
+	 * @param frameDelaysMs per-frame durations in ms (length == frameCount)
+	 */
+	setAnimatedCursorOverlay(
+		x: number,
+		y: number,
+		packedRgba: ArrayBuffer | ArrayBufferView,
+		w: number,
+		h: number,
+		frameCount: number,
+		frameDelaysMs: ArrayBufferView,
+	): void {
+		$.setAnimatedCursorOverlay(x, y, packedRgba, w, h, frameCount, frameDelaysMs);
+	}
+
+	/**
 	 * Cheap position-only update for the cursor overlay. Avoids re-copying
 	 * the bitmap when the user has only moved the cursor by a pixel.
 	 */

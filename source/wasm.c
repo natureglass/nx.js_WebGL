@@ -83,6 +83,7 @@ typedef struct {
 	int is_shared;
 	JSValue cached_buffer;    // Cached ArrayBuffer for .buffer getter
 	size_t cached_buffer_len; // Length when cached (invalidate on grow)
+	void *cached_buffer_ptr;  // Underlying memory pointer at cache time
 } nx_wasm_memory_t;
 
 static nx_wasm_memory_t *nx_wasm_memory_get(JSContext *ctx, JSValueConst obj) {
@@ -640,10 +641,18 @@ static JSValue nx_wasm_new_instance(JSContext *ctx, JSValueConst this_val,
 
 			JS_FreeValue(ctx, v);
 			JS_FreeValue(ctx, matching_import);
-		} else if (f->export_name) {
+		} else if (f->numNames > 0) {
 			// Exported `Function` — pass the Instance opaque so the JS handle
 			// keeps the Instance (and therefore its runtime / module /
 			// functions[]) alive for as long as the export wrapper is reachable.
+			//
+			// wasm-bindgen-style bundles (e.g. Rapier) emit MULTIPLE export
+			// names that all alias the same underlying function. wasm3's parser
+			// records up to d_m3MaxDuplicateFunctionImpl names per function
+			// (16 — see m3_config.h). We must surface ALL of them as separate
+			// exports so JS code that calls e.g. `A.rawvector_y` and
+			// `A.rawrotation_y` (both bound to the same WASM function via
+			// signature dedup) gets a function each.
 			JSValue val = nx_wasm_exported_func_new(ctx, f, opaque);
 			if (JS_IsException(val)) {
 				JS_FreeValue(ctx, exports_array);
@@ -651,16 +660,26 @@ static JSValue nx_wasm_new_instance(JSContext *ctx, JSValueConst this_val,
 				return JS_EXCEPTION;
 			}
 
-			JSValue item = JS_NewObject(ctx);
-			JS_DefinePropertyValueStr(ctx, item, "kind",
-									  JS_NewString(ctx, "function"),
-									  JS_PROP_C_W_E);
-			JS_DefinePropertyValueStr(ctx, item, "name",
-									  JS_NewString(ctx, f->export_name),
-									  JS_PROP_C_W_E);
-			JS_DefinePropertyValueStr(ctx, item, "val", val, JS_PROP_C_W_E);
-			JS_DefinePropertyValueUint32(ctx, exports_array, exports_index++,
-										 item, JS_PROP_C_W_E);
+			for (u16 ni = 0; ni < f->numNames; ni++) {
+				cstr_t name = f->names[ni];
+				if (!name) continue;
+				JSValue item = JS_NewObject(ctx);
+				JS_DefinePropertyValueStr(ctx, item, "kind",
+										  JS_NewString(ctx, "function"),
+										  JS_PROP_C_W_E);
+				JS_DefinePropertyValueStr(ctx, item, "name",
+										  JS_NewString(ctx, name),
+										  JS_PROP_C_W_E);
+				// All export entries for one underlying function share the same
+				// callable value. Dup so each export holds its own reference.
+				JS_DefinePropertyValueStr(ctx, item, "val", JS_DupValue(ctx, val),
+										  JS_PROP_C_W_E);
+				JS_DefinePropertyValueUint32(ctx, exports_array,
+											 exports_index++, item,
+											 JS_PROP_C_W_E);
+			}
+			// Release our own reference; the dups inside the loop keep it alive.
+			JS_FreeValue(ctx, val);
 		}
 	}
 
@@ -865,13 +884,17 @@ static JSValue nx_wasm_module_exports(JSContext *ctx, JSValueConst this_val,
 	size_t index = 0;
 	for (size_t i = 0; i < m->module->numFunctions; ++i) {
 		IM3Function f = &m->module->functions[i];
-		if (f->export_name) {
+		// Emit ONE descriptor per stored alias (see Instance.exports loop
+		// above and m3_parse.c for the alias list).
+		for (u16 ni = 0; ni < f->numNames; ni++) {
+			cstr_t name = f->names[ni];
+			if (!name) continue;
 			JSValue item = JS_NewObject(ctx);
 			JS_DefinePropertyValueStr(ctx, item, "kind",
 									  JS_NewString(ctx, "function"),
 									  JS_PROP_C_W_E);
 			JS_DefinePropertyValueStr(ctx, item, "name",
-									  JS_NewString(ctx, f->export_name),
+									  JS_NewString(ctx, name),
 									  JS_PROP_C_W_E);
 			JS_DefinePropertyValueUint32(ctx, exports, index++, item,
 										 JS_PROP_C_W_E);
@@ -941,15 +964,61 @@ static JSValue nx_wasm_call_func(JSContext *ctx, JSValueConst this_val,
 	if (nargs == 0) {
 		r = m3_Call(func, 0, NULL);
 	} else {
-		const char *m3_argv[nargs + 1];
+		// Convert each JS argument to the WASM-declared type. The previous
+		// implementation stringified every argument via JS_ToCString +
+		// m3_CallArgv (strtoul/strtod), which silently turned every JS
+		// boolean into 0 (because strtoul("true",NULL,10) = 0) and dropped
+		// float precision in some cases. wasm-bindgen bundles (Rapier,
+		// Emscripten exports) call functions with lots of bool flags + mixed
+		// int/float args; the bool-stringification bug made every flag false
+		// in WASM, including RigidBodyDesc.enabled / translationsEnabled* /
+		// canSleep, which manifested as "physics bodies don't fall under
+		// gravity". Typed conversion + m3_Call fixes the underlying issue.
+		uint64_t valbuf[nargs];
+		const void *argptrs[nargs];
 		for (int i = 0; i < nargs; i++) {
-			m3_argv[i] = JS_ToCString(ctx, argv[i + 1]);
+			argptrs[i] = &valbuf[i];
+			JSValueConst v = argv[i + 1];
+			M3ValueType type = m3_GetArgType(func, i);
+			switch (type) {
+			case c_m3Type_i32: {
+				int32_t iv;
+				if (JS_ToInt32(ctx, &iv, v)) {
+					return JS_EXCEPTION;
+				}
+				*(int32_t *)&valbuf[i] = iv;
+				break;
+			}
+			case c_m3Type_i64: {
+				int64_t iv;
+				if (JS_ToInt64(ctx, &iv, v)) {
+					return JS_EXCEPTION;
+				}
+				*(int64_t *)&valbuf[i] = iv;
+				break;
+			}
+			case c_m3Type_f32: {
+				double dv;
+				if (JS_ToFloat64(ctx, &dv, v)) {
+					return JS_EXCEPTION;
+				}
+				*(float *)&valbuf[i] = (float)dv;
+				break;
+			}
+			case c_m3Type_f64: {
+				double dv;
+				if (JS_ToFloat64(ctx, &dv, v)) {
+					return JS_EXCEPTION;
+				}
+				*(double *)&valbuf[i] = dv;
+				break;
+			}
+			default:
+				return nx_throw_wasm_error(ctx, "RuntimeError",
+										   "unknown argument type");
+			}
 		}
-		m3_argv[nargs] = NULL;
-		r = m3_CallArgv(func, nargs, m3_argv);
-		for (int i = 0; i < nargs; i++) {
-			JS_FreeCString(ctx, m3_argv[i]);
-		}
+		r = m3_Call(func, nargs, argptrs);
 	}
 
 	if (r) {
@@ -1052,29 +1121,44 @@ static JSValue nx_wasm_memory_buffer_get(JSContext *ctx, JSValueConst this_val,
 	}
 
 	size_t size = mallocated->length;
+	uint8_t *memory = m3MemData(mallocated);
 
-	// Return cached buffer if size hasn't changed (invalidated by grow)
+	// Return cached buffer if BOTH size and underlying pointer are unchanged.
+	// Previously checked only size — but wasm3's m3_ResizeMemory does
+	// realloc(), which can move the underlying buffer to a NEW address even
+	// when the size grew by N pages from a smaller previous value (the
+	// general allocator behaviour). The stale ArrayBuffer would still
+	// hand out reads from the freed old pointer; for wasm-bindgen libraries
+	// like Rapier (which round-trip handles through linear-memory output
+	// slots) this manifests as the JS side reading garbage f64 values that
+	// then push internal handle-maps into multi-GB array growth and OOM.
+	// See [[rapier-wasm-memory-grow-detach]] for the trip wire.
 	if (!JS_IsUndefined(data->cached_buffer) &&
-		data->cached_buffer_len == size) {
+		data->cached_buffer_len == size &&
+		data->cached_buffer_ptr == memory) {
 		return JS_DupValue(ctx, data->cached_buffer);
 	}
 
-	// Invalidate old cache
+	// Invalidate old cache. Detach FIRST so any DataView / TypedArray still
+	// holding a reference reads .detached === true on next access instead of
+	// silently reading freed memory.
 	if (!JS_IsUndefined(data->cached_buffer)) {
+		JS_DetachArrayBuffer(ctx, data->cached_buffer);
 		JS_FreeValue(ctx, data->cached_buffer);
 	}
 
-	uint8_t *memory = m3MemData(mallocated);
 	JSValue buf =
 		JS_NewArrayBuffer(ctx, memory, size, NULL, NULL, data->is_shared);
 	if (JS_IsException(buf)) {
 		data->cached_buffer = JS_UNDEFINED;
+		data->cached_buffer_ptr = NULL;
 		return JS_EXCEPTION;
 	}
 
-	// Cache the buffer and its size
+	// Cache the buffer, size, AND pointer
 	data->cached_buffer = JS_DupValue(ctx, buf);
 	data->cached_buffer_len = size;
+	data->cached_buffer_ptr = memory;
 	return buf;
 }
 

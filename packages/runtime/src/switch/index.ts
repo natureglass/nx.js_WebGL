@@ -429,3 +429,20 @@ export function setMediaPlaybackState(state: boolean) {
 export function memoryUsage(): MemoryUsage {
 	return $.memoryUsage();
 }
+
+/**
+ * Forces a full QuickJS garbage-collection cycle on the main JS runtime.
+ * Useful when an app generates many short-lived JS wrappers per frame
+ * (e.g. WebAssembly callback returns from wasm-bindgen physics engines)
+ * and the adaptive GC threshold runs too rarely to keep the heap bounded.
+ *
+ * @example
+ *
+ * ```typescript
+ * // call once per second to bound heap growth
+ * setInterval(() => Switch.gc(), 1000);
+ * ```
+ */
+export function gc(): void {
+	$.gc();
+}

@@ -159,8 +159,22 @@ uint8_t *decode_png(uint8_t *input, size_t input_size, u32 *width,
 
 	png_set_bgr(png_ptr);
 	png_set_expand(png_ptr);
+	// has_alpha must catch every PNG that produces a 4-byte-per-pixel
+	// surface after png_set_expand, otherwise png_set_add_alpha appends a
+	// 5th byte and the downstream cairo surface (allocated 4*w*h bytes,
+	// stride = 4*w) reads garbage / wraps rows. The original check
+	// `== PNG_COLOR_TYPE_RGBA` matched only colour-type 6, missing:
+	//   - colour-type 4 (greyscale+alpha)
+	//   - colour-type 3 (palette) WITH a tRNS chunk (png_set_expand
+	//     turns the tRNS into an alpha channel, producing RGBA after
+	//     expansion even though the on-disk colour-type is 3).
+	// `PNG_COLOR_MASK_ALPHA` covers types 4+6; `png_get_valid(..., tRNS)`
+	// catches palette+tRNS. Matches libpng's recommended "is the image
+	// going to have alpha after expansion" check.
+	int color_type = png_get_color_type(png_ptr, info_ptr);
 	bool has_alpha =
-		png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGBA;
+		(color_type & PNG_COLOR_MASK_ALPHA) != 0
+		|| png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS) != 0;
 	if (!has_alpha) {
 		png_set_add_alpha(png_ptr, 0xff, PNG_FILLER_AFTER);
 	}

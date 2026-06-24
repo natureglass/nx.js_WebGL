@@ -429,6 +429,17 @@ typedef struct {
 	float hemi_light_direction[3];
 	float hemi_light_sky_color[3];
 	float hemi_light_ground_color[3];
+	// SpotLight state — Three.js's `spotLights[0].*` uniforms. Position and
+	// direction are view-space (Three.js converts world→view before upload).
+	// `cone_cos` and `penumbra_cos` are pre-computed by Three.js as
+	// `cos(angle)` / `cos(angle * (1 - penumbra))`.
+	float spot_light_position[3];
+	float spot_light_direction[3];
+	float spot_light_color[3];
+	float spot_light_distance;
+	float spot_light_cone_cos;
+	float spot_light_penumbra_cos;
+	float spot_light_decay;
 	int line_distance_attrib_index;
 	int color_attrib_index;
 	int position_attrib_index;
@@ -476,6 +487,13 @@ typedef struct {
 	bool has_hemi_light_direction;
 	bool has_hemi_light_sky_color;
 	bool has_hemi_light_ground_color;
+	bool has_spot_light_position;
+	bool has_spot_light_direction;
+	bool has_spot_light_color;
+	bool has_spot_light_distance;
+	bool has_spot_light_cone_cos;
+	bool has_spot_light_penumbra_cos;
+	bool has_spot_light_decay;
 	bool has_line_distance_attrib_index;
 	bool has_color_attrib_index;
 	bool has_position_attrib_index;
@@ -538,6 +556,20 @@ typedef struct {
 	// Set + populated by webgl_egl helpers; the texture finalizer frees it.
 	// See [[bridge-fbo-support]].
 	uint32_t gles_handle;
+	// Sampler-comparison state (WebGL 2 sampler2DShadow path). Three.js's
+	// WebGLShadowMap sets these via gl.texParameteri BEFORE attaching the
+	// depth texture to an FBO (which is what triggers promotion). When the
+	// caller sets these before gles_handle exists, we stash them here and
+	// replay onto native GL the moment the texture is promoted — see the
+	// `replay_pending_params` path in persistent_texture_image_2d /
+	// framebufferTexture2D. has_* gates avoid touching native state for
+	// textures Three.js never configured for shadow compare (which would
+	// otherwise leave hardware compare ON on a non-shadow sampler and break
+	// regular sampler2D reads with INVALID_OPERATION on some drivers).
+	uint32_t compare_mode;
+	uint32_t compare_func;
+	bool has_compare_mode;
+	bool has_compare_func;
 	bool deleted;
 } nx_webgl_texture_t;
 
@@ -630,6 +662,18 @@ typedef enum {
 	NX_WEBGL_UNIFORM_HEMI_LIGHT_DIRECTION,
 	NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR,
 	NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR,
+	// Three.js's SpotLight stock uniform names (single light only). Position
+	// is in view space; direction is the unit vector from light toward target
+	// in view space; color is intensity-baked linear RGB. cone_cos /
+	// penumbra_cos are pre-computed by Three.js's WebGLLights. distance == 0
+	// means "no cutoff"; decay is the physical inverse-power exponent.
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_POSITION,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_DIRECTION,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_COLOR,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_DISTANCE,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_CONE_COS,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_PENUMBRA_COS,
+	NX_WEBGL_UNIFORM_SPOT_LIGHT_DECAY,
 } nx_webgl_uniform_kind_t;
 
 typedef struct {
@@ -974,6 +1018,25 @@ static nx_webgl_uniform_kind_t uniform_kind_for_name(const char *name) {
 		return NX_WEBGL_UNIFORM_HEMI_LIGHT_SKY_COLOR;
 	if (strcmp(name, "hemisphereLights[0].groundColor") == 0)
 		return NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR;
+	// Three.js SpotLight stock uniform names (single light only). Three.js's
+	// WebGLLights packs the cone into pre-computed cos values so the shader
+	// can use bare `smoothstep(coneCos, penumbraCos, dot(L,-D))` for the
+	// attenuation. The bridge program below mirrors that exact math so the
+	// JS-side intensity / angle / penumbra knobs reach the GPU unchanged.
+	if (strcmp(name, "spotLights[0].position") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_POSITION;
+	if (strcmp(name, "spotLights[0].direction") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_DIRECTION;
+	if (strcmp(name, "spotLights[0].color") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_COLOR;
+	if (strcmp(name, "spotLights[0].distance") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_DISTANCE;
+	if (strcmp(name, "spotLights[0].coneCos") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_CONE_COS;
+	if (strcmp(name, "spotLights[0].penumbraCos") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_PENUMBRA_COS;
+	if (strcmp(name, "spotLights[0].decay") == 0)
+		return NX_WEBGL_UNIFORM_SPOT_LIGHT_DECAY;
 	return NX_WEBGL_UNIFORM_UNKNOWN;
 }
 
@@ -1784,7 +1847,18 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 	 * [[reference-pvzge-clearflag-color-strip]] for the diagnostic story. */
 	bool at_default_fb = JS_IsUndefined(context->framebuffer_binding) ||
 	                      JS_IsNull(context->framebuffer_binding);
-	if (at_default_fb &&
+	/* 2026-06-21: gate the heuristic on scissor test being DISABLED.
+	 * Pages that use gl.scissor to isolate clears to non-overlapping
+	 * regions (Three.js's webgl_camera demo splits the canvas into
+	 * left/right viewports per pass) explicitly want the second clear
+	 * to wipe its own region — the scissor already prevents it from
+	 * touching the first pass's pixels. Stripping the COLOR bit there
+	 * left the right viewport never-cleared and accumulated trails of
+	 * past frames. Cocos/Babylon's multi-camera renders run with scissor
+	 * disabled (full-canvas clears per camera), so the heuristic still
+	 * fires for them. */
+	bool scissor_active = (context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0;
+	if (at_default_fb && !scissor_active &&
 	    context->drawn_to_default_since_color_clear &&
 	    (mask & GL_COLOR_BUFFER_BIT)) {
 		static int suppress_n = 0;
@@ -1946,25 +2020,13 @@ static JSValue nx_webgl_shader_source(JSContext *ctx, JSValueConst this_val,
 	if (!source)
 		return JS_EXCEPTION;
 	{
+		// Shader-source dump (per-chunk) was a one-shot debugging aid for
+		// inspecting Three.js's auto-generated shaders. Each chunk line is
+		// 800 bytes; a typical Three.js MeshStandardMaterial shader produces
+		// ~90 chunks, and the first 10 shaders combined flooded the debug
+		// log with ~900 lines of GLSL on every demo launch. Disabled.
 		static int n = 0;
-		if (n++ < 10) {
-			const char *type =
-				(shader->type == GL_VERTEX_SHADER) ? "vs" : "fs";
-			int len = (int)strlen(source);
-			fprintf(stderr,
-				"[nxjs:shader-src] n=%d type=%s len=%d BEGIN\n",
-				n, type, len);
-			const int CHUNK = 800;
-			for (int off = 0; off < len; off += CHUNK) {
-				int rem = len - off;
-				int take = rem < CHUNK ? rem : CHUNK;
-				fprintf(stderr,
-					"[nxjs:shader-chunk] n=%d off=%d take=%d \"%.*s\"\n",
-					n, off, take, take, source + off);
-			}
-			fprintf(stderr,
-				"[nxjs:shader-src] n=%d type=%s END\n", n, type);
-		}
+		(void)n;  // kept so a future investigator can re-enable easily
 	}
 	replace_string(ctx, &shader->source, source);
 	shader->compile_status = false;
@@ -2230,6 +2292,23 @@ static JSValue nx_webgl_create_program(JSContext *ctx, JSValueConst this_val,
 	program->light_color2[0] = 0.f;
 	program->light_color2[1] = 0.f;
 	program->light_color2[2] = 0.f;
+	// SpotLight defaults (all-zero except direction, kept at +Z so a
+	// stray normalize() can't NaN). has_spot_light_* flags zero-init via
+	// calloc keep these out of the bridge's cone path until Three.js
+	// actually uploads the matching uniforms.
+	program->spot_light_position[0] = 0.f;
+	program->spot_light_position[1] = 0.f;
+	program->spot_light_position[2] = 0.f;
+	program->spot_light_direction[0] = 0.f;
+	program->spot_light_direction[1] = 0.f;
+	program->spot_light_direction[2] = 1.f;
+	program->spot_light_color[0] = 0.f;
+	program->spot_light_color[1] = 0.f;
+	program->spot_light_color[2] = 0.f;
+	program->spot_light_distance = 0.f;
+	program->spot_light_cone_cos = 1.f;
+	program->spot_light_penumbra_cos = 1.f;
+	program->spot_light_decay = 0.f;
 	program->fog_density = 0.f;
 	// Default mapTransform = identity mat3 (column-major). Used as the
 	// fallback when Three.js doesn't bind a texture transform — UVs flow
@@ -3187,6 +3266,17 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	/* 2026-06-23 PMREM Tegra-compat: force MIN/MAG filter to NEAREST
+	 * for half-float / float textures. Tegra GLES advertises
+	 * OES_texture_half_float_linear but in practice LINEAR-filtered
+	 * RGBA16F sampling crashes the driver — this catches Three.js's
+	 * post-texImage2D `texParameteri(LINEAR)` calls and downgrades
+	 * them. The persistent_texture_image_2d allocator has a matching
+	 * force-NEAREST at upload time. */
+	bool tex_is_float =
+		(texture->type == 0x1406 /* GL_FLOAT */) ||
+		(texture->type == 0x140B /* GL_HALF_FLOAT */) ||
+		(texture->type == 0x8D61 /* GL_HALF_FLOAT_OES */);
 	switch (pname) {
 	case GL_TEXTURE_MIN_FILTER:
 		// MIN_FILTER accepts NEAREST / LINEAR plus the 4 mipmap variants
@@ -3201,12 +3291,18 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 			context->error = GL_INVALID_ENUM;
 			return JS_UNDEFINED;
 		}
+		if (tex_is_float && param != GL_NEAREST) {
+			param = GL_NEAREST;
+		}
 		texture->min_filter = param;
 		break;
 	case GL_TEXTURE_MAG_FILTER:
 		if (param != GL_NEAREST && param != GL_LINEAR) {
 			context->error = GL_INVALID_ENUM;
 			return JS_UNDEFINED;
+		}
+		if (tex_is_float && param != GL_NEAREST) {
+			param = GL_NEAREST;
 		}
 		texture->mag_filter = param;
 		break;
@@ -3249,6 +3345,19 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 	// re-uploads filter/wrap on each draw via `persistent_texture_image_2d`
 	// for cached textures, so unpromoted textures don't need this — they
 	// get the new value via the per-draw upload path.
+	// Stash sampler-comparison state so we can replay it onto native GL the
+	// moment the texture is promoted to a persistent handle. Three.js's
+	// WebGLShadowMap on WebGL 2 calls texParameteri(COMPARE_MODE, ...) BEFORE
+	// framebufferTexture2D triggers the promotion — without this stash, the
+	// comparison mode is silently dropped and sampler2DShadow returns 0
+	// everywhere, killing every shadow-gated light contribution.
+	if (pname == 0x884C /* TEXTURE_COMPARE_MODE */) {
+		texture->compare_mode = param;
+		texture->has_compare_mode = true;
+	} else if (pname == 0x884D /* TEXTURE_COMPARE_FUNC */) {
+		texture->compare_func = param;
+		texture->has_compare_func = true;
+	}
 	if (texture->gles_handle) {
 		nx_webgl_egl_texture_set_parameteri(context->egl, target,
 		                                    texture->gles_handle, pname, param);
@@ -3460,13 +3569,6 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
-	// 2026-06-07 pvzge investigation: log every texImage2D call.
-	static int teximgN = 0;
-	++teximgN;
-	if (teximgN <= 20 || (teximgN % 50) == 0)
-		fprintf(stderr,
-			"[nxjs:tex-image2d] n=%d argc=%d target=0x%x level=%d intl=0x%x w=%d h=%d format=0x%x type=0x%x\n",
-			teximgN, argc, target, level, internal_format, width, height, format, type);
 	// Try to extract an HTMLImageElement-like source. If successful, the
 	// image's natural dimensions override any width/height the caller
 	// supplied (per WebGL spec for the image-source form), and the source
@@ -3512,24 +3614,40 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	      internal_format == 0x8C41 /*SRGB8*/) &&
 	     format == GL_RGB && type == GL_UNSIGNED_BYTE);
 	// P2 HDR float texture combos. Three.js typically passes:
-	//   - texture.type = HalfFloatType (gl.HALF_FLOAT_OES = 0x8D61) for
-	//     PMREMGenerator render targets and RGBELoader output
-	//   - texture.type = FloatType (gl.FLOAT = 0x1406) for high-precision
-	//     env maps
+	//   - WebGL 1: texture.type = HalfFloatType → gl.HALF_FLOAT_OES = 0x8D61
+	//   - WebGL 2: texture.type = HalfFloatType → gl.HALF_FLOAT = 0x140B
+	//     (the GLES3 core token; WebGL2RenderingContext exposes it under
+	//     the unprefixed `HALF_FLOAT` name)
+	//   - texture.type = FloatType → gl.FLOAT = 0x1406 (same on WebGL 1/2)
 	// Both RGB and RGBA channel layouts can show up; sized internal formats
 	// (RGBA16F = 0x881A, RGBA32F = 0x8814, RGB16F = 0x881B, RGB32F = 0x8815)
 	// may also show up when Three.js detects WebGL 2 capabilities, though
 	// in WebGL 1 mode unsized is more common.
+	//
+	// 2026-06-23 PMREM crash fix: must accept GL_HALF_FLOAT (0x140B) here.
+	// PMREMGenerator on WebGL 2 calls texImage2D(RGBA16F, RGBA, HALF_FLOAT,
+	// null) at 1536×2048 for its prefilter RT. Without 0x140B in the
+	// accept-list this returned INVALID_ENUM, the texture never got its
+	// GLES storage allocated, then framebufferTexture2D's safety net at
+	// line ~9296 created a 1×1 RGBA UByte placeholder, and the subsequent
+	// prefilter draw sampling a non-functional cubeUV target crashed the
+	// driver. The EGL layer already passes 0x140B through to native
+	// glTexImage2D correctly — only the JS-layer accept-list needed
+	// widening.
 	bool is_float_rgba = ((internal_format == GL_RGBA ||
 	                       internal_format == GL_RGBA16F ||
 	                       internal_format == GL_RGBA32F) &&
 	                      format == GL_RGBA &&
-	                      (type == GL_FLOAT || type == GL_HALF_FLOAT_OES));
+	                      (type == GL_FLOAT ||
+	                       type == GL_HALF_FLOAT_OES ||
+	                       type == 0x140B /* GL_HALF_FLOAT */));
 	bool is_float_rgb = ((internal_format == GL_RGB ||
 	                      internal_format == GL_RGB16F ||
 	                      internal_format == GL_RGB32F) &&
 	                     format == GL_RGB &&
-	                     (type == GL_FLOAT || type == GL_HALF_FLOAT_OES));
+	                     (type == GL_FLOAT ||
+	                      type == GL_HALF_FLOAT_OES ||
+	                      type == 0x140B /* GL_HALF_FLOAT */));
 	// Accept both unsized (GL_DEPTH_COMPONENT) and sized
 	// (GL_DEPTH_COMPONENT16/24/32F) internalformats with format =
 	// GL_DEPTH_COMPONENT. Three.js's WebGLTextures always passes the
@@ -3594,6 +3712,7 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	size_t bytes_per_channel = 1;
 	if (type == GL_FLOAT) bytes_per_channel = 4;
 	else if (type == GL_HALF_FLOAT_OES) bytes_per_channel = 2;
+	else if (type == 0x140B /* GL_HALF_FLOAT */) bytes_per_channel = 2;
 	else if (type == GL_UNSIGNED_SHORT) bytes_per_channel = 2;
 	else if (type == GL_UNSIGNED_INT) bytes_per_channel = 4;
 	else if (type == GL_UNSIGNED_INT_24_8_WEBGL) bytes_per_channel = 4;
@@ -3719,6 +3838,17 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		if (!ok) {
 			context->error = GL_INVALID_OPERATION;
 			return JS_UNDEFINED;
+		}
+		// Replay pre-promotion sampler-compare state — see texStorage2D
+		// flush for the rationale. Three.js's depth shadow texture lands
+		// here when texImage2D(NULL) allocates the storage.
+		if (texture->has_compare_mode) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, GL_TEXTURE_2D,
+			    texture->gles_handle, 0x884C, texture->compare_mode);
+		}
+		if (texture->has_compare_func) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, GL_TEXTURE_2D,
+			    texture->gles_handle, 0x884D, texture->compare_func);
 		}
 		texture->revision++;
 		if (texture->revision == 0)
@@ -4340,6 +4470,18 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 	} else if (location->kind == NX_WEBGL_UNIFORM_SHININESS) {
 		program->shininess = (float)value;
 		program->has_shininess = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_DISTANCE) {
+		program->spot_light_distance = (float)value;
+		program->has_spot_light_distance = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_CONE_COS) {
+		program->spot_light_cone_cos = (float)value;
+		program->has_spot_light_cone_cos = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_PENUMBRA_COS) {
+		program->spot_light_penumbra_cos = (float)value;
+		program->has_spot_light_penumbra_cos = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_DECAY) {
+		program->spot_light_decay = (float)value;
+		program->has_spot_light_decay = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -4455,6 +4597,26 @@ static JSValue nx_webgl_uniform3f(JSContext *ctx, JSValueConst this_val,
 		program->hemi_light_ground_color[1] = values[1];
 		program->hemi_light_ground_color[2] = values[2];
 		program->has_hemi_light_ground_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_POSITION) {
+		// View-space position (Three.js does the world→view conversion before
+		// upload). Same convention as point_light_position.
+		program->spot_light_position[0] = values[0];
+		program->spot_light_position[1] = values[1];
+		program->spot_light_position[2] = values[2];
+		program->has_spot_light_position = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_DIRECTION) {
+		// View-space unit vector, points from light toward target.
+		program->spot_light_direction[0] = values[0];
+		program->spot_light_direction[1] = values[1];
+		program->spot_light_direction[2] = values[2];
+		program->has_spot_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_COLOR) {
+		// Three.js bakes intensity into the color before upload, so values
+		// can exceed 1.0 — don't clamp.
+		program->spot_light_color[0] = values[0];
+		program->spot_light_color[1] = values[1];
+		program->spot_light_color[2] = values[2];
+		program->has_spot_light_color = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -4553,6 +4715,15 @@ static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 	} else if (location->kind == NX_WEBGL_UNIFORM_HEMI_LIGHT_GROUND_COLOR) {
 		memcpy(program->hemi_light_ground_color, source, sizeof(float) * 3);
 		program->has_hemi_light_ground_color = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_POSITION) {
+		memcpy(program->spot_light_position, source, sizeof(float) * 3);
+		program->has_spot_light_position = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_DIRECTION) {
+		memcpy(program->spot_light_direction, source, sizeof(float) * 3);
+		program->has_spot_light_direction = true;
+	} else if (location->kind == NX_WEBGL_UNIFORM_SPOT_LIGHT_COLOR) {
+		memcpy(program->spot_light_color, source, sizeof(float) * 3);
+		program->has_spot_light_color = true;
 	}
 	return JS_UNDEFINED;
 }
@@ -5944,7 +6115,8 @@ static bool draw_sprite_bridge(JSContext *ctx, nx_webgl_context_t *context,
 			program->has_color ? program->color : NULL,
 			false, NULL, 0.f, NULL,
 			false,
-			false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for sprites
+			false, NULL, NULL, NULL,
+			NULL);  // specular + emissive + derivative-normals + hemi + spot DISABLED for sprites
 	}
 	return drew;
 }
@@ -5979,6 +6151,9 @@ static bool draw_indexed_textured_triangles_bridge(
 	bool has_hemi_light = program->has_hemi_light_direction &&
 						  program->has_hemi_light_sky_color &&
 						  program->has_hemi_light_ground_color;
+	bool has_spot_light = program->has_spot_light_position &&
+						  program->has_spot_light_direction &&
+						  program->has_spot_light_color;
 	// Lighting wants per-fragment normals; sourced from either the
 	// per-vertex `a_normal` buffer OR (milestone #16) the bridge fragment
 	// shader's view-position derivatives via OES_standard_derivatives.
@@ -5986,7 +6161,7 @@ static bool draw_indexed_textured_triangles_bridge(
 	// the program has no `normal` attribute (Three.js's `flatShading: true`
 	// optimizer drops it — [[bridge-flatshading-gap]]).
 	bool has_lighting_uniforms = has_directional || has_point_light ||
-								 has_hemi_light;
+								 has_hemi_light || has_spot_light;
 	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyzuv =
@@ -6129,6 +6304,16 @@ static bool draw_indexed_textured_triangles_bridge(
 		float zero3[3] = {0.f, 0.f, 0.f};
 		bool has_directional2 = program->has_light_direction2 &&
 								program->has_light_color2;
+		nx_webgl_egl_spot_light_t spot_light_state = {
+			.enabled = has_spot_light,
+			.position = program->spot_light_position,
+			.direction = program->spot_light_direction,
+			.color = program->spot_light_color,
+			.distance = program->spot_light_distance,
+			.cone_cos = program->spot_light_cone_cos,
+			.penumbra_cos = program->spot_light_penumbra_cos,
+			.decay = program->spot_light_decay,
+		};
 		drew = nx_webgl_egl_draw_textured_triangles_bridge(
 			context->egl, context->canvas, clip_xyzuv, vertex_count,
 			texture->bridge_id, texture->revision, (int)texture->width,
@@ -6169,7 +6354,8 @@ static bool draw_indexed_textured_triangles_bridge(
 			has_hemi_light,
 			has_hemi_light ? program->hemi_light_direction : NULL,
 			has_hemi_light ? program->hemi_light_sky_color : NULL,
-			has_hemi_light ? program->hemi_light_ground_color : NULL);
+			has_hemi_light ? program->hemi_light_ground_color : NULL,
+			&spot_light_state);
 	}
 	js_free(ctx, clip_xyzuv);
 	js_free(ctx, fog_depth_data);
@@ -6219,10 +6405,13 @@ static bool draw_indexed_triangles_bridge(
 	bool has_hemi_light = program->has_hemi_light_direction &&
 						  program->has_hemi_light_sky_color &&
 						  program->has_hemi_light_ground_color;
+	bool has_spot_light = program->has_spot_light_position &&
+						  program->has_spot_light_direction &&
+						  program->has_spot_light_color;
 	// See draw_indexed_textured_triangles_bridge for the derivative-normals
 	// gating rationale (milestone #16).
 	bool has_lighting_uniforms = has_directional || has_point_light ||
-								 has_hemi_light;
+								 has_hemi_light || has_spot_light;
 	bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 	bool lighting_enabled = has_lighting_uniforms;
 	float *clip_xyz =
@@ -6360,6 +6549,16 @@ static bool draw_indexed_triangles_bridge(
 					 color & 0xff, (color >> 24) & 0xff);
 			nx_webgl_egl_set_dispatch_debug(context->egl, dbg);
 		}
+		nx_webgl_egl_spot_light_t spot_light_state = {
+			.enabled = has_spot_light,
+			.position = program->spot_light_position,
+			.direction = program->spot_light_direction,
+			.color = program->spot_light_color,
+			.distance = program->spot_light_distance,
+			.cone_cos = program->spot_light_cone_cos,
+			.penumbra_cos = program->spot_light_penumbra_cos,
+			.decay = program->spot_light_decay,
+		};
 		drew = nx_webgl_egl_draw_triangles_bridge(
 			context->egl, context->canvas, clip_xyz,
 			has_vertex_color ? vertex_color_data : NULL, vertex_count,
@@ -6397,7 +6596,8 @@ static bool draw_indexed_triangles_bridge(
 			has_hemi_light,
 			has_hemi_light ? program->hemi_light_direction : NULL,
 			has_hemi_light ? program->hemi_light_sky_color : NULL,
-			has_hemi_light ? program->hemi_light_ground_color : NULL);
+			has_hemi_light ? program->hemi_light_ground_color : NULL,
+			&spot_light_state);
 	}
 	js_free(ctx, clip_xyz);
 	js_free(ctx, vertex_color_data);
@@ -7417,7 +7617,8 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 					false, 0u,    // cull face — N/A for screen-aligned points
 					program->has_color ? program->color : NULL,
 					false, NULL, 0.f, NULL, false,
-					false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for points
+					false, NULL, NULL, NULL,
+					NULL);  // specular + emissive + derivative-normals + hemi + spot DISABLED for points
 			} else {
 				drew = nx_webgl_egl_draw_triangles_bridge(
 					context->egl, canvas, clip_xyz,
@@ -7438,7 +7639,8 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 					(context->enabled_caps & GL_CAP_CULL_FACE) != 0,
 					context->cull_face,
 					false, NULL, 0.f, NULL, false,
-					false, NULL, NULL, NULL);  // specular + emissive + derivative-normals + hemi DISABLED for points
+					false, NULL, NULL, NULL,
+					NULL);  // specular + emissive + derivative-normals + hemi + spot DISABLED for points
 			}
 			js_free(ctx, clip_xyz);
 			js_free(ctx, clip_xyzuv);
@@ -7837,10 +8039,13 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		bool has_hemi_light = program->has_hemi_light_direction &&
 							  program->has_hemi_light_sky_color &&
 							  program->has_hemi_light_ground_color;
+		bool has_spot_light = program->has_spot_light_position &&
+							  program->has_spot_light_direction &&
+							  program->has_spot_light_color;
 		// See draw_indexed_textured_triangles_bridge for derivative-normals
 		// (milestone #16) gating rationale.
 		bool has_lighting_uniforms = has_directional || has_point_light ||
-									 has_hemi_light;
+									 has_hemi_light || has_spot_light;
 		bool use_derivative_normals = has_lighting_uniforms && !has_normals;
 		bool lighting_enabled = has_lighting_uniforms;
 
@@ -7942,6 +8147,16 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			float zero3[3] = {0.f, 0.f, 0.f};
 			bool has_directional2 = program->has_light_direction2 &&
 									program->has_light_color2;
+			nx_webgl_egl_spot_light_t spot_light_state = {
+				.enabled = has_spot_light,
+				.position = program->spot_light_position,
+				.direction = program->spot_light_direction,
+				.color = program->spot_light_color,
+				.distance = program->spot_light_distance,
+				.cone_cos = program->spot_light_cone_cos,
+				.penumbra_cos = program->spot_light_penumbra_cos,
+				.decay = program->spot_light_decay,
+			};
 			bool drew = nx_webgl_egl_draw_triangles_bridge(
 				context->egl, canvas, clip_xyz,
 				has_vertex_color ? vertex_color_data : NULL, vertex_count,
@@ -7979,7 +8194,8 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			has_hemi_light,
 			has_hemi_light ? program->hemi_light_direction : NULL,
 			has_hemi_light ? program->hemi_light_sky_color : NULL,
-			has_hemi_light ? program->hemi_light_ground_color : NULL);
+			has_hemi_light ? program->hemi_light_ground_color : NULL,
+			&spot_light_state);
 			js_free(ctx, clip_xyz);
 			js_free(ctx, vertex_color_data);
 			js_free(ctx, fog_depth_data);
@@ -9018,33 +9234,24 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	    JS_ToUint32(ctx, &textarget, argv[2]) ||
 	    JS_ToInt32(ctx, &level, argv[4]))
 		return JS_EXCEPTION;
-	/* 2026-06-08 ROUND 44: framebuffer attachment probe. Logs every
-	 * texture attachment to an FBO so we can see WHICH textures Cocos
-	 * is using as render-target color/depth/stencil buffers. Capped 40. */
-	{
-		static int ft_n = 0;
-		if (ft_n < 40) {
-			ft_n++;
-			int tex_handle = -1;
-			bool detach = JS_IsNull(argv[3]) || JS_IsUndefined(argv[3]);
-			if (!detach) {
-				nx_webgl_texture_t *_t = nx_get_webgl_texture(argv[3]);
-				tex_handle = _t ? (int)_t->gles_handle : -2;
-			} else { tex_handle = 0; }
-			nx_webgl_framebuffer_t *_fb_now =
-				nx_get_webgl_framebuffer(context->framebuffer_binding);
-			fprintf(stderr,
-				"[nxjs:framebufferTex2D] n=%d fbo=%d attachment=0x%x textarget=0x%x texHandle=%d level=%d\n",
-				ft_n, _fb_now ? (int)_fb_now->handle : 0,
-				attachment, textarget, tex_handle, level);
-			fflush(stderr);
-		}
-	}
 	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
-	if (textarget != GL_TEXTURE_2D) {
+	/* 2026-06-23 cube-map FBO attachment: accept all 6 cube map face
+	 * targets in addition to GL_TEXTURE_2D. Three.js's WebGLCubeRenderTarget
+	 * + CubemapFromEquirect (triggered by `scene.background = equirectTex`
+	 * with EquirectangularReflectionMapping) loops through
+	 * GL_TEXTURE_CUBE_MAP_POSITIVE_X..NEGATIVE_Z (0x8515..0x851a) attaching
+	 * each face to a per-face FBO before drawing the equirect onto it.
+	 * Pre-fix the bridge rejected these with INVALID_ENUM — the JS-side
+	 * attachment never landed, the native FBO had no color buffer, draws
+	 * succeeded without writing anywhere, and cube map sampling returned
+	 * (0,0,0,0) → black scene background. */
+	bool textarget_ok = (textarget == GL_TEXTURE_2D) ||
+		(textarget >= 0x8515 /* CUBE_MAP_POSITIVE_X */ &&
+		 textarget <= 0x851A /* CUBE_MAP_NEGATIVE_Z */);
+	if (!textarget_ok) {
 		context->error = GL_INVALID_ENUM;
 		return JS_UNDEFINED;
 	}
@@ -9114,6 +9321,19 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 			    texture->mag_filter, texture->wrap_s, texture->wrap_t);
 			texture->width = w;
 			texture->height = h;
+			// Replay pre-promotion sampler-compare state — see texStorage2D
+			// flush above for the rationale. Three.js's shadow textures
+			// land here when fbTex2D triggers promotion ahead of texImage2D.
+			if (texture->has_compare_mode) {
+				nx_webgl_egl_texture_set_parameteri(context->egl,
+				    GL_TEXTURE_2D, texture->gles_handle, 0x884C,
+				    texture->compare_mode);
+			}
+			if (texture->has_compare_func) {
+				nx_webgl_egl_texture_set_parameteri(context->egl,
+				    GL_TEXTURE_2D, texture->gles_handle, 0x884D,
+				    texture->compare_func);
+			}
 		}
 		tex_handle = texture->gles_handle;
 		if (slot) {
@@ -9136,7 +9356,8 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	}
 
 	if (!nx_webgl_egl_framebuffer_texture_2d(context->egl, fb->handle,
-	                                          attachment, tex_handle)) {
+	                                          attachment, textarget,
+	                                          tex_handle)) {
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
@@ -9325,9 +9546,27 @@ static JSValue nx_webgl_renderbuffer_storage(JSContext *ctx,
 		context->error = GL_INVALID_OPERATION;
 		return JS_UNDEFINED;
 	}
+	/* 2026-06-23 PMREM probe: log renderbufferStorage. PMREM allocates
+	 * a DEPTH_COMPONENT16 or DEPTH24_STENCIL8 RB alongside its half-float
+	 * color attachment. If this fails, FBO completeness check returns
+	 * INCOMPLETE_ATTACHMENT. */
+	{
+		static int rbs_n = 0;
+		if (rbs_n < 40) {
+			rbs_n++;
+			fprintf(stderr,
+				"[nxjs:pmrem:renderbufferStorage] n=%d rb=%u intl=0x%x w=%d h=%d\n",
+				rbs_n, (unsigned)rb->handle, internalformat, width, height);
+			fflush(stderr);
+		}
+	}
 	if (!nx_webgl_egl_renderbuffer_storage(context->egl, rb->handle,
 	                                        internalformat, width, height)) {
 		context->error = GL_INVALID_OPERATION;
+		fprintf(stderr,
+			"[nxjs:pmrem:renderbufferStorage:FAIL] intl=0x%x w=%d h=%d\n",
+			internalformat, width, height);
+		fflush(stderr);
 		return JS_UNDEFINED;
 	}
 	rb->internal_format = internalformat;
@@ -10795,6 +11034,21 @@ static JSValue nx_webgl_draw_buffers(JSContext *ctx, JSValueConst this_val,
 				buf[i] = GL_COLOR_ATTACHMENT0;
 		}
 	}
+	/* 2026-06-23 PMREM probe: log drawBuffers. PMREM calls
+	 * drawBuffers([COLOR_ATTACHMENT0]) when binding its RT. */
+	{
+		static int db_n = 0;
+		if (db_n < 30) {
+			db_n++;
+			nx_webgl_framebuffer_t *_fb =
+				nx_get_webgl_framebuffer(context->framebuffer_binding);
+			fprintf(stderr,
+				"[nxjs:pmrem:drawBuffers] n=%d fbo=%u count=%d buf[0]=0x%x default=%d\n",
+				db_n, _fb ? (unsigned)_fb->handle : 0u, count,
+				count > 0 ? buf[0] : 0u, targeting_default ? 1 : 0);
+			fflush(stderr);
+		}
+	}
 	nx_webgl_egl_draw_buffers(context->egl, count, buf);
 	if (buf != stack)
 		js_free(ctx, buf);
@@ -11348,6 +11602,23 @@ static JSValue nx_webgl_tex_storage_2d(JSContext *ctx, JSValueConst this_val,
 		JS_ToInt32(ctx, &width, argv[3]) ||
 		JS_ToInt32(ctx, &height, argv[4]))
 		return JS_EXCEPTION;
+	/* 2026-06-23 PMREM probe: log every texStorage2D so we can see the
+	 * internalformat that goes into the native call right before any
+	 * crash. RGBA16F (0x881A) / RGB16F (0x881B) / RGBA32F (0x8814) are
+	 * the PMREM smoking guns. */
+	{
+		static int ts2_n = 0;
+		if (ts2_n < 80) {
+			ts2_n++;
+			nx_webgl_texture_t *_t =
+				nx_get_webgl_texture(context->texture_2d_binding);
+			fprintf(stderr,
+				"[nxjs:pmrem:texStorage2D] n=%d target=0x%x levels=%d intl=0x%x w=%d h=%d gles_handle=%u\n",
+				ts2_n, target, levels, internalformat, width, height,
+				_t ? (unsigned)_t->gles_handle : 0u);
+			fflush(stderr);
+		}
+	}
 	nx_webgl_texture_t *tex = nx_get_webgl_texture(context->texture_2d_binding);
 	if (tex && tex->gles_handle == 0) {
 		tex->gles_handle = nx_webgl_egl_create_persistent_texture(context->egl,
@@ -11359,6 +11630,10 @@ static JSValue nx_webgl_tex_storage_2d(JSContext *ctx, JSValueConst this_val,
 	if (!nx_webgl_egl_tex_storage_2d(context->egl, target, levels,
 	                                  internalformat, width, height)) {
 		context->error = GL_INVALID_OPERATION;
+		fprintf(stderr,
+			"[nxjs:pmrem:texStorage2D:FAIL] intl=0x%x w=%d h=%d\n",
+			internalformat, width, height);
+		fflush(stderr);
 	}
 	// Flush any sampler parameters the user set BEFORE texStorage2D ran —
 	// they were stored in `tex->{min,mag}_filter` and `tex->wrap_{s,t}`
@@ -11382,6 +11657,22 @@ static JSValue nx_webgl_tex_storage_2d(JSContext *ctx, JSValueConst this_val,
 		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
 		                                     GL_TEXTURE_WRAP_T,
 		                                     tex->wrap_t);
+		// Shadow compare state — see nx_webgl_tex_parameteri stash above.
+		// Three.js's WebGLShadowMap sets COMPARE_MODE/FUNC BEFORE
+		// texStorage2D allocates immutable storage, so without this flush
+		// the comparison mode is silently dropped and sampler2DShadow
+		// returns 0 everywhere → every fragment "in shadow" → SpotLight
+		// contribution × 0 = invisible.
+		if (tex->has_compare_mode) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			                                     tex->gles_handle, 0x884C,
+			                                     tex->compare_mode);
+		}
+		if (tex->has_compare_func) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			                                     tex->gles_handle, 0x884D,
+			                                     tex->compare_func);
+		}
 	}
 	return JS_UNDEFINED;
 }
@@ -11427,6 +11718,16 @@ static JSValue nx_webgl_tex_storage_3d(JSContext *ctx, JSValueConst this_val,
 		nx_webgl_egl_texture_set_parameteri(context->egl, target, tex->gles_handle,
 		                                     GL_TEXTURE_WRAP_T,
 		                                     tex->wrap_t);
+		if (tex->has_compare_mode) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			                                     tex->gles_handle, 0x884C,
+			                                     tex->compare_mode);
+		}
+		if (tex->has_compare_func) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			                                     tex->gles_handle, 0x884D,
+			                                     tex->compare_func);
+		}
 	}
 	return JS_UNDEFINED;
 }

@@ -60,6 +60,28 @@ bool nx_webgl_egl_has_pending_readback(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_flush_bridge_present(nx_webgl_egl_t *backend,
 									   nx_canvas_t *canvas);
 uint32_t nx_webgl_egl_get_last_draw_gl_error(nx_webgl_egl_t *backend);
+
+// SpotLight state passed alongside the bridge dispatch. When `enabled` is
+// false (or the pointer is NULL), the bridge skips the spotlight contribution
+// entirely. All vector fields are vec3 (3 floats) in the same coordinate
+// space as the corresponding `point_light_*` args (view-space for position,
+// already-unit world→view direction). `color` has Three.js's
+// intensity*decay_scale already baked in (same convention as the existing
+// directional/point light colors). `distance == 0` means "no cutoff distance"
+// matching Three.js's SpotLight.distance semantics. `cone_cos` and
+// `penumbra_cos` are pre-computed by Three.js's WebGLLights from
+// `Math.cos(angle)` and `Math.cos(angle * (1 - penumbra))` respectively.
+typedef struct {
+  bool enabled;
+  const float *position;       // vec3, view-space
+  const float *direction;      // vec3, view-space, unit length, points from light toward target
+  const float *color;          // vec3, linear RGB with intensity baked in
+  float distance;              // cutoff distance; 0 = no cutoff
+  float cone_cos;              // cos(SpotLight.angle)
+  float penumbra_cos;          // cos(SpotLight.angle * (1 - SpotLight.penumbra))
+  float decay;                 // physical decay exponent (typically 2 for inverse-square)
+} nx_webgl_egl_spot_light_t;
+
 bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
   nx_canvas_t *canvas,
   const float *clip_xyz,
@@ -106,7 +128,8 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
   bool hemi_light_enabled,
   const float *hemi_light_direction,
   const float *hemi_light_sky_color,
-  const float *hemi_light_ground_color);
+  const float *hemi_light_ground_color,
+  const nx_webgl_egl_spot_light_t *spot_light);
 bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
   nx_canvas_t *canvas,
   const float *clip_xyz,
@@ -192,7 +215,8 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
   bool hemi_light_enabled,
   const float *hemi_light_direction,
   const float *hemi_light_sky_color,
-  const float *hemi_light_ground_color);
+  const float *hemi_light_ground_color,
+  const nx_webgl_egl_spot_light_t *spot_light);
 bool nx_webgl_egl_clear_prototype(nx_webgl_egl_t *backend,
 								  nx_canvas_t *canvas);
 bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas);
@@ -420,6 +444,7 @@ uint32_t nx_webgl_egl_check_framebuffer_status(nx_webgl_egl_t *backend,
 bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,
                                           uint32_t framebuffer_handle,
                                           uint32_t attachment,
+                                          uint32_t textarget,
                                           uint32_t texture_handle);
 bool nx_webgl_egl_framebuffer_renderbuffer(nx_webgl_egl_t *backend,
                                             uint32_t framebuffer_handle,

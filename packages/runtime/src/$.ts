@@ -375,6 +375,7 @@ export interface Init {
 
 	// memory.c
 	memoryUsage(): MemoryUsage;
+	gc(): void;
 
 	// main.c
 	argv: string[];
@@ -402,6 +403,15 @@ export interface Init {
 		rgba: ArrayBuffer | ArrayBufferView,
 		w: number,
 		h: number,
+	): void;
+	setAnimatedCursorOverlay(
+		x: number,
+		y: number,
+		packedRgba: ArrayBuffer | ArrayBufferView,
+		w: number,
+		h: number,
+		frameCount: number,
+		frameDelaysMs: ArrayBufferView,
 	): void;
 	setCursorOverlayPosition(x: number, y: number): void;
 	clearCursorOverlay(): void;

@@ -33,7 +33,7 @@
 # endif
 
 # ifndef d_m3MaxDuplicateFunctionImpl
-#   define d_m3MaxDuplicateFunctionImpl         3
+#   define d_m3MaxDuplicateFunctionImpl         16
 # endif
 
 # ifndef d_m3CascadedOpcodes                            // Cascaded opcodes are slightly faster at the expense of some memory

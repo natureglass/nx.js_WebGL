@@ -62,8 +62,44 @@ static JSValue nx_memory_usage(JSContext *ctx, JSValueConst this_val, int argc,
 	return obj;
 }
 
+static JSValue nx_run_gc(JSContext *ctx, JSValueConst this_val, int argc,
+						 JSValueConst *argv) {
+	JSRuntime *rt = JS_GetRuntime(ctx);
+	JS_RunGC(rt);
+	// QuickJS's `js_trigger_gc` sets the next auto-GC threshold to
+	// `live_heap + (live_heap >> 1)` — fine on x86 where a GC pass on a
+	// 7-10 MB heap is ~10ms, but on Switch hardware the same walk takes
+	// 5+ seconds (cache patterns + slower memory). The default 50%
+	// regrowth turns into a 3-5 MB garbage tolerance at warm steady
+	// state, so when auto-GC eventually fires it has a huge mark phase
+	// and the whole page freezes for 5s — visible to the user as the
+	// rapier-physics demo locking up after ~30s of steady-state play
+	// (data chain in [[reference-rapier-gc-pause-investigation]]).
+	//
+	// After a forced GC, cap the next-trigger threshold to live_heap +
+	// 4 MB so subsequent auto-fires don't accidentally land inside an
+	// app-level allocation burst (e.g. addBody creating a Mesh +
+	// Material + 5-6 wbindgen calls + scene mutations would punch
+	// through a 1 MB cap mid-call, triggering auto-GC inside the burst
+	// — which we observed as a death spiral that re-froze the
+	// rapier-physics demo when its JS-side heartbeat was 5s instead of
+	// 1s). 4 MB is comfortably larger than any one realistic addBody
+	// burst (~10-100 KB) and still small enough that auto-GC fires
+	// promptly when garbage really accumulates. The JS-side
+	// `setInterval(Switch.gc, ...)` heartbeat still flattens the
+	// pause-time distribution; this cap just gives the heartbeat the
+	// headroom to run at a humane cadence (5s) without spurious
+	// in-burst auto-GCs.
+	JSMemoryUsage stats;
+	JS_ComputeMemoryUsage(rt, &stats);
+	size_t capped = (size_t)stats.malloc_size + (4 * 1024 * 1024);
+	JS_SetGCThreshold(rt, capped);
+	return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("memoryUsage", 0, nx_memory_usage),
+	JS_CFUNC_DEF("gc", 0, nx_run_gc),
 };
 
 void nx_init_memory(JSContext *ctx, JSValueConst init_obj) {
