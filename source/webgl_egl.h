@@ -387,6 +387,15 @@ bool nx_webgl_egl_draw_passthrough(
 
 bool nx_webgl_egl_has_instancing(nx_webgl_egl_t *backend);
 
+/* Native `glGetString(GL_VENDOR)` / `glGetString(GL_RENDERER)` strings
+ * captured at backend init. NULL if the backend isn't available yet or
+ * the GLES driver returned NULL. Surfaced via `WEBGL_debug_renderer_info`'s
+ * `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` pnames so diagnostic
+ * pages (jQuery's WebGL Report, Three.js's `WebGLDebugInfo`) can show the
+ * actual driver instead of the masked `"nx.js"` brand. */
+const char *nx_webgl_egl_get_vendor(nx_webgl_egl_t *backend);
+const char *nx_webgl_egl_get_renderer(nx_webgl_egl_t *backend);
+
 // FBO / RBO / persistent-texture native entry points. Used by the JS-facing
 // glue in webgl.c to back `gl.createFramebuffer` / `framebufferTexture2D`
 // / etc. Bridge dispatch consults `current_user_framebuffer` (set via

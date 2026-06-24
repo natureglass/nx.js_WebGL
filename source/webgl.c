@@ -1499,6 +1499,14 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 		JS_NewString(ctx, "EXT_color_buffer_float"), JS_PROP_C_W_E);
 	JS_DefinePropertyValueUint32(ctx, arr, idx++,
 		JS_NewString(ctx, "EXT_color_buffer_half_float"), JS_PROP_C_W_E);
+	// WEBGL_debug_renderer_info — surfaces native `glGetString(GL_VENDOR)` /
+	// `glGetString(GL_RENDERER)` (the actual Mesa Nouveau / Tegra driver
+	// strings) via `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL`
+	// pnames. Diagnostic pages (jQuery WebGL Report, Three.js's WebGLDebugInfo)
+	// feature-detect this to show the real driver instead of the masked
+	// `"nx.js"` brand.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "WEBGL_debug_renderer_info"), JS_PROP_C_W_E);
 	return arr;
 }
 
@@ -1636,6 +1644,23 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 			return ext;
 		JS_DefinePropertyValueStr(ctx, ext, "UNSIGNED_INT_24_8_WEBGL",
 								  JS_NewInt32(ctx, 0x84FA), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_debug_renderer_info — exposes the UNMASKED_VENDOR_WEBGL /
+	// UNMASKED_RENDERER_WEBGL pname constants. Pages then call
+	// `gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)` and the parameter
+	// handler below returns the native vendor/renderer captured at EGL
+	// backend init.
+	if (strcmp(name, "WEBGL_debug_renderer_info") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext))
+			return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "UNMASKED_VENDOR_WEBGL",
+								  JS_NewInt32(ctx, 0x9245), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "UNMASKED_RENDERER_WEBGL",
+								  JS_NewInt32(ctx, 0x9246), JS_PROP_C_W_E);
 		return ext;
 	}
 
@@ -2542,21 +2567,7 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 	// user program's uniform table.
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle) {
-		/* PMREM crash diagnostic: log every useProgram so we can see
-		 * which program was active when an async GPU fault surfaces. */
-		static int useprog_cap = 0;
-		if (useprog_cap < 40) {
-			fprintf(stderr, "[nxjs:pmrem-probe:useProgram-pre] gles_handle=%u\n",
-				(unsigned)program->gles_handle);
-			fflush(stderr);
-		}
 		nx_webgl_egl_use_native_program(context->egl, program->gles_handle);
-		if (useprog_cap < 40) {
-			fprintf(stderr, "[nxjs:pmrem-probe:useProgram-post] gles_handle=%u\n",
-				(unsigned)program->gles_handle);
-			fflush(stderr);
-			useprog_cap++;
-		}
 	}
 	return JS_UNDEFINED;
 }
@@ -4475,20 +4486,7 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle && location->location >= 0) {
-		/* PMREM crash diagnostic. */
-		static int u1f_cap = 0;
-		if (u1f_cap < 30) {
-			fprintf(stderr, "[nxjs:pmrem-probe:uniform1f-pre] prog=%u loc=%d val=%f\n",
-				(unsigned)program->gles_handle, location->location, (float)value);
-			fflush(stderr);
-		}
 		nx_webgl_egl_uniform1f(context->egl, location->location, (float)value);
-		if (u1f_cap < 30) {
-			fprintf(stderr, "[nxjs:pmrem-probe:uniform1f-post] prog=%u loc=%d\n",
-				(unsigned)program->gles_handle, location->location);
-			fflush(stderr);
-			u1f_cap++;
-		}
 	}
 	if (location->kind == NX_WEBGL_UNIFORM_OPACITY) {
 		program->color[3] = (float)clamp01(value);
@@ -4849,20 +4847,7 @@ static JSValue nx_webgl_uniform1i(JSContext *ctx, JSValueConst this_val,
 	// See [[nxjs-uniform1i-fix]] memory for the milestone-#20 backstory.
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
 		program->gles_handle && location->location >= 0) {
-		/* PMREM crash diagnostic. */
-		static int u1i_cap = 0;
-		if (u1i_cap < 30) {
-			fprintf(stderr, "[nxjs:pmrem-probe:uniform1i-pre] prog=%u loc=%d val=%d\n",
-				(unsigned)program->gles_handle, location->location, value);
-			fflush(stderr);
-		}
 		nx_webgl_egl_uniform1i(context->egl, location->location, value);
-		if (u1i_cap < 30) {
-			fprintf(stderr, "[nxjs:pmrem-probe:uniform1i-post] prog=%u loc=%d\n",
-				(unsigned)program->gles_handle, location->location);
-			fflush(stderr);
-			u1i_cap++;
-		}
 	}
 
 	// Bridge-mode legacy stashing: only the bridge's hardcoded sampler at
@@ -9928,6 +9913,20 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		return JS_NewString(ctx, "nx.js");
 	case GL_RENDERER:
 		return JS_NewString(ctx, "nx.js framebuffer WebGL skeleton");
+	// WEBGL_debug_renderer_info — return the native
+	// `glGetString(GL_VENDOR/RENDERER)` captured at backend init.
+	// Falls back to the masked brand if the EGL backend isn't
+	// available (`NXJS_HAS_EGL_GLES` undefined) so the field never
+	// reads as null — matches real browsers which always return a
+	// non-empty string for these pnames once the extension is granted.
+	case 0x9245 /* UNMASKED_VENDOR_WEBGL */: {
+		const char *s = nx_webgl_egl_get_vendor(context->egl);
+		return JS_NewString(ctx, (s && *s) ? s : "nx.js");
+	}
+	case 0x9246 /* UNMASKED_RENDERER_WEBGL */: {
+		const char *s = nx_webgl_egl_get_renderer(context->egl);
+		return JS_NewString(ctx, (s && *s) ? s : "nx.js framebuffer WebGL skeleton");
+	}
 	case GL_VERSION:
 		return JS_NewString(ctx, context->is_webgl2
 								? "WebGL 2.0 (nx.js experimental)"

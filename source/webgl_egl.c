@@ -267,10 +267,13 @@ GLuint bridge_color_program;
 	void *fn_bind_vertex_array;
 	void *fn_delete_vertex_arrays;
 	uint32_t passthrough_vao;
-	// First ~1024 chars of glGetString(GL_EXTENSIONS), so the probe page
-	// can show what the driver advertises even if the EXT_instanced_arrays
-	// token is absent or spelled differently.
-	char gl_extensions[1024];
+	// Full glGetString(GL_EXTENSIONS) string, surfaced via
+	// gl.getBackendInfo().glExtensions so probe pages (com.natureglass.webglreport)
+	// can audit which GL_* tokens the driver actually advertises. Mesa
+	// Nouveau on Tegra reports ~80-150 tokens averaging ~30 chars each
+	// (4-6 KB typical). 16 KB gives ~3x headroom; truncation would
+	// silently hide tokens from the audit.
+	char gl_extensions[16384];
 	// User-supplied FBO currently bound via gl.bindFramebuffer(GL_FRAMEBUFFER,
 	// fb). 0 means "no user FBO bound" — bridge dispatch falls back to its
 	// own bridge_framebuffer + canvas-y top-down viewport convention +
@@ -2807,6 +2810,24 @@ void nx_webgl_egl_use_native_program(nx_webgl_egl_t *backend,
 // `gl.drawXxx()`, their `gl.uniform*` setters have already uploaded values
 // to `program_handle` (via the `gl.useProgram → glUseProgram` plumbing in
 // `nx_webgl_use_program`).
+const char *nx_webgl_egl_get_vendor(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend ? backend->vendor : NULL;
+#else
+	(void)backend;
+	return NULL;
+#endif
+}
+
+const char *nx_webgl_egl_get_renderer(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend ? backend->renderer : NULL;
+#else
+	(void)backend;
+	return NULL;
+#endif
+}
+
 bool nx_webgl_egl_has_instancing(nx_webgl_egl_t *backend) {
 #if NXJS_HAS_EGL_GLES
 	return backend &&
@@ -3485,35 +3506,19 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	                    backend->context))
 		return false;
 	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
-	/* 2026-06-23 PMREM Tegra-compat: force MIN/MAG = NEAREST for any
-	 * half-float / float texture. Tegra's GLES driver advertises
-	 * OES_texture_half_float_linear (we forward `glGetString(EXTENSIONS)`)
-	 * but in practice LINEAR-filtered RGBA16F sampling crashes the
-	 * driver in PMREM's prefilter pass. NEAREST avoids the extension
-	 * dependency. Quality cost: slightly more pixelated PMREM blur (the
-	 * importance-sampling already approximates the filter, so this is
-	 * a minor compound loss). */
+	/* 2026-06-23 → 2026-06-24 (LIFTED): historically forced MIN/MAG=NEAREST
+	 * for half-float / float textures because "LINEAR-filtered RGBA16F
+	 * sampling crashes the driver in PMREM's prefilter pass". That
+	 * diagnosis is now suspect — the actual crash root cause was the
+	 * PMREMGGXConvolution FS body's uint/bitwise constructs (see
+	 * [[reference-pmrem-tegra-compiler-workaround]]) which has since
+	 * been worked around via FS replacement. The NEAREST-forcing
+	 * caused real quality loss for HDR equirects (1k-2k textures alias
+	 * badly with NEAREST). Trial-lifting in concert with the
+	 * halfFloatDowngrade lift below — if PMREM regresses to driver
+	 * crashes when HDR data enters the pipeline, restore both. */
 	uint32_t min_filter_effective = min_filter;
 	uint32_t mag_filter_effective = mag_filter;
-	bool is_float_type =
-		(type == 0x1406 /* GL_FLOAT */) ||
-		(type == 0x140B /* GL_HALF_FLOAT */) ||
-		(type == 0x8D61 /* GL_HALF_FLOAT_OES */);
-	if (is_float_type) {
-		min_filter_effective = 0x2600; /* GL_NEAREST */
-		mag_filter_effective = 0x2600; /* GL_NEAREST */
-		{
-			static int hf_n = 0;
-			if (hf_n < 20) {
-				hf_n++;
-				fprintf(stderr,
-					"[nxjs:pmrem-fix:halfFloatFilter] handle=%u type=0x%x forced NEAREST (was min=0x%x mag=0x%x)\n",
-					(unsigned)handle, (unsigned)type,
-					(unsigned)min_filter, (unsigned)mag_filter);
-				fflush(stderr);
-			}
-		}
-	}
 	// Persistent textures may carry mipmap minFilter variants (set by JS
 	// via tex_parameteri + generateMipmap). Pass them through to native
 	// instead of collapsing — that's what makes real mipmap sampling
@@ -3598,35 +3603,21 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	 * of half-float; for the zero_buf case this is fine (zeros stay
 	 * zeros). For genuine half-float pixel data this would corrupt;
 	 * we accept that for now. */
-	if (internal == 0x881A /* RGBA16F */ || internal == 0x8814 /* RGBA32F */) {
-		internal = 0x8058 /* RGBA8 */;
-		native_type = 0x1401 /* GL_UNSIGNED_BYTE */;
-		format = 0x1908 /* RGBA */;
-		{
-			static int dg_n = 0;
-			if (dg_n < 20) {
-				dg_n++;
-				fprintf(stderr,
-					"[nxjs:pmrem-fix:halfFloatDowngrade] handle=%u RGBA16F/32F\xe2\x86\x92RGBA8\n",
-					(unsigned)handle);
-				fflush(stderr);
-			}
-		}
-	} else if (internal == 0x881B /* RGB16F */ || internal == 0x8815 /* RGB32F */) {
-		internal = 0x8051 /* RGB8 */;
-		native_type = 0x1401;
-		format = 0x1907 /* RGB */;
-		{
-			static int dg_n = 0;
-			if (dg_n < 20) {
-				dg_n++;
-				fprintf(stderr,
-					"[nxjs:pmrem-fix:halfFloatDowngrade] handle=%u RGB16F/32F\xe2\x86\x92RGB8\n",
-					(unsigned)handle);
-				fflush(stderr);
-			}
-		}
-	}
+	/* 2026-06-23 → 2026-06-24 (LIFTED): historically downgraded
+	 * RGBA16F/32F → RGBA8 and RGB16F/32F → RGB8 unconditionally because
+	 * "Tegra cannot complete a sample+write cycle on a real RGBA16F /
+	 * RGB16F texture — every PMREM prefilter draw hard-crashes the
+	 * driver". That was a misdiagnosis of the PMREMGGXConvolution FS
+	 * uint/bitwise GLSL crash (now fixed via FS replacement,
+	 * [[reference-pmrem-tegra-compiler-workaround]]). With the lift,
+	 * HDR equirect → PMREM → IBL flows real half-float dynamic range
+	 * through the prefilter; that's what gives MeshStandardMaterial
+	 * its punchy specular highlights. The companion halfFloatFilter
+	 * NEAREST forcing was lifted at the same time so Three.js's
+	 * requested LINEAR filtering for HDR equirects is honored. The bg
+	 * cube map still gets downgraded in
+	 * nx_webgl_egl_persistent_cube_texture_image_2d (Fix G v3's UByte
+	 * CPU-roundtrip assumes RGBA8 storage). */
 
 	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
 	             (GLenum)format, native_type, data);
@@ -3740,6 +3731,35 @@ bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
 			fflush(stderr);
 		}
 		internal = 0x8058 /* RGBA8 */;
+	}
+	/* 2026-06-24 Cube-map HDR downgrade: when Three.js's WebGLBackground
+	 * runs CubemapFromEquirect on an HDR equirect (HalfFloatType source),
+	 * the destination cube_map is allocated as RGBA16F to preserve range.
+	 * That conflicts with Fix G v3's CPU-roundtrip rescue
+	 * (cube_face_rescue_transition above) which assumes 4-byte RGBA UByte
+	 * storage in glReadPixels + glTexSubImage2D — reading half-float
+	 * storage as UByte gives garbage, so the rescue writes garbage to
+	 * face N>0 and only POSITIVE_X shows correct content. Downgrade
+	 * RGBA16F/32F → RGBA8 here so the bg cube is UByte-storage, the
+	 * rescue's format assumption stays valid, and the background renders
+	 * correctly on all 6 faces. The PMREM cube_uv (2D atlas, separate
+	 * texture) keeps its half-float storage and gets the full HDR
+	 * dynamic range for IBL — that's where the "shiny" comes from. The
+	 * background loses HDR range but that's just a backdrop; the
+	 * Mesa-Nouveau aliasing bug forces this trade. */
+	if (internal == 0x881A /* RGBA16F */ ||
+	    internal == 0x8814 /* RGBA32F */) {
+		static int dg_n = 0;
+		if (dg_n < 20) {
+			dg_n++;
+			fprintf(stderr,
+				"[nxjs:cube-fix:hdrDowngrade] handle=%u face=0x%x RGBA16F/32F\xe2\x86\x92RGBA8 (FixG-compat)\n",
+				(unsigned)handle, (unsigned)face_target);
+			fflush(stderr);
+		}
+		internal = 0x8058 /* RGBA8 */;
+		format = 0x1908 /* RGBA */;
+		type = 0x1401 /* UNSIGNED_BYTE */;
 	}
 	/* 2026-06-23 Fix-attempt F: glTexStorage2D for NULL-data cube alloc.
 	 * Probe data shows that mutable-storage cube maps allocated via 6
@@ -3954,6 +3974,30 @@ bool nx_webgl_egl_framebuffer_renderbuffer(nx_webgl_egl_t *backend,
  * freed on texture delete — acceptable lifetime leak, see memory entry
  * [[reference-mesa-cube-face-aliasing-rescue]]. */
 #if NXJS_HAS_EGL_GLES
+/* 2026-06-24 Fix G v3 Y-flip helper: glReadPixels reads from an FBO with
+ * the OpenGL lower-left origin convention. glTexSubImage2D to a cube face
+ * writes with the cube-face upper-left origin convention. Without an
+ * explicit row reverse in between, every cube face Fix G writes lands
+ * upside-down — which surfaced visibly the moment MeshStandardMaterial+
+ * PMREM forced Three.js's WebGLBackground through the CubemapFromEquirect
+ * path (older Phong-with-equirect demos sidestepped this because they
+ * never triggered the cube-face rescue). 4 BPP fixed since the cube
+ * downgrade above forces RGBA8 storage. */
+static void cube_face_rescue_flip_y_rgba8(uint8_t *buf, int w, int h) {
+	if (!buf || w <= 0 || h <= 0) return;
+	size_t row_bytes = (size_t)w * 4;
+	uint8_t *tmp = (uint8_t *)malloc(row_bytes);
+	if (!tmp) return;
+	for (int y = 0; y < h / 2; y++) {
+		uint8_t *r0 = buf + (size_t)y * row_bytes;
+		uint8_t *r1 = buf + (size_t)(h - 1 - y) * row_bytes;
+		memcpy(tmp, r0, row_bytes);
+		memcpy(r0, r1, row_bytes);
+		memcpy(r1, tmp, row_bytes);
+	}
+	free(tmp);
+}
+
 static void cube_face_rescue_transition(GLuint old_fbo_handle,
                                          int old_width, int old_height) {
 	/* Per-cube CPU staging buffers + size record. We use CPU round-trip
@@ -4072,6 +4116,7 @@ static void cube_face_rescue_transition(GLuint old_fbo_handle,
 		glReadPixels(0, 0, backup_size, backup_size,
 		             GL_RGBA, GL_UNSIGNED_BYTE, backup_cpu);
 		(void)glGetError();
+		cube_face_rescue_flip_y_rgba8(backup_cpu, backup_size, backup_size);
 		static int g_n = 0;
 		if (g_n < 3) {
 			g_n++;
@@ -4112,6 +4157,7 @@ static void cube_face_rescue_transition(GLuint old_fbo_handle,
 				glReadPixels(0, 0, backup_size, backup_size,
 				             GL_RGBA, GL_UNSIGNED_BYTE, stage_cpu);
 				(void)glGetError();
+				cube_face_rescue_flip_y_rgba8(stage_cpu, backup_size, backup_size);
 				face_n_src = stage_cpu;
 			}
 		}
@@ -4122,7 +4168,20 @@ static void cube_face_rescue_transition(GLuint old_fbo_handle,
 		                backup_size, backup_size,
 		                GL_RGBA, GL_UNSIGNED_BYTE, backup_cpu);
 		(void)glGetError();
-		glTexSubImage2D((GLenum)at_face, 0, 0, 0,
+		/* 2026-06-24 cube-face-Y-pair swap: the global Y-flip applied to
+		 * every glReadPixels above is geometrically correct for the four
+		 * side faces (±X, ±Z) whose image-space "up" is world +Y, so
+		 * inverting the rows matches the FBO-vs-texture origin
+		 * convention difference. For the ±Y faces, image-space "up" is
+		 * along ±Z (Three.js's per-face camera up vector flips), and a
+		 * vertical row reverse on those images effectively turns the
+		 * +Y image into -Y image content (and vice versa). To
+		 * compensate, the rescue redirects POSITIVE_Y writes to
+		 * NEGATIVE_Y and vice versa. */
+		GLenum write_face = (GLenum)at_face;
+		if (at_face == 0x8517 /* POSITIVE_Y */)       write_face = 0x8518 /* NEGATIVE_Y */;
+		else if (at_face == 0x8518 /* NEGATIVE_Y */)  write_face = 0x8517 /* POSITIVE_Y */;
+		glTexSubImage2D(write_face, 0, 0, 0,
 		                backup_size, backup_size,
 		                GL_RGBA, GL_UNSIGNED_BYTE, face_n_src);
 		(void)glGetError();
@@ -7317,33 +7376,30 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 				int n_j = 0;
 				if (shader_type == 0x8B30 /* GL_FRAGMENT_SHADER */ &&
 				    strstr(patched_owned, "PMREMGGXConvolution") != NULL) {
-					/* PMREMGGXConvolution replacement. Iterations 1-3
-					 * (loop / unrolled blur) all crashed Mesa Nouveau at
-					 * the first prefilter draw despite compile+link
-					 * reporting OK. Probe data (see [nxjs:pmrem-probe:*]
-					 * sentries in webgl.c) confirmed crash is at the
-					 * actual glDrawElements after uniform set, not at
-					 * compile/link/useProgram/uniformSet.
+					/* PMREMGGXConvolution replacement. Upstream uses
+					 * 256-sample GGX VNDF importance sampling whose
+					 * Hammersley sequence depends on uint+bitwise ops
+					 * (radicalInverse_VdC) that Mesa Nouveau's GLSL
+					 * compiler can't process even when unreachable —
+					 * see [[reference-pmrem-tegra-compiler-workaround]].
 					 *
-					 * Root cause identified: hardcoded CUBEUV_MAX_MIP /
-					 * CUBEUV_TEXEL_WIDTH / CUBEUV_TEXEL_HEIGHT in our
-					 * replacement only matched cubeSize=256 (lodMax=8,
-					 * 768x1024 layout). For cubeSize=512 (lodMax=9, the
-					 * size Three.js picks for a 2048-px-wide source
-					 * equirect via cubeSize = width/4), our MAX_MIP=8
-					 * makes `4.0 * (exp2(MAX_MIP) - faceSize)` go
-					 * negative when mipInt=9, so every cubeUV fetch
-					 * lands outside the texture. Iteration 0 (1 sample
-					 * per pixel) accidentally tolerated this; iteration
-					 * 3 (5 samples per pixel) overwhelmed the driver.
+					 * The replacement: 5-tap unrolled cross blur using
+					 * a tangent/bitangent basis around the output normal.
+					 * Each per-pass roughness scales the kernel radius;
+					 * across PMREM's cumulative passes this produces a
+					 * widening hemisphere coverage in the cube_uv mip
+					 * chain. No uint, no bitwise, no early-return
+					 * conditional, no function calls — every construct
+					 * that crashed an earlier iteration during the
+					 * 13-iteration bisect is excluded.
 					 *
-					 * Fix: parse the three `#define`s from the source
-					 * Three.js actually emits, and inject them into our
-					 * replacement FS. The replacement still does a
-					 * Fibonacci-spiral hemisphere integration without
-					 * uint/bitwise (the original Mesa Nouveau trigger
-					 * from radicalInverse_VdC), but UVs land in the
-					 * texture regardless of cubeSize. */
+					 * CUBEUV_MAX_MIP / CUBEUV_TEXEL_WIDTH /
+					 * CUBEUV_TEXEL_HEIGHT are PARSED from the source
+					 * Three.js emits — hardcoding them only matches one
+					 * cubeSize, which broke when the demo's equirect was
+					 * sized to produce lodMax=9 instead of the
+					 * hardcoded 8. UVs would land outside the texture
+					 * and writes via multi-tap sampling crashed Mesa. */
 					double max_mip = 8.0;
 					double texel_w = 1.0 / 1536.0;
 					double texel_h = 1.0 / 2048.0;
@@ -7356,19 +7412,6 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 						p = strstr(patched_owned, "#define CUBEUV_TEXEL_HEIGHT ");
 						if (p) { p += strlen("#define CUBEUV_TEXEL_HEIGHT "); texel_h = strtod(p, NULL); }
 					}
-					fprintf(stderr,
-						"[nxjs:pmrem-fix:constants] max_mip=%.4f texel_w=%.10f texel_h=%.10f\n",
-						max_mip, texel_w, texel_h);
-					fflush(stderr);
-
-					/* Iteration 8: add `uniform float roughness;` back
-					 * (iter 7 worked without it). Blur radius scales with
-					 * roughness so high-roughness passes (the diffuse-
-					 * irradiance mip) cover much wider hemisphere area.
-					 * Still no conditional / no function — those are
-					 * still suspects from iter 5. If iter 8 works, the
-					 * iter-5 crash trigger was the early-return
-					 * conditional. */
 					char *built = (char *)malloc(16384);
 					if (built) {
 						int written = snprintf(built, 16384,
@@ -7469,10 +7512,6 @@ bool nx_webgl_egl_compile_shader(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 							"  pc_fragColor = vec4(acc * 0.2, 1.0);\n"
 							"}\n",
 							texel_w, texel_h, max_mip);
-						fprintf(stderr,
-							"[nxjs:pmrem-fix:snprintf] written=%d (cap=16384)\n",
-							written);
-						fflush(stderr);
 						if (written > 0 && written < 16384) {
 							free(patched_owned);
 							patched_owned = built;
