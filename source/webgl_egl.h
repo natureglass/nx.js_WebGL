@@ -845,6 +845,14 @@ bool nx_webgl_egl_has_texture_compression_etc1(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_has_texture_compression_etc(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_has_texture_compression_astc(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_has_disjoint_timer_query(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_vertex_array_object(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_draw_buffers(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_blend_minmax(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_frag_depth(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_element_index_uint(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_fbo_render_mipmap(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_srgb(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_ext_color_buffer_float(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_query_counter_ext(nx_webgl_egl_t *backend, uint32_t handle,
                                       uint32_t target);
 bool nx_webgl_egl_get_gpu_disjoint(nx_webgl_egl_t *backend);

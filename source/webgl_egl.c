@@ -286,6 +286,15 @@ GLuint bridge_color_program;
 	bool has_texture_compression_astc; // GL_KHR_texture_compression_astc_ldr
 	bool has_disjoint_timer_query;     // GL_EXT_disjoint_timer_query
 	void *fn_query_counter_ext;        // glQueryCounter / glQueryCounterEXT
+	// Wave 3 — v1 audit residuals. All effectively present on any GLES 3+
+	// driver (these features were promoted to ES3 core), but we prefer the
+	// explicit token when the driver advertises it.
+	bool has_blend_minmax;        // GL_EXT_blend_minmax (or ES3 core)
+	bool has_frag_depth;          // GL_EXT_frag_depth (or ES3 core gl_FragDepth)
+	bool has_element_index_uint;  // GL_OES_element_index_uint (or ES3 core)
+	bool has_fbo_render_mipmap;   // GL_OES_fbo_render_mipmap (or ES3 core)
+	bool has_srgb;                // GL_EXT_sRGB (or ES3 core SRGB formats)
+	bool has_ext_color_buffer_float; // GL_EXT_color_buffer_float
 	// Entry-point loaders for the new extensions.
 	void *fn_clip_control;                    // glClipControl[EXT]
 	void *fn_polygon_offset_clamp_ext;        // glPolygonOffsetClampEXT
@@ -2459,6 +2468,22 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 			EXT_HAS("GL_OES_texture_compression_astc");
 		backend->has_disjoint_timer_query =
 			EXT_HAS("GL_EXT_disjoint_timer_query");
+		// Wave 3 — promote-to-ES3-core extensions. Driver-token first,
+		// fall back to webgl2_present which is true iff ES3 entry points
+		// loaded successfully.
+		backend->has_blend_minmax =
+			EXT_HAS("GL_EXT_blend_minmax") || backend->webgl2_present;
+		backend->has_frag_depth =
+			EXT_HAS("GL_EXT_frag_depth") || backend->webgl2_present;
+		backend->has_element_index_uint =
+			EXT_HAS("GL_OES_element_index_uint") || backend->webgl2_present;
+		backend->has_fbo_render_mipmap =
+			EXT_HAS("GL_OES_fbo_render_mipmap") || backend->webgl2_present;
+		backend->has_srgb =
+			EXT_HAS("GL_EXT_sRGB") || EXT_HAS("GL_EXT_texture_sRGB_decode") ||
+			backend->webgl2_present;
+		backend->has_ext_color_buffer_float =
+			EXT_HAS("GL_EXT_color_buffer_float");
 		backend->fn_query_counter_ext =
 			(void *)eglGetProcAddress("glQueryCounterEXT");
 		if (!backend->fn_query_counter_ext)
@@ -9742,7 +9767,32 @@ NX_HAS_GETTER(has_texture_compression_etc1)
 NX_HAS_GETTER(has_texture_compression_etc)
 NX_HAS_GETTER(has_texture_compression_astc)
 NX_HAS_GETTER(has_disjoint_timer_query)
+NX_HAS_GETTER(has_blend_minmax)
+NX_HAS_GETTER(has_frag_depth)
+NX_HAS_GETTER(has_element_index_uint)
+NX_HAS_GETTER(has_fbo_render_mipmap)
+NX_HAS_GETTER(has_srgb)
+NX_HAS_GETTER(has_ext_color_buffer_float)
 #undef NX_HAS_GETTER
+
+// VAO + drawBuffers entry-points are loaded unconditionally in step 8.
+// The "has" check is just whether resolve succeeded — extensions for v1
+// gate on these so the page only sees them when callable.
+bool nx_webgl_egl_has_vertex_array_object(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->fn_gen_vertex_arrays &&
+	       backend->fn_bind_vertex_array && backend->fn_delete_vertex_arrays;
+#else
+	(void)backend; return false;
+#endif
+}
+bool nx_webgl_egl_has_draw_buffers(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->fn_draw_buffers;
+#else
+	(void)backend; return false;
+#endif
+}
 
 // EXT_disjoint_timer_query_webgl2 — record a GPU timestamp into the
 // query's storage. Caller has already created the query via createQuery

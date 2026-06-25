@@ -1451,6 +1451,12 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+	// v1 EGL routing epic phase 1: drive the backend probe for v1
+	// contexts too so the wave 1+2 has_* extension flags are populated
+	// when the page calls gl.getSupportedExtensions(). Without this, v1
+	// would only ever see the 11 always-on extensions hard-listed below.
+	if (context->egl)
+		(void)nx_webgl_egl_ensure_initialized(context->egl, context->canvas);
 	JSValue arr = JS_NewArray(ctx);
 	if (JS_IsException(arr))
 		return arr;
@@ -1568,30 +1574,32 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "WEBGL_compressed_texture_s3tc_srgb"), JS_PROP_C_W_E);
 		}
-		// EXT_texture_norm16 — 8 sized-internal-format constants.
-		if (nx_webgl_egl_has_texture_norm16(context->egl)) {
+		// EXT_texture_norm16 — 8 sized-internal-format constants. v2-only
+		// per WebGL spec (ES3 sized internalformats).
+		if (context->is_webgl2 && nx_webgl_egl_has_texture_norm16(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "EXT_texture_norm16"), JS_PROP_C_W_E);
 		}
-		// WEBGL_clip_cull_distance — 8 constants, GLSL-side feature.
-		if (nx_webgl_egl_has_clip_cull_distance(context->egl)) {
+		// WEBGL_clip_cull_distance — 8 constants, GLSL-side feature. v2-only.
+		if (context->is_webgl2 && nx_webgl_egl_has_clip_cull_distance(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "WEBGL_clip_cull_distance"), JS_PROP_C_W_E);
 		}
 		// Pure feature-flag stubs (page checks getExtension !== null only).
-		if (nx_webgl_egl_has_float_blend(context->egl)) {
+		// All v2-only per WebGL spec.
+		if (context->is_webgl2 && nx_webgl_egl_has_float_blend(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "EXT_float_blend"), JS_PROP_C_W_E);
 		}
-		if (nx_webgl_egl_has_render_snorm(context->egl)) {
+		if (context->is_webgl2 && nx_webgl_egl_has_render_snorm(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "EXT_render_snorm"), JS_PROP_C_W_E);
 		}
-		if (nx_webgl_egl_has_sample_variables(context->egl)) {
+		if (context->is_webgl2 && nx_webgl_egl_has_sample_variables(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "OES_sample_variables"), JS_PROP_C_W_E);
 		}
-		if (nx_webgl_egl_has_shader_multisample_interpolation(context->egl)) {
+		if (context->is_webgl2 && nx_webgl_egl_has_shader_multisample_interpolation(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "OES_shader_multisample_interpolation"), JS_PROP_C_W_E);
 		}
@@ -1606,12 +1614,13 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 				JS_NewString(ctx, "WEBGL_multi_draw"), JS_PROP_C_W_E);
 		}
 		// OES_draw_buffers_indexed — 6 per-attachment blend-state methods.
-		if (nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
+		// v2-only per WebGL spec.
+		if (context->is_webgl2 && nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "OES_draw_buffers_indexed"), JS_PROP_C_W_E);
 		}
-		// WEBGL_blend_func_extended — dual-source blending.
-		if (nx_webgl_egl_has_blend_func_extended(context->egl)) {
+		// WEBGL_blend_func_extended — dual-source blending. v2-only.
+		if (context->is_webgl2 && nx_webgl_egl_has_blend_func_extended(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "WEBGL_blend_func_extended"), JS_PROP_C_W_E);
 		}
@@ -1622,7 +1631,8 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "WEBGL_compressed_texture_etc1"), JS_PROP_C_W_E);
 		}
-		if (nx_webgl_egl_has_texture_compression_etc(context->egl)) {
+		// WEBGL_compressed_texture_etc — ES3 core ETC2/EAC. v2-only.
+		if (context->is_webgl2 && nx_webgl_egl_has_texture_compression_etc(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "WEBGL_compressed_texture_etc"), JS_PROP_C_W_E);
 		}
@@ -1633,10 +1643,53 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 		// EXT_disjoint_timer_query_webgl2 — bridge's WebGL 2 query objects
 		// already cover the createQuery/begin/end/getQueryParameter surface;
 		// this extension adds GPU timestamp recording via queryCounterEXT
-		// plus the disjoint state pname.
-		if (nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+		// plus the disjoint state pname. v2-only by name (the v1 sibling
+		// would be EXT_disjoint_timer_query — not wired here).
+		if (context->is_webgl2 && nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
 			JS_DefinePropertyValueUint32(ctx, arr, idx++,
 				JS_NewString(ctx, "EXT_disjoint_timer_query_webgl2"), JS_PROP_C_W_E);
+		}
+		// v1 epic phase 1.5 — extensions that are v1-only because WebGL 2
+		// has the equivalent as core. Aliased to the same native dispatch.
+		if (!context->is_webgl2 && nx_webgl_egl_has_vertex_array_object(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_vertex_array_object"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_draw_buffers(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_draw_buffers"), JS_PROP_C_W_E);
+		}
+		// v1 wave 3 — promote-to-ES3-core extensions. WebGL 2 has all of
+		// these as core features, so they're v1-only by spec.
+		if (!context->is_webgl2 && nx_webgl_egl_has_blend_minmax(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_blend_minmax"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_frag_depth(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_frag_depth"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_element_index_uint(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_element_index_uint"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_fbo_render_mipmap(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_fbo_render_mipmap"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_srgb(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_sRGB"), JS_PROP_C_W_E);
+		}
+		if (!context->is_webgl2 && nx_webgl_egl_has_ext_color_buffer_float(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_color_buffer_float"), JS_PROP_C_W_E);
+		}
+		// EXT_disjoint_timer_query — v1 sibling of the _webgl2 variant.
+		// Aliases the WebGL 2 core query surface to EXT-suffixed names.
+		if (!context->is_webgl2 && nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_disjoint_timer_query"), JS_PROP_C_W_E);
 		}
 	}
 	return arr;
@@ -1985,6 +2038,42 @@ static JSValue ext_get_translated_shader_source_w(JSContext *ctx, JSValueConst t
 static bool ext_query_counter_dispatch(nx_webgl_egl_t *egl, JSValueConst q_val,
                                         uint32_t target);
 
+// Forward declarations for VAO + drawBuffers core entry points (defined
+// alongside the WebGL 2 surface ~line 11525+). v1 epic phase 1.5 just
+// aliases the OES/WEBGL-suffixed extension method names onto these.
+static JSValue nx_webgl_create_vertex_array(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv);
+static JSValue nx_webgl_delete_vertex_array(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv);
+static JSValue nx_webgl_is_vertex_array(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv);
+static JSValue nx_webgl_bind_vertex_array(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv);
+static JSValue nx_webgl_draw_buffers(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv);
+
+// Forward declarations for WebGL 2 core query methods (defined
+// at line ~13690+). EXT_disjoint_timer_query (v1) aliases the EXT-suffixed
+// names onto these — same pattern as VAO/drawBuffers above.
+static JSValue nx_webgl_create_query(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv);
+static JSValue nx_webgl_delete_query(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv);
+static JSValue nx_webgl_is_query(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv);
+static JSValue nx_webgl_begin_query(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv);
+static JSValue nx_webgl_end_query(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv);
+static JSValue nx_webgl_get_query(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv);
+static JSValue nx_webgl_get_query_parameter(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv);
+
 // EXT_disjoint_timer_query_webgl2.queryCounterEXT(query, target).
 // The WebGL 2 query infrastructure (createQuery/deleteQuery/beginQuery/etc)
 // is already wired separately — this method just records a GPU timestamp
@@ -2001,6 +2090,91 @@ static JSValue ext_query_counter_w(JSContext *ctx, JSValueConst this_val,
 	if (!ext_query_counter_dispatch(c->egl, argv[0], target))
 		c->error = GL_INVALID_OPERATION;
 	return JS_UNDEFINED;
+}
+
+// OES_vertex_array_object wrappers — v1 alias for the WebGL 2 core
+// createVertexArray/delete/is/bind. Forward straight through; the bridge's
+// existing implementation already handles both v1 and v2 contexts (the
+// passthrough_vao init in webgl_egl.c is GLES 3+ regardless).
+static JSValue ext_vao_create_w(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv,
+                                  int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_create_vertex_array(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_vao_delete_w(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv,
+                                  int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_delete_vertex_array(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_vao_is_w(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv,
+                              int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_is_vertex_array(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_vao_bind_w(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv,
+                                int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_bind_vertex_array(ctx, func_data[0], argc, argv);
+}
+
+// WEBGL_draw_buffers.drawBuffersWEBGL — v1 alias for WebGL 2 core
+// gl.drawBuffers. The implementation accepts the same constant list
+// (COLOR_ATTACHMENT0..15 in the WEBGL spec are identical to the GL_*
+// COLOR_ATTACHMENT0..15 enums).
+static JSValue ext_draw_buffers_w(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_draw_buffers(ctx, func_data[0], argc, argv);
+}
+
+// EXT_disjoint_timer_query (v1) — alias the WebGL 2 core query surface to
+// EXT-suffixed method names. Same wrap-and-forward pattern as VAO/drawBuffers.
+static JSValue ext_create_query_w(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_create_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_delete_query_w(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_delete_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_is_query_w(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv,
+                                int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_is_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_begin_query_w(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv,
+                                   int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_begin_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_end_query_w(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_end_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_get_query_w(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_get_query(ctx, func_data[0], argc, argv);
+}
+static JSValue ext_get_query_object_w(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv,
+                                        int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	return nx_webgl_get_query_parameter(ctx, func_data[0], argc, argv);
 }
 
 // WEBGL_compressed_texture_astc.getSupportedProfiles() — return ["ldr"].
@@ -2022,6 +2196,11 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+	// v1 EGL routing epic phase 1: same rationale as get_supported_extensions
+	// — drive the backend probe so has_* flags reflect driver capability
+	// before the per-extension switch decides whether to return a stub vs null.
+	if (context->egl)
+		(void)nx_webgl_egl_ensure_initialized(context->egl, context->canvas);
 	const char *name = JS_ToCString(ctx, argv[0]);
 	if (!name)
 		return JS_EXCEPTION;
@@ -2291,9 +2470,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		return ext;
 	}
 
-	// EXT_texture_norm16 — 8 sized internal-format constants.
-	if (strcmp(name, "EXT_texture_norm16") == 0 && context->egl &&
-	    nx_webgl_egl_has_texture_norm16(context->egl)) {
+	// EXT_texture_norm16 — 8 sized internal-format constants. v2-only.
+	if (strcmp(name, "EXT_texture_norm16") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_texture_norm16(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2316,9 +2495,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		return ext;
 	}
 
-	// WEBGL_clip_cull_distance — 11 constants (3 maxes + 8 indexed CLIP_DISTANCE).
-	if (strcmp(name, "WEBGL_clip_cull_distance") == 0 && context->egl &&
-	    nx_webgl_egl_has_clip_cull_distance(context->egl)) {
+	// WEBGL_clip_cull_distance — 11 constants. v2-only.
+	if (strcmp(name, "WEBGL_clip_cull_distance") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_clip_cull_distance(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2338,13 +2517,13 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 	}
 
 	// Pure feature-flag stubs — return {} so getExtension !== null but
-	// there's nothing for the page to call.
-	if ((strcmp(name, "EXT_float_blend") == 0 && context->egl &&
-	     nx_webgl_egl_has_float_blend(context->egl)) ||
-	    (strcmp(name, "EXT_render_snorm") == 0 && context->egl &&
-	     nx_webgl_egl_has_render_snorm(context->egl)) ||
-	    (strcmp(name, "OES_sample_variables") == 0 && context->egl &&
-	     nx_webgl_egl_has_sample_variables(context->egl))) {
+	// there's nothing for the page to call. All v2-only per WebGL spec.
+	if ((strcmp(name, "EXT_float_blend") == 0 && context->is_webgl2 &&
+	     context->egl && nx_webgl_egl_has_float_blend(context->egl)) ||
+	    (strcmp(name, "EXT_render_snorm") == 0 && context->is_webgl2 &&
+	     context->egl && nx_webgl_egl_has_render_snorm(context->egl)) ||
+	    (strcmp(name, "OES_sample_variables") == 0 && context->is_webgl2 &&
+	     context->egl && nx_webgl_egl_has_sample_variables(context->egl))) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		return JS_IsException(ext) ? ext : ext;
@@ -2352,8 +2531,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 
 	// OES_shader_multisample_interpolation — 3 optional pnames for
 	// gl.getParameter. GLSL-side methods (interpolateAtSample/Centroid/Offset)
-	// are shader-only.
-	if (strcmp(name, "OES_shader_multisample_interpolation") == 0 && context->egl &&
+	// are shader-only. v2-only.
+	if (strcmp(name, "OES_shader_multisample_interpolation") == 0 &&
+	    context->is_webgl2 && context->egl &&
 	    nx_webgl_egl_has_shader_multisample_interpolation(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
@@ -2409,9 +2589,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		return ext;
 	}
 
-	// OES_draw_buffers_indexed — 6 per-attachment blend-state methods.
-	if (strcmp(name, "OES_draw_buffers_indexed") == 0 && context->egl &&
-	    nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
+	// OES_draw_buffers_indexed — 6 per-attachment blend-state methods. v2-only.
+	if (strcmp(name, "OES_draw_buffers_indexed") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2439,9 +2619,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 	}
 
 	// WEBGL_blend_func_extended — dual-source blending. 3 methods +
-	// 5 constants.
-	if (strcmp(name, "WEBGL_blend_func_extended") == 0 && context->egl &&
-	    nx_webgl_egl_has_blend_func_extended(context->egl)) {
+	// 5 constants. v2-only.
+	if (strcmp(name, "WEBGL_blend_func_extended") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_blend_func_extended(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2513,9 +2693,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		return ext;
 	}
 
-	// WEBGL_compressed_texture_etc — ES3 core ETC2/EAC formats (11 const).
-	if (strcmp(name, "WEBGL_compressed_texture_etc") == 0 && context->egl &&
-	    nx_webgl_egl_has_texture_compression_etc(context->egl)) {
+	// WEBGL_compressed_texture_etc — ES3 core ETC2/EAC formats (11 const). v2-only.
+	if (strcmp(name, "WEBGL_compressed_texture_etc") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_texture_compression_etc(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2544,8 +2724,9 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 
 	// EXT_disjoint_timer_query_webgl2 — GPU timestamp queries on top of the
 	// WebGL 2 core query object surface. 4 constants + queryCounterEXT.
-	if (strcmp(name, "EXT_disjoint_timer_query_webgl2") == 0 && context->egl &&
-	    nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+	// v2-only by name (v1 sibling EXT_disjoint_timer_query not wired).
+	if (strcmp(name, "EXT_disjoint_timer_query_webgl2") == 0 && context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
 		JS_FreeCString(ctx, name);
 		JSValue ext = JS_NewObject(ctx);
 		if (JS_IsException(ext)) return ext;
@@ -2561,6 +2742,186 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		                          JS_NewInt32(ctx, 0x8E28), JS_PROP_C_W_E);
 		JS_DefinePropertyValueStr(ctx, ext, "GPU_DISJOINT_EXT",
 		                          JS_NewInt32(ctx, 0x8FBB), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_blend_minmax — v1-only (v2 has MIN/MAX as core BlendEquation
+	// values). 2 constants.
+	if (strcmp(name, "EXT_blend_minmax") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_blend_minmax(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "MIN_EXT",
+		                          JS_NewInt32(ctx, 0x8007), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_EXT",
+		                          JS_NewInt32(ctx, 0x8008), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_frag_depth — v1-only (v2 has gl_FragDepth in core GLSL). Pure
+	// stub: enables `#extension GL_EXT_frag_depth : enable` + gl_FragDepthEXT.
+	if (strcmp(name, "EXT_frag_depth") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_frag_depth(context->egl)) {
+		JS_FreeCString(ctx, name);
+		return JS_NewObject(ctx);
+	}
+
+	// OES_element_index_uint — v1-only (v2 always supports UINT element
+	// indices). Pure stub.
+	if (strcmp(name, "OES_element_index_uint") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_element_index_uint(context->egl)) {
+		JS_FreeCString(ctx, name);
+		return JS_NewObject(ctx);
+	}
+
+	// OES_fbo_render_mipmap — v1-only (v2 allows render-to-non-zero-mip
+	// always). Pure stub.
+	if (strcmp(name, "OES_fbo_render_mipmap") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_fbo_render_mipmap(context->egl)) {
+		JS_FreeCString(ctx, name);
+		return JS_NewObject(ctx);
+	}
+
+	// EXT_sRGB — v1-only (v2 has SRGB internalformats as core). 4 constants.
+	if (strcmp(name, "EXT_sRGB") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_srgb(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "SRGB_EXT",
+		                          JS_NewInt32(ctx, 0x8C40), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "SRGB_ALPHA_EXT",
+		                          JS_NewInt32(ctx, 0x8C42), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "SRGB8_ALPHA8_EXT",
+		                          JS_NewInt32(ctx, 0x8C43), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING_EXT",
+		                          JS_NewInt32(ctx, 0x8210), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_color_buffer_float — v1-only (v2 has EXT_color_buffer_float).
+	// 4 constants for renderable FLOAT formats + FBO attachment queries.
+	if (strcmp(name, "WEBGL_color_buffer_float") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_ext_color_buffer_float(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "RGBA32F_EXT",
+		                          JS_NewInt32(ctx, 0x8814), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RGB32F_EXT",
+		                          JS_NewInt32(ctx, 0x8815), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT",
+		                          JS_NewInt32(ctx, 0x8211), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "UNSIGNED_NORMALIZED_EXT",
+		                          JS_NewInt32(ctx, 0x8C17), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_disjoint_timer_query — v1 sibling of the _webgl2 variant. 7
+	// methods aliased onto the existing WebGL 2 core query surface +
+	// 7 constants. Differs from the _webgl2 spec by exposing the createQuery/
+	// delete/begin/end/get/getObject surface itself (the _webgl2 variant
+	// piggybacks on WebGL 2 core); v1 has no core query objects so the
+	// extension provides them.
+	if (strcmp(name, "EXT_disjoint_timer_query") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JS_DefinePropertyValueStr(ctx, ext, "createQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_create_query_w, 0, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "deleteQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_delete_query_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "isQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_is_query_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "beginQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_begin_query_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "endQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_end_query_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "queryCounterEXT",
+		                          JS_NewCFunctionData(ctx, ext_query_counter_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "getQueryEXT",
+		                          JS_NewCFunctionData(ctx, ext_get_query_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "getQueryObjectEXT",
+		                          JS_NewCFunctionData(ctx, ext_get_query_object_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "QUERY_COUNTER_BITS_EXT",
+		                          JS_NewInt32(ctx, 0x8864), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "CURRENT_QUERY_EXT",
+		                          JS_NewInt32(ctx, 0x8865), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "QUERY_RESULT_EXT",
+		                          JS_NewInt32(ctx, 0x8866), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "QUERY_RESULT_AVAILABLE_EXT",
+		                          JS_NewInt32(ctx, 0x8867), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "TIME_ELAPSED_EXT",
+		                          JS_NewInt32(ctx, 0x88BF), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "TIMESTAMP_EXT",
+		                          JS_NewInt32(ctx, 0x8E28), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "GPU_DISJOINT_EXT",
+		                          JS_NewInt32(ctx, 0x8FBB), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// OES_vertex_array_object — v1-only (v2 has VAOs as core). 4 methods
+	// + 1 constant. Aliases the WebGL 2 core implementation underneath.
+	if (strcmp(name, "OES_vertex_array_object") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_vertex_array_object(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JS_DefinePropertyValueStr(ctx, ext, "createVertexArrayOES",
+		                          JS_NewCFunctionData(ctx, ext_vao_create_w, 0, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "deleteVertexArrayOES",
+		                          JS_NewCFunctionData(ctx, ext_vao_delete_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "isVertexArrayOES",
+		                          JS_NewCFunctionData(ctx, ext_vao_is_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "bindVertexArrayOES",
+		                          JS_NewCFunctionData(ctx, ext_vao_bind_w, 1, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "VERTEX_ARRAY_BINDING_OES",
+		                          JS_NewInt32(ctx, 0x85B5), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_draw_buffers — v1-only (v2 has drawBuffers as core). 1 method
+	// + 34 constants (16 COLOR_ATTACHMENT_WEBGL + 16 DRAW_BUFFER_WEBGL + 2 max).
+	if (strcmp(name, "WEBGL_draw_buffers") == 0 && !context->is_webgl2 &&
+	    context->egl && nx_webgl_egl_has_draw_buffers(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m = JS_NewCFunctionData(ctx, ext_draw_buffers_w, 1, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "drawBuffersWEBGL", m, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_COLOR_ATTACHMENTS_WEBGL",
+		                          JS_NewInt32(ctx, 0x8CDF), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_DRAW_BUFFERS_WEBGL",
+		                          JS_NewInt32(ctx, 0x8824), JS_PROP_C_W_E);
+		for (int i = 0; i < 16; i++) {
+			char key[40];
+			snprintf(key, sizeof(key), "COLOR_ATTACHMENT%d_WEBGL", i);
+			JS_DefinePropertyValueStr(ctx, ext, key,
+			                          JS_NewInt32(ctx, 0x8CE0 + i), JS_PROP_C_W_E);
+			snprintf(key, sizeof(key), "DRAW_BUFFER%d_WEBGL", i);
+			JS_DefinePropertyValueStr(ctx, ext, key,
+			                          JS_NewInt32(ctx, 0x8825 + i), JS_PROP_C_W_E);
+		}
 		return ext;
 	}
 
@@ -10760,13 +11121,15 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 
-	// On a WebGL 2 context, ensure the EGL backend has finished its probe
-	// before any of the WebGL 2 pnames below dispatch to native glGet*
-	// helpers. The bridge dispatch paths normally trigger this lazily on
-	// first compile/draw, but a page can legitimately query (e.g.)
-	// MAX_SAMPLES at capability-detection time before issuing any other
-	// GL call, and the native helpers gate on `backend->available`.
-	if (context->is_webgl2) {
+	// Ensure the EGL backend has finished its probe before any pnames
+	// below dispatch to native glGet* helpers OR read backend->has_*
+	// flags. Previously this was gated on `is_webgl2` so WebGL 1 contexts
+	// never initialized the backend — v1 audit log showed empty
+	// vendor/renderer/glVersion/extensions. v1 EGL routing epic phase 1:
+	// drive the probe for v1 too. Native dispatch from v1 still won't
+	// run unless bridge_enabled is also set (currently only via explicit
+	// gl.enableGpuBridge() call); this gate only unlocks queries.
+	if (context->egl) {
 		(void)nx_webgl_egl_ensure_initialized(context->egl, context->canvas);
 	}
 
@@ -11159,6 +11522,11 @@ static JSValue nx_webgl_get_backend_info(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+	// v1 EGL routing epic phase 1: probe-trigger so v1's getBackendInfo
+	// shows real glVendor/glRenderer/glVersion (was empty pre-epic since
+	// init only happened lazily on a v2 query).
+	if (context->egl)
+		(void)nx_webgl_egl_ensure_initialized(context->egl, context->canvas);
 	return nx_webgl_egl_get_backend_info(ctx, context->egl);
 }
 
