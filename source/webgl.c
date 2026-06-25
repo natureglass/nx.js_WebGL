@@ -1247,6 +1247,20 @@ static JSValue nx_webgl_context_new(JSContext *ctx, JSValueConst this_val,
 	for (int i = 0; i < NX_WEBGL_MAX_VERTEX_ATTRIBS; i++)
 		context->vertex_attribs[i].buffer = JS_UNDEFINED;
 	context->egl = nx_webgl_egl_create(ctx, canvas);
+	// v1→GLES routing epic phase 2: default the bridge to enabled so v1
+	// contexts route draws through native GLES (via try_draw_passthrough
+	// for Three.js's `#define SHADER_NAME `-tagged programs, and bridge
+	// color/texture programs for hand-rolled fixed-pipeline geometry).
+	// Pre-phase-2 v1 contexts ran the CPU "framebuffer WebGL skeleton"
+	// path unless the caller explicitly opted in via
+	// `gl.enableGpuBridgePrototype(true)`. brewser-runtime's canvas-runner
+	// already opts in for both v1 and v2 shared screen contexts, so this
+	// matches existing behavior and exposes it to raw nx.js apps that don't
+	// go through that path. Clients can still opt out with
+	// `gl.enableGpuBridgePrototype(false)`. v2 inherits the same default —
+	// the rationale is identical and v2 already runs with bridge=on in
+	// practice.
+	nx_webgl_egl_set_bridge_enabled(context->egl, true);
 
 	JS_SetOpaque(obj, context);
 	return obj;
