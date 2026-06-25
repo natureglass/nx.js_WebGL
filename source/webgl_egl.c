@@ -256,6 +256,58 @@ GLuint bridge_color_program;
 	void *fn_vertex_attrib_divisor_ext;
 	void *fn_draw_arrays_instanced_ext;
 	void *fn_draw_elements_instanced_ext;
+	// 2026-06-24 extension audit wave 1 — per-extension presence flags
+	// probed from gl_extensions string at step 8 + entry-point loaders
+	// resolved alongside. Used by webgl.c::nx_webgl_get_supported_extensions
+	// to advertise only what the driver actually exposes, and by
+	// nx_webgl_get_extension to gate the constants/methods stubs.
+	bool has_anisotropic;            // GL_EXT_texture_filter_anisotropic
+	bool has_clip_control;           // GL_EXT_clip_control
+	bool has_depth_clamp;            // GL_EXT_depth_clamp
+	bool has_polygon_offset_clamp;   // GL_EXT_polygon_offset_clamp
+	bool has_texture_compression_bptc;
+	bool has_texture_compression_rgtc;
+	bool has_texture_compression_s3tc;     // any of EXT/DXT1/ANGLE-DXT3/5
+	bool has_texture_compression_s3tc_srgb;
+	bool has_texture_norm16;
+	bool has_clip_cull_distance;     // GL_EXT_clip_cull_distance
+	bool has_float_blend;            // GL_EXT_float_blend
+	bool has_render_snorm;           // GL_EXT_render_snorm
+	bool has_sample_variables;       // GL_OES_sample_variables
+	bool has_shader_multisample_interpolation; // GL_OES_shader_multisample_interpolation
+	bool has_parallel_shader_compile;          // GL_KHR_parallel_shader_compile
+	bool has_multi_draw;             // GL_EXT_multi_draw_arrays
+	bool has_draw_buffers_indexed;   // GL_OES/EXT_draw_buffers_indexed
+	bool has_blend_func_extended;    // GL_EXT_blend_func_extended
+	// Wave 2 compressed-texture extensions — driven by the same
+	// compressedTexImage2D dispatch wired in wave 1.
+	bool has_texture_compression_etc1; // GL_OES_compressed_ETC1_RGB8_texture
+	bool has_texture_compression_etc;  // ES3 core (ETC2/EAC) — gated on webgl2_present
+	bool has_texture_compression_astc; // GL_KHR_texture_compression_astc_ldr
+	bool has_disjoint_timer_query;     // GL_EXT_disjoint_timer_query
+	void *fn_query_counter_ext;        // glQueryCounter / glQueryCounterEXT
+	// Entry-point loaders for the new extensions.
+	void *fn_clip_control;                    // glClipControl[EXT]
+	void *fn_polygon_offset_clamp_ext;        // glPolygonOffsetClampEXT
+	void *fn_max_shader_compiler_threads_khr; // glMaxShaderCompilerThreadsKHR
+	void *fn_multi_draw_arrays_ext;           // glMultiDrawArraysEXT
+	void *fn_multi_draw_elements_ext;         // glMultiDrawElementsEXT
+	void *fn_multi_draw_arrays_instanced_base_instance; // EXT variant; may be NULL
+	void *fn_multi_draw_elements_instanced_base_vertex_base_instance; // EXT; may be NULL
+	void *fn_enablei_ext;                     // glEnableiEXT
+	void *fn_disablei_ext;                    // glDisableiEXT
+	void *fn_blend_equationi_ext;             // glBlendEquationiEXT
+	void *fn_blend_equation_separatei_ext;    // glBlendEquationSeparateiEXT
+	void *fn_blend_funci_ext;                 // glBlendFunciEXT
+	void *fn_blend_func_separatei_ext;        // glBlendFuncSeparateiEXT
+	void *fn_bind_frag_data_location_ext;     // glBindFragDataLocationEXT
+	void *fn_bind_frag_data_location_indexed_ext; // glBindFragDataLocationIndexedEXT
+	void *fn_get_frag_data_index_ext;         // glGetFragDataIndexEXT
+	void *fn_compressed_tex_image_2d;         // core glCompressedTexImage2D (for s3tc/bptc/rgtc wiring)
+	void *fn_compressed_tex_sub_image_2d;     // core glCompressedTexSubImage2D
+	// MSAA-config presence: true if eglChooseConfig granted a config with
+	// EGL_SAMPLE_BUFFERS=1 + EGL_SAMPLES>=4. Surfaced via gl.getContextAttributes().antialias.
+	bool egl_msaa_enabled;
 	// Mesa-on-Citron gives us a GLES 3.2 context (even when we request ES2),
 	// and ES 3.0+ requires an explicit VAO to be bound — the default VAO
 	// (object 0) is reserved for ES 2.x and is not valid in ES 3 core.
@@ -1937,6 +1989,20 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 			 "EGL/OpenGL ES support was not built.");
 	return false;
 #else
+	// 4x MSAA preferred config — granted by Nouveau when available, makes
+	// gl.getContextAttributes().antialias return true. Falls back to no-MSAA
+	// RGBA8 if eglChooseConfig denies it (e.g. driver doesn't support
+	// multisampled default FBOs on the surfaceless path).
+	EGLint rgba8_msaa_attrs[] = {
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+		EGL_RED_SIZE, 8,
+		EGL_GREEN_SIZE, 8,
+		EGL_BLUE_SIZE, 8,
+		EGL_ALPHA_SIZE, 8,
+		EGL_SAMPLE_BUFFERS, 1,
+		EGL_SAMPLES, 4,
+		EGL_NONE,
+	};
 	EGLint rgba8_attrs[] = {
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 		EGL_RED_SIZE, 8,
@@ -2019,10 +2085,20 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "step 4: calling eglChooseConfig(surfaceless)");
 	EGLint config_count = 0;
-	const char *config_profile = "RGBA8 ES2";
-	bool config_ok = eglChooseConfig(backend->display, rgba8_attrs,
+	const char *config_profile = "RGBA8 ES2 4xMSAA";
+	bool config_ok = eglChooseConfig(backend->display, rgba8_msaa_attrs,
 									 &backend->config, 1, &config_count);
 	EGLint config_error = eglGetError();
+	if (config_ok && config_count > 0) {
+		backend->egl_msaa_enabled = true;
+	} else {
+		backend->egl_msaa_enabled = false;
+		config_count = 0;
+		config_profile = "RGBA8 ES2";
+		config_ok = eglChooseConfig(backend->display, rgba8_attrs,
+									&backend->config, 1, &config_count);
+		config_error = eglGetError();
+	}
 	if (!config_ok || config_count == 0) {
 		config_count = 0;
 		config_profile = "any ES2";
@@ -2320,6 +2396,163 @@ bool nx_webgl_egl_probe_step(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 			backend->fn_vertex_attrib_i_pointer && backend->fn_uniform1ui &&
 			backend->fn_draw_buffers && backend->fn_tex_image_3d &&
 			backend->fn_tex_storage_2d && backend->fn_bind_buffer_base;
+
+		// 2026-06-24 extension audit wave 1 — probe per-extension presence
+		// in the gl_extensions string captured above, and resolve the
+		// entry points each one adds. NULL function pointers + false flag
+		// = silently skip the advertise in nx_webgl_get_supported_extensions.
+		// Token-presence convention: substring match on the GL_* name.
+		{
+			const char *exts = backend->gl_extensions;
+			#define EXT_HAS(name) (exts && strstr(exts, name) != NULL)
+
+			backend->has_anisotropic = EXT_HAS("GL_EXT_texture_filter_anisotropic");
+			backend->has_clip_control = EXT_HAS("GL_EXT_clip_control");
+			backend->has_depth_clamp = EXT_HAS("GL_EXT_depth_clamp");
+			backend->has_polygon_offset_clamp = EXT_HAS("GL_EXT_polygon_offset_clamp");
+			backend->has_texture_compression_bptc = EXT_HAS("GL_EXT_texture_compression_bptc");
+			backend->has_texture_compression_rgtc = EXT_HAS("GL_EXT_texture_compression_rgtc");
+			// WEBGL_compressed_texture_s3tc needs DXT1 + DXT3 + DXT5 simultaneously.
+			// The Tegra/Mesa driver advertises DXT1 via GL_EXT_texture_compression_dxt1
+			// or GL_EXT_texture_compression_s3tc (covers all four), and DXT3/5 via
+			// the ANGLE-suffixed aliases. Accept any combination that covers all four.
+			backend->has_texture_compression_s3tc =
+				EXT_HAS("GL_EXT_texture_compression_s3tc") ||
+				(EXT_HAS("GL_EXT_texture_compression_dxt1") &&
+				 EXT_HAS("GL_ANGLE_texture_compression_dxt3") &&
+				 EXT_HAS("GL_ANGLE_texture_compression_dxt5"));
+			backend->has_texture_compression_s3tc_srgb =
+				EXT_HAS("GL_EXT_texture_compression_s3tc_srgb") ||
+				EXT_HAS("GL_NV_sRGB_formats");
+			backend->has_texture_norm16 = EXT_HAS("GL_EXT_texture_norm16");
+			backend->has_clip_cull_distance =
+				EXT_HAS("GL_EXT_clip_cull_distance") ||
+				EXT_HAS("GL_APPLE_clip_distance") ||
+				EXT_HAS("GL_ANGLE_clip_cull_distance");
+			backend->has_float_blend = EXT_HAS("GL_EXT_float_blend");
+			backend->has_render_snorm = EXT_HAS("GL_EXT_render_snorm");
+			backend->has_sample_variables =
+				EXT_HAS("GL_OES_sample_variables") ||
+				EXT_HAS("GL_EXT_sample_variables");
+			backend->has_shader_multisample_interpolation =
+				EXT_HAS("GL_OES_shader_multisample_interpolation") ||
+				EXT_HAS("GL_EXT_shader_multisample_interpolation");
+			backend->has_parallel_shader_compile = EXT_HAS("GL_KHR_parallel_shader_compile");
+			backend->has_multi_draw =
+				EXT_HAS("GL_EXT_multi_draw_arrays") ||
+				EXT_HAS("GL_ANGLE_multi_draw");
+			backend->has_draw_buffers_indexed =
+				EXT_HAS("GL_OES_draw_buffers_indexed") ||
+				EXT_HAS("GL_EXT_draw_buffers_indexed");
+			backend->has_blend_func_extended = EXT_HAS("GL_EXT_blend_func_extended");
+		// Wave 2 compressed-texture probes.
+		backend->has_texture_compression_etc1 =
+			EXT_HAS("GL_OES_compressed_ETC1_RGB8_texture") ||
+			EXT_HAS("GL_EXT_compressed_ETC1_RGB8_sub_texture");
+		// ETC2/EAC is ES3 core — present on any GLES 3+ context. The
+		// extension token GL_ARB_ES3_compatibility isn't usually in the
+		// GLES string; instead we infer from successful WebGL 2 setup.
+		// `webgl2_present` is set just above in this block.
+		backend->has_texture_compression_etc = backend->webgl2_present;
+		backend->has_texture_compression_astc =
+			EXT_HAS("GL_KHR_texture_compression_astc_ldr") ||
+			EXT_HAS("GL_OES_texture_compression_astc");
+		backend->has_disjoint_timer_query =
+			EXT_HAS("GL_EXT_disjoint_timer_query");
+		backend->fn_query_counter_ext =
+			(void *)eglGetProcAddress("glQueryCounterEXT");
+		if (!backend->fn_query_counter_ext)
+			backend->fn_query_counter_ext =
+				(void *)eglGetProcAddress("glQueryCounter");
+
+			// Resolve entry points. eglGetProcAddress returns NULL for tokens
+			// the driver doesn't have, so we don't even need to gate by the
+			// has_ flag here — the flag gates the advertise side.
+			backend->fn_clip_control = (void *)eglGetProcAddress("glClipControl");
+			if (!backend->fn_clip_control)
+				backend->fn_clip_control = (void *)eglGetProcAddress("glClipControlEXT");
+			backend->fn_polygon_offset_clamp_ext =
+				(void *)eglGetProcAddress("glPolygonOffsetClampEXT");
+			if (!backend->fn_polygon_offset_clamp_ext)
+				backend->fn_polygon_offset_clamp_ext =
+					(void *)eglGetProcAddress("glPolygonOffsetClamp");
+			backend->fn_max_shader_compiler_threads_khr =
+				(void *)eglGetProcAddress("glMaxShaderCompilerThreadsKHR");
+			if (!backend->fn_max_shader_compiler_threads_khr)
+				backend->fn_max_shader_compiler_threads_khr =
+					(void *)eglGetProcAddress("glMaxShaderCompilerThreadsARB");
+			backend->fn_multi_draw_arrays_ext =
+				(void *)eglGetProcAddress("glMultiDrawArraysEXT");
+			if (!backend->fn_multi_draw_arrays_ext)
+				backend->fn_multi_draw_arrays_ext =
+					(void *)eglGetProcAddress("glMultiDrawArrays");
+			if (!backend->fn_multi_draw_arrays_ext)
+				backend->fn_multi_draw_arrays_ext =
+					(void *)eglGetProcAddress("glMultiDrawArraysANGLE");
+			backend->fn_multi_draw_elements_ext =
+				(void *)eglGetProcAddress("glMultiDrawElementsEXT");
+			if (!backend->fn_multi_draw_elements_ext)
+				backend->fn_multi_draw_elements_ext =
+					(void *)eglGetProcAddress("glMultiDrawElements");
+			if (!backend->fn_multi_draw_elements_ext)
+				backend->fn_multi_draw_elements_ext =
+					(void *)eglGetProcAddress("glMultiDrawElementsANGLE");
+			backend->fn_multi_draw_arrays_instanced_base_instance =
+				(void *)eglGetProcAddress("glMultiDrawArraysInstancedBaseInstanceEXT");
+			backend->fn_multi_draw_elements_instanced_base_vertex_base_instance =
+				(void *)eglGetProcAddress("glMultiDrawElementsInstancedBaseVertexBaseInstanceEXT");
+			backend->fn_enablei_ext = (void *)eglGetProcAddress("glEnableiEXT");
+			if (!backend->fn_enablei_ext)
+				backend->fn_enablei_ext = (void *)eglGetProcAddress("glEnableiOES");
+			if (!backend->fn_enablei_ext)
+				backend->fn_enablei_ext = (void *)eglGetProcAddress("glEnablei");
+			backend->fn_disablei_ext = (void *)eglGetProcAddress("glDisableiEXT");
+			if (!backend->fn_disablei_ext)
+				backend->fn_disablei_ext = (void *)eglGetProcAddress("glDisableiOES");
+			if (!backend->fn_disablei_ext)
+				backend->fn_disablei_ext = (void *)eglGetProcAddress("glDisablei");
+			backend->fn_blend_equationi_ext = (void *)eglGetProcAddress("glBlendEquationiEXT");
+			if (!backend->fn_blend_equationi_ext)
+				backend->fn_blend_equationi_ext = (void *)eglGetProcAddress("glBlendEquationiOES");
+			if (!backend->fn_blend_equationi_ext)
+				backend->fn_blend_equationi_ext = (void *)eglGetProcAddress("glBlendEquationi");
+			backend->fn_blend_equation_separatei_ext =
+				(void *)eglGetProcAddress("glBlendEquationSeparateiEXT");
+			if (!backend->fn_blend_equation_separatei_ext)
+				backend->fn_blend_equation_separatei_ext =
+					(void *)eglGetProcAddress("glBlendEquationSeparateiOES");
+			if (!backend->fn_blend_equation_separatei_ext)
+				backend->fn_blend_equation_separatei_ext =
+					(void *)eglGetProcAddress("glBlendEquationSeparatei");
+			backend->fn_blend_funci_ext = (void *)eglGetProcAddress("glBlendFunciEXT");
+			if (!backend->fn_blend_funci_ext)
+				backend->fn_blend_funci_ext = (void *)eglGetProcAddress("glBlendFunciOES");
+			if (!backend->fn_blend_funci_ext)
+				backend->fn_blend_funci_ext = (void *)eglGetProcAddress("glBlendFunci");
+			backend->fn_blend_func_separatei_ext =
+				(void *)eglGetProcAddress("glBlendFuncSeparateiEXT");
+			if (!backend->fn_blend_func_separatei_ext)
+				backend->fn_blend_func_separatei_ext =
+					(void *)eglGetProcAddress("glBlendFuncSeparateiOES");
+			if (!backend->fn_blend_func_separatei_ext)
+				backend->fn_blend_func_separatei_ext =
+					(void *)eglGetProcAddress("glBlendFuncSeparatei");
+			backend->fn_bind_frag_data_location_ext =
+				(void *)eglGetProcAddress("glBindFragDataLocationEXT");
+			backend->fn_bind_frag_data_location_indexed_ext =
+				(void *)eglGetProcAddress("glBindFragDataLocationIndexedEXT");
+			backend->fn_get_frag_data_index_ext =
+				(void *)eglGetProcAddress("glGetFragDataIndexEXT");
+			// Core compressed-tex calls — already available in GLES 2, but the
+			// existing bridge code only wired the 3D variants. Resolving here
+			// gives the 2D path (used by all of s3tc / bptc / rgtc).
+			backend->fn_compressed_tex_image_2d =
+				(void *)eglGetProcAddress("glCompressedTexImage2D");
+			backend->fn_compressed_tex_sub_image_2d =
+				(void *)eglGetProcAddress("glCompressedTexSubImage2D");
+
+			#undef EXT_HAS
+		}
 	}
 
 	backend->available = true;
@@ -9396,5 +9629,427 @@ int nx_webgl_egl_get_max_texture_lod_bias(nx_webgl_egl_t *backend) {
 	return webgl2_get_int(backend, GL_MAX_TEXTURE_LOD_BIAS);
 #else
 	(void)backend; return 0;
+#endif
+}
+
+// ============================================================================
+// 2026-06-24 extension audit wave 1 — accessors + dispatch shims
+// ============================================================================
+
+// Generic int getter for limits queried through ES core glGetIntegerv that
+// the bridge previously hardcoded. Mirrors webgl2_get_int but uses
+// surfaceless makeCurrent so it works on both WebGL 1 and 2 contexts (ES
+// core pnames are valid on both, GLES makes no distinction). Returns 0 if
+// the backend isn't built.
+static int egl_get_int_core(nx_webgl_egl_t *backend, GLenum pname) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend) return 0;
+	// Reuse webgl2_make_current; it's just an eglMakeCurrent on the EGL
+	// backend's surfaceless config, valid for any ES version.
+	if (!webgl2_make_current(backend)) return 0;
+	GLint v = 0;
+	glGetIntegerv(pname, &v);
+	if (glGetError() != GL_NO_ERROR) return 0;
+	return (int)v;
+#else
+	(void)backend; (void)pname; return 0;
+#endif
+}
+
+int nx_webgl_egl_get_max_vertex_attribs_native(nx_webgl_egl_t *backend) {
+	return egl_get_int_core(backend, 0x8869 /* GL_MAX_VERTEX_ATTRIBS */);
+}
+int nx_webgl_egl_get_max_texture_image_units_native(nx_webgl_egl_t *backend) {
+	return egl_get_int_core(backend, 0x8872 /* GL_MAX_TEXTURE_IMAGE_UNITS */);
+}
+int nx_webgl_egl_get_max_combined_texture_image_units_native(nx_webgl_egl_t *backend) {
+	return egl_get_int_core(backend, 0x8B4D /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */);
+}
+int nx_webgl_egl_get_max_combined_vertex_uniform_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, 0x8A31 /* GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS */);
+#else
+	(void)backend; return 0;
+#endif
+}
+int nx_webgl_egl_get_max_combined_fragment_uniform_components(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return webgl2_get_int(backend, 0x8A33 /* GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS */);
+#else
+	(void)backend; return 0;
+#endif
+}
+
+float nx_webgl_egl_get_max_anisotropy(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->has_anisotropic) return 0.0f;
+	if (!webgl2_make_current(backend)) return 0.0f;
+	GLfloat v = 0.0f;
+	glGetFloatv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT */, &v);
+	if (glGetError() != GL_NO_ERROR) return 0.0f;
+	return (float)v;
+#else
+	(void)backend; return 0.0f;
+#endif
+}
+
+void nx_webgl_egl_get_aliased_line_width_range_native(nx_webgl_egl_t *backend,
+                                                       float out[2]) {
+	out[0] = 1.0f; out[1] = 1.0f;
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !webgl2_make_current(backend)) return;
+	GLfloat vals[2] = {1.0f, 1.0f};
+	glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, vals);
+	if (glGetError() == GL_NO_ERROR && vals[1] >= vals[0] && vals[1] >= 1.0f) {
+		out[0] = (float)vals[0];
+		out[1] = (float)vals[1];
+	}
+#endif
+}
+
+bool nx_webgl_egl_get_msaa_enabled(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->egl_msaa_enabled;
+#else
+	(void)backend; return false;
+#endif
+}
+
+// Per-extension presence accessors (driven by the probe at step 8).
+#define NX_HAS_GETTER(field) \
+	bool nx_webgl_egl_##field(nx_webgl_egl_t *backend) { \
+		return backend && backend->field; \
+	}
+NX_HAS_GETTER(has_anisotropic)
+NX_HAS_GETTER(has_clip_control)
+NX_HAS_GETTER(has_depth_clamp)
+NX_HAS_GETTER(has_polygon_offset_clamp)
+NX_HAS_GETTER(has_texture_compression_bptc)
+NX_HAS_GETTER(has_texture_compression_rgtc)
+NX_HAS_GETTER(has_texture_compression_s3tc)
+NX_HAS_GETTER(has_texture_compression_s3tc_srgb)
+NX_HAS_GETTER(has_texture_norm16)
+NX_HAS_GETTER(has_clip_cull_distance)
+NX_HAS_GETTER(has_float_blend)
+NX_HAS_GETTER(has_render_snorm)
+NX_HAS_GETTER(has_sample_variables)
+NX_HAS_GETTER(has_shader_multisample_interpolation)
+NX_HAS_GETTER(has_parallel_shader_compile)
+NX_HAS_GETTER(has_multi_draw)
+NX_HAS_GETTER(has_draw_buffers_indexed)
+NX_HAS_GETTER(has_blend_func_extended)
+NX_HAS_GETTER(has_texture_compression_etc1)
+NX_HAS_GETTER(has_texture_compression_etc)
+NX_HAS_GETTER(has_texture_compression_astc)
+NX_HAS_GETTER(has_disjoint_timer_query)
+#undef NX_HAS_GETTER
+
+// EXT_disjoint_timer_query_webgl2 — record a GPU timestamp into the
+// query's storage. Caller has already created the query via createQuery
+// + has the handle. Target must be TIMESTAMP_EXT (0x8E28).
+bool nx_webgl_egl_query_counter_ext(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t target) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_query_counter_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLenum);
+	((pfn_t)backend->fn_query_counter_ext)((GLuint)handle, (GLenum)target);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)handle; (void)target; return false;
+#endif
+}
+
+// GPU_DISJOINT_EXT — probe whether a disjoint operation (context loss,
+// thermal throttle, eviction) happened since the last query. Reading the
+// pname clears the flag. On Mesa Nouveau this typically returns false
+// (no disjoint events on a stable surfaceless context).
+bool nx_webgl_egl_get_gpu_disjoint(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->has_disjoint_timer_query) return false;
+	if (!webgl2_make_current(backend)) return false;
+	GLint v = 0;
+	glGetIntegerv(0x8FBB /* GPU_DISJOINT_EXT */, &v);
+	// glGetError may flag INVALID_ENUM on drivers that don't accept the
+	// pname despite advertising the extension — swallow it.
+	(void)glGetError();
+	return v != 0;
+#else
+	(void)backend; return false;
+#endif
+}
+
+// EXT_clip_control dispatch.
+bool nx_webgl_egl_clip_control(nx_webgl_egl_t *backend, uint32_t origin,
+                                uint32_t depth) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_clip_control) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, GLenum);
+	((pfn_t)backend->fn_clip_control)((GLenum)origin, (GLenum)depth);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)origin; (void)depth; return false;
+#endif
+}
+
+// EXT_polygon_offset_clamp dispatch.
+bool nx_webgl_egl_polygon_offset_clamp(nx_webgl_egl_t *backend, float factor,
+                                        float units, float clamp) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_polygon_offset_clamp_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLfloat, GLfloat, GLfloat);
+	((pfn_t)backend->fn_polygon_offset_clamp_ext)((GLfloat)factor, (GLfloat)units,
+	                                                (GLfloat)clamp);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)factor; (void)units; (void)clamp; return false;
+#endif
+}
+
+// KHR_parallel_shader_compile dispatch.
+bool nx_webgl_egl_max_shader_compiler_threads_khr(nx_webgl_egl_t *backend,
+                                                    uint32_t count) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_max_shader_compiler_threads_khr) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint);
+	((pfn_t)backend->fn_max_shader_compiler_threads_khr)((GLuint)count);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)count; return false;
+#endif
+}
+
+// WEBGL_multi_draw dispatch (EXT_multi_draw_arrays).
+bool nx_webgl_egl_multi_draw_arrays(nx_webgl_egl_t *backend, uint32_t mode,
+                                     const int *firsts, const int *counts,
+                                     int drawcount) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_multi_draw_arrays_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, const GLint *, const GLsizei *, GLsizei);
+	((pfn_t)backend->fn_multi_draw_arrays_ext)((GLenum)mode, (const GLint *)firsts,
+	                                            (const GLsizei *)counts,
+	                                            (GLsizei)drawcount);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)mode; (void)firsts; (void)counts; (void)drawcount;
+	return false;
+#endif
+}
+
+bool nx_webgl_egl_multi_draw_elements(nx_webgl_egl_t *backend, uint32_t mode,
+                                       const int *counts, uint32_t type,
+                                       const int *offsets_bytes, int drawcount) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_multi_draw_elements_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	// EXT_multi_draw_arrays uses const void *const *indices; we synthesize a
+	// pointer array from byte-offsets so JS callers can pass element-buffer
+	// offsets the WebGL way (drawElements semantics).
+	const void *ptrs_stack[32];
+	const void **ptrs = ptrs_stack;
+	const void **ptrs_heap = NULL;
+	if (drawcount > 32) {
+		ptrs_heap = (const void **)malloc(sizeof(void *) * (size_t)drawcount);
+		if (!ptrs_heap) return false;
+		ptrs = ptrs_heap;
+	}
+	for (int i = 0; i < drawcount; i++) {
+		ptrs[i] = (const void *)(uintptr_t)offsets_bytes[i];
+	}
+	typedef void (*pfn_t)(GLenum, const GLsizei *, GLenum, const void *const *,
+	                       GLsizei);
+	((pfn_t)backend->fn_multi_draw_elements_ext)((GLenum)mode,
+	                                              (const GLsizei *)counts,
+	                                              (GLenum)type, ptrs,
+	                                              (GLsizei)drawcount);
+	bool ok = glGetError() == GL_NO_ERROR;
+	if (ptrs_heap) free(ptrs_heap);
+	return ok;
+#else
+	(void)backend; (void)mode; (void)counts; (void)type;
+	(void)offsets_bytes; (void)drawcount;
+	return false;
+#endif
+}
+
+// OES_draw_buffers_indexed dispatch.
+bool nx_webgl_egl_enablei(nx_webgl_egl_t *backend, uint32_t target,
+                           uint32_t index) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_enablei_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, GLuint);
+	((pfn_t)backend->fn_enablei_ext)((GLenum)target, (GLuint)index);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)index; return false;
+#endif
+}
+bool nx_webgl_egl_disablei(nx_webgl_egl_t *backend, uint32_t target,
+                            uint32_t index) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_disablei_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, GLuint);
+	((pfn_t)backend->fn_disablei_ext)((GLenum)target, (GLuint)index);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)index; return false;
+#endif
+}
+bool nx_webgl_egl_blend_equationi(nx_webgl_egl_t *backend, uint32_t buf,
+                                    uint32_t mode) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_blend_equationi_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLenum);
+	((pfn_t)backend->fn_blend_equationi_ext)((GLuint)buf, (GLenum)mode);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)buf; (void)mode; return false;
+#endif
+}
+bool nx_webgl_egl_blend_equation_separatei(nx_webgl_egl_t *backend,
+                                             uint32_t buf, uint32_t modeRGB,
+                                             uint32_t modeAlpha) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_blend_equation_separatei_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLenum, GLenum);
+	((pfn_t)backend->fn_blend_equation_separatei_ext)((GLuint)buf, (GLenum)modeRGB,
+	                                                    (GLenum)modeAlpha);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)buf; (void)modeRGB; (void)modeAlpha; return false;
+#endif
+}
+bool nx_webgl_egl_blend_funci(nx_webgl_egl_t *backend, uint32_t buf,
+                                uint32_t src, uint32_t dst) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_blend_funci_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLenum, GLenum);
+	((pfn_t)backend->fn_blend_funci_ext)((GLuint)buf, (GLenum)src, (GLenum)dst);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)buf; (void)src; (void)dst; return false;
+#endif
+}
+bool nx_webgl_egl_blend_func_separatei(nx_webgl_egl_t *backend, uint32_t buf,
+                                         uint32_t srcRGB, uint32_t dstRGB,
+                                         uint32_t srcAlpha, uint32_t dstAlpha) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_blend_func_separatei_ext) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLenum, GLenum, GLenum, GLenum);
+	((pfn_t)backend->fn_blend_func_separatei_ext)(
+		(GLuint)buf, (GLenum)srcRGB, (GLenum)dstRGB,
+		(GLenum)srcAlpha, (GLenum)dstAlpha);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)buf; (void)srcRGB; (void)dstRGB;
+	(void)srcAlpha; (void)dstAlpha; return false;
+#endif
+}
+
+// WEBGL_blend_func_extended dispatch.
+bool nx_webgl_egl_bind_frag_data_location(nx_webgl_egl_t *backend,
+                                            uint32_t program, uint32_t color,
+                                            const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_bind_frag_data_location_ext || !name) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLuint, const GLchar *);
+	((pfn_t)backend->fn_bind_frag_data_location_ext)((GLuint)program, (GLuint)color,
+	                                                   (const GLchar *)name);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program; (void)color; (void)name; return false;
+#endif
+}
+bool nx_webgl_egl_bind_frag_data_location_indexed(nx_webgl_egl_t *backend,
+                                                    uint32_t program,
+                                                    uint32_t color,
+                                                    uint32_t index,
+                                                    const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_bind_frag_data_location_indexed_ext || !name)
+		return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLuint, GLuint, GLuint, const GLchar *);
+	((pfn_t)backend->fn_bind_frag_data_location_indexed_ext)(
+		(GLuint)program, (GLuint)color, (GLuint)index, (const GLchar *)name);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)program; (void)color; (void)index; (void)name;
+	return false;
+#endif
+}
+int nx_webgl_egl_get_frag_data_index(nx_webgl_egl_t *backend, uint32_t program,
+                                       const char *name) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_get_frag_data_index_ext || !name) return -1;
+	if (!webgl2_make_current(backend)) return -1;
+	typedef GLint (*pfn_t)(GLuint, const GLchar *);
+	GLint idx = ((pfn_t)backend->fn_get_frag_data_index_ext)((GLuint)program,
+	                                                          (const GLchar *)name);
+	if (glGetError() != GL_NO_ERROR) return -1;
+	return (int)idx;
+#else
+	(void)backend; (void)program; (void)name; return -1;
+#endif
+}
+
+// Compressed texture 2D dispatch — wires up s3tc / s3tc_srgb / bptc / rgtc
+// uploads to the native driver. The bridge previously only had 3D variants
+// (compressedTexImage3D / SubImage3D) — the 2D path was a logging stub.
+bool nx_webgl_egl_compressed_tex_image_2d(nx_webgl_egl_t *backend,
+                                            uint32_t target, int level,
+                                            uint32_t internalformat,
+                                            int width, int height, int border,
+                                            size_t image_size,
+                                            const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_compressed_tex_image_2d) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint,
+	                       GLsizei, const void *);
+	((pfn_t)backend->fn_compressed_tex_image_2d)((GLenum)target, level,
+	                                               (GLenum)internalformat,
+	                                               width, height, border,
+	                                               (GLsizei)image_size, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)internalformat;
+	(void)width; (void)height; (void)border; (void)image_size; (void)data;
+	return false;
+#endif
+}
+bool nx_webgl_egl_compressed_tex_sub_image_2d(nx_webgl_egl_t *backend,
+                                                uint32_t target, int level,
+                                                int xoff, int yoff,
+                                                int width, int height,
+                                                uint32_t format,
+                                                size_t image_size,
+                                                const void *data) {
+#if NXJS_HAS_EGL_GLES
+	if (!backend || !backend->fn_compressed_tex_sub_image_2d) return false;
+	if (!webgl2_make_current(backend)) return false;
+	typedef void (*pfn_t)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum,
+	                       GLsizei, const void *);
+	((pfn_t)backend->fn_compressed_tex_sub_image_2d)((GLenum)target, level,
+	                                                    xoff, yoff,
+	                                                    width, height,
+	                                                    (GLenum)format,
+	                                                    (GLsizei)image_size, data);
+	return glGetError() == GL_NO_ERROR;
+#else
+	(void)backend; (void)target; (void)level; (void)xoff; (void)yoff;
+	(void)width; (void)height; (void)format; (void)image_size; (void)data;
+	return false;
 #endif
 }

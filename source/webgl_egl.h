@@ -810,3 +810,92 @@ int nx_webgl_egl_get_max_fragment_uniform_components(nx_webgl_egl_t *backend);
 int nx_webgl_egl_get_max_vertex_output_components(nx_webgl_egl_t *backend);
 int nx_webgl_egl_get_max_fragment_input_components(nx_webgl_egl_t *backend);
 int nx_webgl_egl_get_max_texture_lod_bias(nx_webgl_egl_t *backend);
+
+// 2026-06-24 extension audit wave 1.
+int nx_webgl_egl_get_max_vertex_attribs_native(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_texture_image_units_native(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_combined_texture_image_units_native(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_combined_vertex_uniform_components(nx_webgl_egl_t *backend);
+int nx_webgl_egl_get_max_combined_fragment_uniform_components(nx_webgl_egl_t *backend);
+float nx_webgl_egl_get_max_anisotropy(nx_webgl_egl_t *backend);
+void nx_webgl_egl_get_aliased_line_width_range_native(nx_webgl_egl_t *backend,
+                                                       float out[2]);
+bool nx_webgl_egl_get_msaa_enabled(nx_webgl_egl_t *backend);
+
+// Per-extension presence accessors (probed at backend init from gl_extensions).
+bool nx_webgl_egl_has_anisotropic(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_clip_control(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_depth_clamp(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_polygon_offset_clamp(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_bptc(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_rgtc(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_s3tc(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_s3tc_srgb(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_norm16(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_clip_cull_distance(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_float_blend(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_render_snorm(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_sample_variables(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_shader_multisample_interpolation(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_parallel_shader_compile(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_multi_draw(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_draw_buffers_indexed(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_blend_func_extended(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_etc1(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_etc(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_texture_compression_astc(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_has_disjoint_timer_query(nx_webgl_egl_t *backend);
+bool nx_webgl_egl_query_counter_ext(nx_webgl_egl_t *backend, uint32_t handle,
+                                      uint32_t target);
+bool nx_webgl_egl_get_gpu_disjoint(nx_webgl_egl_t *backend);
+
+// Dispatch shims for the new extensions.
+bool nx_webgl_egl_clip_control(nx_webgl_egl_t *backend, uint32_t origin,
+                                uint32_t depth);
+bool nx_webgl_egl_polygon_offset_clamp(nx_webgl_egl_t *backend, float factor,
+                                        float units, float clamp);
+bool nx_webgl_egl_max_shader_compiler_threads_khr(nx_webgl_egl_t *backend,
+                                                    uint32_t count);
+bool nx_webgl_egl_multi_draw_arrays(nx_webgl_egl_t *backend, uint32_t mode,
+                                     const int *firsts, const int *counts,
+                                     int drawcount);
+bool nx_webgl_egl_multi_draw_elements(nx_webgl_egl_t *backend, uint32_t mode,
+                                       const int *counts, uint32_t type,
+                                       const int *offsets_bytes, int drawcount);
+bool nx_webgl_egl_enablei(nx_webgl_egl_t *backend, uint32_t target,
+                           uint32_t index);
+bool nx_webgl_egl_disablei(nx_webgl_egl_t *backend, uint32_t target,
+                            uint32_t index);
+bool nx_webgl_egl_blend_equationi(nx_webgl_egl_t *backend, uint32_t buf,
+                                    uint32_t mode);
+bool nx_webgl_egl_blend_equation_separatei(nx_webgl_egl_t *backend,
+                                             uint32_t buf, uint32_t modeRGB,
+                                             uint32_t modeAlpha);
+bool nx_webgl_egl_blend_funci(nx_webgl_egl_t *backend, uint32_t buf,
+                                uint32_t src, uint32_t dst);
+bool nx_webgl_egl_blend_func_separatei(nx_webgl_egl_t *backend, uint32_t buf,
+                                         uint32_t srcRGB, uint32_t dstRGB,
+                                         uint32_t srcAlpha, uint32_t dstAlpha);
+bool nx_webgl_egl_bind_frag_data_location(nx_webgl_egl_t *backend,
+                                            uint32_t program, uint32_t color,
+                                            const char *name);
+bool nx_webgl_egl_bind_frag_data_location_indexed(nx_webgl_egl_t *backend,
+                                                    uint32_t program,
+                                                    uint32_t color,
+                                                    uint32_t index,
+                                                    const char *name);
+int nx_webgl_egl_get_frag_data_index(nx_webgl_egl_t *backend, uint32_t program,
+                                       const char *name);
+bool nx_webgl_egl_compressed_tex_image_2d(nx_webgl_egl_t *backend,
+                                            uint32_t target, int level,
+                                            uint32_t internalformat,
+                                            int width, int height, int border,
+                                            size_t image_size,
+                                            const void *data);
+bool nx_webgl_egl_compressed_tex_sub_image_2d(nx_webgl_egl_t *backend,
+                                                uint32_t target, int level,
+                                                int xoff, int yoff,
+                                                int width, int height,
+                                                uint32_t format,
+                                                size_t image_size,
+                                                const void *data);

@@ -1426,8 +1426,13 @@ static JSValue nx_webgl_get_context_attributes(JSContext *ctx,
 							  JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, obj, "stencil", JS_NewBool(ctx, false),
 							  JS_PROP_C_W_E);
-	JS_DefinePropertyValueStr(ctx, obj, "antialias", JS_NewBool(ctx, false),
-							  JS_PROP_C_W_E);
+	// 2026-06-24 audit: surface the real EGL MSAA state. true iff
+	// eglChooseConfig granted a 4x-multisample config at backend init.
+	{
+		bool msaa = context->egl && nx_webgl_egl_get_msaa_enabled(context->egl);
+		JS_DefinePropertyValueStr(ctx, obj, "antialias", JS_NewBool(ctx, msaa),
+								  JS_PROP_C_W_E);
+	}
 	JS_DefinePropertyValueStr(ctx, obj, "premultipliedAlpha",
 							  JS_NewBool(ctx, true), JS_PROP_C_W_E);
 	JS_DefinePropertyValueStr(ctx, obj, "preserveDrawingBuffer",
@@ -1507,6 +1512,133 @@ static JSValue nx_webgl_get_supported_extensions(JSContext *ctx,
 	// `"nx.js"` brand.
 	JS_DefinePropertyValueUint32(ctx, arr, idx++,
 		JS_NewString(ctx, "WEBGL_debug_renderer_info"), JS_PROP_C_W_E);
+
+	// Always-on stubs — no native driver dependency. WEBGL_lose_context's
+	// loseContext/restoreContext are bridge no-ops; isContextLost returns
+	// false. WEBGL_debug_shaders.getTranslatedShaderSource returns the
+	// original source verbatim (the bridge doesn't translate). Engines
+	// feature-check these for cleanup / debug-source paths.
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "WEBGL_lose_context"), JS_PROP_C_W_E);
+	JS_DefinePropertyValueUint32(ctx, arr, idx++,
+		JS_NewString(ctx, "WEBGL_debug_shaders"), JS_PROP_C_W_E);
+
+	// 2026-06-24 extension audit wave 1. Each name gated on the
+	// corresponding has_* flag set at backend init from the native
+	// gl_extensions string. WebGL 1 contexts don't have an EGL backend
+	// (they run on the bridge's CPU framebuffer skeleton) — the helpers
+	// return false for has_*, so nothing in this block advertises on v1.
+	if (context->egl) {
+		// EXT_clip_control — clipControlEXT + 4 constants.
+		if (nx_webgl_egl_has_clip_control(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_clip_control"), JS_PROP_C_W_E);
+		}
+		// EXT_depth_clamp — 1 constant, use via gl.enable().
+		if (nx_webgl_egl_has_depth_clamp(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_depth_clamp"), JS_PROP_C_W_E);
+		}
+		// EXT_polygon_offset_clamp — polygonOffsetClampEXT method.
+		if (nx_webgl_egl_has_polygon_offset_clamp(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_polygon_offset_clamp"), JS_PROP_C_W_E);
+		}
+		// EXT_texture_filter_anisotropic — 2 constants, plumb through
+		// texParameter[if] + getParameter.
+		if (nx_webgl_egl_has_anisotropic(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_texture_filter_anisotropic"), JS_PROP_C_W_E);
+		}
+		// Compressed texture families — driver advertises GL_EXT_texture_compression_*
+		// + DXT/ANGLE aliases. Bridge wires compressedTexImage2D / SubImage2D to native.
+		if (nx_webgl_egl_has_texture_compression_bptc(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_texture_compression_bptc"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_texture_compression_rgtc(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_texture_compression_rgtc"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_texture_compression_s3tc(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_compressed_texture_s3tc"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_texture_compression_s3tc_srgb(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_compressed_texture_s3tc_srgb"), JS_PROP_C_W_E);
+		}
+		// EXT_texture_norm16 — 8 sized-internal-format constants.
+		if (nx_webgl_egl_has_texture_norm16(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_texture_norm16"), JS_PROP_C_W_E);
+		}
+		// WEBGL_clip_cull_distance — 8 constants, GLSL-side feature.
+		if (nx_webgl_egl_has_clip_cull_distance(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_clip_cull_distance"), JS_PROP_C_W_E);
+		}
+		// Pure feature-flag stubs (page checks getExtension !== null only).
+		if (nx_webgl_egl_has_float_blend(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_float_blend"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_render_snorm(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_render_snorm"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_sample_variables(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_sample_variables"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_shader_multisample_interpolation(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_shader_multisample_interpolation"), JS_PROP_C_W_E);
+		}
+		// KHR_parallel_shader_compile — method + COMPLETION_STATUS_KHR pname.
+		if (nx_webgl_egl_has_parallel_shader_compile(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "KHR_parallel_shader_compile"), JS_PROP_C_W_E);
+		}
+		// WEBGL_multi_draw — 4 methods for batched draws.
+		if (nx_webgl_egl_has_multi_draw(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_multi_draw"), JS_PROP_C_W_E);
+		}
+		// OES_draw_buffers_indexed — 6 per-attachment blend-state methods.
+		if (nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "OES_draw_buffers_indexed"), JS_PROP_C_W_E);
+		}
+		// WEBGL_blend_func_extended — dual-source blending.
+		if (nx_webgl_egl_has_blend_func_extended(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_blend_func_extended"), JS_PROP_C_W_E);
+		}
+		// Wave 2 compressed-texture trifecta. compressedTexImage2D /
+		// SubImage2D dispatch was wired in wave 1, so these just add
+		// internalformat constants the page passes to those calls.
+		if (nx_webgl_egl_has_texture_compression_etc1(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_compressed_texture_etc1"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_texture_compression_etc(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_compressed_texture_etc"), JS_PROP_C_W_E);
+		}
+		if (nx_webgl_egl_has_texture_compression_astc(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "WEBGL_compressed_texture_astc"), JS_PROP_C_W_E);
+		}
+		// EXT_disjoint_timer_query_webgl2 — bridge's WebGL 2 query objects
+		// already cover the createQuery/begin/end/getQueryParameter surface;
+		// this extension adds GPU timestamp recording via queryCounterEXT
+		// plus the disjoint state pname.
+		if (nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+			JS_DefinePropertyValueUint32(ctx, arr, idx++,
+				JS_NewString(ctx, "EXT_disjoint_timer_query_webgl2"), JS_PROP_C_W_E);
+		}
+	}
 	return arr;
 }
 
@@ -1543,6 +1675,346 @@ static JSValue ext_inst_divisor_w(JSContext *ctx, JSValueConst this_val,
 								   int magic, JSValue *func_data) {
 	(void)this_val; (void)magic;
 	return nx_webgl_vertex_attrib_divisor(ctx, func_data[0], argc, argv);
+}
+
+// 2026-06-24 extension audit wave 1 — JS-callable method wrappers.
+// Each wrapper closes over the gl context (in func_data[0]) so it knows
+// which EGL backend to dispatch through. All wrappers call into the
+// nx_webgl_egl_* dispatch shims and set the gl error on failure.
+
+static nx_webgl_context_t *audit_get_ctx(JSContext *ctx, JSValueConst gl) {
+	return nx_get_webgl_context(ctx, gl);
+}
+
+// EXT_clip_control.clipControlEXT(origin, depth)
+static JSValue ext_clip_control_w(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t origin, depth;
+	if (JS_ToUint32(ctx, &origin, argv[0]) || JS_ToUint32(ctx, &depth, argv[1]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_clip_control(c->egl, origin, depth))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+
+// EXT_polygon_offset_clamp.polygonOffsetClampEXT(factor, units, clamp)
+static JSValue ext_polygon_offset_clamp_w(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv,
+                                            int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 3) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	double f, u, cl;
+	if (JS_ToFloat64(ctx, &f, argv[0]) || JS_ToFloat64(ctx, &u, argv[1]) ||
+	    JS_ToFloat64(ctx, &cl, argv[2]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_polygon_offset_clamp(c->egl, (float)f, (float)u, (float)cl))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+
+// KHR_parallel_shader_compile.maxShaderCompilerThreadsKHR(count)
+static JSValue ext_parallel_max_threads_w(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv,
+                                            int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 1) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t count;
+	if (JS_ToUint32(ctx, &count, argv[0])) return JS_EXCEPTION;
+	if (!nx_webgl_egl_max_shader_compiler_threads_khr(c->egl, count))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+
+// Helpers for WEBGL_multi_draw — extract Int32Array (or typed-array view of
+// any numeric kind) into a malloc'd int[]. drawcount items starting at
+// `view_offset_elements`. Returns NULL + sets *count_out=0 on failure.
+static int *audit_extract_int_array(JSContext *ctx, JSValueConst arr_val,
+                                     uint32_t view_offset, int drawcount) {
+	if (drawcount <= 0) return NULL;
+	int *out = (int *)malloc(sizeof(int) * (size_t)drawcount);
+	if (!out) return NULL;
+	for (int i = 0; i < drawcount; i++) {
+		JSValue item = JS_GetPropertyUint32(ctx, arr_val,
+		                                     view_offset + (uint32_t)i);
+		int32_t v = 0;
+		if (JS_ToInt32(ctx, &v, item)) {
+			JS_FreeValue(ctx, item);
+			free(out);
+			return NULL;
+		}
+		out[i] = (int)v;
+		JS_FreeValue(ctx, item);
+	}
+	return out;
+}
+
+// WEBGL_multi_draw.multiDrawArraysWEBGL(mode, firsts, firstsOffset, counts, countsOffset, drawcount)
+static JSValue ext_multi_draw_arrays_w(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv,
+                                         int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 6) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t mode, firsts_off, counts_off;
+	int32_t drawcount;
+	if (JS_ToUint32(ctx, &mode, argv[0]) ||
+	    JS_ToUint32(ctx, &firsts_off, argv[2]) ||
+	    JS_ToUint32(ctx, &counts_off, argv[4]) ||
+	    JS_ToInt32(ctx, &drawcount, argv[5]))
+		return JS_EXCEPTION;
+	int *firsts = audit_extract_int_array(ctx, argv[1], firsts_off, drawcount);
+	int *counts = audit_extract_int_array(ctx, argv[3], counts_off, drawcount);
+	if (firsts && counts) {
+		if (!nx_webgl_egl_multi_draw_arrays(c->egl, mode, firsts, counts, drawcount))
+			c->error = GL_INVALID_OPERATION;
+	} else {
+		c->error = GL_INVALID_VALUE;
+	}
+	free(firsts); free(counts);
+	return JS_UNDEFINED;
+}
+
+// WEBGL_multi_draw.multiDrawElementsWEBGL(mode, counts, countsOffset, type, offsets, offsetsOffset, drawcount)
+static JSValue ext_multi_draw_elements_w(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv,
+                                           int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 7) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t mode, counts_off, type, offsets_off;
+	int32_t drawcount;
+	if (JS_ToUint32(ctx, &mode, argv[0]) ||
+	    JS_ToUint32(ctx, &counts_off, argv[2]) ||
+	    JS_ToUint32(ctx, &type, argv[3]) ||
+	    JS_ToUint32(ctx, &offsets_off, argv[5]) ||
+	    JS_ToInt32(ctx, &drawcount, argv[6]))
+		return JS_EXCEPTION;
+	int *counts = audit_extract_int_array(ctx, argv[1], counts_off, drawcount);
+	int *offsets = audit_extract_int_array(ctx, argv[4], offsets_off, drawcount);
+	if (counts && offsets) {
+		if (!nx_webgl_egl_multi_draw_elements(c->egl, mode, counts, type,
+		                                        offsets, drawcount))
+			c->error = GL_INVALID_OPERATION;
+	} else {
+		c->error = GL_INVALID_VALUE;
+	}
+	free(counts); free(offsets);
+	return JS_UNDEFINED;
+}
+
+// OES_draw_buffers_indexed wrappers.
+static JSValue ext_enablei_w(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv,
+                               int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t target, index;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &index, argv[1]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_enablei(c->egl, target, index))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+static JSValue ext_disablei_w(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv,
+                                int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t target, index;
+	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &index, argv[1]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_disablei(c->egl, target, index))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+static JSValue ext_blend_equationi_w(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t buf, mode;
+	if (JS_ToUint32(ctx, &buf, argv[0]) || JS_ToUint32(ctx, &mode, argv[1]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_blend_equationi(c->egl, buf, mode))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+static JSValue ext_blend_equation_separatei_w(JSContext *ctx, JSValueConst this_val,
+                                                int argc, JSValueConst *argv,
+                                                int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 3) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t buf, mrgb, malpha;
+	if (JS_ToUint32(ctx, &buf, argv[0]) || JS_ToUint32(ctx, &mrgb, argv[1]) ||
+	    JS_ToUint32(ctx, &malpha, argv[2]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_blend_equation_separatei(c->egl, buf, mrgb, malpha))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+static JSValue ext_blend_funci_w(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv,
+                                   int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 3) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t buf, src, dst;
+	if (JS_ToUint32(ctx, &buf, argv[0]) || JS_ToUint32(ctx, &src, argv[1]) ||
+	    JS_ToUint32(ctx, &dst, argv[2]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_blend_funci(c->egl, buf, src, dst))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+static JSValue ext_blend_func_separatei_w(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv,
+                                            int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 5) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t buf, srgb, drgb, sa, da;
+	if (JS_ToUint32(ctx, &buf, argv[0]) || JS_ToUint32(ctx, &srgb, argv[1]) ||
+	    JS_ToUint32(ctx, &drgb, argv[2]) || JS_ToUint32(ctx, &sa, argv[3]) ||
+	    JS_ToUint32(ctx, &da, argv[4]))
+		return JS_EXCEPTION;
+	if (!nx_webgl_egl_blend_func_separatei(c->egl, buf, srgb, drgb, sa, da))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+
+// WEBGL_blend_func_extended wrappers.
+static JSValue ext_bind_frag_data_location_w(JSContext *ctx, JSValueConst this_val,
+                                               int argc, JSValueConst *argv,
+                                               int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 3) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
+	if (!prog) { c->error = GL_INVALID_VALUE; return JS_UNDEFINED; }
+	uint32_t color;
+	if (JS_ToUint32(ctx, &color, argv[1])) return JS_EXCEPTION;
+	const char *name = JS_ToCString(ctx, argv[2]);
+	if (!name) return JS_EXCEPTION;
+	if (!nx_webgl_egl_bind_frag_data_location(c->egl, prog->gles_handle, color, name))
+		c->error = GL_INVALID_OPERATION;
+	JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+}
+static JSValue ext_bind_frag_data_location_indexed_w(JSContext *ctx, JSValueConst this_val,
+                                                       int argc, JSValueConst *argv,
+                                                       int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 4) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
+	if (!prog) { c->error = GL_INVALID_VALUE; return JS_UNDEFINED; }
+	uint32_t color, index;
+	if (JS_ToUint32(ctx, &color, argv[1]) || JS_ToUint32(ctx, &index, argv[2]))
+		return JS_EXCEPTION;
+	const char *name = JS_ToCString(ctx, argv[3]);
+	if (!name) return JS_EXCEPTION;
+	if (!nx_webgl_egl_bind_frag_data_location_indexed(c->egl, prog->gles_handle,
+	                                                    color, index, name))
+		c->error = GL_INVALID_OPERATION;
+	JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+}
+static JSValue ext_get_frag_data_index_w(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv,
+                                           int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_NewInt32(ctx, -1);
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
+	if (!prog) { c->error = GL_INVALID_VALUE; return JS_NewInt32(ctx, -1); }
+	const char *name = JS_ToCString(ctx, argv[1]);
+	if (!name) return JS_EXCEPTION;
+	int idx = nx_webgl_egl_get_frag_data_index(c->egl, prog->gles_handle, name);
+	JS_FreeCString(ctx, name);
+	return JS_NewInt32(ctx, idx);
+}
+
+// WEBGL_lose_context — pure no-op stubs. Plain JSCFunction signature (no
+// closure needed — these don't dispatch through gl context).
+static JSValue ext_lose_context_w(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+	(void)ctx; (void)this_val; (void)argc; (void)argv;
+	return JS_UNDEFINED;
+}
+
+// WEBGL_debug_shaders.getTranslatedShaderSource(shader) — return the
+// original source verbatim. Bridge doesn't translate shaders (we pass GLSL
+// straight to the driver), so original === translated.
+static JSValue ext_get_translated_shader_source_w(JSContext *ctx, JSValueConst this_val,
+                                                    int argc, JSValueConst *argv) {
+	(void)this_val;
+	if (argc < 1) return JS_NewString(ctx, "");
+	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
+	if (!shader || !shader->source) return JS_NewString(ctx, "");
+	return JS_NewString(ctx, shader->source);
+}
+
+// Forward-declared dispatch helper for queryCounterEXT — full body lives
+// alongside the WebGL 2 query class (~line 11400) where the struct fields
+// are visible. Returns true on success, false on invalid query / native
+// dispatch error.
+static bool ext_query_counter_dispatch(nx_webgl_egl_t *egl, JSValueConst q_val,
+                                        uint32_t target);
+
+// EXT_disjoint_timer_query_webgl2.queryCounterEXT(query, target).
+// The WebGL 2 query infrastructure (createQuery/deleteQuery/beginQuery/etc)
+// is already wired separately — this method just records a GPU timestamp
+// into the query's storage. Target must be ext.TIMESTAMP_EXT (0x8E28).
+static JSValue ext_query_counter_w(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv,
+                                     int magic, JSValue *func_data) {
+	(void)this_val; (void)magic;
+	if (argc < 2) return JS_UNDEFINED;
+	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
+	if (!c) return JS_EXCEPTION;
+	uint32_t target;
+	if (JS_ToUint32(ctx, &target, argv[1])) return JS_EXCEPTION;
+	if (!ext_query_counter_dispatch(c->egl, argv[0], target))
+		c->error = GL_INVALID_OPERATION;
+	return JS_UNDEFINED;
+}
+
+// WEBGL_compressed_texture_astc.getSupportedProfiles() — return ["ldr"].
+// Mesa Nouveau advertises GL_KHR_texture_compression_astc_ldr only (no
+// _hdr variant in our driver). The spec says return the array of strings;
+// "ldr" satisfies the page's feature-detect.
+static JSValue ext_astc_get_supported_profiles_w(JSContext *ctx, JSValueConst this_val,
+                                                   int argc, JSValueConst *argv) {
+	(void)this_val; (void)argc; (void)argv;
+	JSValue arr = JS_NewArray(ctx);
+	if (JS_IsException(arr)) return arr;
+	JS_DefinePropertyValueUint32(ctx, arr, 0,
+	                              JS_NewString(ctx, "ldr"), JS_PROP_C_W_E);
+	return arr;
 }
 
 static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
@@ -1683,6 +2155,440 @@ static JSValue nx_webgl_get_extension(JSContext *ctx, JSValueConst this_val,
 		// OES_texture_half_float exposes the constant HALF_FLOAT_OES = 0x8D61.
 		JS_DefinePropertyValueStr(ctx, ext, "HALF_FLOAT_OES",
 								  JS_NewInt32(ctx, 0x8D61), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// ========================================================================
+	// 2026-06-24 extension audit wave 1. Each block is gated on the
+	// has_* probe set at backend init from the gl_extensions string.
+	// Constants and methods match the WebGL extension registry.
+	// ========================================================================
+
+	// EXT_clip_control — 1 method + 4 constants.
+	if (strcmp(name, "EXT_clip_control") == 0 && context->egl &&
+	    nx_webgl_egl_has_clip_control(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m = JS_NewCFunctionData(ctx, ext_clip_control_w, 2, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "clipControlEXT", m, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "LOWER_LEFT_EXT",
+		                          JS_NewInt32(ctx, 0x8CA1), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "UPPER_LEFT_EXT",
+		                          JS_NewInt32(ctx, 0x8CA2), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "NEGATIVE_ONE_TO_ONE_EXT",
+		                          JS_NewInt32(ctx, 0x935E), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "ZERO_TO_ONE_EXT",
+		                          JS_NewInt32(ctx, 0x935F), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_depth_clamp — 1 constant.
+	if (strcmp(name, "EXT_depth_clamp") == 0 && context->egl &&
+	    nx_webgl_egl_has_depth_clamp(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "DEPTH_CLAMP_EXT",
+		                          JS_NewInt32(ctx, 0x864F), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_polygon_offset_clamp — 1 method.
+	if (strcmp(name, "EXT_polygon_offset_clamp") == 0 && context->egl &&
+	    nx_webgl_egl_has_polygon_offset_clamp(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m = JS_NewCFunctionData(ctx, ext_polygon_offset_clamp_w, 3, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "polygonOffsetClampEXT", m, JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_texture_filter_anisotropic — 2 constants. Plumbed into
+	// nx_webgl_tex_parameter[if] and nx_webgl_get_parameter separately.
+	if (strcmp(name, "EXT_texture_filter_anisotropic") == 0 && context->egl &&
+	    nx_webgl_egl_has_anisotropic(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "TEXTURE_MAX_ANISOTROPY_EXT",
+		                          JS_NewInt32(ctx, 0x84FE), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_TEXTURE_MAX_ANISOTROPY_EXT",
+		                          JS_NewInt32(ctx, 0x84FF), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_texture_compression_bptc — 4 internal-format constants.
+	if (strcmp(name, "EXT_texture_compression_bptc") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_bptc(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGBA_BPTC_UNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8E8C), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8E8D), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT",
+		                          JS_NewInt32(ctx, 0x8E8E), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT",
+		                          JS_NewInt32(ctx, 0x8E8F), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_texture_compression_rgtc — 4 constants.
+	if (strcmp(name, "EXT_texture_compression_rgtc") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_rgtc(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RED_RGTC1_EXT",
+		                          JS_NewInt32(ctx, 0x8DBB), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SIGNED_RED_RGTC1_EXT",
+		                          JS_NewInt32(ctx, 0x8DBC), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RED_GREEN_RGTC2_EXT",
+		                          JS_NewInt32(ctx, 0x8DBD), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT",
+		                          JS_NewInt32(ctx, 0x8DBE), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_compressed_texture_s3tc — 4 DXT constants.
+	if (strcmp(name, "WEBGL_compressed_texture_s3tc") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_s3tc(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB_S3TC_DXT1_EXT",
+		                          JS_NewInt32(ctx, 0x83F0), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGBA_S3TC_DXT1_EXT",
+		                          JS_NewInt32(ctx, 0x83F1), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGBA_S3TC_DXT3_EXT",
+		                          JS_NewInt32(ctx, 0x83F2), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGBA_S3TC_DXT5_EXT",
+		                          JS_NewInt32(ctx, 0x83F3), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_compressed_texture_s3tc_srgb — 4 SRGB DXT constants.
+	if (strcmp(name, "WEBGL_compressed_texture_s3tc_srgb") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_s3tc_srgb(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB_S3TC_DXT1_EXT",
+		                          JS_NewInt32(ctx, 0x8C4C), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT",
+		                          JS_NewInt32(ctx, 0x8C4D), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT",
+		                          JS_NewInt32(ctx, 0x8C4E), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT",
+		                          JS_NewInt32(ctx, 0x8C4F), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_texture_norm16 — 8 sized internal-format constants.
+	if (strcmp(name, "EXT_texture_norm16") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_norm16(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "R16_EXT",
+		                          JS_NewInt32(ctx, 0x822A), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RG16_EXT",
+		                          JS_NewInt32(ctx, 0x822C), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RGB16_EXT",
+		                          JS_NewInt32(ctx, 0x8054), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RGBA16_EXT",
+		                          JS_NewInt32(ctx, 0x805B), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "R16_SNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8F98), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RG16_SNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8F99), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RGB16_SNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8F9A), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "RGBA16_SNORM_EXT",
+		                          JS_NewInt32(ctx, 0x8F9B), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_clip_cull_distance — 11 constants (3 maxes + 8 indexed CLIP_DISTANCE).
+	if (strcmp(name, "WEBGL_clip_cull_distance") == 0 && context->egl &&
+	    nx_webgl_egl_has_clip_cull_distance(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_CLIP_DISTANCES_WEBGL",
+		                          JS_NewInt32(ctx, 0x0D32), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_CULL_DISTANCES_WEBGL",
+		                          JS_NewInt32(ctx, 0x82F9), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_COMBINED_CLIP_AND_CULL_DISTANCES_WEBGL",
+		                          JS_NewInt32(ctx, 0x82FA), JS_PROP_C_W_E);
+		for (int i = 0; i < 8; i++) {
+			char key[32];
+			snprintf(key, sizeof(key), "CLIP_DISTANCE%d_WEBGL", i);
+			JS_DefinePropertyValueStr(ctx, ext, key,
+			                          JS_NewInt32(ctx, 0x3000 + i), JS_PROP_C_W_E);
+		}
+		return ext;
+	}
+
+	// Pure feature-flag stubs — return {} so getExtension !== null but
+	// there's nothing for the page to call.
+	if ((strcmp(name, "EXT_float_blend") == 0 && context->egl &&
+	     nx_webgl_egl_has_float_blend(context->egl)) ||
+	    (strcmp(name, "EXT_render_snorm") == 0 && context->egl &&
+	     nx_webgl_egl_has_render_snorm(context->egl)) ||
+	    (strcmp(name, "OES_sample_variables") == 0 && context->egl &&
+	     nx_webgl_egl_has_sample_variables(context->egl))) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		return JS_IsException(ext) ? ext : ext;
+	}
+
+	// OES_shader_multisample_interpolation — 3 optional pnames for
+	// gl.getParameter. GLSL-side methods (interpolateAtSample/Centroid/Offset)
+	// are shader-only.
+	if (strcmp(name, "OES_shader_multisample_interpolation") == 0 && context->egl &&
+	    nx_webgl_egl_has_shader_multisample_interpolation(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "MIN_FRAGMENT_INTERPOLATION_OFFSET_OES",
+		                          JS_NewInt32(ctx, 0x8E5B), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_FRAGMENT_INTERPOLATION_OFFSET_OES",
+		                          JS_NewInt32(ctx, 0x8E5C), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "FRAGMENT_INTERPOLATION_OFFSET_BITS_OES",
+		                          JS_NewInt32(ctx, 0x8E5D), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// KHR_parallel_shader_compile — 1 method + COMPLETION_STATUS_KHR pname.
+	// The pname is wired into nx_webgl_get_program_parameter /
+	// get_shader_parameter separately.
+	if (strcmp(name, "KHR_parallel_shader_compile") == 0 && context->egl &&
+	    nx_webgl_egl_has_parallel_shader_compile(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m = JS_NewCFunctionData(ctx, ext_parallel_max_threads_w, 1, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "maxShaderCompilerThreadsKHR", m, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPLETION_STATUS_KHR",
+		                          JS_NewInt32(ctx, 0x91B1), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_multi_draw — 4 batched-draw methods.
+	if (strcmp(name, "WEBGL_multi_draw") == 0 && context->egl &&
+	    nx_webgl_egl_has_multi_draw(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue mda = JS_NewCFunctionData(ctx, ext_multi_draw_arrays_w, 6, 0, 1, &gl);
+		JSValue mde = JS_NewCFunctionData(ctx, ext_multi_draw_elements_w, 7, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "multiDrawArraysWEBGL", mda, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "multiDrawElementsWEBGL", mde, JS_PROP_C_W_E);
+		// Instanced variants — defer to non-instanced wrappers if the driver
+		// doesn't have the base-instance entry points. The single-call
+		// `multi_draw_arrays` is what most apps use; instanced batching is a
+		// further win that can be added later.
+		JS_DefinePropertyValueStr(ctx, ext, "multiDrawArraysInstancedWEBGL",
+		                          JS_NewCFunctionData(ctx, ext_multi_draw_arrays_w, 6, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "multiDrawElementsInstancedWEBGL",
+		                          JS_NewCFunctionData(ctx, ext_multi_draw_elements_w, 7, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// OES_draw_buffers_indexed — 6 per-attachment blend-state methods.
+	if (strcmp(name, "OES_draw_buffers_indexed") == 0 && context->egl &&
+	    nx_webgl_egl_has_draw_buffers_indexed(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JS_DefinePropertyValueStr(ctx, ext, "enableiOES",
+		                          JS_NewCFunctionData(ctx, ext_enablei_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "disableiOES",
+		                          JS_NewCFunctionData(ctx, ext_disablei_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "blendEquationiOES",
+		                          JS_NewCFunctionData(ctx, ext_blend_equationi_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "blendEquationSeparateiOES",
+		                          JS_NewCFunctionData(ctx, ext_blend_equation_separatei_w, 3, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "blendFunciOES",
+		                          JS_NewCFunctionData(ctx, ext_blend_funci_w, 3, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "blendFuncSeparateiOES",
+		                          JS_NewCFunctionData(ctx, ext_blend_func_separatei_w, 5, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_FreeValue(ctx, gl);
+		return ext;
+	}
+
+	// WEBGL_blend_func_extended — dual-source blending. 3 methods +
+	// 5 constants.
+	if (strcmp(name, "WEBGL_blend_func_extended") == 0 && context->egl &&
+	    nx_webgl_egl_has_blend_func_extended(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JS_DefinePropertyValueStr(ctx, ext, "bindFragDataLocationWEBGL",
+		                          JS_NewCFunctionData(ctx, ext_bind_frag_data_location_w, 3, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "bindFragDataLocationIndexedWEBGL",
+		                          JS_NewCFunctionData(ctx, ext_bind_frag_data_location_indexed_w, 4, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "getFragDataIndexWEBGL",
+		                          JS_NewCFunctionData(ctx, ext_get_frag_data_index_w, 2, 0, 1, &gl),
+		                          JS_PROP_C_W_E);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "SRC1_COLOR_WEBGL",
+		                          JS_NewInt32(ctx, 0x88F9), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "SRC1_ALPHA_WEBGL",
+		                          JS_NewInt32(ctx, 0x8589), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "ONE_MINUS_SRC1_COLOR_WEBGL",
+		                          JS_NewInt32(ctx, 0x88FA), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "ONE_MINUS_SRC1_ALPHA_WEBGL",
+		                          JS_NewInt32(ctx, 0x88FB), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL",
+		                          JS_NewInt32(ctx, 0x88FC), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_lose_context — always-on stub: loseContext/restoreContext no-op,
+	// isContextLost would return false (the gl.isContextLost method on the
+	// context itself already returns false unconditionally).
+	if (strcmp(name, "WEBGL_lose_context") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue m_lose = JS_NewCFunction(ctx, ext_lose_context_w, "loseContext", 0);
+		JSValue m_rest = JS_NewCFunction(ctx, ext_lose_context_w, "restoreContext", 0);
+		JS_DefinePropertyValueStr(ctx, ext, "loseContext", m_lose, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "restoreContext", m_rest, JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_debug_shaders — getTranslatedShaderSource returns the original
+	// source verbatim (bridge doesn't translate).
+	if (strcmp(name, "WEBGL_debug_shaders") == 0) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue m = JS_NewCFunction(ctx, ext_get_translated_shader_source_w,
+		                             "getTranslatedShaderSource", 1);
+		JS_DefinePropertyValueStr(ctx, ext, "getTranslatedShaderSource", m, JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// ========================================================================
+	// 2026-06-24 wave 2 — compressed texture trifecta (ETC1 / ETC2/EAC / ASTC).
+	// All three rely on the wave-1 compressedTexImage2D / SubImage2D native
+	// dispatch; this block just adds the JS-visible internalformat constants
+	// pages pass to those calls.
+	// ========================================================================
+
+	// WEBGL_compressed_texture_etc1 — legacy Android ETC1.
+	if (strcmp(name, "WEBGL_compressed_texture_etc1") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_etc1(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB_ETC1_WEBGL",
+		                          JS_NewInt32(ctx, 0x8D64), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_compressed_texture_etc — ES3 core ETC2/EAC formats (11 const).
+	if (strcmp(name, "WEBGL_compressed_texture_etc") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_etc(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_R11_EAC",
+		                          JS_NewInt32(ctx, 0x9270), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SIGNED_R11_EAC",
+		                          JS_NewInt32(ctx, 0x9271), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RG11_EAC",
+		                          JS_NewInt32(ctx, 0x9272), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SIGNED_RG11_EAC",
+		                          JS_NewInt32(ctx, 0x9273), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB8_ETC2",
+		                          JS_NewInt32(ctx, 0x9274), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB8_ETC2",
+		                          JS_NewInt32(ctx, 0x9275), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2",
+		                          JS_NewInt32(ctx, 0x9276), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2",
+		                          JS_NewInt32(ctx, 0x9277), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_RGBA8_ETC2_EAC",
+		                          JS_NewInt32(ctx, 0x9278), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "COMPRESSED_SRGB8_ALPHA8_ETC2_EAC",
+		                          JS_NewInt32(ctx, 0x9279), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// EXT_disjoint_timer_query_webgl2 — GPU timestamp queries on top of the
+	// WebGL 2 core query object surface. 4 constants + queryCounterEXT.
+	if (strcmp(name, "EXT_disjoint_timer_query_webgl2") == 0 && context->egl &&
+	    nx_webgl_egl_has_disjoint_timer_query(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		JSValue gl = JS_DupValue(ctx, this_val);
+		JSValue m = JS_NewCFunctionData(ctx, ext_query_counter_w, 2, 0, 1, &gl);
+		JS_FreeValue(ctx, gl);
+		JS_DefinePropertyValueStr(ctx, ext, "queryCounterEXT", m, JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "QUERY_COUNTER_BITS_EXT",
+		                          JS_NewInt32(ctx, 0x8864), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "TIME_ELAPSED_EXT",
+		                          JS_NewInt32(ctx, 0x88BF), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "TIMESTAMP_EXT",
+		                          JS_NewInt32(ctx, 0x8E28), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, ext, "GPU_DISJOINT_EXT",
+		                          JS_NewInt32(ctx, 0x8FBB), JS_PROP_C_W_E);
+		return ext;
+	}
+
+	// WEBGL_compressed_texture_astc — modern adaptive scalable texture
+	// compression. 28 constants (14 RGBA + 14 SRGB) generated programmatically
+	// from the canonical block-size list. Plus getSupportedProfiles() →
+	// ["ldr"] (Mesa Nouveau has GL_KHR_texture_compression_astc_ldr only).
+	if (strcmp(name, "WEBGL_compressed_texture_astc") == 0 && context->egl &&
+	    nx_webgl_egl_has_texture_compression_astc(context->egl)) {
+		JS_FreeCString(ctx, name);
+		JSValue ext = JS_NewObject(ctx);
+		if (JS_IsException(ext)) return ext;
+		static const char *astc_block_sizes[14] = {
+			"4x4", "5x4", "5x5", "6x5", "6x6", "8x5", "8x6", "8x8",
+			"10x5", "10x6", "10x8", "10x10", "12x10", "12x12"
+		};
+		for (int i = 0; i < 14; i++) {
+			char key[64];
+			snprintf(key, sizeof(key), "COMPRESSED_RGBA_ASTC_%s_KHR", astc_block_sizes[i]);
+			JS_DefinePropertyValueStr(ctx, ext, key,
+			                          JS_NewInt32(ctx, 0x93B0 + i), JS_PROP_C_W_E);
+			snprintf(key, sizeof(key), "COMPRESSED_SRGB8_ALPHA8_ASTC_%s_KHR", astc_block_sizes[i]);
+			JS_DefinePropertyValueStr(ctx, ext, key,
+			                          JS_NewInt32(ctx, 0x93D0 + i), JS_PROP_C_W_E);
+		}
+		JSValue m = JS_NewCFunction(ctx, ext_astc_get_supported_profiles_w,
+		                             "getSupportedProfiles", 0);
+		JS_DefinePropertyValueStr(ctx, ext, "getSupportedProfiles", m, JS_PROP_C_W_E);
 		return ext;
 	}
 
@@ -2215,6 +3121,12 @@ static JSValue nx_webgl_get_shader_parameter(JSContext *ctx,
 		return JS_NewBool(ctx, shader->deleted);
 	case GL_SHADER_TYPE:
 		return JS_NewUint32(ctx, shader->type);
+	case 0x91B1: // COMPLETION_STATUS_KHR — KHR_parallel_shader_compile
+		// Compile is synchronous in the bridge, so "complete" is always true
+		// once the shader exists. Engines (Three.js's WebGLPrograms.isReady)
+		// poll this; returning true immediately is equivalent to the
+		// non-parallel path.
+		return JS_NewBool(ctx, true);
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
@@ -2660,6 +3572,9 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 				return JS_NewUint32(ctx, (uint32_t)n);
 		}
 		return JS_NewUint32(ctx, 0);
+	case 0x91B1: // COMPLETION_STATUS_KHR — KHR_parallel_shader_compile
+		// Link is synchronous in the bridge — same rationale as shader path.
+		return JS_NewBool(ctx, true);
 	default:
 		context->error = GL_INVALID_ENUM;
 		return JS_NULL;
@@ -3355,6 +4270,17 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 	case 0x813A: // TEXTURE_MIN_LOD
 	case 0x813B: // TEXTURE_MAX_LOD
 		if (!context->is_webgl2) {
+			context->error = GL_INVALID_ENUM;
+			return JS_UNDEFINED;
+		}
+		break;
+	case 0x84FE: // TEXTURE_MAX_ANISOTROPY_EXT
+		// Gated on the driver advertising EXT_texture_filter_anisotropic.
+		// `param` is an integer here (texParameterf not implemented); the
+		// driver clamps to MAX_TEXTURE_MAX_ANISOTROPY_EXT internally so we
+		// don't need to bounds-check. The forward to native at the bottom
+		// of this function dispatches it onto the live texture handle.
+		if (!context->egl || !nx_webgl_egl_has_anisotropic(context->egl)) {
 			context->error = GL_INVALID_ENUM;
 			return JS_UNDEFINED;
 		}
@@ -9904,9 +10830,20 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		return new_int_array(ctx, context->viewport, 4);
 	case GL_SCISSOR_BOX:
 		return new_int_array(ctx, context->scissor_box, 4);
-	case GL_ALIASED_POINT_SIZE_RANGE:
-	case GL_ALIASED_LINE_WIDTH_RANGE: {
+	case GL_ALIASED_POINT_SIZE_RANGE: {
 		double range[2] = {1., 1.};
+		return new_number_array(ctx, range, 2);
+	}
+	case GL_ALIASED_LINE_WIDTH_RANGE: {
+		// Probe the real range from the driver when we have a backend.
+		// Falls back to [1,1] for CPU/skeleton WebGL 1.
+		double range[2] = {1., 1.};
+		if (context->egl) {
+			float native[2] = {1.f, 1.f};
+			nx_webgl_egl_get_aliased_line_width_range_native(context->egl, native);
+			range[0] = (double)native[0];
+			range[1] = (double)native[1];
+		}
 		return new_number_array(ctx, range, 2);
 	}
 	case GL_VENDOR:
@@ -10015,11 +10952,26 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 		int dims[2] = {4096, 4096};
 		return new_int_array(ctx, dims, 2);
 	}
-	case GL_MAX_VERTEX_ATTRIBS:
-		return JS_NewUint32(ctx, 8);
-	case GL_MAX_TEXTURE_IMAGE_UNITS:
-	case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
-		return JS_NewUint32(ctx, 8);
+	case GL_MAX_VERTEX_ATTRIBS: {
+		// Probe driver when available; ES 2 minimum is 8, ES 3 typically 16.
+		// Fall back to the WebGL 1 spec minimum (8) for the no-backend path.
+		int v = context->egl
+			? nx_webgl_egl_get_max_vertex_attribs_native(context->egl) : 0;
+		if (v < 8) v = 8;
+		return JS_NewUint32(ctx, (uint32_t)v);
+	}
+	case GL_MAX_TEXTURE_IMAGE_UNITS: {
+		int v = context->egl
+			? nx_webgl_egl_get_max_texture_image_units_native(context->egl) : 0;
+		if (v < 8) v = 8;
+		return JS_NewUint32(ctx, (uint32_t)v);
+	}
+	case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: {
+		int v = context->egl
+			? nx_webgl_egl_get_max_combined_texture_image_units_native(context->egl) : 0;
+		if (v < 8) v = 8;
+		return JS_NewUint32(ctx, (uint32_t)v);
+	}
 	case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
 		// ES3 spec requires >= 16 vertex texture units. Tegra GLES supports
 		// vertex texture sampling natively. Setting this to 0 (the pre-pivot
@@ -10153,6 +11105,28 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	case 0x84FD: // MAX_TEXTURE_LOD_BIAS
 		if (context->is_webgl2)
 			return JS_NewInt32(ctx, nx_webgl_egl_get_max_texture_lod_bias(context->egl));
+		break;
+	// 2026-06-24 extension audit — combined uniform component limits.
+	case 0x8A31: // MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_combined_vertex_uniform_components(context->egl));
+		break;
+	case 0x8A33: // MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS
+		if (context->is_webgl2)
+			return JS_NewInt32(ctx, nx_webgl_egl_get_max_combined_fragment_uniform_components(context->egl));
+		break;
+	// EXT_texture_filter_anisotropic — MAX_TEXTURE_MAX_ANISOTROPY_EXT
+	// (gated on the extension being advertised).
+	case 0x84FF:
+		if (context->egl && nx_webgl_egl_has_anisotropic(context->egl))
+			return JS_NewFloat64(ctx, (double)nx_webgl_egl_get_max_anisotropy(context->egl));
+		break;
+	// EXT_disjoint_timer_query_webgl2 — GPU_DISJOINT_EXT. Reading clears
+	// the flag (spec). Gated on the extension being advertised so pages
+	// without the extension still get INVALID_ENUM per WebGL contract.
+	case 0x8FBB:
+		if (context->egl && nx_webgl_egl_has_disjoint_timer_query(context->egl))
+			return JS_NewBool(ctx, nx_webgl_egl_get_gpu_disjoint(context->egl));
 		break;
 	case 0x85B5: // VERTEX_ARRAY_BINDING
 		if (context->is_webgl2) {
@@ -10434,11 +11408,23 @@ typedef struct {
 	uint32_t handle;
 	bool deleted;
 } nx_webgl_sampler_t;
-typedef struct {
+typedef struct nx_webgl_query_s {
 	uint32_t handle;
 	bool deleted;
 	uint32_t target;  // 0 until first beginQuery
 } nx_webgl_query_t;
+
+// Body for the forward-declared queryCounterEXT dispatch (declaration
+// near the wave-1 ext wrappers); placed here so the struct fields are
+// visible. nx_get_webgl_query isn't declared yet at this point either —
+// resolve via JS_GetOpaque on the class ID, which IS declared above.
+static bool ext_query_counter_dispatch(nx_webgl_egl_t *egl, JSValueConst q_val,
+                                        uint32_t target) {
+	nx_webgl_query_t *q = (nx_webgl_query_t *)JS_GetOpaque(q_val,
+	                                                        nx_webgl_query_class_id);
+	if (!q || q->deleted) return false;
+	return nx_webgl_egl_query_counter_ext(egl, q->handle, target);
+}
 typedef struct {
 	void *handle;     // GLsync pointer
 	bool deleted;
@@ -11554,24 +12540,41 @@ static JSValue nx_webgl_copy_tex_sub_image_2d(JSContext *ctx,
 	return JS_UNDEFINED;
 }
 
-// 2026-06-07 FREEZE DIAGNOSTIC + missing-method stubs. nxjs only registered
-// compressedTexImage3D/SubImage3D — the 2D variants were never exposed. If
-// Cocos calls gl.compressedTexImage2D for an ASTC texture, JS hits
-// "undefined is not a function" and either throws (caught by onerror, which
-// we observe is silent) or Cocos catches internally and silently fails. These
-// stubs log every call without doing any GL work — minimum-risk diagnostic
-// that also avoids the TypeError-throw cascade if missing-method was the
-// cause of the inGameScene freeze.
+// 2026-06-24 — compressedTexImage2D / SubImage2D now wired to native
+// glCompressedTexImage2D / SubImage2D via nx_webgl_egl_compressed_tex_*_2d.
+// Replaces the prior log-only stubs that just discarded every call (added
+// 2026-06-07 as a missing-method diagnostic). Required for the s3tc /
+// s3tc_srgb / bptc / rgtc extension surface to actually upload texel data
+// instead of leaving the texture zeroed.
 static JSValue nx_webgl_compressed_tex_image_2d_stub(JSContext *ctx,
                                                        JSValueConst this_val,
                                                        int argc,
                                                        JSValueConst *argv) {
-	(void)ctx; (void)this_val; (void)argv;
-	static int cti2d_diag_n = 0;
-	int my_n = ++cti2d_diag_n;
-	if (my_n <= 200 || (my_n % 100) == 0) {
-		fprintf(stderr, "[nxjs:compressedTexImage2D] n=%d argc=%d\n", my_n, argc);
-		fflush(stderr);
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context) return JS_EXCEPTION;
+	if (argc < 7) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	uint32_t target, internalformat;
+	int32_t level, width, height, border;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+	    JS_ToInt32(ctx, &level, argv[1]) ||
+	    JS_ToUint32(ctx, &internalformat, argv[2]) ||
+	    JS_ToInt32(ctx, &width, argv[3]) ||
+	    JS_ToInt32(ctx, &height, argv[4]) ||
+	    JS_ToInt32(ctx, &border, argv[5]))
+		return JS_EXCEPTION;
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (!js_pixels_pointer(ctx, argv[6], &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_compressed_tex_image_2d(context->egl, target, level,
+	                                            internalformat, width, height,
+	                                            border, pixels_len, pixels)) {
+		context->error = GL_INVALID_OPERATION;
 	}
 	return JS_UNDEFINED;
 }
@@ -11580,12 +12583,32 @@ static JSValue nx_webgl_compressed_tex_sub_image_2d_stub(JSContext *ctx,
                                                            JSValueConst this_val,
                                                            int argc,
                                                            JSValueConst *argv) {
-	(void)ctx; (void)this_val; (void)argv;
-	static int ctsi2d_diag_n = 0;
-	int my_n = ++ctsi2d_diag_n;
-	if (my_n <= 200 || (my_n % 100) == 0) {
-		fprintf(stderr, "[nxjs:compressedTexSubImage2D] n=%d argc=%d\n", my_n, argc);
-		fflush(stderr);
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context) return JS_EXCEPTION;
+	if (argc < 8) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	uint32_t target, format;
+	int32_t level, xoff, yoff, width, height;
+	if (JS_ToUint32(ctx, &target, argv[0]) ||
+	    JS_ToInt32(ctx, &level, argv[1]) ||
+	    JS_ToInt32(ctx, &xoff, argv[2]) ||
+	    JS_ToInt32(ctx, &yoff, argv[3]) ||
+	    JS_ToInt32(ctx, &width, argv[4]) ||
+	    JS_ToInt32(ctx, &height, argv[5]) ||
+	    JS_ToUint32(ctx, &format, argv[6]))
+		return JS_EXCEPTION;
+	void *pixels = NULL;
+	size_t pixels_len = 0;
+	if (!js_pixels_pointer(ctx, argv[7], &pixels, &pixels_len)) {
+		context->error = GL_INVALID_VALUE;
+		return JS_UNDEFINED;
+	}
+	if (!nx_webgl_egl_compressed_tex_sub_image_2d(context->egl, target, level,
+	                                                xoff, yoff, width, height,
+	                                                format, pixels_len, pixels)) {
+		context->error = GL_INVALID_OPERATION;
 	}
 	return JS_UNDEFINED;
 }
