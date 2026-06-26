@@ -51,6 +51,7 @@ struct nx_webgl_egl_s {
 	const char *renderer;
 	void *native_window;
 	bool bridge_enabled;
+	bool spec_y_origin;
 	int bridge_requested_width;
 	int bridge_requested_height;
 	int bridge_width;
@@ -806,8 +807,17 @@ static void bridge_render_size(nx_webgl_egl_t *backend, nx_canvas_t *canvas,
 		*height = (int)canvas->height;
 }
 
+// `spec_y=false` (the historical default): input rect.y is in canvas-y
+// top-down convention; output y is flipped to GL-y bottom-up. Every
+// production demo's coordinate system depends on this — see the bridge-
+// Y-convention entry in REAL_GL_FAILURES.md.
+// `spec_y=true` (the Option 2 opt-in for the conformance runner): input
+// rect.y is already in spec/GL-y bottom-up convention; pass through with
+// only scaling, no axis inversion. Scaling math is identical in both
+// modes; only the output-y derivation differs.
 static void bridge_scale_rect(nx_canvas_t *canvas, int render_width,
-							  int render_height, const int *rect, int *x,
+							  int render_height, const int *rect,
+							  bool spec_y, int *x,
 							  int *y, int *width, int *height) {
 	int canvas_width = (int)canvas->width;
 	int canvas_height = (int)canvas->height;
@@ -827,14 +837,21 @@ static void bridge_scale_rect(nx_canvas_t *canvas, int render_width,
 	int sx0 = (int)(((int64_t)x0 * render_width) / canvas_width);
 	int sx1 = (int)(((int64_t)x1 * render_width + canvas_width - 1) /
 					canvas_width);
-	int sy0_top = (int)(((int64_t)y0 * render_height) / canvas_height);
-	int sy1_top = (int)(((int64_t)y1 * render_height + canvas_height - 1) /
-						canvas_height);
+	int sy0 = (int)(((int64_t)y0 * render_height) / canvas_height);
+	int sy1 = (int)(((int64_t)y1 * render_height + canvas_height - 1) /
+					canvas_height);
 	*x = clamp_int(sx0, 0, render_width);
 	*width = clamp_int(sx1, 0, render_width) - *x;
-	*y = render_height - clamp_int(sy1_top, 0, render_height);
-	*height = clamp_int(sy1_top, 0, render_height) -
-			  clamp_int(sy0_top, 0, render_height);
+	if (spec_y) {
+		// Pass-through: input rect.y is already GL bottom-up.
+		*y = clamp_int(sy0, 0, render_height);
+		*height = clamp_int(sy1, 0, render_height) - *y;
+	} else {
+		// Canvas-y top-down → GL-y bottom-up flip.
+		*y = render_height - clamp_int(sy1, 0, render_height);
+		*height = clamp_int(sy1, 0, render_height) -
+				  clamp_int(sy0, 0, render_height);
+	}
 	if (*width < 0)
 		*width = 0;
 	if (*height < 0)
@@ -842,19 +859,20 @@ static void bridge_scale_rect(nx_canvas_t *canvas, int render_width,
 }
 
 static void bridge_apply_viewport(nx_canvas_t *canvas, int render_width,
-								  int render_height, const int *viewport) {
+								  int render_height, const int *viewport,
+								  bool spec_y) {
 	int x;
 	int y;
 	int width;
 	int height;
-	bridge_scale_rect(canvas, render_width, render_height, viewport, &x, &y,
-					  &width, &height);
+	bridge_scale_rect(canvas, render_width, render_height, viewport, spec_y,
+					  &x, &y, &width, &height);
 	glViewport(x, y, width, height);
 }
 
 static void bridge_apply_scissor(nx_canvas_t *canvas, int render_width,
 								 int render_height, bool enabled,
-								 const int *scissor_box) {
+								 const int *scissor_box, bool spec_y) {
 	if (!enabled) {
 		glDisable(GL_SCISSOR_TEST);
 		return;
@@ -863,8 +881,8 @@ static void bridge_apply_scissor(nx_canvas_t *canvas, int render_width,
 	int y;
 	int width;
 	int height;
-	bridge_scale_rect(canvas, render_width, render_height, scissor_box, &x, &y,
-					  &width, &height);
+	bridge_scale_rect(canvas, render_width, render_height, scissor_box, spec_y,
+					  &x, &y, &width, &height);
 	glEnable(GL_SCISSOR_TEST);
 	glScissor(x, y, width, height);
 }
@@ -916,11 +934,13 @@ static bool bridge_acquire_target(nx_webgl_egl_t *backend,
 // viewport rect interpreted directly). For the bridge FBO we keep the
 // canvas-y top-down convention via bridge_apply_viewport/scissor.
 static void bridge_bind_target(const bridge_target_t *t,
+                               nx_webgl_egl_t *backend,
                                nx_canvas_t *canvas,
                                const int *viewport,
                                bool scissor_enabled,
                                const int *scissor_box) {
 	glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+	bool spec_y = backend && backend->spec_y_origin;
 	if (t->is_user_fbo) {
 		int rx = viewport ? viewport[0] : 0;
 		int ry = viewport ? viewport[1] : 0;
@@ -938,9 +958,9 @@ static void bridge_bind_target(const bridge_target_t *t,
 			glDisable(GL_SCISSOR_TEST);
 		}
 	} else {
-		bridge_apply_viewport(canvas, t->width, t->height, viewport);
+		bridge_apply_viewport(canvas, t->width, t->height, viewport, spec_y);
 		bridge_apply_scissor(canvas, t->width, t->height, scissor_enabled,
-		                     scissor_box);
+		                     scissor_box, spec_y);
 	}
 }
 
@@ -2621,6 +2641,97 @@ void nx_webgl_egl_destroy(JSRuntime *rt, nx_webgl_egl_t *backend) {
 	js_free_rt(rt, backend);
 }
 
+bool nx_webgl_egl_reset_context(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
+	if (!backend)
+		return false;
+#if NXJS_HAS_EGL_GLES
+	// Reset is meaningful only after a successful first init. If the
+	// backend never reached available=true, just re-run the initializer
+	// from wherever it left off — it's idempotent up to first success.
+	if (backend->display == EGL_NO_DISPLAY) {
+		return nx_webgl_egl_initialize(backend, canvas);
+	}
+	// 1. Make the current context current so the destroy calls below
+	//    delete the bridge resources from the right GLES name space.
+	//    If the context is already gone (defensive), skip the deletes.
+	if (backend->context != EGL_NO_CONTEXT) {
+		eglMakeCurrent(backend->display, backend->surface, backend->surface,
+		               backend->context);
+		// 2. Tear down everything the bridge owns INSIDE the context.
+		//    These mirror nx_webgl_egl_destroy's pre-context-destroy
+		//    work — they free all `bridge_*` programs/buffers/textures
+		//    plus the texture cache. After this the lazy ensure_*
+		//    helpers will rebuild them on first use against the new
+		//    context.
+		destroy_texture_cache(backend);
+		destroy_bridge_resources(backend);
+		// Also drop the passthrough VAO created at step 8; it belongs
+		// to the doomed context. probe_step regenerates it on re-init.
+		if (backend->passthrough_vao && backend->fn_delete_vertex_arrays) {
+			typedef void (*pfn_del_vao_t)(GLsizei, const GLuint *);
+			pfn_del_vao_t del =
+				(pfn_del_vao_t)backend->fn_delete_vertex_arrays;
+			GLuint v = backend->passthrough_vao;
+			del(1, &v);
+		}
+		backend->passthrough_vao = 0;
+		// 3. Detach the context so eglDestroyContext can free it. EGL
+		//    spec: a destroyed context is marked for deletion but only
+		//    actually freed once it's not current — make_current(NO_*)
+		//    first satisfies that.
+		eglMakeCurrent(backend->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+		               EGL_NO_CONTEXT);
+		eglDestroyContext(backend->display, backend->context);
+		backend->context = EGL_NO_CONTEXT;
+	}
+	// 4. Destroy the surface too (no-op in surfaceless mode where
+	//    surface is already EGL_NO_SURFACE, which is the path
+	//    nx_webgl_egl on Switch takes per the probe_step config flow).
+	if (backend->surface != EGL_NO_SURFACE) {
+		eglDestroySurface(backend->display, backend->surface);
+		backend->surface = EGL_NO_SURFACE;
+	}
+	// 5. Keep display + config alive (DO NOT eglTerminate). Restart the
+	//    probe state machine at step 4 — that's the first step that
+	//    runs AFTER eglChooseConfig (which already cached
+	//    backend->config) and BEFORE surface/context creation. Walking
+	//    the machine from there: step 4 → 5 (set surface=NO_SURFACE) →
+	//    6 (eglCreateContext) → 7 (eglMakeCurrent) → 8 (resolve
+	//    function pointers + extension probes) → done. All against the
+	//    fresh context.
+	backend->available = false;
+	backend->step = 4;
+	// 6. Function pointers (`fn_*` table) intentionally NOT cleared.
+	//    Per EGL spec, eglGetProcAddress returns display-scoped function
+	//    pointers that remain valid until the application terminates —
+	//    they don't change across eglCreateContext/eglDestroyContext
+	//    cycles on the same display. Re-running probe_step 8's
+	//    `if (!backend->fn_X) backend->fn_X = eglGetProcAddress(...)`
+	//    block would short-circuit, but that's fine: the cached value
+	//    points to the same driver function the new context will use.
+	//    Leaving them alone also avoids a 96-field-explicit-null block.
+	// Stick the bridge_pending_textured_warmup flag back on so the next
+	// bridge-mode draw runs the validation warmup that bridge_enabled
+	// would also set after a fresh `set_bridge_enabled(true)`.
+	backend->bridge_pending_textured_warmup = true;
+	backend->bridge_auto_flush_initialized = false;
+	// 7. Drive the state machine to completion. probe_step transitions
+	//    one step per call; loop until available flips back on or until
+	//    a step returns false (failure).
+	while (!backend->available) {
+		int previous_step = backend->step;
+		if (!nx_webgl_egl_probe_step(backend, canvas))
+			return false;
+		if (backend->step == previous_step)
+			return false;
+	}
+	return true;
+#else
+	(void)canvas;
+	return false;
+#endif
+}
+
 bool nx_webgl_egl_is_available(nx_webgl_egl_t *backend) {
 	return backend && backend->available;
 }
@@ -2744,6 +2855,24 @@ bool nx_webgl_egl_get_tessellation_fix(nx_webgl_egl_t *backend) {
 bool nx_webgl_egl_is_bridge_enabled(nx_webgl_egl_t *backend) {
 #if NXJS_HAS_EGL_GLES
 	return backend && backend->bridge_enabled;
+#else
+	(void)backend;
+	return false;
+#endif
+}
+
+// Option 2 / spec-y opt-in (2026-06-26). See header comment.
+void nx_webgl_egl_set_spec_y_origin(nx_webgl_egl_t *backend, bool enabled) {
+#if NXJS_HAS_EGL_GLES
+	if (backend) backend->spec_y_origin = enabled;
+#else
+	(void)backend; (void)enabled;
+#endif
+}
+
+bool nx_webgl_egl_get_spec_y_origin(nx_webgl_egl_t *backend) {
+#if NXJS_HAS_EGL_GLES
+	return backend && backend->spec_y_origin;
 #else
 	(void)backend;
 	return false;
@@ -3173,7 +3302,7 @@ bool nx_webgl_egl_draw_passthrough(
 	if (!bridge_acquire_target(backend, canvas, &target))
 		return false;
 
-	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	bridge_bind_target(&target, backend, canvas, viewport, scissor_enabled, scissor_box);
 
 	// Bind a VAO so vertex attribute state has somewhere to land. On
 	// ES 3+ the default VAO 0 is reserved (no attribute state, all draws
@@ -3877,8 +4006,26 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 	 * nx_webgl_egl_persistent_cube_texture_image_2d (Fix G v3's UByte
 	 * CPU-roundtrip assumes RGBA8 storage). */
 
+	/* 2026-06-25 EXT_sRGB translation: Three.js's WebGL 1 path with
+	 * `texture.colorSpace = SRGBColorSpace` uploads via the EXT_sRGB
+	 * combo (internalformat == format == SRGB_EXT or SRGB_ALPHA_EXT,
+	 * type=UByte). GLES3 requires (sized SRGB internalformat) + (unsized
+	 * RGB/RGBA format). Translate so the driver does sRGB→linear decoding
+	 * in the texture unit and Three.js's shader (which expects pre-decoded
+	 * linear samples when EXT_sRGB is advertised) sees correct values.
+	 * Phase 1.6 advertised EXT_sRGB but never wired the texImage2D path —
+	 * surfaced 2026-06-25 as 4 demos rendering with black textures. */
+	GLenum native_format = (GLenum)format;
+	if (internal == 0x8C40 /* SRGB_EXT */) {
+		internal = 0x8C41 /* SRGB8 */;
+		native_format = GL_RGB;
+	} else if (internal == 0x8C42 /* SRGB_ALPHA_EXT */) {
+		internal = 0x8C43 /* SRGB8_ALPHA8 */;
+		native_format = GL_RGBA;
+	}
+
 	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
-	             (GLenum)format, native_type, data);
+	             native_format, native_type, data);
 	return glGetError() == GL_NO_ERROR;
 #endif
 }
@@ -4597,6 +4744,169 @@ void nx_webgl_egl_generate_mipmap(nx_webgl_egl_t *backend,
 #endif
 }
 
+void nx_webgl_egl_texture_set_parameterf(nx_webgl_egl_t *backend,
+                                          uint32_t target,
+                                          uint32_t handle, uint32_t pname,
+                                          float param) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)target; (void)handle; (void)pname; (void)param;
+#else
+	if (!backend || !handle) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glBindTexture((GLenum)target, (GLuint)handle);
+	glTexParameterf((GLenum)target, (GLenum)pname, (GLfloat)param);
+#endif
+}
+
+// ============================================================================
+// Method-binding pass (2026-06-26): finish / flush / vertexAttrib*f /
+// getVertexAttrib / getUniform forwarders. Each is the standard
+// eglMakeCurrent + native-call pattern.
+// ============================================================================
+
+void nx_webgl_egl_finish(nx_webgl_egl_t *backend) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glFinish();
+#endif
+}
+
+void nx_webgl_egl_flush(nx_webgl_egl_t *backend) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glFlush();
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_1f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)x;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glVertexAttrib1f((GLuint)index, (GLfloat)x);
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_2f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)x; (void)y;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glVertexAttrib2f((GLuint)index, (GLfloat)x, (GLfloat)y);
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_3f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y, float z) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)x; (void)y; (void)z;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glVertexAttrib3f((GLuint)index, (GLfloat)x, (GLfloat)y, (GLfloat)z);
+#endif
+}
+
+void nx_webgl_egl_vertex_attrib_4f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y, float z, float w) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)x; (void)y; (void)z; (void)w;
+#else
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	glVertexAttrib4f((GLuint)index, (GLfloat)x, (GLfloat)y, (GLfloat)z,
+	                  (GLfloat)w);
+#endif
+}
+
+bool nx_webgl_egl_get_vertex_attrib_fv(nx_webgl_egl_t *backend,
+                                        uint32_t index, uint32_t pname,
+                                        float *out) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)pname; (void)out;
+	return false;
+#else
+	if (!backend || !out) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glGetVertexAttribfv((GLuint)index, (GLenum)pname, (GLfloat *)out);
+	return true;
+#endif
+}
+
+bool nx_webgl_egl_get_vertex_attrib_iv(nx_webgl_egl_t *backend,
+                                        uint32_t index, uint32_t pname,
+                                        int *out) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)index; (void)pname; (void)out;
+	return false;
+#else
+	if (!backend || !out) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glGetVertexAttribiv((GLuint)index, (GLenum)pname, (GLint *)out);
+	return true;
+#endif
+}
+
+bool nx_webgl_egl_get_uniform_fv(nx_webgl_egl_t *backend,
+                                  uint32_t program_handle, int location,
+                                  float *out) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)program_handle; (void)location; (void)out;
+	return false;
+#else
+	if (!backend || !program_handle || !out || location < 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glGetUniformfv((GLuint)program_handle, (GLint)location, (GLfloat *)out);
+	return true;
+#endif
+}
+
+bool nx_webgl_egl_get_uniform_iv(nx_webgl_egl_t *backend,
+                                  uint32_t program_handle, int location,
+                                  int *out) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)program_handle; (void)location; (void)out;
+	return false;
+#else
+	if (!backend || !program_handle || !out || location < 0) return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	glGetUniformiv((GLuint)program_handle, (GLint)location, (GLint *)out);
+	return true;
+#endif
+}
+
 bool nx_webgl_egl_read_user_fbo_pixels(nx_webgl_egl_t *backend,
                                         uint32_t fbo_handle,
                                         int x, int y, int width, int height,
@@ -4819,7 +5129,17 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 	// shaves ~95 ms/frame off the cube demo vs. the previous JS-side
 	// `TypedArray.set(subarray)` row-flip loop in canvas-runner.ts.
 	// Scratch is one row's worth (≤ 5 KB for the cube case).
-	if (clipped_start && clip_h > 1 && clipped_row_bytes > 0) {
+	// Option 2 (2026-06-26): SKIP this reverse when spec_y_origin=true
+	// — the caller wants standard GL bottom-up rows. This is the third
+	// y-inversion site the conformance opt-in has to neutralize, after
+	// bridge_scale_rect and the JS-side gl_y translation in
+	// nx_webgl_read_pixels. Missing this is why the canvas-tex tests
+	// didn't move under Option 2's first pass — the viewport gate +
+	// JS-side gate aligned the draw and the requested rect, but this
+	// internal flip re-mirrored the rows on the way back to JS.
+	bool spec_y_skip_reverse = backend->spec_y_origin;
+	if (!spec_y_skip_reverse &&
+		clipped_start && clip_h > 1 && clipped_row_bytes > 0) {
 		uint8_t *scratch_row = malloc(clipped_row_bytes);
 		if (scratch_row) {
 			for (int top = 0; top < clip_h / 2; top++) {
@@ -5125,7 +5445,7 @@ bool nx_webgl_egl_clear_bridge_with_state(nx_webgl_egl_t *backend,
 		}
 	} else {
 		bridge_apply_scissor(canvas, width, height, scissor_enabled,
-		                     scissor_box);
+		                     scissor_box, backend->spec_y_origin);
 	}
 	// Defensively re-enable color writes; some callers (Three.js's
 	// WebGLState) leave the color mask in a mode that would silently
@@ -5528,7 +5848,7 @@ bool nx_webgl_egl_draw_triangles_bridge(nx_webgl_egl_t *backend,
 	int width = target.width;
 	int height = target.height;
 
-	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	bridge_bind_target(&target, backend, canvas, viewport, scissor_enabled, scissor_box);
 	// Honor Three.js's `gl.enable(GL_CULL_FACE)` + `gl.cullFace(...)` state
 	// so single-sided materials (MeshPhongMaterial default
 	// `side: FrontSide`) don't render their back-facing triangles. Without
@@ -5986,7 +6306,7 @@ bool nx_webgl_egl_draw_lines_bridge(nx_webgl_egl_t *backend,
 	int width = target.width;
 	int height = target.height;
 
-	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	bridge_bind_target(&target, backend, canvas, viewport, scissor_enabled, scissor_box);
 	glUseProgram(backend->bridge_line_program);
 	if (backend->bridge_line_color_loc >= 0)
 		glUniform4f(backend->bridge_line_color_loc, color[0], color[1],
@@ -6292,7 +6612,7 @@ bool nx_webgl_egl_draw_textured_triangles_bridge(
 		}
 	}
 
-	bridge_bind_target(&target, canvas, viewport, scissor_enabled, scissor_box);
+	bridge_bind_target(&target, backend, canvas, viewport, scissor_enabled, scissor_box);
 	// See cull_enabled comment in nx_webgl_egl_draw_triangles_bridge.
 	if (cull_enabled) {
 		GLenum gl_mode = GL_BACK;

@@ -6,10 +6,30 @@ typedef struct nx_webgl_egl_s nx_webgl_egl_t;
 
 nx_webgl_egl_t *nx_webgl_egl_create(JSContext *ctx, nx_canvas_t *canvas);
 void nx_webgl_egl_destroy(JSRuntime *rt, nx_webgl_egl_t *backend);
+/* Tear down the current EGL context + surface (keeping eglDisplay alive)
+ * and re-initialise. Used to flush cumulative Mesa-side name allocator
+ * state and bridge-cache pressure between test batches without losing
+ * the EGL display. Returns true on success — backend is left in the same
+ * available=true state as immediately after nx_webgl_egl_create. On
+ * failure the backend may be in a partially-initialised state; the JS-
+ * side caller is expected to bump its context generation either way so
+ * stale handles never re-enter native GL. Does NOT call eglTerminate. */
+bool nx_webgl_egl_reset_context(nx_webgl_egl_t *backend, nx_canvas_t *canvas);
 bool nx_webgl_egl_is_available(nx_webgl_egl_t *backend);
 void nx_webgl_egl_set_clear_color(nx_webgl_egl_t *backend, double *color);
 void nx_webgl_egl_set_bridge_enabled(nx_webgl_egl_t *backend, bool enabled);
 bool nx_webgl_egl_is_bridge_enabled(nx_webgl_egl_t *backend);
+// Spec-Y origin opt-in (2026-06-26). When false (the default and the
+// shipping config for every production demo), the bridge interprets
+// gl.viewport/gl.scissor coords as canvas-y top-down — bridge_scale_rect
+// inverts Y so input rect.y=0 maps to the canvas top. When true, the
+// bridge honors the WebGL spec convention (input rect.y=0 = GL bottom),
+// which is what spec-correct readPixels semantics require. Used by the
+// conformance runner as a measurement-tool opt-in; see
+// REAL_GL_FAILURES.md "bridge-Y-convention" for the deferred Option 1
+// architectural fix this gates around.
+void nx_webgl_egl_set_spec_y_origin(nx_webgl_egl_t *backend, bool enabled);
+bool nx_webgl_egl_get_spec_y_origin(nx_webgl_egl_t *backend);
 void nx_webgl_egl_set_auto_flush(nx_webgl_egl_t *backend, bool enabled);
 void nx_webgl_egl_set_dispatch_debug(nx_webgl_egl_t *backend, const char *label);
 void nx_webgl_egl_append_dispatch_debug(nx_webgl_egl_t *backend, const char *tag);
@@ -483,11 +503,58 @@ void nx_webgl_egl_texture_set_parameteri(nx_webgl_egl_t *backend,
                                           uint32_t target,
                                           uint32_t handle, uint32_t pname,
                                           uint32_t param);
+// Float-valued sibling of texture_set_parameteri. Same lifecycle; used by
+// gl.texParameterf — only TEXTURE_MAX_LOD / TEXTURE_MIN_LOD (WebGL2) and
+// TEXTURE_MAX_ANISOTROPY_EXT actually carry a real float, but the spec
+// permits any pname; integer-valued pnames pass through with a float→int
+// cast on the GLES side.
+void nx_webgl_egl_texture_set_parameterf(nx_webgl_egl_t *backend,
+                                          uint32_t target,
+                                          uint32_t handle, uint32_t pname,
+                                          float param);
 // Generate mipmaps on a persistent texture handle. Caller must have
 // promoted the texture and uploaded the level-0 texels first. Milestone
 // #24.
 void nx_webgl_egl_generate_mipmap(nx_webgl_egl_t *backend,
                                     uint32_t handle, uint32_t target);
+
+// ============================================================================
+// Method-binding pass (2026-06-26): wrappers for previously-unbound WebGL1
+// entry points. Each is the minimal eglMakeCurrent + forward + return pattern.
+// No state caching on the JS side — GLES tracks the canonical value and we
+// query it back on read. See the audit comment block at the top of webgl.c
+// for the corresponding JS-side bindings.
+// ============================================================================
+void nx_webgl_egl_finish(nx_webgl_egl_t *backend);
+void nx_webgl_egl_flush(nx_webgl_egl_t *backend);
+void nx_webgl_egl_vertex_attrib_1f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x);
+void nx_webgl_egl_vertex_attrib_2f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y);
+void nx_webgl_egl_vertex_attrib_3f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y, float z);
+void nx_webgl_egl_vertex_attrib_4f(nx_webgl_egl_t *backend, uint32_t index,
+                                    float x, float y, float z, float w);
+// getVertexAttrib read-side. `pname` is one of the VERTEX_ATTRIB_* enums;
+// for CURRENT_VERTEX_ATTRIB the caller must pass a float[4] buffer (the
+// only multi-element pname). For scalar int pnames (SIZE / STRIDE / TYPE /
+// BUFFER_BINDING / DIVISOR / INTEGER) `*out_int` receives the single value.
+bool nx_webgl_egl_get_vertex_attrib_fv(nx_webgl_egl_t *backend,
+                                        uint32_t index, uint32_t pname,
+                                        float *out);
+bool nx_webgl_egl_get_vertex_attrib_iv(nx_webgl_egl_t *backend,
+                                        uint32_t index, uint32_t pname,
+                                        int *out);
+// getUniform read-side. Caller supplies a buffer sized for the uniform's
+// GLSL type (1/2/3/4 components for scalars/vecs, 4/9/16 for mat2/3/4);
+// dispatcher in webgl.c picks fv-vs-iv based on the type returned by
+// glGetActiveUniform.
+bool nx_webgl_egl_get_uniform_fv(nx_webgl_egl_t *backend,
+                                  uint32_t program_handle, int location,
+                                  float *out);
+bool nx_webgl_egl_get_uniform_iv(nx_webgl_egl_t *backend,
+                                  uint32_t program_handle, int location,
+                                  int *out);
 
 // Read pixels from a user-bound FBO. Standard GL bottom-up convention
 // (no y-flip — the user FBO doesn't share the bridge FBO's canvas-y
