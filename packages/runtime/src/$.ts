@@ -334,9 +334,37 @@ export interface Init {
 	imageNew(width?: number, height?: number): Image | ImageBitmap;
 	imageDecode(img: Image | ImageBitmap, data: ArrayBuffer): Promise<void>;
 	imageClose(img: ImageBitmap): void;
+	/** Convert straight RGBA source bytes → cairo BGRA premultiplied
+	 * storage on the Image. Optional 3rd arg `preserveStraight`: when
+	 * true, ALSO stash the original straight bytes in
+	 * `nx_image_t::straight_data` so the WebGL extractor can read
+	 * non-lossy straight pixels for STRAIGHT-intent bitmaps. The polyfill
+	 * passes true from the createImageBitmap(ImageData) branch so the
+	 * conformance tests' premultiplyAlpha:'none' option semantic holds
+	 * at a=0 source pixels (otherwise lost in the lossy premul
+	 * roundtrip). */
 	imageWriteRGBA(
 		img: Image | ImageBitmap,
 		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+		preserveStraight?: boolean,
+	): void;
+	/** Clone the source Image's pixel buffer (cairo BGRA-premultiplied
+	 * payload) into a freshly-allocated ImageBitmap-shaped Image.
+	 * Returns `null` when the source has no realized buffer (decode in
+	 * flight or never given dims) so the caller can fall back to the
+	 * convertToBlob roundtrip. See source/image.c::nx_image_clone_from
+	 * for the byte-equivalence reasoning. */
+	imageCloneFrom(src: Image | ImageBitmap): ImageBitmap | null;
+	/** Stamp the createImageBitmap option intent onto an ImageBitmap so
+	 * the WebGL texImage2D extractor can compute the effective flip /
+	 * un-premultiply transform at upload time. `alphaMode`: 0
+	 * UNSPECIFIED (legacy), 1 STRAIGHT, 2 PREMULTIPLIED. See
+	 * source/image.h::nx_image_t comments + source/webgl.c::
+	 * nx_webgl_extract_image_source for the upload-time math. */
+	imageSetBitmapOptions(
+		img: Image | ImageBitmap,
+		flipY: boolean,
+		alphaMode: number,
 	): void;
 	/** Animation (multi-frame GIF) accessors. `imageFrameCount` returns
 	 * 0 for static images and the frame total otherwise; `imageFrameDelay`

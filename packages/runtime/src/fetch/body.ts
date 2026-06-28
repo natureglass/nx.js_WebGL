@@ -91,7 +91,33 @@ export abstract class Body implements globalThis.Body {
 		let contentType: string | undefined;
 		let contentLength: number | undefined;
 
+		// Session 9 Blob suspect-(II) probe: log init shape + the
+		// `'body' in init` branch decision. The session-8 pinpoint
+		// showed Response.body===null for from_blob fetches; suspect
+		// (II) is that 'body' in init returns true (because the
+		// init has a .body property somehow) and `init = init.body`
+		// replaces init with null. This probe surfaces exactly which
+		// branch fires.
+		const probe = (globalThis as { __nxjsBlobProbe?: boolean }).__nxjsBlobProbe;
+		if (probe) {
+			const initType = init === null ? 'null'
+				: init === undefined ? 'undefined'
+				: typeof init !== 'object' ? typeof init
+				: init instanceof ArrayBuffer ? `ArrayBuffer(${init.byteLength})`
+				: ArrayBuffer.isView(init) ? `${init.constructor.name}(byteLength=${init.byteLength})`
+				: init instanceof Blob ? `Blob(size=${init.size})`
+				: init && typeof init === 'object' && 'body' in init ? `Body-like(body=${init.body === null ? 'null' : init.body === undefined ? 'undefined' : 'set'})`
+				: 'plainObject';
+			const bodyInInit = !!(init && typeof init === 'object' && 'body' in init);
+			console.debug(
+				`[nxjs:blob-probe:Body.ctor:enter] initType=${initType} bodyInInit=${bodyInInit}`,
+			);
+		}
+
 		if (init && typeof init === 'object' && 'body' in init) {
+			if (probe) console.debug(
+				`[nxjs:blob-probe:Body.ctor:bodyInBranch] taking 'body' in init path; init.body=${init.body === null ? 'null' : init.body === undefined ? 'undefined' : 'set'}`,
+			);
 			if (init.bodyUsed) {
 				throw new Error("Input request's body is unusable");
 			}
@@ -100,6 +126,20 @@ export abstract class Body implements globalThis.Body {
 		}
 
 		if (init) {
+			if (probe) {
+				const dispatchType =
+					typeof init === 'string' ? 'string'
+					: init instanceof Blob ? 'Blob'
+					: init instanceof URLSearchParams ? 'URLSearchParams'
+					: init instanceof ReadableStream ? 'ReadableStream'
+					: init instanceof FormData ? 'FormData'
+					: init instanceof ArrayBuffer ? 'ArrayBuffer(else-branch)'
+					: ArrayBuffer.isView(init) ? `${(init as ArrayBufferView).constructor.name}(else-branch)`
+					: 'other';
+				console.debug(
+					`[nxjs:blob-probe:Body.ctor:dispatch] willSet=${dispatchType}`,
+				);
+			}
 			if (typeof init === 'string') {
 				this.body = asyncIteratorToStream(stringIterator(init));
 				contentType = 'text/plain;charset=UTF-8';
@@ -140,21 +180,37 @@ export abstract class Body implements globalThis.Body {
 	 * If the body is null, it returns an empty ArrayBuffer.
 	 */
 	async arrayBuffer(): Promise<ArrayBuffer> {
+		// Blob-probe instrumentation (session 7) — pinpointing the
+		// loader→Blob→decoder size=0-despite-101-bytes-in pathology.
+		// Gated on a global so the trace only fires when explicitly
+		// turned on (test setup or a one-shot probe).
+		const probe = (globalThis as { __nxjsBlobProbe?: boolean }).__nxjsBlobProbe;
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Body.arrayBuffer:enter] bodyUsed=${this.bodyUsed} bodyNull=${!this.body}`,
+		);
 		if (this.bodyUsed) {
 			throw new TypeError('Body has already been consumed.');
 		}
 		if (!this.body) {
 			this.bodyUsed = true;
+			if (probe) console.debug(
+				`[nxjs:blob-probe:Body.arrayBuffer:exit] EMPTY (body was null)`,
+			);
 			return new ArrayBuffer(0);
 		}
 		let bytes = 0;
 		const chunks: Uint8Array[] = [];
 		const reader = this.body.getReader();
+		let chunkIdx = 0;
 		while (true) {
 			const next = await reader.read();
 			if (next.done) break;
 			chunks.push(next.value);
 			bytes += next.value.length;
+			if (probe) console.debug(
+				`[nxjs:blob-probe:Body.arrayBuffer:chunk] idx=${chunkIdx} size=${next.value.length} runningTotal=${bytes}`,
+			);
+			chunkIdx++;
 		}
 		this.bodyUsed = true;
 		const arr = new Uint8Array(bytes);
@@ -163,6 +219,9 @@ export abstract class Body implements globalThis.Body {
 			arr.set(chunk, offset);
 			offset += chunk.length;
 		}
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Body.arrayBuffer:exit] totalBytes=${bytes} arr.buffer.byteLength=${arr.buffer.byteLength}`,
+		);
 		return arr.buffer;
 	}
 

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <pixman.h>
 #include <switch.h>
 #include <turbojpeg.h>
@@ -1318,9 +1319,33 @@ int main(int argc, char *argv[]) {
 	// probes captured below survive a hang in any of the libnx init steps
 	// (romfs / socket / pl). Existing call site (after plInitialize) moved
 	// here so NX_BOOT_LOG output lands in the file from `+0ms` onward.
-	// Original semantics preserved: same path, same "w" mode, same fd kept
-	// for `fclose` at shutdown.
-	FILE *debug_fd = freopen(LOG_FILENAME, "w", stderr);
+	//
+	// 2026-06-27 measurement-integrity fix: open in "a" (append) mode, NOT
+	// "w" (truncate). Pre-fix every brewser launch wiped nxjs-debug.log,
+	// destroying evidence captured during a prior app/session. This was
+	// observed concretely when the WebGL2 conformance run's
+	// `[nxjs:tex-format-probe]` slot 10-15 markers (the empirical answer
+	// to "did Phase 1a Group C transfer to Mesa cleanly?") vanished when
+	// the WebGL1 conformance run started, leaving the per-format Mesa-
+	// acceptance table UNKNOWN. The same wipe likely corrupted prior
+	// passes silently. Per-session boundaries are now marked by a single
+	// SESSION line written immediately after the freopen so readers can
+	// disambiguate concatenated sessions. `delete_if_empty` at process
+	// exit becomes effectively a no-op (we just wrote at least the
+	// SESSION marker) — that's fine; an "empty" debug log was rarely
+	// what we wanted anyway.
+	FILE *debug_fd = freopen(LOG_FILENAME, "a", stderr);
+	{
+		time_t now = time(NULL);
+		struct tm *tm_utc = gmtime(&now);
+		char ts[32] = "?";
+		if (tm_utc)
+			strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm_utc);
+		fprintf(stderr,
+		        "\n=== nxjs session start ts=%s argc=%d argv0=%s ===\n",
+		        ts, argc, (argc > 0 && argv[0]) ? argv[0] : "?");
+		fflush(stderr);
+	}
 	NX_BOOT_LOG("entry");
 
 	nx_context_t *nx_ctx = malloc(sizeof(nx_context_t));

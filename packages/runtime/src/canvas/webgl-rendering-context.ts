@@ -89,9 +89,17 @@ export class WebGLRenderingContext {
 		return ctx;
 	}
 
-	get canvas() {
-		return _(this).canvas;
-	}
+	// 2026-06-26: `gl.canvas` is now a native-backed getter. The
+	// construction-time TS getter returned the Screen singleton the
+	// context was built against (shared-context model: one gl serves
+	// every LiveElement on the page), making `gl.canvas.width` always
+	// 1280 regardless of which LiveElement the page actually asked for.
+	// The native getter reads `context->canvas_value`, which `setCanvas`
+	// updates via brewser-runtime's LiveElement.getContext hook with
+	// sticky-first semantics + a sub-100px probe-guard. See
+	// nx_webgl_set_canvas in webgl.c for the rebind rules.
+	declare readonly canvas: unknown;
+	setCanvas(canvas: unknown): boolean { stub(); }
 
 	declare readonly drawingBufferWidth: number;
 	declare readonly drawingBufferHeight: number;

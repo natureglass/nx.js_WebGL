@@ -80,6 +80,11 @@ bool nx_webgl_egl_has_pending_readback(nx_webgl_egl_t *backend);
 bool nx_webgl_egl_flush_bridge_present(nx_webgl_egl_t *backend,
 									   nx_canvas_t *canvas);
 uint32_t nx_webgl_egl_get_last_draw_gl_error(nx_webgl_egl_t *backend);
+uint32_t nx_webgl_egl_probe_native_error(nx_webgl_egl_t *backend);
+void nx_webgl_egl_probe_3d_bindings(nx_webgl_egl_t *backend,
+                                     uint32_t active_unit_enum,
+                                     uint32_t *out_binding_2d_array,
+                                     uint32_t *out_binding_3d);
 
 // SpotLight state passed alongside the bridge dispatch. When `enabled` is
 // false (or the pointer is NULL), the bridge skips the spotlight contribution
@@ -468,6 +473,18 @@ bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
                                                     uint32_t mag_filter,
                                                     uint32_t wrap_s,
                                                     uint32_t wrap_t);
+// Per-face sub-image upload for an existing cube-map handle. Mirrors
+// nx_webgl_egl_persistent_texture_sub_image_2d but binds the cube target
+// and forwards to glTexSubImage2D with the supplied face_target
+// (0x8515..0x851A). No mipmap regeneration — sub-uploads target level 0
+// only. Used by the cube branch of texSubImage2D for the conformance
+// image_bitmap-from-* tests' cube-binding path; previously the entire
+// path was rejected with INVALID_ENUM, leaving cube faces at the zero-
+// fill from texImage2D(null) and producing uniform (0,0,0) reads.
+bool nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+    nx_webgl_egl_t *backend, uint32_t handle, uint32_t face_target,
+    int xoffset, int yoffset, int width, int height,
+    uint32_t format, uint32_t type, const void *pixels);
 uint32_t nx_webgl_egl_check_framebuffer_status(nx_webgl_egl_t *backend,
                                                  uint32_t handle);
 bool nx_webgl_egl_framebuffer_texture_2d(nx_webgl_egl_t *backend,

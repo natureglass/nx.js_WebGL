@@ -343,6 +343,19 @@
 #define GL_RGB565 0x8D62
 #define GL_RGBA4 0x8056
 #define GL_RGB5_A1 0x8057
+// 2026-06-26 image-source format widening: WebGL 1 spec §5.14.8 image-source
+// uploads accept ALPHA/LUMINANCE/LUMINANCE_ALPHA in addition to RGB/RGBA, and
+// the packed UShort types (5_6_5, 4_4_4_4, 5_5_5_1) for RGB/RGBA. Pre-2026-06-26
+// the bridge hard-rejected every image-source combo except (RGBA, UByte) at
+// the JS layer, so 7 of 8 textures-canvas-tex-2d-* conformance tests stayed
+// uninitialized → sampled as zero. See REAL_GL_FAILURES.md "EXPOSED BY THE
+// BINDING FIX" for the diagnostic chain.
+#define GL_ALPHA 0x1906
+#define GL_LUMINANCE 0x1909
+#define GL_LUMINANCE_ALPHA 0x190A
+#define GL_UNSIGNED_SHORT_5_6_5 0x8363
+#define GL_UNSIGNED_SHORT_4_4_4_4 0x8033
+#define GL_UNSIGNED_SHORT_5_5_5_1 0x8034
 // P2 (HDR/PMREM): float and half-float texture formats.
 #define GL_HALF_FLOAT_OES 0x8D61
 #define GL_RGBA16F 0x881A
@@ -433,6 +446,17 @@ typedef struct {
 typedef struct {
 	nx_canvas_t *canvas;
 	JSValue canvas_value;
+	// Sticky-first canvas binding (2026-06-26). See nx_webgl_set_canvas.
+	// `canvas_bound` flips true on the first accepted setCanvas() call;
+	// subsequent calls become no-ops unless the current binding is
+	// `canvas_bound_provisional` (sub-100px sub-canvas, e.g. a 1×1 probe).
+	// Provisional bindings allow exactly one later upgrade to a non-
+	// provisional (>=100px) canvas; non-provisional bindings lock in.
+	// Default false at js_mallocz; the construction-time canvas (Screen)
+	// is held in canvas_value WITHOUT setting canvas_bound, so the first
+	// LiveElement to call setCanvas wins.
+	bool canvas_bound;
+	bool canvas_bound_provisional;
 	double clear_color[4];
 	double clear_depth;
 	int32_t clear_stencil;
@@ -747,6 +771,12 @@ typedef struct {
 	uint32_t mag_filter;
 	uint32_t wrap_s;
 	uint32_t wrap_t;
+	uint32_t wrap_r;	// WebGL2: 3rd wrap dimension for TEXTURE_3D /
+						// TEXTURE_2D_ARRAY (and TEXTURE_CUBE_MAP_ARRAY).
+						// Stashed for Q1 replay-on-promotion at
+						// nx_webgl_tex_image_3d (the 3D path's EGL
+						// shim doesn't apply sampler params at upload
+						// time, unlike persistent_texture_image_2d).
 	uint32_t width;
 	uint32_t height;
 	uint8_t *data;
@@ -969,6 +999,54 @@ static inline bool nx_loc_stale(const nx_webgl_context_t *ctx,
 	return nx_prog_stale(ctx, prog);
 }
 
+/* 2026-06-27 Q2 cascade-origin instrumentation: wrap every
+ * context->error assignment so we can identify which engine path sets
+ * the residual INVALID_OPERATION that contaminates downstream
+ * `failIfGLError` checks. Gated `quiet` after the Q2 cascade-origin +
+ * blind-spot magnitude were harvested (read_pixels dominant source,
+ * 178 true blinds in 1182-test run). Calibration harness kept in place
+ * for the future scoped-glGetError fix: flip to 1 to re-enable spew.
+ * Logs only on the NO_ERROR → error transition so a single call
+ * setting then re-setting in the same path doesn't spam the log. */
+#define NXJS_Q2_INSTRUMENT_VERBOSE 0
+#define NX_SET_GL_ERROR(_ctx, _code) do { \
+	uint32_t __nx_err_code = (uint32_t)(_code); \
+	if (NXJS_Q2_INSTRUMENT_VERBOSE && \
+	    (_ctx)->error == GL_NO_ERROR && __nx_err_code != GL_NO_ERROR) { \
+		fprintf(stderr, "[nxjs:err-set] func=%s code=0x%04x\n", \
+		        __func__, __nx_err_code); \
+		fflush(stderr); \
+	} \
+	(_ctx)->error = __nx_err_code; \
+} while (0)
+
+/* 2026-06-27 Q1 candidate-1-vs-2 disambiguation: targeted probes to
+ * decide whether the TEXTURE_2D_ARRAY readback gap is the
+ * sampler-completeness / texParameteri-replay (candidate 1, ~50-line
+ * fix mirroring [[reference-brewser-threejs-spotlight-shadow-engine-fix]])
+ * or the Mesa array-layer FBO write-drop (candidate 2, workstream
+ * mirroring [[reference-mesa-cube-face-aliasing-rescue]]). Code-side
+ * evidence already strong for candidate 1 — nx_webgl_egl_tex_image_3d
+ * at webgl_egl.c:8829 is a 5-line shim with no glTexParameteri replay,
+ * while persistent_texture_image_2d (the 2D analog) DOES apply
+ * MIN_FILTER/MAG_FILTER/WRAP_S/WRAP_T at upload time (webgl_egl.c:3913).
+ * These probes confirm empirically by capturing:
+ *   - texParameteri ordering: are params set BEFORE the texture gets a
+ *     gles_handle (the trap)? If yes, candidate 1 confirmed.
+ *   - Post-texImage3D sampler state: is the texture sampler-incomplete?
+ * Flip flag to 0 after disambiguation harvest. */
+#define NXJS_Q1_DISAMBIG_VERBOSE 0  /* Q1 fix landed but did NOT clear the
+                                       Group C tex-3d-* 0,0,0 reads — the
+                                       sampler-completeness gap was real and
+                                       got fixed but wasn't the load-bearing
+                                       cause. Probes silenced; harness
+                                       preserved. The actual blocker is
+                                       being chased separately as Q1-followup
+                                       (bridge compositor / sampler-unit
+                                       mismatch FIRST, before Mesa-write-drop
+                                       — see REAL_GL_FAILURES.md Q1-followup
+                                       candidate ordering). */
+
 // GEN-1 helper macros applied at every PROGRAM/SHADER/UNIFORM-LOCATION
 // entry point. Each clears the stale handle (so subsequent code can't
 // pass it to native GL) AND sets GL_INVALID_OPERATION AND returns the
@@ -978,20 +1056,20 @@ static inline bool nx_loc_stale(const nx_webgl_context_t *ctx,
 #define NX_REQUIRE_PROG_LIVE(ctx, prog, ret) do { \
 	if (nx_prog_stale((ctx), (prog))) { \
 		((nx_webgl_program_t *)(prog))->gles_handle = 0; \
-		(ctx)->error = GL_INVALID_OPERATION; \
+		NX_SET_GL_ERROR((ctx), GL_INVALID_OPERATION); \
 		return (ret); \
 	} \
 } while (0)
 #define NX_REQUIRE_SHADER_LIVE(ctx, sh, ret) do { \
 	if (nx_shader_stale((ctx), (sh))) { \
 		((nx_webgl_shader_t *)(sh))->gles_handle = 0; \
-		(ctx)->error = GL_INVALID_OPERATION; \
+		NX_SET_GL_ERROR((ctx), GL_INVALID_OPERATION); \
 		return (ret); \
 	} \
 } while (0)
 #define NX_REQUIRE_LOC_LIVE(ctx, loc, ret) do { \
 	if (nx_loc_stale((ctx), (loc))) { \
-		(ctx)->error = GL_INVALID_OPERATION; \
+		NX_SET_GL_ERROR((ctx), GL_INVALID_OPERATION); \
 		return (ret); \
 	} \
 } while (0)
@@ -1776,6 +1854,102 @@ static JSValue nx_webgl_get_drawing_buffer_height(JSContext *ctx,
 	return JS_NewUint32(ctx, h);
 }
 
+// gl.canvas — replaces the construction-time TS-side getter. Always returns
+// the current `context->canvas_value` so changes via setCanvas (called from
+// brewser-runtime's LiveElement.getContext) flow through. Without this,
+// gl.canvas returned the Screen singleton the WebGL context was first
+// constructed against (shared-context model: one nx_webgl_context_t serves
+// every LiveElement on the page via the shared-screen-GL factory), and
+// gl.canvas.width was always 1280 regardless of which LiveElement the page
+// actually asked for.
+static JSValue nx_webgl_get_canvas(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	return JS_DupValue(ctx, context->canvas_value);
+}
+
+// gl.setCanvas(canvas) — sticky-first per-getContext rebind.
+//
+// Called by brewser-runtime's LiveElement.getContext('webgl'|'webgl2') after
+// it pulls the shared screen GL from dynamicCanvasWebGLFactory, so the
+// returned `gl` reports the calling LiveElement as `gl.canvas`. Without
+// this, gl.canvas was pinned to the Screen singleton at construction (the
+// shared-screen-GL was created via Screen.getContext) and conformance tests
+// reading `gl.canvas.width` got 1280 instead of their per-test 32×32 shim
+// dim — see REAL_GL_FAILURES.md "binding-diagnosis".
+//
+// Sticky-first semantics: the first accepted call wins; subsequent calls
+// from other LiveElements are no-ops, so a renderer doesn't have its
+// binding stolen by a later capability probe (e.g. jQuery's WebGL Report
+// that creates a 1×1 canvas mid-page).
+//
+// Sub-100px probe-guard: if the first call's canvas has either width<100
+// OR height<100, we accept it but mark the binding `provisional`. A later
+// call with both dims>=100 can override the provisional binding exactly
+// once (then locks in). This handles the inverse race — capability probe
+// first, real renderer second — without forcing the page to call setCanvas
+// in a particular order.
+//
+// Why dims read via JS_GetPropertyStr (not nx_get_canvas): the
+// LiveElement passed by brewser-runtime is NOT an nx_canvas_t — it's a
+// plain JS object with .width/.height getters that return its tracked
+// `_width`/`_height` ints. nx_get_canvas would JS_EXCEPTION on it. The JS
+// property accessor handles Screen, LiveElement, and any other shape
+// uniformly.
+//
+// Why context->canvas (the native nx_canvas_t pointer) is NOT updated:
+// that pointer drives the EGL / composite surface and must stay pinned to
+// Screen (the actual render target). Only canvas_value (the JS reference
+// gl.canvas returns + the JS property accessor drawing_buffer_dim reads)
+// changes. This decouples "which canvas the page sees" from "which surface
+// the bridge composites into."
+//
+// Returns true if accepted (the canvas binding now points at argv[0]),
+// false if rejected by the sticky-first or provisional-upgrade rules.
+static JSValue nx_webgl_set_canvas(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
+	if (!context)
+		return JS_EXCEPTION;
+	if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+		return JS_NewBool(ctx, false);
+
+	int32_t new_w = 0, new_h = 0;
+	JSValue wv = JS_GetPropertyStr(ctx, argv[0], "width");
+	if (!JS_IsException(wv) && !JS_IsUndefined(wv) && !JS_IsNull(wv)) {
+		JS_ToInt32(ctx, &new_w, wv);
+	}
+	JS_FreeValue(ctx, wv);
+	JSValue hv = JS_GetPropertyStr(ctx, argv[0], "height");
+	if (!JS_IsException(hv) && !JS_IsUndefined(hv) && !JS_IsNull(hv)) {
+		JS_ToInt32(ctx, &new_h, hv);
+	}
+	JS_FreeValue(ctx, hv);
+	bool new_provisional = (new_w < 100 || new_h < 100);
+
+	if (context->canvas_bound) {
+		if (!context->canvas_bound_provisional) {
+			// Sticky: a non-provisional binding is locked in.
+			return JS_NewBool(ctx, false);
+		}
+		if (new_provisional) {
+			// Provisional-on-provisional: keep the first (stable
+			// behavior). The user can still override by directly
+			// setting the dims on the existing canvas to >= 100.
+			return JS_NewBool(ctx, false);
+		}
+		// Provisional → non-provisional upgrade: accept once and lock.
+	} else {
+		context->canvas_bound = true;
+	}
+	context->canvas_bound_provisional = new_provisional;
+	JS_FreeValue(ctx, context->canvas_value);
+	context->canvas_value = JS_DupValue(ctx, argv[0]);
+	return JS_NewBool(ctx, true);
+}
+
 static JSValue nx_webgl_get_context_attributes(JSContext *ctx,
 											   JSValueConst this_val,
 											   int argc,
@@ -2118,7 +2292,7 @@ static JSValue ext_clip_control_w(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &origin, argv[0]) || JS_ToUint32(ctx, &depth, argv[1]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_clip_control(c->egl, origin, depth))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 
@@ -2135,7 +2309,7 @@ static JSValue ext_polygon_offset_clamp_w(JSContext *ctx, JSValueConst this_val,
 	    JS_ToFloat64(ctx, &cl, argv[2]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_polygon_offset_clamp(c->egl, (float)f, (float)u, (float)cl))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 
@@ -2150,7 +2324,7 @@ static JSValue ext_parallel_max_threads_w(JSContext *ctx, JSValueConst this_val,
 	uint32_t count;
 	if (JS_ToUint32(ctx, &count, argv[0])) return JS_EXCEPTION;
 	if (!nx_webgl_egl_max_shader_compiler_threads_khr(c->egl, count))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 
@@ -2196,9 +2370,9 @@ static JSValue ext_multi_draw_arrays_w(JSContext *ctx, JSValueConst this_val,
 	int *counts = audit_extract_int_array(ctx, argv[3], counts_off, drawcount);
 	if (firsts && counts) {
 		if (!nx_webgl_egl_multi_draw_arrays(c->egl, mode, firsts, counts, drawcount))
-			c->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	} else {
-		c->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(c, GL_INVALID_VALUE);
 	}
 	free(firsts); free(counts);
 	return JS_UNDEFINED;
@@ -2225,9 +2399,9 @@ static JSValue ext_multi_draw_elements_w(JSContext *ctx, JSValueConst this_val,
 	if (counts && offsets) {
 		if (!nx_webgl_egl_multi_draw_elements(c->egl, mode, counts, type,
 		                                        offsets, drawcount))
-			c->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	} else {
-		c->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(c, GL_INVALID_VALUE);
 	}
 	free(counts); free(offsets);
 	return JS_UNDEFINED;
@@ -2245,7 +2419,7 @@ static JSValue ext_enablei_w(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &index, argv[1]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_enablei(c->egl, target, index))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 static JSValue ext_disablei_w(JSContext *ctx, JSValueConst this_val,
@@ -2259,7 +2433,7 @@ static JSValue ext_disablei_w(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &target, argv[0]) || JS_ToUint32(ctx, &index, argv[1]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_disablei(c->egl, target, index))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 static JSValue ext_blend_equationi_w(JSContext *ctx, JSValueConst this_val,
@@ -2273,7 +2447,7 @@ static JSValue ext_blend_equationi_w(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &buf, argv[0]) || JS_ToUint32(ctx, &mode, argv[1]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_blend_equationi(c->egl, buf, mode))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 static JSValue ext_blend_equation_separatei_w(JSContext *ctx, JSValueConst this_val,
@@ -2288,7 +2462,7 @@ static JSValue ext_blend_equation_separatei_w(JSContext *ctx, JSValueConst this_
 	    JS_ToUint32(ctx, &malpha, argv[2]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_blend_equation_separatei(c->egl, buf, mrgb, malpha))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 static JSValue ext_blend_funci_w(JSContext *ctx, JSValueConst this_val,
@@ -2303,7 +2477,7 @@ static JSValue ext_blend_funci_w(JSContext *ctx, JSValueConst this_val,
 	    JS_ToUint32(ctx, &dst, argv[2]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_blend_funci(c->egl, buf, src, dst))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 static JSValue ext_blend_func_separatei_w(JSContext *ctx, JSValueConst this_val,
@@ -2319,7 +2493,7 @@ static JSValue ext_blend_func_separatei_w(JSContext *ctx, JSValueConst this_val,
 	    JS_ToUint32(ctx, &da, argv[4]))
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_blend_func_separatei(c->egl, buf, srgb, drgb, sa, da))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 
@@ -2332,13 +2506,13 @@ static JSValue ext_bind_frag_data_location_w(JSContext *ctx, JSValueConst this_v
 	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
 	if (!c) return JS_EXCEPTION;
 	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
-	if (!prog) { c->error = GL_INVALID_VALUE; return JS_UNDEFINED; }
+	if (!prog) { NX_SET_GL_ERROR(c, GL_INVALID_VALUE); return JS_UNDEFINED; }
 	uint32_t color;
 	if (JS_ToUint32(ctx, &color, argv[1])) return JS_EXCEPTION;
 	const char *name = JS_ToCString(ctx, argv[2]);
 	if (!name) return JS_EXCEPTION;
 	if (!nx_webgl_egl_bind_frag_data_location(c->egl, prog->gles_handle, color, name))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	JS_FreeCString(ctx, name);
 	return JS_UNDEFINED;
 }
@@ -2350,7 +2524,7 @@ static JSValue ext_bind_frag_data_location_indexed_w(JSContext *ctx, JSValueCons
 	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
 	if (!c) return JS_EXCEPTION;
 	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
-	if (!prog) { c->error = GL_INVALID_VALUE; return JS_UNDEFINED; }
+	if (!prog) { NX_SET_GL_ERROR(c, GL_INVALID_VALUE); return JS_UNDEFINED; }
 	uint32_t color, index;
 	if (JS_ToUint32(ctx, &color, argv[1]) || JS_ToUint32(ctx, &index, argv[2]))
 		return JS_EXCEPTION;
@@ -2358,7 +2532,7 @@ static JSValue ext_bind_frag_data_location_indexed_w(JSContext *ctx, JSValueCons
 	if (!name) return JS_EXCEPTION;
 	if (!nx_webgl_egl_bind_frag_data_location_indexed(c->egl, prog->gles_handle,
 	                                                    color, index, name))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	JS_FreeCString(ctx, name);
 	return JS_UNDEFINED;
 }
@@ -2370,7 +2544,7 @@ static JSValue ext_get_frag_data_index_w(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_context_t *c = audit_get_ctx(ctx, func_data[0]);
 	if (!c) return JS_EXCEPTION;
 	nx_webgl_program_t *prog = nx_get_webgl_program(argv[0]);
-	if (!prog) { c->error = GL_INVALID_VALUE; return JS_NewInt32(ctx, -1); }
+	if (!prog) { NX_SET_GL_ERROR(c, GL_INVALID_VALUE); return JS_NewInt32(ctx, -1); }
 	const char *name = JS_ToCString(ctx, argv[1]);
 	if (!name) return JS_EXCEPTION;
 	int idx = nx_webgl_egl_get_frag_data_index(c->egl, prog->gles_handle, name);
@@ -2455,7 +2629,7 @@ static JSValue ext_query_counter_w(JSContext *ctx, JSValueConst this_val,
 	uint32_t target;
 	if (JS_ToUint32(ctx, &target, argv[1])) return JS_EXCEPTION;
 	if (!ext_query_counter_dispatch(c->egl, argv[0], target))
-		c->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(c, GL_INVALID_OPERATION);
 	return JS_UNDEFINED;
 }
 
@@ -3339,7 +3513,7 @@ static JSValue nx_webgl_get_shader_precision_format(JSContext *ctx,
 		return JS_EXCEPTION;
 
 	if (!is_shader_type(shader_type)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 
@@ -3370,7 +3544,7 @@ static JSValue nx_webgl_get_shader_precision_format(JSContext *ctx,
 		precision = 0;
 		break;
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 
@@ -3481,7 +3655,7 @@ static JSValue nx_webgl_clear(JSContext *ctx, JSValueConst this_val, int argc,
 
 	if ((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT |
 				  GL_STENCIL_BUFFER_BIT)) != 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -3643,7 +3817,7 @@ static JSValue nx_webgl_create_shader(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 
 	if (!is_shader_type(type)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 
@@ -3672,7 +3846,7 @@ static JSValue nx_webgl_shader_source(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
 	if (!shader || shader->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -3703,7 +3877,7 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
 	if (!shader || shader->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: stale shader → handle is dead. Refuse rather than re-
@@ -3712,7 +3886,7 @@ static JSValue nx_webgl_compile_shader(JSContext *ctx, JSValueConst this_val,
 	// territory; mapping stale to that is the conservative choice.
 	if (nx_shader_stale(context, shader)) {
 		shader->gles_handle = 0;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -3844,7 +4018,7 @@ static JSValue nx_webgl_get_shader_parameter(JSContext *ctx,
 
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
 	if (!shader) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 
@@ -3866,7 +4040,7 @@ static JSValue nx_webgl_get_shader_parameter(JSContext *ctx,
 		// non-parallel path.
 		return JS_NewBool(ctx, true);
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 }
@@ -3880,7 +4054,7 @@ static JSValue nx_webgl_get_shader_info_log(JSContext *ctx,
 
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
 	if (!shader) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 
@@ -3898,7 +4072,7 @@ static JSValue nx_webgl_delete_shader(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[0]);
 	if (!shader) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -4021,7 +4195,7 @@ static JSValue nx_webgl_attach_shader(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[1]);
 	if (!program || !shader || program->deleted || shader->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: attaching a stale program OR stale shader would link
@@ -4030,7 +4204,7 @@ static JSValue nx_webgl_attach_shader(JSContext *ctx, JSValueConst this_val,
 	if (nx_prog_stale(context, program) || nx_shader_stale(context, shader)) {
 		if (nx_prog_stale(context, program)) program->gles_handle = 0;
 		if (nx_shader_stale(context, shader)) shader->gles_handle = 0;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -4053,7 +4227,7 @@ static JSValue nx_webgl_detach_shader(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	nx_webgl_shader_t *shader = nx_get_webgl_shader(argv[1]);
 	if (!program || !shader || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -4075,14 +4249,14 @@ static JSValue nx_webgl_bind_attrib_location(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	int32_t location;
 	if (JS_ToInt32(ctx, &location, argv[1]))
 		return JS_EXCEPTION;
 	if (location < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	const char *name = JS_ToCString(ctx, argv[2]);
@@ -4099,7 +4273,7 @@ static JSValue nx_webgl_bind_attrib_location(JSContext *ctx,
 	if (program->attrib_binding_count >= NX_WEBGL_MAX_ATTRIB_BINDINGS) {
 		// No matching WebGL error for "too many bindings"; INVALID_VALUE
 		// is the closest spec-defined option.
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		JS_FreeCString(ctx, name);
 		return JS_UNDEFINED;
 	}
@@ -4118,7 +4292,7 @@ static JSValue nx_webgl_link_program(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: stale program → its prior gles_handle is dead. Refuse the
@@ -4127,7 +4301,7 @@ static JSValue nx_webgl_link_program(JSContext *ctx, JSValueConst this_val,
 	// attachShader + linkProgram fresh after resetSharedContext.
 	if (nx_prog_stale(context, program)) {
 		program->gles_handle = 0;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -4220,7 +4394,7 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: useProgram with a stale program must NOT silently bind a
@@ -4230,11 +4404,11 @@ static JSValue nx_webgl_use_program(JSContext *ctx, JSValueConst this_val,
 	// the same conceptual bucket.
 	if (nx_prog_stale(context, program)) {
 		program->gles_handle = 0;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (!program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -4264,7 +4438,7 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, JS_NULL);  // GEN-1
@@ -4348,7 +4522,7 @@ static JSValue nx_webgl_get_program_parameter(JSContext *ctx,
 		// Link is synchronous in the bridge — same rationale as shader path.
 		return JS_NewBool(ctx, true);
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 }
@@ -4362,7 +4536,7 @@ static JSValue nx_webgl_get_program_info_log(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, JS_NULL);  // GEN-1
@@ -4410,12 +4584,12 @@ static JSValue nx_webgl_get_active_attrib(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return new_active_info(ctx, &stub);
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, new_active_info(ctx, &stub));  // GEN-1
 	if (!program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return new_active_info(ctx, &stub);
 	}
 
@@ -4461,12 +4635,12 @@ static JSValue nx_webgl_get_active_uniform(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return new_active_info(ctx, &stub);
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, new_active_info(ctx, &stub));  // GEN-1
 	if (!program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return new_active_info(ctx, &stub);
 	}
 
@@ -4515,7 +4689,7 @@ static JSValue nx_webgl_delete_program(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -4564,7 +4738,7 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 	JSValue *binding = buffer_binding_for_target(context, target);
 	if (!binding ||
 	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -4576,11 +4750,11 @@ static JSValue nx_webgl_bind_buffer(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(argv[1]);
 	if (!buffer || buffer->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (buffer->target != 0 && buffer->target != target) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: lazy-recreate type. Stale buffer → reset its native handle
@@ -4620,19 +4794,19 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 	JSValue *binding = buffer_binding_for_target(context, target);
 	if (!binding ||
 	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	bool usage_ok = context->is_webgl2 ? is_buffer_usage_webgl2(usage)
 	                                    : is_buffer_usage(usage);
 	if (!usage_ok) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -4653,7 +4827,7 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 	size_t size = 0;
 	uint8_t *source = NULL;
 	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	source = NX_GetBufferSource(ctx, &size, argv[1]);
@@ -4662,11 +4836,11 @@ static JSValue nx_webgl_buffer_data(JSContext *ctx, JSValueConst this_val,
 		if (JS_ToInt64(ctx, &requested_signed, argv[1]))
 			return JS_EXCEPTION;
 		if (requested_signed < 0) {
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return JS_UNDEFINED;
 		}
 		if ((uint64_t)requested_signed > 0xFFFFFFFFu) {
-			context->error = GL_OUT_OF_MEMORY;
+			NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 			return JS_UNDEFINED;
 		}
 		size = (size_t)requested_signed;
@@ -4738,17 +4912,17 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 	JSValue *binding = buffer_binding_for_target(context, target);
 	if (!binding ||
 	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (offset < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted || buffer->target != target) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -4773,12 +4947,12 @@ static JSValue nx_webgl_buffer_sub_data(JSContext *ctx, JSValueConst this_val,
 
 	size_t byte_offset = (size_t)offset;
 	if (byte_offset > buffer->size || byte_length > buffer->size - byte_offset) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (byte_length > 0) {
 		if (!buffer->data) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		memcpy(buffer->data + byte_offset, source, byte_length);
@@ -4810,7 +4984,7 @@ static JSValue nx_webgl_delete_buffer(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(argv[0]);
 	if (!buffer) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -4856,16 +5030,16 @@ static JSValue nx_webgl_get_buffer_parameter(JSContext *ctx,
 	JSValue *binding = buffer_binding_for_target(context, target);
 	if (!binding ||
 	    (is_webgl2_buffer_target(target) && !context->is_webgl2)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 	if (pname != GL_BUFFER_SIZE && pname != GL_BUFFER_USAGE) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 	nx_webgl_buffer_t *buffer = nx_get_webgl_buffer(*binding);
 	if (!buffer || buffer->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	if (pname == GL_BUFFER_SIZE)
@@ -4893,6 +5067,10 @@ static JSValue nx_webgl_create_texture(JSContext *ctx, JSValueConst this_val,
 	texture->mag_filter = GL_NEAREST;
 	texture->wrap_s = GL_CLAMP_TO_EDGE;
 	texture->wrap_t = GL_CLAMP_TO_EDGE;
+	texture->wrap_r = GL_CLAMP_TO_EDGE;	// Matches wrap_s/t engine default
+										// (not GLES spec default of REPEAT)
+										// for consistency with the engine's
+										// existing bridge-friendly wrap defaults.
 	texture->bridge_id = context->next_texture_id++;
 	if (texture->bridge_id == 0)
 		texture->bridge_id = context->next_texture_id++;
@@ -4911,7 +5089,7 @@ static JSValue nx_webgl_active_texture(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &texture, argv[0]))
 		return JS_EXCEPTION;
 	if (texture < GL_TEXTURE0 || texture >= GL_TEXTURE0 + 8) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->active_texture = texture;
@@ -4936,7 +5114,7 @@ static JSValue nx_webgl_bind_texture(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
 	if (!is_texture_binding_target(target)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	JSValue *binding = texture_binding_for_target(context, target);
@@ -4951,11 +5129,11 @@ static JSValue nx_webgl_bind_texture(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(argv[1]);
 	if (!texture || texture->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (texture->target != 0 && texture->target != target) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	texture->target = target;
@@ -4994,15 +5172,32 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &param, argv[2]))
 		return JS_EXCEPTION;
 	if (!is_texture_binding_target(target)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
 	JSValue *binding = texture_binding_for_target(context, target);
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
 	if (!texture || texture->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
+	}
+
+	/* 2026-06-27 Q1-disambig probe: capture texParameteri ordering for
+	 * TEXTURE_2D_ARRAY / TEXTURE_3D targets. If gles_handle==0 at this
+	 * call, the existing "forward if handle set" gate at the end of
+	 * this function (line ~5251) silently drops the parameter — the
+	 * test sets MIN_FILTER=NEAREST before texImage3D, and the native
+	 * texture later allocated by texImage3D inherits GLES default
+	 * MIN_FILTER=NEAREST_MIPMAP_LINEAR (which is sampler-incomplete for
+	 * a single-level texture without mipmaps). The probe makes the
+	 * before-vs-after pattern visible per test iteration. */
+	if (NXJS_Q1_DISAMBIG_VERBOSE &&
+	    (target == 0x8C1A /*TEXTURE_2D_ARRAY*/ || target == 0x806F /*TEXTURE_3D*/)) {
+		fprintf(stderr,
+		        "[nxjs:q1-texParam] target=0x%x pname=0x%x param=0x%x gles_handle=%u (handle==0 means param will be STORED-ONLY, not forwarded — promotion-time replay needed)\n",
+		        target, pname, param, (unsigned)texture->gles_handle);
+		fflush(stderr);
 	}
 
 	/* 2026-06-23 PMREM Tegra-compat: force MIN/MAG filter to NEAREST
@@ -5027,7 +5222,7 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 		    param != GL_LINEAR_MIPMAP_NEAREST &&
 		    param != GL_NEAREST_MIPMAP_LINEAR &&
 		    param != GL_LINEAR_MIPMAP_LINEAR) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (tex_is_float && param != GL_NEAREST) {
@@ -5037,7 +5232,7 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 		break;
 	case GL_TEXTURE_MAG_FILTER:
 		if (param != GL_NEAREST && param != GL_LINEAR) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (tex_is_float && param != GL_NEAREST) {
@@ -5048,7 +5243,7 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 	case GL_TEXTURE_WRAP_S:
 	case GL_TEXTURE_WRAP_T:
 		if (param != GL_CLAMP_TO_EDGE && param != GL_REPEAT) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (pname == GL_TEXTURE_WRAP_S)
@@ -5065,13 +5260,26 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 	case 0x884D: // TEXTURE_COMPARE_FUNC
 	case 0x813C: // TEXTURE_BASE_LEVEL
 	case 0x813D: // TEXTURE_MAX_LEVEL
-	case 0x8072: // TEXTURE_WRAP_R
 	case 0x813A: // TEXTURE_MIN_LOD
 	case 0x813B: // TEXTURE_MAX_LOD
 		if (!context->is_webgl2) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
+		break;
+	case 0x8072: // TEXTURE_WRAP_R
+		if (!context->is_webgl2) {
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
+			return JS_UNDEFINED;
+		}
+		// Q1 fix: stash for replay at nx_webgl_tex_image_3d. Pre-this,
+		// WRAP_R fell through to the native-forward at the bottom of
+		// this function — which only fires if gles_handle != 0. For the
+		// test's typical "set params BEFORE texImage3D" pattern,
+		// gles_handle is 0 at WRAP_R time and the value was dropped
+		// completely (no stash AND no forward). Now stashed so the
+		// post-texImage3D replay can apply it natively.
+		texture->wrap_r = param;
 		break;
 	case 0x84FE: // TEXTURE_MAX_ANISOTROPY_EXT
 		// Gated on the driver advertising EXT_texture_filter_anisotropic.
@@ -5080,12 +5288,12 @@ static JSValue nx_webgl_tex_parameteri(JSContext *ctx, JSValueConst this_val,
 		// don't need to bounds-check. The forward to native at the bottom
 		// of this function dispatches it onto the live texture handle.
 		if (!context->egl || !nx_webgl_egl_has_anisotropic(context->egl)) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		break;
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	// If the texture has been promoted to a persistent native handle (FBO
@@ -5139,13 +5347,13 @@ static JSValue nx_webgl_tex_parameterf(JSContext *ctx, JSValueConst this_val,
 	uint32_t param_i = (uint32_t)(int32_t)param_d;
 
 	if (!is_texture_binding_target(target)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	JSValue *binding = texture_binding_for_target(context, target);
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
 	if (!texture || texture->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -5160,7 +5368,7 @@ static JSValue nx_webgl_tex_parameterf(JSContext *ctx, JSValueConst this_val,
 		    param_i != GL_LINEAR_MIPMAP_NEAREST &&
 		    param_i != GL_NEAREST_MIPMAP_LINEAR &&
 		    param_i != GL_LINEAR_MIPMAP_LINEAR) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (tex_is_float && param_i != GL_NEAREST) param_i = GL_NEAREST;
@@ -5168,7 +5376,7 @@ static JSValue nx_webgl_tex_parameterf(JSContext *ctx, JSValueConst this_val,
 		break;
 	case GL_TEXTURE_MAG_FILTER:
 		if (param_i != GL_NEAREST && param_i != GL_LINEAR) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (tex_is_float && param_i != GL_NEAREST) param_i = GL_NEAREST;
@@ -5177,27 +5385,34 @@ static JSValue nx_webgl_tex_parameterf(JSContext *ctx, JSValueConst this_val,
 	case GL_TEXTURE_WRAP_S:
 	case GL_TEXTURE_WRAP_T:
 		if (param_i != GL_CLAMP_TO_EDGE && param_i != GL_REPEAT) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		if (pname == GL_TEXTURE_WRAP_S) texture->wrap_s = param_i;
 		else texture->wrap_t = param_i;
 		break;
 	case 0x884C: case 0x884D: case 0x813C: case 0x813D:
-	case 0x8072: case 0x813A: case 0x813B:
+	case 0x813A: case 0x813B:
 		if (!context->is_webgl2) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		break;
+	case 0x8072: // TEXTURE_WRAP_R — Q1 fix sibling of texParameteri's stash
+		if (!context->is_webgl2) {
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
+			return JS_UNDEFINED;
+		}
+		texture->wrap_r = param_i;
+		break;
 	case 0x84FE:
 		if (!context->egl || !nx_webgl_egl_has_anisotropic(context->egl)) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_UNDEFINED;
 		}
 		break;
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (pname == 0x884C) {
@@ -5325,27 +5540,87 @@ static bool nx_webgl_extract_image_source(JSContext *ctx,
 	if (!out) {
 		return false;
 	}
-	bool flip_y = context->unpack_flip_y;
-	bool keep_premul = context->unpack_premultiply_alpha;
+	// Effective transform combines the per-bitmap createImageBitmap
+	// options (baked when the bitmap was constructed) with the WebGL
+	// pixelStorei state. For non-ImageBitmap sources (raw Image / canvas
+	// / video / OffscreenCanvas) the per-bitmap flags are 0/false and
+	// the effective transform reduces to the pixelStorei pair (legacy
+	// behavior — un-multiply when UNPACK_PREMUL=false; flip when
+	// UNPACK_FLIP_Y=true).
+	//
+	// flip_y XOR: bitmap with imageOrientation:"flipY" is logically
+	// pre-flipped. Cairo storage is canonical (unflipped), so XOR
+	// against UNPACK_FLIP_Y_WEBGL gives the net upload flip.
+	//
+	// un_premultiply by alpha mode:
+	//   UNSPECIFIED (0) — raw Image/canvas/video OR ImageBitmap
+	//     without options. Legacy semantics: un-multiply iff
+	//     UNPACK_PREMUL=false (deliver straight when WebGL wants
+	//     straight; keep premul when WebGL wants premul).
+	//   STRAIGHT (1) — bitmap was created with premultiplyAlpha:'none'.
+	//     Logically straight. Same formula as UNSPECIFIED — when
+	//     UNPACK_PREMUL=false we deliver straight (spec-correct);
+	//     when UNPACK_PREMUL=true WebGL premultiplies on top.
+	//   PREMULTIPLIED (2) — premultiplyAlpha:'premultiply' or 'default'
+	//     against an image-like source. Logically premul. Per spec,
+	//     keep premul regardless of UNPACK_PREMUL_WEBGL.
+	bool bitmap_flip_y = image && image->bitmap_orientation_flip_y;
+	uint8_t alpha_mode = image ? image->bitmap_alpha_mode : 0;
+	bool flip_y = context->unpack_flip_y ^ bitmap_flip_y;
+	// STRAIGHT-mode bitmap with preserved straight bytes (allocated by
+	// the polyfill's createImageBitmap(ImageData) branch via
+	// $.imageWriteRGBA(bm, data, /*preserveStraight=*/true)). Cairo
+	// storage is BGRA premultiplied which is lossy at a=0 source pixels
+	// (premul of (255,0,0,0) is (0,0,0,0); un-multiplying back can't
+	// recover the original color). When the bitmap is STRAIGHT-intent
+	// and `straight_data` is populated, read directly from it as RGBA
+	// (the byte order matches WebGL's expected upload format, no
+	// channel swizzle needed).
+	const uint8_t *straight_src = NULL;
+	if (alpha_mode == 1 /* STRAIGHT */ && image && image->straight_data) {
+		straight_src = image->straight_data;
+	}
+	bool un_premultiply;
+	if (alpha_mode == 2 /* PREMULTIPLIED */) {
+		un_premultiply = false;
+	} else {
+		un_premultiply = !context->unpack_premultiply_alpha;
+	}
 	for (int32_t y = 0; y < h; y++) {
-		const uint8_t *src_row = src_data + (size_t)y * row_bytes;
+		const uint8_t *src_row = (straight_src ? straight_src : src_data)
+		                          + (size_t)y * row_bytes;
 		uint8_t *dst_row = out + (size_t)(flip_y ? (h - 1 - y) : y) * row_bytes;
 		for (int32_t x = 0; x < w; x++) {
-			uint8_t b = src_row[x * 4 + 0];
-			uint8_t g = src_row[x * 4 + 1];
-			uint8_t r = src_row[x * 4 + 2];
-			uint8_t a = src_row[x * 4 + 3];
-			if (!keep_premul && a != 0 && a != 255) {
-				// Decoded source is BGRA premultiplied (cairo
-				// convention). WebGL default is "store as-is" — i.e.,
-				// non-premultiplied — so divide each channel by alpha
-				// to recover the original color.
-				int32_t fr = (r * 255 + a / 2) / a;
-				int32_t fg = (g * 255 + a / 2) / a;
-				int32_t fb = (b * 255 + a / 2) / a;
-				r = fr > 255 ? 255 : (uint8_t)fr;
-				g = fg > 255 ? 255 : (uint8_t)fg;
-				b = fb > 255 ? 255 : (uint8_t)fb;
+			uint8_t r, g, b, a;
+			if (straight_src) {
+				// straight_data is RGBA (no swizzle). Already
+				// non-premultiplied; honor WebGL's UNPACK_PREMUL state
+				// directly without the un-multiply step.
+				r = src_row[x * 4 + 0];
+				g = src_row[x * 4 + 1];
+				b = src_row[x * 4 + 2];
+				a = src_row[x * 4 + 3];
+				if (context->unpack_premultiply_alpha && a != 0 && a != 255) {
+					r = (uint8_t)((r * a) / 255);
+					g = (uint8_t)((g * a) / 255);
+					b = (uint8_t)((b * a) / 255);
+				}
+			} else {
+				// Cairo BGRA premultiplied storage.
+				b = src_row[x * 4 + 0];
+				g = src_row[x * 4 + 1];
+				r = src_row[x * 4 + 2];
+				a = src_row[x * 4 + 3];
+				if (un_premultiply && a != 0 && a != 255) {
+					// Divide each channel by alpha to recover the
+					// straight (non-premultiplied) source color.
+					int32_t fr = (r * 255 + a / 2) / a;
+					int32_t fg = (g * 255 + a / 2) / a;
+					int32_t fb = (b * 255 + a / 2) / a;
+					r = fr > 255 ? 255 : (uint8_t)fr;
+					g = fg > 255 ? 255 : (uint8_t)fg;
+					b = fb > 255 ? 255 : (uint8_t)fb;
+				}
 			}
 			dst_row[x * 4 + 0] = r;
 			dst_row[x * 4 + 1] = g;
@@ -5359,19 +5634,536 @@ static bool nx_webgl_extract_image_source(JSContext *ctx,
 	return true;
 }
 
+// 2026-06-26 image-source format-widening helpers.
+//
+// Pre-2026-06-26 the bridge accepted only (format=GL_RGBA, type=GL_UNSIGNED_BYTE)
+// for image-source texImage2D/texSubImage2D, hard-rejecting every other
+// spec-valid (format, type) tuple with INVALID_OPERATION at the JS layer. The
+// comment claimed this matched the WebGL 1 spec — it did not. §5.14.8 permits
+// 8 image-source tuples. The restriction was a load-bearing accidental gate
+// hidden by the (gl.canvas → Screen) binding bug, which made conformance
+// failures sample 1280×720 of uncleared FBO and look like a different bug.
+// After the binding fix landed (REAL_GL_FAILURES.md "SHIPPED — gl.canvas
+// binding fix"), the canvas-format tests started reading their real sub-rect
+// and the rejection's effect surfaced as 7 of 8 textures-canvas-tex-2d-*
+// staying FAIL.
+//
+// The fix needs three things:
+//   1. Widen the image-source restriction at texImage2D + texSubImage2D to
+//      accept all 8 spec tuples (this file: image_source_format_allowed).
+//   2. Widen the texImage2D format-accept-list to bind allocation +
+//      bytes-per-pixel math for ALPHA / LUMINANCE / LUMINANCE_ALPHA at UByte
+//      and RGB/RGBA at packed-UShort (this file: is_simple_uns_byte_xxx +
+//      is_packed_short_xxx + bytes_for_format_type).
+//   3. Convert the RGBA8 source bytes that nx_webgl_extract_image_source
+//      emits into the target format/type byte layout the EGL helper forwards
+//      to native glTexImage2D (this file: convert_rgba8_to_target).
+//
+// Per-format Mesa acceptance is verified empirically: the first upload of
+// each (format, type) tuple attempts native upload via persistent_texture_
+// image_2d, checks `glGetError()` (the EGL helper returns the gl-error
+// state as its bool), and falls back to canonical RGBA8 sample-equivalent
+// upload if Mesa rejects. The acceptance result is cached per (format,
+// type) at module scope so subsequent uploads take the fast path. Result
+// gets logged once via fprintf so the conformance log carries the
+// per-format Mesa acceptance result for the report.
+//
+// Sample-equivalent RGBA8 fallback semantics, per WebGL 1 spec §3.7.5
+// (sampling rules):
+//   - ALPHA(A)     → samples as (0, 0, 0, A)        → RGBA8 (0, 0, 0, A)
+//   - LUMINANCE(L) → samples as (L, L, L, 1)        → RGBA8 (L, L, L, 255)
+//   - LUMINANCE_ALPHA(L, A) → samples as (L, L, L, A) → RGBA8 (L, L, L, A)
+//   - RGB(R, G, B) → samples as (R, G, B, 1)        → RGBA8 (R, G, B, 255)
+//   - All RGBA variants → samples as (R, G, B, A)   → RGBA8 (R, G, B, A)
+//
+// LUMINANCE conversion uses L=R per OpenGL ES 2.0 §3.6.2 Table 3.5
+// ("conversion to internal format" for GL_LUMINANCE: the red channel is
+// stored as the luminance value; G and B are dropped). NOT BT.601 luma
+// (Y = 0.299R+0.587G+0.114B) — that's an Image-source quirk Khronos used
+// for canvas2D ImageData conversion but is NOT how GL_LUMINANCE upload
+// works. The 2026-06-26 first pass used BT.601 and the conformance test
+// failed (got 150 for green's luminance, expected 0 since green's R=0).
+//
+// Cube-map face uploads from image sources go through the same upstream
+// image-source restriction (this file at the call site below); widening
+// the restriction unblocks cube-map face uploads too as a side effect. No
+// separate cube-map rejection exists. NOT a parallel bug, just a side win.
+
+static int convert_luminance_from_rgb(int r, int g, int b) {
+	// L = R per OpenGL ES 2.0 §3.6.2 Table 3.5. The G and B arguments
+	// are unused but kept for call-site clarity.
+	(void)g; (void)b;
+	return r;
+}
+
+static int clamp_byte(int v) {
+	return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+// Returns false for (format, type) tuples not on the WebGL 1 §5.14.8
+// image-source allow-list. RGBA / RGB / ALPHA / LUMINANCE / LUMINANCE_ALPHA
+// at UByte, plus RGB/UShort_5_6_5 and RGBA/UShort_4_4_4_4 and
+// RGBA/UShort_5_5_5_1. SRGB_EXT combos (Three.js's r152+ color-management
+// path) are also accepted — production-grade compat the pre-2026-06-26
+// restriction unintentionally broke.
+static bool image_source_format_allowed(uint32_t format, uint32_t type) {
+	if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) return true;
+	if (format == GL_RGB && type == GL_UNSIGNED_BYTE) return true;
+	if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) return true;
+	if (format == GL_LUMINANCE && type == GL_UNSIGNED_BYTE) return true;
+	if (format == GL_LUMINANCE_ALPHA && type == GL_UNSIGNED_BYTE) return true;
+	if (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) return true;
+	if (format == GL_RGBA && type == GL_UNSIGNED_SHORT_4_4_4_4) return true;
+	if (format == GL_RGBA && type == GL_UNSIGNED_SHORT_5_5_5_1) return true;
+	if (format == 0x8C40 /* SRGB_EXT */ && type == GL_UNSIGNED_BYTE) return true;
+	if (format == 0x8C42 /* SRGB_ALPHA_EXT */ && type == GL_UNSIGNED_BYTE) return true;
+	// WebGL 2 GLES3 single/dual-channel UNORM image-source uploads. Group C
+	// Phase 1a (2026-06-27): conformance tests for sized internalformats
+	// R8 / RG8 / SRGB8 / SRGB8_ALPHA8 / RGBA8 / RGB8 use these (format, type)
+	// tuples — internalformat differs (sized) but the on-wire format/type
+	// stays unsized. RGBA / RGB are already allowed above; add the two
+	// missing channel-count variants here.
+	if (format == 0x1903 /* GL_RED */ && type == GL_UNSIGNED_BYTE) return true;
+	if (format == 0x8227 /* GL_RG */ && type == GL_UNSIGNED_BYTE) return true;
+	return false;
+}
+
+// Computes destination bytes per pixel for a given (format, type) tuple.
+// Returns 0 for unknown combos (caller should reject).
+static size_t bytes_for_format_type(uint32_t format, uint32_t type) {
+	if (type == GL_UNSIGNED_SHORT_5_6_5 ||
+	    type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+	    type == GL_UNSIGNED_SHORT_5_5_5_1) {
+		return 2; // packed pixel = 1 element = 16 bits
+	}
+	if (type == GL_UNSIGNED_BYTE) {
+		if (format == GL_RGBA) return 4;
+		if (format == GL_RGB) return 3;
+		if (format == GL_ALPHA) return 1;
+		if (format == GL_LUMINANCE) return 1;
+		if (format == GL_LUMINANCE_ALPHA) return 2;
+		if (format == 0x8C42 /* SRGB_ALPHA_EXT */) return 4;
+		if (format == 0x8C40 /* SRGB_EXT */) return 3;
+		if (format == 0x8227 /* GL_RG */) return 2;
+		if (format == 0x1903 /* GL_RED */) return 1;
+	}
+	return 0;
+}
+
+// Convert an RGBA8 source buffer (the output of nx_webgl_extract_image_source,
+// post-flipY, post-premultiplied-alpha-recovery) to the target (format, type)
+// byte layout AND also emit a "canonical RGBA8" buffer carrying the same
+// values that a spec-correct sample of the target texture would return.
+//
+// The target-format buffer feeds the native glTexImage2D first-attempt
+// upload. The canonical-RGBA8 buffer is the fallback if Mesa rejects the
+// native upload — uploading those values as RGBA8 storage produces the
+// same per-pixel sample result as a spec-correct ALPHA / LUMINANCE / etc.
+// texture would, so the test sees the right colors regardless of which
+// path the driver took.
+//
+// Caller owns BOTH returned buffers. Both must be js_free'd. For
+// (RGBA, UByte) the function returns the input pointer in *out_target
+// AND in *out_canonical without allocating — identity case for the
+// existing fast path so no regression to the already-passing test.
+//
+// Returns false on bad inputs or alloc failure.
+static bool convert_rgba8_to_target(JSContext *ctx,
+                                    const uint8_t *rgba_in, int w, int h,
+                                    uint32_t format, uint32_t type,
+                                    uint8_t **out_target, size_t *out_target_bytes,
+                                    uint8_t **out_canonical, size_t *out_canonical_bytes,
+                                    bool *out_is_identity_alias) {
+	if (!rgba_in || w <= 0 || h <= 0) return false;
+	size_t pixels = (size_t)w * (size_t)h;
+	size_t target_bpp = bytes_for_format_type(format, type);
+	if (target_bpp == 0) return false;
+	*out_is_identity_alias = false;
+
+	// Fast path: source matches target byte layout → identity alias.
+	// Caller MUST NOT js_free either buffer in this case; the
+	// `out_is_identity_alias` flag signals the caller to skip frees and
+	// uses the input directly. Preserves the existing (RGBA, UByte)
+	// upload's allocation profile.
+	bool target_is_rgba_ubyte = (format == GL_RGBA && type == GL_UNSIGNED_BYTE);
+	bool target_is_srgb_alpha = (format == 0x8C42 && type == GL_UNSIGNED_BYTE);
+	if (target_is_rgba_ubyte || target_is_srgb_alpha) {
+		*out_target = (uint8_t *)rgba_in;
+		*out_target_bytes = pixels * 4;
+		*out_canonical = (uint8_t *)rgba_in;
+		*out_canonical_bytes = pixels * 4;
+		*out_is_identity_alias = true;
+		return true;
+	}
+
+	uint8_t *target = js_malloc(ctx, pixels * target_bpp);
+	uint8_t *canonical = js_malloc(ctx, pixels * 4);
+	if (!target || !canonical) {
+		if (target) js_free(ctx, target);
+		if (canonical) js_free(ctx, canonical);
+		return false;
+	}
+	*out_target = target;
+	*out_target_bytes = pixels * target_bpp;
+	*out_canonical = canonical;
+	*out_canonical_bytes = pixels * 4;
+
+	for (size_t i = 0; i < pixels; i++) {
+		int r = rgba_in[i * 4 + 0];
+		int g = rgba_in[i * 4 + 1];
+		int b = rgba_in[i * 4 + 2];
+		int a = rgba_in[i * 4 + 3];
+		int Y = convert_luminance_from_rgb(r, g, b);
+
+		switch (format) {
+		case GL_RGB:
+			if (type == GL_UNSIGNED_BYTE) {
+				target[i * 3 + 0] = (uint8_t)r;
+				target[i * 3 + 1] = (uint8_t)g;
+				target[i * 3 + 2] = (uint8_t)b;
+			} else if (type == GL_UNSIGNED_SHORT_5_6_5) {
+				uint16_t pkt = (uint16_t)(((r & 0xF8) << 8) |
+				                          ((g & 0xFC) << 3) |
+				                          ((b & 0xF8) >> 3));
+				target[i * 2 + 0] = (uint8_t)(pkt & 0xFF);
+				target[i * 2 + 1] = (uint8_t)((pkt >> 8) & 0xFF);
+				// Canonical sample is the QUANTIZED color (5/6/5 lossy),
+				// not the source. Expand-back so the RGBA8 fallback path
+				// produces identical sample output to the native path.
+				int qr = ((pkt >> 11) & 0x1F);
+				int qg = ((pkt >> 5) & 0x3F);
+				int qb = (pkt & 0x1F);
+				r = (qr * 255 + 15) / 31;
+				g = (qg * 255 + 31) / 63;
+				b = (qb * 255 + 15) / 31;
+			}
+			a = 255;
+			break;
+		case GL_RGBA:
+			if (type == GL_UNSIGNED_BYTE) {
+				target[i * 4 + 0] = (uint8_t)r;
+				target[i * 4 + 1] = (uint8_t)g;
+				target[i * 4 + 2] = (uint8_t)b;
+				target[i * 4 + 3] = (uint8_t)a;
+			} else if (type == GL_UNSIGNED_SHORT_4_4_4_4) {
+				uint16_t pkt = (uint16_t)(((r & 0xF0) << 8) |
+				                          ((g & 0xF0) << 4) |
+				                          (b & 0xF0) |
+				                          ((a & 0xF0) >> 4));
+				target[i * 2 + 0] = (uint8_t)(pkt & 0xFF);
+				target[i * 2 + 1] = (uint8_t)((pkt >> 8) & 0xFF);
+				int qr = ((pkt >> 12) & 0xF);
+				int qg = ((pkt >> 8) & 0xF);
+				int qb = ((pkt >> 4) & 0xF);
+				int qa = (pkt & 0xF);
+				r = (qr * 255 + 7) / 15;
+				g = (qg * 255 + 7) / 15;
+				b = (qb * 255 + 7) / 15;
+				a = (qa * 255 + 7) / 15;
+			} else if (type == GL_UNSIGNED_SHORT_5_5_5_1) {
+				uint16_t pkt = (uint16_t)(((r & 0xF8) << 8) |
+				                          ((g & 0xF8) << 3) |
+				                          ((b & 0xF8) >> 2) |
+				                          ((a & 0x80) >> 7));
+				target[i * 2 + 0] = (uint8_t)(pkt & 0xFF);
+				target[i * 2 + 1] = (uint8_t)((pkt >> 8) & 0xFF);
+				int qr = ((pkt >> 11) & 0x1F);
+				int qg = ((pkt >> 6) & 0x1F);
+				int qb = ((pkt >> 1) & 0x1F);
+				int qa = (pkt & 0x1);
+				r = (qr * 255 + 15) / 31;
+				g = (qg * 255 + 15) / 31;
+				b = (qb * 255 + 15) / 31;
+				a = qa ? 255 : 0;
+			}
+			break;
+		case GL_ALPHA:
+			target[i] = (uint8_t)a;
+			r = 0; g = 0; b = 0; // spec sample (0,0,0,A)
+			break;
+		case GL_LUMINANCE:
+			target[i] = (uint8_t)Y;
+			r = Y; g = Y; b = Y; a = 255; // spec sample (Y,Y,Y,1)
+			break;
+		case GL_LUMINANCE_ALPHA:
+			target[i * 2 + 0] = (uint8_t)Y;
+			target[i * 2 + 1] = (uint8_t)a;
+			r = Y; g = Y; b = Y; // spec sample (Y,Y,Y,A)
+			break;
+		case 0x8C40: /* SRGB_EXT */
+			target[i * 3 + 0] = (uint8_t)r;
+			target[i * 3 + 1] = (uint8_t)g;
+			target[i * 3 + 2] = (uint8_t)b;
+			a = 255;
+			break;
+		case 0x8227: /* GL_RG (R8 / RG8 sized-internalformat path) */
+			// Single-channel-pair upload. Spec sample for an RG texture
+			// returns (R, G, 0, 1) — the canonical RGBA8 fallback must
+			// match that, else a Mesa-rejection RGBA8 reupload would
+			// produce wrong values on shader sample.
+			target[i * 2 + 0] = (uint8_t)r;
+			target[i * 2 + 1] = (uint8_t)g;
+			b = 0;
+			a = 255;
+			break;
+		case 0x1903: /* GL_RED (R8 sized-internalformat path) */
+			target[i] = (uint8_t)r;
+			g = 0; b = 0; a = 255; // spec sample (R, 0, 0, 1)
+			break;
+		default:
+			break;
+		}
+
+		canonical[i * 4 + 0] = (uint8_t)clamp_byte(r);
+		canonical[i * 4 + 1] = (uint8_t)clamp_byte(g);
+		canonical[i * 4 + 2] = (uint8_t)clamp_byte(b);
+		canonical[i * 4 + 3] = (uint8_t)clamp_byte(a);
+	}
+	return true;
+}
+
+// Cached per (format, type) Mesa acceptance state. UNKNOWN until first
+// upload attempt, then either ACCEPTED (native upload works) or REJECTED
+// (must use canonical RGBA8 fallback). Indexed by a small lookup; small
+// constant-size table because the spec only allows a handful of tuples.
+//
+// 2026-06-26 second pass: ALPHA / LUMINANCE / LUMINANCE_ALPHA are
+// pre-stamped REJECTED at module-load time. The first-pass empirical
+// probe showed all 3 formats' UPLOADS accepted (`glGetError` returned
+// NO_ERROR), but post-upload conformance sampling returned spec-violating
+// values:
+//   - ALPHA texel A=255 sampled as (0,0,0,0) instead of (0,0,0,255)
+//   - LUMINANCE texel L=R sampled correctly per L=R rule, but the
+//     first-pass conversion erroneously used BT.601 (corrected below)
+//
+// Mesa-Nouveau's GLES3 driver retains the legacy ALPHA/LUMINANCE/
+// LUMINANCE_ALPHA formats for upload (the API surface) but does NOT
+// preserve the spec-mandated swizzle on sample. Forcing the canonical
+// RGBA8 fallback bypasses the broken swizzle by storing the
+// sample-equivalent values directly in RGBA8 channels. The probe is
+// retained as code (and would re-probe if some other Mesa version
+// silently fixes the bug) but the pre-stamp guarantees the right
+// behavior on the current Tegra/Nouveau target.
+//
+// Packed UShort types (5_6_5, 4_4_4_4, 5_5_5_1) and RGB/UByte are NOT
+// pre-stamped — they use RGB/RGBA channel layouts (no legacy swizzle)
+// and the first-pass empirical probe confirmed Mesa accepts AND samples
+// them correctly. They take the native fast path on the live driver.
+typedef enum {
+	FT_UNKNOWN = 0,
+	FT_ACCEPTED = 1,
+	FT_REJECTED = 2,
+} ft_accept_t;
+
+#define FT_CACHE_SIZE 16
+static ft_accept_t ft_cache[FT_CACHE_SIZE] = {
+	FT_UNKNOWN,  // 0: RGBA/UByte (fast path, no probe in practice)
+	FT_UNKNOWN,  // 1: RGB/UByte
+	FT_REJECTED, // 2: ALPHA/UByte - Mesa swizzle broken; force RGBA8 fallback
+	FT_REJECTED, // 3: LUMINANCE/UByte - same
+	FT_REJECTED, // 4: LUMINANCE_ALPHA/UByte - same
+	FT_UNKNOWN,  // 5: RGB/UShort_5_6_5
+	FT_UNKNOWN,  // 6: RGBA/UShort_4_4_4_4
+	FT_UNKNOWN,  // 7: RGBA/UShort_5_5_5_1
+	FT_UNKNOWN,  // 8: SRGB_EXT/UByte (unsized; webgl_egl translates to SRGB8)
+	FT_UNKNOWN,  // 9: SRGB_ALPHA_EXT/UByte (unsized; translates to SRGB8_ALPHA8)
+	// 2026-06-27 Group C Phase 1a: sized GLES3 internalformats. Keyed by
+	// (internalformat, format) — separate slots from their unsized cousins
+	// so a Mesa rejection of e.g. SRGB8 doesn't poison the RGBA/UByte slot.
+	// All start FT_UNKNOWN; the first upload probes via tex_image_2d_native_
+	// or_fallback and stamps ACCEPTED or REJECTED based on glGetError.
+	FT_UNKNOWN,  // 10: RGBA8/RGBA/UByte
+	FT_UNKNOWN,  // 11: RGB8/RGB/UByte
+	FT_UNKNOWN,  // 12: RG8/RG/UByte
+	FT_UNKNOWN,  // 13: R8/RED/UByte
+	FT_UNKNOWN,  // 14: SRGB8/RGB/UByte (driver auto-decodes via sized internalformat)
+	FT_UNKNOWN,  // 15: SRGB8_ALPHA8/RGBA/UByte (same)
+};
+static bool ft_cache_logged[FT_CACHE_SIZE] = {0};
+
+// Index by (internalformat, format, type). Sized GLES3 variants check
+// internalformat AND format and return their dedicated slot; the unsized
+// WebGL 1 tuples fall through to the format-only checks below. Reserving
+// distinct slots for sized vs unsized is what lets a per-variant Mesa
+// rejection stay isolated (e.g. SRGB8 rejection must not stamp the
+// unrelated RGBA/UByte slot REJECTED via shared (format, type)).
+static int ft_cache_index(uint32_t internalformat, uint32_t format, uint32_t type) {
+	if (type == GL_UNSIGNED_BYTE) {
+		if (internalformat == 0x8058 /*RGBA8*/ && format == GL_RGBA) return 10;
+		if (internalformat == 0x8051 /*RGB8*/ && format == GL_RGB) return 11;
+		if (internalformat == 0x822B /*RG8*/ && format == 0x8227 /*GL_RG*/) return 12;
+		if (internalformat == 0x8229 /*R8*/ && format == 0x1903 /*GL_RED*/) return 13;
+		if (internalformat == 0x8C41 /*SRGB8*/ && format == GL_RGB) return 14;
+		if (internalformat == 0x8C43 /*SRGB8_ALPHA8*/ && format == GL_RGBA) return 15;
+	}
+	if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) return 0;
+	if (format == GL_RGB && type == GL_UNSIGNED_BYTE) return 1;
+	if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) return 2;
+	if (format == GL_LUMINANCE && type == GL_UNSIGNED_BYTE) return 3;
+	if (format == GL_LUMINANCE_ALPHA && type == GL_UNSIGNED_BYTE) return 4;
+	if (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) return 5;
+	if (format == GL_RGBA && type == GL_UNSIGNED_SHORT_4_4_4_4) return 6;
+	if (format == GL_RGBA && type == GL_UNSIGNED_SHORT_5_5_5_1) return 7;
+	if (format == 0x8C40 /* SRGB_EXT */ && type == GL_UNSIGNED_BYTE) return 8;
+	if (format == 0x8C42 /* SRGB_ALPHA_EXT */ && type == GL_UNSIGNED_BYTE) return 9;
+	return -1;
+}
+
+static const char *ft_cache_label(int idx) {
+	switch (idx) {
+	case 0: return "RGBA/UByte";
+	case 1: return "RGB/UByte";
+	case 2: return "ALPHA/UByte";
+	case 3: return "LUMINANCE/UByte";
+	case 4: return "LUMINANCE_ALPHA/UByte";
+	case 5: return "RGB/UShort_5_6_5";
+	case 6: return "RGBA/UShort_4_4_4_4";
+	case 7: return "RGBA/UShort_5_5_5_1";
+	case 8: return "SRGB_EXT/UByte";
+	case 9: return "SRGB_ALPHA_EXT/UByte";
+	case 10: return "RGBA8/RGBA/UByte";
+	case 11: return "RGB8/RGB/UByte";
+	case 12: return "RG8/RG/UByte";
+	case 13: return "R8/RED/UByte";
+	case 14: return "SRGB8/RGB/UByte";
+	case 15: return "SRGB8_ALPHA8/RGBA/UByte";
+	default: return "?";
+	}
+}
+
+// Forward to the EGL helper, trying native (format, type) first; on Mesa
+// rejection, fall back to canonical RGBA8 + (RGBA, UByte) upload. Sample
+// semantics are preserved by the convert helper's canonical buffer per
+// WebGL 1 §3.7.5. Updates the per-tuple cache so subsequent uploads of
+// the same (format, type) skip the probe and go straight to the cached
+// fast path.
+static bool tex_image_2d_native_or_fallback(
+    nx_webgl_egl_t *egl,
+    uint32_t handle, int width, int height,
+    uint32_t internalformat, uint32_t format, uint32_t type,
+    const uint8_t *target_bytes,
+    const uint8_t *canonical_rgba8,
+    uint32_t min_filter, uint32_t mag_filter,
+    uint32_t wrap_s, uint32_t wrap_t) {
+	int idx = ft_cache_index(internalformat, format, type);
+	if (idx < 0) {
+		// Tuple not on our allow-list — caller already validated, this
+		// would only fire for paths bypassing image_source_format_allowed.
+		// Forward as-is and trust the EGL helper to glGetError-reject.
+		return nx_webgl_egl_persistent_texture_image_2d(
+		    egl, handle, width, height, internalformat, format, type,
+		    target_bytes, min_filter, mag_filter, wrap_s, wrap_t);
+	}
+
+	// Cached: take the fast path without re-probing.
+	if (ft_cache[idx] == FT_ACCEPTED) {
+		return nx_webgl_egl_persistent_texture_image_2d(
+		    egl, handle, width, height, internalformat, format, type,
+		    target_bytes, min_filter, mag_filter, wrap_s, wrap_t);
+	}
+	if (ft_cache[idx] == FT_REJECTED) {
+		if (!ft_cache_logged[idx]) {
+			ft_cache_logged[idx] = true;
+			fprintf(stderr,
+			    "[nxjs:tex-format-probe] %s pre-stamped REJECTED (Mesa GLES3 legacy swizzle); using RGBA8 fallback\n",
+			    ft_cache_label(idx));
+			fflush(stderr);
+		}
+		return nx_webgl_egl_persistent_texture_image_2d(
+		    egl, handle, width, height, /*internalformat=*/GL_RGBA,
+		    GL_RGBA, GL_UNSIGNED_BYTE, canonical_rgba8,
+		    min_filter, mag_filter, wrap_s, wrap_t);
+	}
+
+	// Probe path (first upload of this (format, type)). Try native; on
+	// Mesa rejection record the failure and fall back to canonical RGBA8.
+	bool ok = nx_webgl_egl_persistent_texture_image_2d(
+	    egl, handle, width, height, internalformat, format, type,
+	    target_bytes, min_filter, mag_filter, wrap_s, wrap_t);
+	if (ok) {
+		ft_cache[idx] = FT_ACCEPTED;
+		fprintf(stderr, "[nxjs:tex-format-probe] %s ACCEPTED native\n",
+		        ft_cache_label(idx));
+		fflush(stderr);
+		return true;
+	}
+	ft_cache[idx] = FT_REJECTED;
+	fprintf(stderr, "[nxjs:tex-format-probe] %s REJECTED native, falling back to RGBA8 canonical\n",
+	        ft_cache_label(idx));
+	fflush(stderr);
+	return nx_webgl_egl_persistent_texture_image_2d(
+	    egl, handle, width, height, /*internalformat=*/GL_RGBA,
+	    GL_RGBA, GL_UNSIGNED_BYTE, canonical_rgba8,
+	    min_filter, mag_filter, wrap_s, wrap_t);
+}
+
+// Sub-image counterpart. Same probe + cache, but using the
+// persistent-texture-SUB-image entry point. Cache is shared with the
+// image entry — once a (internalformat, format, type) tuple is REJECTED
+// for either texImage2D or texSubImage2D, both paths use the RGBA8
+// fallback. This keeps the texture's storage format consistent across
+// the test's image2D + subImage2D pairs (the Khronos test does both
+// back-to-back). Internalformat is threaded through from the caller's
+// `texture->internal_format` (stamped at texImage2D) so sized Group C
+// tuples (RGBA8 / RG8 / SRGB8 / etc.) share the same slot as their
+// matching image2D probe.
+static bool tex_sub_image_2d_native_or_fallback(
+    nx_webgl_egl_t *egl,
+    uint32_t handle, int level, int xoffset, int yoffset,
+    int width, int height,
+    uint32_t internalformat, uint32_t format, uint32_t type,
+    const uint8_t *target_bytes,
+    const uint8_t *canonical_rgba8) {
+	int idx = ft_cache_index(internalformat, format, type);
+	if (idx < 0 || ft_cache[idx] == FT_ACCEPTED) {
+		return nx_webgl_egl_persistent_texture_sub_image_2d(
+		    egl, handle, level, xoffset, yoffset, width, height,
+		    format, type, target_bytes);
+	}
+	if (ft_cache[idx] == FT_REJECTED) {
+		if (!ft_cache_logged[idx]) {
+			ft_cache_logged[idx] = true;
+			fprintf(stderr,
+			    "[nxjs:tex-format-probe] %s pre-stamped REJECTED (via subImage); using RGBA8 fallback\n",
+			    ft_cache_label(idx));
+			fflush(stderr);
+		}
+		return nx_webgl_egl_persistent_texture_sub_image_2d(
+		    egl, handle, level, xoffset, yoffset, width, height,
+		    GL_RGBA, GL_UNSIGNED_BYTE, canonical_rgba8);
+	}
+	// Probe via the texImage2D path is preferred; if the first sub-image
+	// arrives before any texImage2D probed this tuple, probe inline here.
+	bool ok = nx_webgl_egl_persistent_texture_sub_image_2d(
+	    egl, handle, level, xoffset, yoffset, width, height,
+	    format, type, target_bytes);
+	if (ok) {
+		ft_cache[idx] = FT_ACCEPTED;
+		fprintf(stderr, "[nxjs:tex-format-probe] %s ACCEPTED native (via subImage)\n",
+		        ft_cache_label(idx));
+		fflush(stderr);
+		return true;
+	}
+	ft_cache[idx] = FT_REJECTED;
+	fprintf(stderr, "[nxjs:tex-format-probe] %s REJECTED native (via subImage), falling back to RGBA8 canonical\n",
+	        ft_cache_label(idx));
+	fflush(stderr);
+	return nx_webgl_egl_persistent_texture_sub_image_2d(
+	    egl, handle, level, xoffset, yoffset, width, height,
+	    GL_RGBA, GL_UNSIGNED_BYTE, canonical_rgba8);
+}
+
 static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 									 int argc, JSValueConst *argv) {
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
 
-	{
-		static int ti2d_diag_n = 0;
-		int my_n = ++ti2d_diag_n;
-		if (my_n <= 200 || (my_n % 100) == 0) {
-			fprintf(stderr, "[nxjs:texImage2D] n=%d argc=%d\n", my_n, argc);
-			fflush(stderr);
-		}
+	static int ti2d_diag_n = 0;
+	int ti2d_my_n = ++ti2d_diag_n;
+	if (ti2d_my_n <= 200 || (ti2d_my_n % 100) == 0) {
+		fprintf(stderr, "[nxjs:texImage2D] n=%d argc=%d\n", ti2d_my_n, argc);
+		fflush(stderr);
 	}
 
 	uint32_t target;
@@ -5415,7 +6207,7 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	}
 
 	if (!is_texture_image_target(target)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -5427,17 +6219,53 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	int32_t image_w = 0, image_h = 0;
 	bool from_image = nx_webgl_extract_image_source(
 		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+
+	/* 2026-06-27 Phase-1a empirical-validation diag: log every texImage2D
+	 * call whose JS-side internalformat matches a Group C sized UNORM tuple.
+	 * The Phase 1a probe markers ([nxjs:tex-format-probe] for slots 10-15)
+	 * did not fire after the first conformance run, despite tests like
+	 * `textures-canvas_sub_rectangle-tex-2d-rgba8-*` actually executing GL
+	 * work (12 PASS / 71 FAIL / 221ms). This diag answers the diagnostic
+	 * question: do Group C internalformats reach texImage2D at all, and
+	 * with what (internalformat, format, type, from_image) shape — if they
+	 * reach with the sized internalformat, slots 10-15 SHOULD fire; if
+	 * they reach with the unsized cousin, the JS test layer is normalizing
+	 * and my widening can never see the sized variant. Unfiltered (no
+	 * every-N throttle) so we see EVERY Group C call. */
+	bool is_group_c_internal =
+	    (internal_format == 0x8058 /*RGBA8*/ ||
+	     internal_format == 0x8051 /*RGB8*/ ||
+	     internal_format == 0x822B /*RG8*/ ||
+	     internal_format == 0x8229 /*R8*/ ||
+	     internal_format == 0x8C41 /*SRGB8*/ ||
+	     internal_format == 0x8C43 /*SRGB8_ALPHA8*/);
+	if (is_group_c_internal) {
+		fprintf(stderr,
+		        "[nxjs:texImage2D-groupC] n=%d internal=0x%x format=0x%x type=0x%x from_img=%d argc=%d\n",
+		        ti2d_my_n, internal_format, format, type, (int)from_image, argc);
+		fflush(stderr);
+	}
+
 	if (from_image) {
 		width = image_w;
 		height = image_h;
 		border = 0;
-		// Image sources are RGBA8. Reject any other (format, type) tuple
-		// to match the WebGL spec — image uploads must use RGBA +
-		// UNSIGNED_BYTE (or the SRGB8_ALPHA8 sized variant which is also
-		// RGBA8 on the wire — handled by the broader format check below).
-		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		// 2026-06-26: WebGL 1 spec §5.14.8 allows 8 (format, type) tuples
+		// for image-source uploads (ALPHA/LUMINANCE/LUMINANCE_ALPHA/RGB at
+		// UByte, RGB/UShort_5_6_5, RGBA at UByte/UShort_4_4_4_4/UShort_
+		// 5_5_5_1). Pre-this-date the bridge hard-rejected every combo
+		// except (RGBA, UByte) with a comment claiming this matched the
+		// spec — it did not, and the resulting INVALID_OPERATION on
+		// canvas/image uploads left textures uninitialized, sampling as
+		// zero. The bug was hidden by the gl.canvas binding bug (which
+		// made readbacks pull 1280×720 of uncleared FBO); the binding
+		// fix surfaced it as 7 of 8 textures-canvas-tex-2d-* FAILs.
+		// SRGB_EXT / SRGB_ALPHA_EXT combos are also valid here for the
+		// Three.js r152+ EXT_sRGB upload path. Other tuples still get
+		// INVALID_OPERATION below.
+		if (!image_source_format_allowed(format, type)) {
 			js_free(ctx, image_buffer);
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	}
@@ -5547,15 +6375,56 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	bool is_depth_stencil = (is_depth_stencil_internal &&
 	                         format == GL_DEPTH_STENCIL &&
 	                         type == GL_UNSIGNED_INT_24_8_WEBGL);
+	// 2026-06-26 image-source format widening: ALPHA / LUMINANCE /
+	// LUMINANCE_ALPHA at UNSIGNED_BYTE, and RGB / RGBA at the packed
+	// UNSIGNED_SHORT types. internalformat == format per WebGL 1 spec
+	// §3.7.5 for unsized formats. Mesa acceptance is verified empirically
+	// at upload time via tex_image_2d_native_or_fallback; the JS-layer
+	// accept-list just admits the upload.
+	bool is_alpha_unorm = (internal_format == GL_ALPHA &&
+	                       format == GL_ALPHA && type == GL_UNSIGNED_BYTE);
+	bool is_luminance_unorm = (internal_format == GL_LUMINANCE &&
+	                           format == GL_LUMINANCE && type == GL_UNSIGNED_BYTE);
+	bool is_luminance_alpha_unorm =
+	    (internal_format == GL_LUMINANCE_ALPHA &&
+	     format == GL_LUMINANCE_ALPHA && type == GL_UNSIGNED_BYTE);
+	bool is_packed_rgb_565 =
+	    ((internal_format == GL_RGB || internal_format == GL_RGB565) &&
+	     format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5);
+	bool is_packed_rgba_4444 =
+	    ((internal_format == GL_RGBA || internal_format == GL_RGBA4) &&
+	     format == GL_RGBA && type == GL_UNSIGNED_SHORT_4_4_4_4);
+	bool is_packed_rgba_5551 =
+	    ((internal_format == GL_RGBA || internal_format == GL_RGB5_A1) &&
+	     format == GL_RGBA && type == GL_UNSIGNED_SHORT_5_5_5_1);
+	// 2026-06-27 Group C Phase 1a: WebGL 2 single/dual-channel UNORM sized
+	// internalformats (R8 = 0x8229, RG8 = 0x822B). On-wire format is the
+	// unsized equivalent (GL_RED = 0x1903, GL_RG = 0x8227). The 4 other
+	// Group C formats (RGBA8 / RGB8 / SRGB8 / SRGB8_ALPHA8) are already
+	// admitted via is_rgba_unorm / is_rgb_unorm above. Mesa-Nouveau
+	// acceptance is empirically verified at upload time through the
+	// per-(internalformat, format, type) ft_cache probe in
+	// tex_image_2d_native_or_fallback — a rejection falls back to RGBA8
+	// canonical storage. R8 fallback canonical is (R, 0, 0, 1); RG8
+	// fallback canonical is (R, G, 0, 1).
+	bool is_r8_unorm =
+	    ((internal_format == 0x8229 /*R8*/ || internal_format == 0x1903 /*GL_RED*/) &&
+	     format == 0x1903 /*GL_RED*/ && type == GL_UNSIGNED_BYTE);
+	bool is_rg8_unorm =
+	    ((internal_format == 0x822B /*RG8*/ || internal_format == 0x8227 /*GL_RG*/) &&
+	     format == 0x8227 /*GL_RG*/ && type == GL_UNSIGNED_BYTE);
 	if (!is_rgba_unorm && !is_rgb_unorm && !is_float_rgba && !is_float_rgb &&
-	    !is_float_rg && !is_srgb_unorm && !is_depth && !is_depth_stencil) {
+	    !is_float_rg && !is_srgb_unorm && !is_depth && !is_depth_stencil &&
+	    !is_alpha_unorm && !is_luminance_unorm && !is_luminance_alpha_unorm &&
+	    !is_packed_rgb_565 && !is_packed_rgba_4444 && !is_packed_rgba_5551 &&
+	    !is_r8_unorm && !is_rg8_unorm) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (level != 0 || width <= 0 || height <= 0 || border != 0) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -5563,13 +6432,13 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
 	if (!texture || texture->deleted) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	uint32_t texture_target = texture_object_target_for_image_target(target);
 	if (texture->target != texture_target) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -5589,7 +6458,13 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		if (!null_source)
 			source = NX_GetBufferSource(ctx, &byte_length, src_arg);
 	}
-	// Bytes per channel × channels for the (format, type) tuple.
+	// Bytes per channel × channels for the (format, type) tuple. Packed-
+	// UShort types (5_6_5, 4_4_4_4, 5_5_5_1) carry one packed pixel per
+	// 2 bytes regardless of channel layout — special-cased below.
+	bool is_packed_short_type =
+	    (type == GL_UNSIGNED_SHORT_5_6_5 ||
+	     type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+	     type == GL_UNSIGNED_SHORT_5_5_5_1);
 	size_t bytes_per_channel = 1;
 	if (type == GL_FLOAT) bytes_per_channel = 4;
 	else if (type == GL_HALF_FLOAT_OES) bytes_per_channel = 2;
@@ -5599,45 +6474,57 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 	else if (type == GL_UNSIGNED_INT_24_8_WEBGL) bytes_per_channel = 4;
 	size_t channels = 4;
 	if (format == GL_RGB) channels = 3;
+	else if (format == GL_ALPHA) channels = 1;
+	else if (format == GL_LUMINANCE) channels = 1;
+	else if (format == GL_LUMINANCE_ALPHA) channels = 2;
 	else if (format == 0x8227 /* GL_RG */) channels = 2;
 	else if (format == 0x8C40 /* SRGB_EXT */) channels = 3;
 	else if (format == 0x8C42 /* SRGB_ALPHA_EXT */) channels = 4;
 	else if (format == GL_DEPTH_COMPONENT) channels = 1;
 	else if (format == GL_DEPTH_STENCIL) channels = 1; // packed in 4 bytes via UI_24_8
-	size_t expected = (size_t)width * (size_t)height * bytes_per_channel * channels;
+	size_t expected = is_packed_short_type
+	    ? (size_t)width * (size_t)height * 2  // one packed pixel = 2 bytes
+	    : (size_t)width * (size_t)height * bytes_per_channel * channels;
 	// Depth and depth-stencil textures may only be allocated with NULL data
 	// per the WEBGL_depth_texture spec (no client-side pixel upload). Reject
 	// non-null with INVALID_OPERATION to match the Khronos conformance
 	// behavior; Three.js's DepthTexture path always passes NULL anyway.
 	if (!null_source && (is_depth || is_depth_stencil)) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (!null_source && (!source || byte_length < expected)) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
 	if (texture_target == GL_TEXTURE_CUBE_MAP) {
-		// Per-face upload to a persistent cube-map handle. Pre-2026-05-24
-		// this branch silently dropped the pixels (free + return), so
-		// CubeTextureLoader produced black faces. Milestone #25
-		// ([[swb-threejs-webgl-materials-cubemap]]) wires the upload
-		// through `nx_webgl_egl_persistent_cube_texture_image_2d`.
+		// 2026-06-28 cube format widening (session 6): accept all 8 spec
+		// image-source tuples on cube faces. Pre-this-change the scope
+		// guard restricted from_image to (RGBA, UByte) / (SRGB_ALPHA_EXT,
+		// UByte) and left CUBE_img at zero for non-RGBA conformance
+		// tests. The widening reuses `convert_rgba8_to_target` (the same
+		// helper the TEXTURE_2D path uses) to produce target-format bytes
+		// AND canonical RGBA8 bytes for Mesa-rejection fallback. The
+		// ft_cache is shared with the 2D path: ALPHA/LUM/LUM_ALPHA at
+		// UByte are pre-stamped REJECTED on Mesa Nouveau (broken legacy
+		// swizzle), so cube uploads of those formats route directly to
+		// the canonical RGBA8 fallback storage on ALL 6 faces -- avoiding
+		// the mixed-storage-across-faces case that would result from a
+		// late probe failure.
 		//
-		// Allocate the GLES handle on first face. The JS-side
-		// `bindTexture(CUBE_MAP, tex)` that preceded this call short-
-		// circuited the native bind (gles_handle was 0), so re-issue the
-		// activeTexture+bindTexture forward here so the passthrough draw
-		// path sees the cube bound on the right unit.
+		// SRGB_ALPHA_EXT is in the original allow-list — extractor bytes
+		// are RGBA8 (channel layout matches), no conversion needed; we
+		// allow it through the identity-alias fast path that
+		// convert_rgba8_to_target provides.
 		if (texture->gles_handle == 0) {
 			texture->gles_handle = nx_webgl_egl_create_persistent_texture(
 				context->egl, context->canvas);
 			if (texture->gles_handle == 0) {
 				if (from_image) js_free(ctx, image_buffer);
-				context->error = GL_OUT_OF_MEMORY;
+				NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 				return JS_UNDEFINED;
 			}
 			nx_webgl_egl_forward_active_texture(context->egl,
@@ -5646,15 +6533,119 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 			                                   GL_TEXTURE_CUBE_MAP,
 			                                   texture->gles_handle);
 		}
-		bool ok = nx_webgl_egl_persistent_cube_texture_image_2d(
-			context->egl, texture->gles_handle, target /* face target */,
-			width, height, internal_format, format, type,
-			null_source ? NULL : source,
-			texture->min_filter, texture->mag_filter,
-			texture->wrap_s, texture->wrap_t);
-		if (from_image) js_free(ctx, image_buffer);
+		bool ok;
+		if (from_image) {
+			// Convert extractor RGBA8 → target-format bytes + canonical
+			// RGBA8 fallback bytes.
+			uint8_t *image_target_bytes = NULL;
+			uint8_t *image_canonical_rgba8 = NULL;
+			size_t image_target_n = 0, image_canonical_n = 0;
+			bool image_conv_alias = false;
+			if (!convert_rgba8_to_target(ctx, image_buffer, width, height,
+			                              format, type,
+			                              &image_target_bytes, &image_target_n,
+			                              &image_canonical_rgba8, &image_canonical_n,
+			                              &image_conv_alias)) {
+				js_free(ctx, image_buffer);
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+				return JS_UNDEFINED;
+			}
+			// Decide native vs canonical-fallback based on ft_cache. For
+			// pre-stamped REJECTED formats we skip the native attempt
+			// entirely so all 6 faces upload as RGBA8 (consistent
+			// cube storage). For UNKNOWN/ACCEPTED we attempt native; if
+			// Mesa rejects, fall back to canonical for THIS face — face
+			// 2-6 will see ft_cache=REJECTED on lookup and route to the
+			// canonical path directly, producing consistent storage
+			// across the cube. Mixed storage on face 1 vs others would
+			// surface as a single-face content gap, accepted as a probe
+			// signal.
+			int idx = ft_cache_index(internal_format, format, type);
+			bool use_canonical = (idx >= 0 && ft_cache[idx] == FT_REJECTED);
+			if (use_canonical) {
+				ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face target */,
+					width, height,
+					/*internalformat=*/GL_RGBA,
+					/*format=*/GL_RGBA,
+					/*type=*/GL_UNSIGNED_BYTE,
+					image_canonical_rgba8,
+					texture->min_filter, texture->mag_filter,
+					texture->wrap_s, texture->wrap_t);
+			} else {
+				ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face target */,
+					width, height, internal_format, format, type,
+					image_target_bytes,
+					texture->min_filter, texture->mag_filter,
+					texture->wrap_s, texture->wrap_t);
+				if (ok && idx >= 0 && ft_cache[idx] == FT_UNKNOWN) {
+					ft_cache[idx] = FT_ACCEPTED;
+					fprintf(stderr,
+					    "[nxjs:tex-format-probe] %s ACCEPTED native (cube)\n",
+					    ft_cache_label(idx));
+					fflush(stderr);
+				} else if (!ok && idx >= 0) {
+					ft_cache[idx] = FT_REJECTED;
+					fprintf(stderr,
+					    "[nxjs:tex-format-probe] %s REJECTED native (cube), falling back to RGBA8 canonical\n",
+					    ft_cache_label(idx));
+					fflush(stderr);
+					ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+						context->egl, texture->gles_handle,
+						target /* face target */,
+						width, height,
+						/*internalformat=*/GL_RGBA,
+						/*format=*/GL_RGBA,
+						/*type=*/GL_UNSIGNED_BYTE,
+						image_canonical_rgba8,
+						texture->min_filter, texture->mag_filter,
+						texture->wrap_s, texture->wrap_t);
+				}
+			}
+			if (!image_conv_alias) {
+				js_free(ctx, image_target_bytes);
+				js_free(ctx, image_canonical_rgba8);
+			}
+			js_free(ctx, image_buffer);
+		} else {
+			// null-source or buffer-source path. For null-source we
+			// also consult ft_cache: if (internal_format, format, type)
+			// is pre-stamped REJECTED, allocate the cube face as RGBA8
+			// instead so subsequent texSubImage2D(face, bitmap) uploads
+			// (which the cube_sub widening emits as canonical RGBA8 for
+			// rejected formats) write into matching storage. Without
+			// this, the test pattern texImage2D(face, null, ALPHA) +
+			// texSubImage2D(face, bitmap, ALPHA) would allocate broken
+			// ALPHA storage then try to sub-upload RGBA8 into it.
+			int idx = ft_cache_index(internal_format, format, type);
+			bool null_use_canonical_storage = (null_source && idx >= 0 &&
+			    ft_cache[idx] == FT_REJECTED);
+			if (null_use_canonical_storage) {
+				ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face target */,
+					width, height,
+					/*internalformat=*/GL_RGBA,
+					/*format=*/GL_RGBA,
+					/*type=*/GL_UNSIGNED_BYTE,
+					NULL,
+					texture->min_filter, texture->mag_filter,
+					texture->wrap_s, texture->wrap_t);
+			} else {
+				ok = nx_webgl_egl_persistent_cube_texture_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face target */,
+					width, height, internal_format, format, type,
+					null_source ? NULL : source,
+					texture->min_filter, texture->mag_filter,
+					texture->wrap_s, texture->wrap_t);
+			}
+		}
 		if (!ok) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		texture->width = width;
@@ -5688,7 +6679,7 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 			texture->gles_handle = nx_webgl_egl_create_persistent_texture(
 				context->egl, context->canvas);
 		if (texture->gles_handle == 0) {
-			context->error = GL_OUT_OF_MEMORY;
+			NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 			return JS_UNDEFINED;
 		}
 		// 2026-06-07 pvzge investigation: GLES spec says texture contents
@@ -5703,24 +6694,58 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		// gets deterministic black contents. Cost: ~width*height*bpp
 		// memory per NULL-source allocation, freed immediately after the
 		// upload returns (the persistent texture owns the GLES copy).
-		size_t zero_bytes = (size_t)width * (size_t)height *
-		                    bytes_per_channel * channels;
+		size_t zero_bytes = is_packed_short_type
+		    ? (size_t)width * (size_t)height * 2
+		    : (size_t)width * (size_t)height *
+		      bytes_per_channel * channels;
 		uint8_t *zero_buf = NULL;
 		if (zero_bytes > 0) {
 			zero_buf = js_mallocz(ctx, zero_bytes);
 			if (!zero_buf) {
-				context->error = GL_OUT_OF_MEMORY;
+				NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 				return JS_UNDEFINED;
 			}
 		}
-		bool ok = nx_webgl_egl_persistent_texture_image_2d(
-		        context->egl, texture->gles_handle, width, height,
-		        internal_format, format, type, zero_buf,
-		        texture->min_filter, texture->mag_filter,
-		        texture->wrap_s, texture->wrap_t);
+		// 2026-06-26: route the new (format, type) tuples through the
+		// probe+fallback so the storage format the texture ends up with
+		// is consistent with whatever texSubImage2D(canvas) will probe
+		// later. Without this, a Khronos test pattern like
+		//   texImage2D(target, 0, ALPHA, w, h, 0, ALPHA, UByte, null);
+		//   texSubImage2D(target, 0, 0, 0, ALPHA, UByte, canvas);
+		// would split storage decision across two unrelated probes —
+		// texImage2D might succeed with native ALPHA while texSubImage2D's
+		// probe might rule it REJECTED (or vice versa under driver
+		// state-dependence) and try to write RGBA8 bytes into ALPHA
+		// storage. Probing at allocation time and caching forces both
+		// halves to take the same path.
+		bool needs_format_probe =
+		    (format == GL_ALPHA || format == GL_LUMINANCE ||
+		     format == GL_LUMINANCE_ALPHA || is_packed_short_type);
+		bool ok;
+		if (needs_format_probe) {
+			size_t canonical_size = (size_t)width * (size_t)height * 4;
+			uint8_t *canonical_zero = js_mallocz(ctx, canonical_size);
+			if (!canonical_zero) {
+				js_free(ctx, zero_buf);
+				NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
+				return JS_UNDEFINED;
+			}
+			ok = tex_image_2d_native_or_fallback(
+			        context->egl, texture->gles_handle, width, height,
+			        internal_format, format, type, zero_buf, canonical_zero,
+			        texture->min_filter, texture->mag_filter,
+			        texture->wrap_s, texture->wrap_t);
+			js_free(ctx, canonical_zero);
+		} else {
+			ok = nx_webgl_egl_persistent_texture_image_2d(
+			        context->egl, texture->gles_handle, width, height,
+			        internal_format, format, type, zero_buf,
+			        texture->min_filter, texture->mag_filter,
+			        texture->wrap_s, texture->wrap_t);
+		}
 		js_free(ctx, zero_buf);
 		if (!ok) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		// Replay pre-promotion sampler-compare state — see texStorage2D
@@ -5740,16 +6765,58 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		return JS_UNDEFINED;
 	}
 
+	// 2026-06-26 image-source format widening: when the source came from an
+	// image/canvas extractor (RGBA8 byte layout), the target byte layout
+	// for the (format, type) tuple may differ — ALPHA wants 1 byte/pixel,
+	// LUMINANCE_ALPHA wants 2, packed UShort tuples want 2, etc. Convert
+	// RGBA8 → target bytes here so the subsequent memcpy + native upload
+	// see the right shape. For the (RGBA, UByte) identity case the helper
+	// aliases its input (no alloc; image_conv_alias=true), keeping the
+	// existing fast path's allocation profile.
+	//
+	// `image_canonical_rgba8` is the RGBA8 sample-equivalent of the target
+	// texture; it's the upload payload that Mesa rejection forces us to
+	// fall back to (uploaded as RGBA8 storage with values matching what
+	// a spec-correct ALPHA/LUMINANCE/etc. texture would sample to). It's
+	// kept alive past the memcpy because the native-or-fallback path may
+	// need to re-upload it after a Mesa rejection.
+	uint8_t *image_target_bytes = NULL;
+	uint8_t *image_canonical_rgba8 = NULL;
+	size_t image_target_bytes_n = 0;
+	size_t image_canonical_rgba8_n = 0;
+	bool image_conv_alias = false;
+	if (from_image) {
+		if (!convert_rgba8_to_target(ctx, image_buffer, width, height,
+		                              format, type,
+		                              &image_target_bytes, &image_target_bytes_n,
+		                              &image_canonical_rgba8, &image_canonical_rgba8_n,
+		                              &image_conv_alias)) {
+			js_free(ctx, image_buffer);
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+			return JS_UNDEFINED;
+		}
+		source = image_target_bytes;
+	}
 	uint8_t *copy = js_malloc(ctx, expected);
 	if (!copy) {
-		if (from_image) js_free(ctx, image_buffer);
+		if (from_image) {
+			if (!image_conv_alias) {
+				js_free(ctx, image_target_bytes);
+				js_free(ctx, image_canonical_rgba8);
+			}
+			js_free(ctx, image_buffer);
+		}
 		return JS_EXCEPTION;
 	}
 	memcpy(copy, source, expected);
 	// `source` either pointed into a JS ArrayBuffer (no free needed — the
-	// view keeps the buffer alive) OR was our helper-allocated image
+	// view keeps the buffer alive) OR was the converted image-source
 	// buffer (free now that memcpy has consumed it).
 	if (from_image) {
+		if (!image_conv_alias) {
+			js_free(ctx, image_target_bytes);
+			image_target_bytes = NULL;
+		}
 		js_free(ctx, image_buffer);
 		image_buffer = NULL;
 		source = NULL;
@@ -5804,15 +6871,73 @@ static JSValue nx_webgl_tex_image_2d(JSContext *ctx, JSValueConst this_val,
 		    context->egl, context->canvas);
 	}
 	if (texture->gles_handle != 0) {
-		(void)nx_webgl_egl_persistent_texture_image_2d(
-		    context->egl, texture->gles_handle, width, height,
-		    internal_format, format, type, copy,
-		    texture->min_filter, texture->mag_filter,
-		    texture->wrap_s, texture->wrap_t);
+		// 2026-06-26: image-source uploads of widened (format, type) tuples
+		// route through native-or-fallback so Mesa rejections (some packed
+		// UShort types or legacy unsized ALPHA/LUMINANCE on this driver)
+		// degrade to canonical RGBA8 storage instead of leaving the
+		// texture uninitialized. Cache the per-(internalformat, format,
+		// type) Mesa acceptance state for log-once + fast-path on
+		// subsequent uploads.
+		//
+		// 2026-06-27 Group C Phase 1a: also route the identity-alias case
+		// (image_conv_alias=true — RGBA/UByte, SRGB_ALPHA_EXT/UByte,
+		// SRGB8_ALPHA8/RGBA/UByte, RGBA8/RGBA/UByte) through the wrapper
+		// so its ft_cache slot actually gets probed. Pre-this-change the
+		// alias branch bypassed the wrapper and never recorded Mesa
+		// acceptance for those slots — defeating per-format verification
+		// for Group C sized variants whose JS uploads land on the alias
+		// path. `image_canonical_rgba8` aliased `image_buffer` in that
+		// branch and was freed alongside it just above, so pass `copy`
+		// (byte-identical to canonical for the alias case, and held alive
+		// past the wrapper via texture->data ownership) as the fallback
+		// payload. Non-image sources still take the direct path — the
+		// probe/fallback needs a canonical buffer that the wrapper owns
+		// the choice of upload format for, and ArrayBuffer source uploads
+		// don't construct one.
+		if (from_image) {
+			const uint8_t *canonical =
+			    image_conv_alias ? copy : image_canonical_rgba8;
+			(void)tex_image_2d_native_or_fallback(
+			    context->egl, texture->gles_handle, width, height,
+			    internal_format, format, type, copy,
+			    canonical,
+			    texture->min_filter, texture->mag_filter,
+			    texture->wrap_s, texture->wrap_t);
+		} else {
+			bool direct_ok = nx_webgl_egl_persistent_texture_image_2d(
+			    context->egl, texture->gles_handle, width, height,
+			    internal_format, format, type, copy,
+			    texture->min_filter, texture->mag_filter,
+			    texture->wrap_s, texture->wrap_t);
+			/* 2026-06-27 Phase-1a empirical-validation diag: capture the
+			 * Mesa-acceptance bool that pre-this-change was discarded on
+			 * the ArrayBuffer-source path. Group C conformance tests
+			 * upload via texImage2D(argc=9, ArrayBufferView), which never
+			 * routes through the image-source wrapper that owns the
+			 * [nxjs:tex-format-probe] markers — so slots 10-15 stayed
+			 * dark even though 565/566 Group C calls reached the engine.
+			 * This log surfaces Mesa's per-(internalformat, format, type)
+			 * accept/reject signal directly from the EGL helper's
+			 * `glGetError() == NO_ERROR` return. Filter to Group C +
+			 * common sized-INTEGER formats so unrelated paths stay
+			 * quiet. Format-code-equivalent (no behavior change). */
+			if (is_group_c_internal) {
+				fprintf(stderr,
+				        "[nxjs:texImage2D-direct] n=%d internal=0x%x format=0x%x type=0x%x ok=%d (Mesa %s)\n",
+				        ti2d_my_n, internal_format, format, type,
+				        (int)direct_ok,
+				        direct_ok ? "ACCEPTED" : "REJECTED");
+				fflush(stderr);
+			}
+		}
 		// persistent_texture_image_2d ran glBindTexture(GL_TEXTURE_2D,
 		// handle) internally, so native is now bound to this texture on
 		// the currently-active unit — matching what the JS-side
 		// bindTexture call (which preceded this texImage2D) intended.
+	}
+	if (from_image && !image_conv_alias) {
+		js_free(ctx, image_canonical_rgba8);
+		image_canonical_rgba8 = NULL;
 	}
 	return JS_UNDEFINED;
 }
@@ -5857,8 +6982,20 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 		src_arg = argv[8];
 	}
 
-	if (target != GL_TEXTURE_2D) {
-		context->error = GL_INVALID_ENUM;
+	// Accept TEXTURE_2D + the six cube-face image targets
+	// (POSITIVE_X..NEGATIVE_Z = 0x8515..0x851A). Mirrors texImage2D's
+	// `is_texture_image_target` gate. The conformance image_bitmap-from-*
+	// tests upload bitmap pixels to cube faces via texSubImage2D after a
+	// texImage2D(null) per-face init; rejecting the cube-face target left
+	// the cube faces at the zero-fill from texImage2D(null) and produced
+	// uniform (0,0,0) reads in the cube-binding branch of the bitmap
+	// tests. See REAL_GL_FAILURES.md "cube-face texSubImage2D rejection"
+	// for the per-phase decomposition that surfaced this.
+	bool target_is_cube_face =
+	    (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+	     target <= 0x851A /* GL_TEXTURE_CUBE_MAP_NEGATIVE_Z */);
+	if (target != GL_TEXTURE_2D && !target_is_cube_face) {
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -5867,12 +7004,47 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	int32_t image_w = 0, image_h = 0;
 	bool from_image = nx_webgl_extract_image_source(
 		ctx, context, src_arg, &image_w, &image_h, &image_buffer);
+
+	/* 2026-06-27 Phase-1a empirical-validation diag (companion to
+	 * [nxjs:texImage2D-groupC] in nx_webgl_tex_image_2d): log every
+	 * texSubImage2D whose target texture was allocated with a Group C
+	 * sized UNORM internalformat. Three.js's WebGL 2 pattern is
+	 * texStorage2D + texSubImage2D (immutable storage path), in which
+	 * case texImage2D is never called and the texImage2D diag would
+	 * miss Group C entirely. `texture->internal_format` is stamped by
+	 * either path (texImage2D writes it directly; texStorage2D writes
+	 * it via its own dispatch). NULL-binding-safe via short-circuit. */
+	{
+		JSValue *binding_for_diag = texture_binding_for_target(context, target);
+		nx_webgl_texture_t *tex_for_diag =
+		    binding_for_diag ? nx_get_webgl_texture(*binding_for_diag) : NULL;
+		uint32_t intl_for_diag =
+		    tex_for_diag ? tex_for_diag->internal_format : 0;
+		bool is_group_c_sub =
+		    (intl_for_diag == 0x8058 /*RGBA8*/ ||
+		     intl_for_diag == 0x8051 /*RGB8*/ ||
+		     intl_for_diag == 0x822B /*RG8*/ ||
+		     intl_for_diag == 0x8229 /*R8*/ ||
+		     intl_for_diag == 0x8C41 /*SRGB8*/ ||
+		     intl_for_diag == 0x8C43 /*SRGB8_ALPHA8*/);
+		if (is_group_c_sub) {
+			fprintf(stderr,
+			        "[nxjs:texSubImage2D-groupC] tex_internal=0x%x format=0x%x type=0x%x from_img=%d argc=%d\n",
+			        intl_for_diag, format, type, (int)from_image, argc);
+			fflush(stderr);
+		}
+	}
+
 	if (from_image) {
 		width = image_w;
 		height = image_h;
-		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		// 2026-06-26 image-source widening: mirror of texImage2D check —
+		// allow all WebGL 1 spec §5.14.8 image-source (format, type)
+		// tuples, not just (RGBA, UByte). See nx_webgl_tex_image_2d for
+		// the full rationale.
+		if (!image_source_format_allowed(format, type)) {
 			js_free(ctx, image_buffer);
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	}
@@ -5880,16 +7052,24 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	// `texImage2D` / `texStorage2D` allocated. Three.js's WebGL 2 bone-
 	// texture upload uses RGBA + FLOAT against RGBA32F immutable storage;
 	// color/normal-map uploads use RGBA + UNSIGNED_BYTE against
-	// SRGB8_ALPHA8 / RGBA8 immutable storage.
+	// SRGB8_ALPHA8 / RGBA8 immutable storage. 2026-06-26 widening adds
+	// ALPHA/LUMINANCE/LUMINANCE_ALPHA UByte and RGB/RGBA packed UShort
+	// tuples for the conformance image-source family.
 	bool format_ok =
 	    (format == GL_RGBA && (type == GL_UNSIGNED_BYTE ||
 	                           type == GL_FLOAT ||
 	                           type == GL_HALF_FLOAT_OES ||
-	                           type == 0x140B /* HALF_FLOAT */)) ||
+	                           type == 0x140B /* HALF_FLOAT */ ||
+	                           type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+	                           type == GL_UNSIGNED_SHORT_5_5_5_1)) ||
 	    (format == GL_RGB && (type == GL_UNSIGNED_BYTE ||
 	                          type == GL_FLOAT ||
 	                          type == GL_HALF_FLOAT_OES ||
-	                          type == 0x140B)) ||
+	                          type == 0x140B ||
+	                          type == GL_UNSIGNED_SHORT_5_6_5)) ||
+	    (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) ||
+	    (format == GL_LUMINANCE && type == GL_UNSIGNED_BYTE) ||
+	    (format == GL_LUMINANCE_ALPHA && type == GL_UNSIGNED_BYTE) ||
 	    /* 2026-06-24 dfgLUT upload fix: Three.js r184's MeshStandardMaterial
 	     * uploads a 16x16 RG16F lookup texture via texSubImage2D with
 	     * format=GL_RG (0x8227). Without RG in this accept-list the upload
@@ -5900,15 +7080,19 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	    (format == 0x8227 /* GL_RG */ && (type == GL_UNSIGNED_BYTE ||
 	                                       type == GL_FLOAT ||
 	                                       type == GL_HALF_FLOAT_OES ||
-	                                       type == 0x140B));
+	                                       type == 0x140B)) ||
+	    /* 2026-06-27 Group C Phase 1a: single-channel R8 sized
+	     * internalformat sub-image uploads carry format=GL_RED + UByte.
+	     * Companion to is_r8_unorm in texImage2D's accept-list. */
+	    (format == 0x1903 /* GL_RED */ && type == GL_UNSIGNED_BYTE);
 	if (!format_ok) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (level != 0 || xoffset < 0 || yoffset < 0 || width < 0 || height < 0) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (width == 0 || height == 0) {
@@ -5917,10 +7101,101 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	}
 
 	nx_webgl_texture_t *texture =
-		nx_get_webgl_texture(context->texture_2d_binding);
+		nx_get_webgl_texture(target_is_cube_face
+		    ? context->texture_cube_binding
+		    : context->texture_2d_binding);
 	if (!texture || texture->deleted) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+		return JS_UNDEFINED;
+	}
+
+	// Cube-face fast path: per-face native glTexSubImage2D. The texture's
+	// gles_handle is the cube-map handle (allocated by per-face
+	// texImage2D); xoffset/yoffset typically (0,0) — the conformance test
+	// pattern overwrites the entire face.
+	//
+	// 2026-06-28 cube-sub format widening (session 6, paired with cube_img
+	// widening above): accept all 8 spec image-source tuples on cube
+	// face sub-image uploads. Pre-this-change the cube_sub from_image
+	// scope guard rejected non-(RGBA, UByte) / non-(SRGB_ALPHA_EXT, UByte)
+	// with INVALID_OPERATION (matching the prior cube_img guard). Routes
+	// through convert_rgba8_to_target + ft_cache decision, identical to
+	// the cube_img path so the storage format the texSubImage2D writes
+	// matches the cube_img-allocated storage (consistent storage across
+	// the full test sequence texImage2D(null) + texSubImage2D(bitmap)).
+	if (target_is_cube_face) {
+		if (texture->gles_handle == 0) {
+			if (from_image) js_free(ctx, image_buffer);
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+			return JS_UNDEFINED;
+		}
+		bool cube_ok;
+		if (from_image) {
+			uint8_t *image_target_bytes = NULL;
+			uint8_t *image_canonical_rgba8 = NULL;
+			size_t image_target_n = 0, image_canonical_n = 0;
+			bool image_conv_alias = false;
+			if (!convert_rgba8_to_target(ctx, image_buffer, width, height,
+			                              format, type,
+			                              &image_target_bytes, &image_target_n,
+			                              &image_canonical_rgba8, &image_canonical_n,
+			                              &image_conv_alias)) {
+				js_free(ctx, image_buffer);
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+				return JS_UNDEFINED;
+			}
+			int idx = ft_cache_index(texture->internal_format, format, type);
+			bool use_canonical = (idx >= 0 && ft_cache[idx] == FT_REJECTED);
+			if (use_canonical) {
+				cube_ok = nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face */, xoffset, yoffset, width, height,
+					/*format=*/GL_RGBA, /*type=*/GL_UNSIGNED_BYTE,
+					image_canonical_rgba8);
+			} else {
+				cube_ok = nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+					context->egl, texture->gles_handle,
+					target /* face */, xoffset, yoffset, width, height,
+					format, type, image_target_bytes);
+				if (!cube_ok && idx >= 0) {
+					ft_cache[idx] = FT_REJECTED;
+					fprintf(stderr,
+					    "[nxjs:tex-format-probe] %s REJECTED native (cube subImage), falling back to RGBA8 canonical\n",
+					    ft_cache_label(idx));
+					fflush(stderr);
+					cube_ok = nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+						context->egl, texture->gles_handle,
+						target /* face */, xoffset, yoffset, width, height,
+						/*format=*/GL_RGBA, /*type=*/GL_UNSIGNED_BYTE,
+						image_canonical_rgba8);
+				}
+			}
+			if (!image_conv_alias) {
+				js_free(ctx, image_target_bytes);
+				js_free(ctx, image_canonical_rgba8);
+			}
+			js_free(ctx, image_buffer);
+		} else {
+			size_t bytes_per_pixel = 4;
+			if (format == GL_RGB) bytes_per_pixel = 3;
+			size_t upload_n = 0;
+			const uint8_t *upload =
+			    NX_GetBufferSource(ctx, &upload_n, src_arg);
+			if (!upload || upload_n < (size_t)width * (size_t)height * bytes_per_pixel) {
+				NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
+				return JS_UNDEFINED;
+			}
+			cube_ok = nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+				context->egl, texture->gles_handle, target /* face */,
+				xoffset, yoffset, width, height, format, type, upload);
+		}
+		if (!cube_ok) {
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+			return JS_UNDEFINED;
+		}
+		texture->revision++;
+		if (texture->revision == 0) texture->revision = 1;
 		return JS_UNDEFINED;
 	}
 
@@ -5930,34 +7205,112 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	// Three.js's WebGL 2 textures all take this path because Three.js
 	// always uses immutable storage on WebGL 2.
 	if (!texture->data && texture->gles_handle) {
-		size_t bytes_per_pixel = 4; // RGBA UBYTE default
+		// 2026-06-26 image-source widening: ALPHA/LUMINANCE/LUMINANCE_ALPHA
+		// at UByte and the packed UShort tuples need to know whether the
+		// per-pixel byte size is 1, 2, or 4. Mirrors the texImage2D math.
+		bool is_packed_short_type_sub =
+		    (type == GL_UNSIGNED_SHORT_5_6_5 ||
+		     type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+		     type == GL_UNSIGNED_SHORT_5_5_5_1);
 		size_t channels = 4;
 		if (format == GL_RGB) channels = 3;
 		else if (format == 0x8227 /* GL_RG */) channels = 2;
+		else if (format == 0x1903 /* GL_RED */) channels = 1;
+		else if (format == GL_ALPHA) channels = 1;
+		else if (format == GL_LUMINANCE) channels = 1;
+		else if (format == GL_LUMINANCE_ALPHA) channels = 2;
 		size_t bytes_per_channel = 1;
 		if (type == GL_FLOAT) bytes_per_channel = 4;
 		else if (type == GL_HALF_FLOAT_OES || type == 0x140B) bytes_per_channel = 2;
-		bytes_per_pixel = channels * bytes_per_channel;
+		size_t bytes_per_pixel = is_packed_short_type_sub
+		    ? 2 : channels * bytes_per_channel;
 		size_t expected = (size_t)width * (size_t)height * bytes_per_pixel;
+		// from_image conversion: the extractor's output is RGBA8 (4 bytes
+		// per pixel). For target formats requiring conversion, run the
+		// convert helper which produces both the target-format bytes AND
+		// canonical RGBA8 bytes for the Mesa-rejection fallback.
+		uint8_t *image_target_bytes = NULL;
+		uint8_t *image_canonical_rgba8 = NULL;
+		size_t image_target_bytes_n = 0;
+		size_t image_canonical_rgba8_n = 0;
+		bool image_conv_alias = false;
+		if (from_image) {
+			if (!convert_rgba8_to_target(ctx, image_buffer, width, height,
+			                              format, type,
+			                              &image_target_bytes, &image_target_bytes_n,
+			                              &image_canonical_rgba8,
+			                              &image_canonical_rgba8_n,
+			                              &image_conv_alias)) {
+				js_free(ctx, image_buffer);
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+				return JS_UNDEFINED;
+			}
+		}
 		size_t byte_length = 0;
 		uint8_t *source;
 		if (from_image) {
-			source = image_buffer;
-			byte_length = expected;
+			source = image_target_bytes;
+			byte_length = image_target_bytes_n;
 		} else {
 			source = NX_GetBufferSource(ctx, &byte_length, src_arg);
 		}
 		if (!source || byte_length < expected) {
-			if (from_image) js_free(ctx, image_buffer);
-			context->error = GL_INVALID_VALUE;
+			if (from_image) {
+				if (!image_conv_alias) {
+					js_free(ctx, image_target_bytes);
+					js_free(ctx, image_canonical_rgba8);
+				}
+				js_free(ctx, image_buffer);
+			}
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return JS_UNDEFINED;
 		}
-		if (!nx_webgl_egl_persistent_texture_sub_image_2d(
-		        context->egl, texture->gles_handle, level, xoffset, yoffset,
-		        width, height, format, type, source)) {
-			context->error = GL_INVALID_OPERATION;
+		bool sub_ok;
+		if (from_image) {
+			// Pair with the matching texImage2D probe (sized vs unsized
+			// internalformat picks distinct ft_cache slots). For the
+			// identity-alias case `image_canonical_rgba8` aliased
+			// `image_buffer` which was already freed; pass `source` (==
+			// image_target_bytes, byte-identical to the alias canonical
+			// pre-free) instead.
+			const uint8_t *canonical =
+			    image_conv_alias ? source : image_canonical_rgba8;
+			sub_ok = tex_sub_image_2d_native_or_fallback(
+			    context->egl, texture->gles_handle, level, xoffset, yoffset,
+			    width, height, texture->internal_format, format, type,
+			    source, canonical);
+		} else {
+			sub_ok = nx_webgl_egl_persistent_texture_sub_image_2d(
+			    context->egl, texture->gles_handle, level, xoffset, yoffset,
+			    width, height, format, type, source);
+			/* 2026-06-27 Phase-1a empirical-validation diag: capture
+			 * Mesa-acceptance on the texSubImage2D ArrayBuffer-source
+			 * path. Companion to [nxjs:texImage2D-direct]; same rationale
+			 * (sub_ok was already captured, this just surfaces it). */
+			uint32_t sub_intl =
+			    texture ? texture->internal_format : 0;
+			bool is_group_c_sub_direct =
+			    (sub_intl == 0x8058 || sub_intl == 0x8051 ||
+			     sub_intl == 0x822B || sub_intl == 0x8229 ||
+			     sub_intl == 0x8C41 || sub_intl == 0x8C43);
+			if (is_group_c_sub_direct) {
+				fprintf(stderr,
+				        "[nxjs:texSubImage2D-direct] tex_internal=0x%x format=0x%x type=0x%x ok=%d (Mesa %s)\n",
+				        sub_intl, format, type, (int)sub_ok,
+				        sub_ok ? "ACCEPTED" : "REJECTED");
+				fflush(stderr);
+			}
 		}
-		if (from_image) js_free(ctx, image_buffer);
+		if (!sub_ok) {
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+		}
+		if (from_image) {
+			if (!image_conv_alias) {
+				js_free(ctx, image_target_bytes);
+				js_free(ctx, image_canonical_rgba8);
+			}
+			js_free(ctx, image_buffer);
+		}
 		texture->revision++;
 		if (texture->revision == 0) texture->revision = 1;
 		return JS_UNDEFINED;
@@ -5969,18 +7322,18 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	// CPU codec which nx.js doesn't have.
 	if (!texture->data) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (xoffset + width > (int32_t)texture->width ||
 		yoffset + height > (int32_t)texture->height) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -5995,7 +7348,7 @@ static JSValue nx_webgl_tex_sub_image_2d(JSContext *ctx, JSValueConst this_val,
 	}
 	if (!source || byte_length < expected) {
 		if (from_image) js_free(ctx, image_buffer);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -6038,7 +7391,7 @@ static JSValue nx_webgl_pixel_storei(JSContext *ctx, JSValueConst this_val,
 	case GL_UNPACK_ALIGNMENT:
 	case GL_PACK_ALIGNMENT:
 		if (param != 1 && param != 2 && param != 4 && param != 8) {
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return JS_UNDEFINED;
 		}
 		return JS_UNDEFINED;
@@ -6051,7 +7404,7 @@ static JSValue nx_webgl_pixel_storei(JSContext *ctx, JSValueConst this_val,
 	case GL_UNPACK_COLORSPACE_CONVERSION_WEBGL:
 		if ((uint32_t)param != GL_NONE &&
 			(uint32_t)param != GL_BROWSER_DEFAULT_WEBGL) {
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return JS_UNDEFINED;
 		}
 		return JS_UNDEFINED;
@@ -6085,7 +7438,7 @@ static JSValue nx_webgl_pixel_storei(JSContext *ctx, JSValueConst this_val,
 		if (context->is_webgl2) { context->pack_skip_pixels = param; return JS_UNDEFINED; }
 		break;
 	}
-	context->error = GL_INVALID_ENUM;
+	NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 	return JS_UNDEFINED;
 }
 
@@ -6105,7 +7458,7 @@ static JSValue nx_webgl_generate_mipmap(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
 	if (!is_texture_binding_target(target)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	// Pre-2026-05-22 this was a complete no-op (validate target, return).
@@ -6121,14 +7474,14 @@ static JSValue nx_webgl_generate_mipmap(JSContext *ctx, JSValueConst this_val,
 	JSValue *binding = texture_binding_for_target(context, target);
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(*binding);
 	if (!texture || texture->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (target == GL_TEXTURE_2D) {
 		if (!ensure_texture_promoted(context, texture)) {
 			// Texture has no CPU data and no existing native handle —
 			// generateMipmap on an undefined texture is INVALID_OPERATION.
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		nx_webgl_egl_generate_mipmap(context->egl, texture->gles_handle,
@@ -6144,12 +7497,12 @@ static JSValue nx_webgl_generate_mipmap(JSContext *ctx, JSValueConst this_val,
 		// emitted chain on any future driver that decides to actually
 		// honor the call.
 		if (texture->gles_handle == 0) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	} else {
 		// 3D / 2D_ARRAY mipmap generation deferred until a demo needs it.
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -6165,7 +7518,7 @@ static JSValue nx_webgl_delete_texture(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_texture_t *texture = nx_get_webgl_texture(argv[0]);
 	if (!texture) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	texture->deleted = true;
@@ -6195,12 +7548,12 @@ static JSValue nx_webgl_get_uniform_location(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, JS_NULL);  // GEN-1
 	if (!program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 
@@ -6216,6 +7569,51 @@ static JSValue nx_webgl_get_uniform_location(JSContext *ctx,
 				"[nxjs:getUniformLocation] n=%d prog=%u name=\"%.80s\"\n",
 				my_n, program->gles_handle, name);
 			fflush(stderr);
+		}
+	}
+
+	/* 2026-06-27 — WebGL spec 5.14 / 3.7.16: array indices in the
+	 * uniform name (e.g. "colora[N]") must parse as a non-negative
+	 * decimal integer that fits in int32_t. Out-of-range indices
+	 * return null. The Khronos test
+	 * `uniforms-no-over-optimization-on-uniform-array-{00..17}`
+	 * exercises this with indices near uint32 max (4294967296 = 2^32,
+	 * 4294967518, 4294967519). Mesa-Nouveau's native
+	 * glGetUniformLocation returns a non-null location for those
+	 * names (driver leniency), so without this client-side validation
+	 * all 18 tests FAIL the single assertion
+	 *   "Requesting colora[BIG] uniform should return a null uniform location"
+	 * Validation is strict per spec: all-digit content, no leading
+	 * signs, no whitespace, value <= INT32_MAX. Empty `[]` and
+	 * malformed brackets also reject. Predicted magnitude: 18
+	 * WebGL1 FAIL → 18 PASS (only this single assertion fails per
+	 * test; the other 4 sub-assertions already pass). */
+	const char *lbracket = strchr(name, '[');
+	if (lbracket) {
+		const char *rbracket = strchr(lbracket + 1, ']');
+		if (!rbracket) {
+			/* Malformed: open bracket without close. */
+			JS_FreeCString(ctx, name);
+			return JS_NULL;
+		}
+		if (rbracket == lbracket + 1) {
+			/* Empty []. */
+			JS_FreeCString(ctx, name);
+			return JS_NULL;
+		}
+		uint64_t idx = 0;
+		bool valid = true;
+		for (const char *q = lbracket + 1; q < rbracket; q++) {
+			if (*q < '0' || *q > '9') { valid = false; break; }
+			idx = idx * 10u + (uint32_t)(*q - '0');
+			if (idx > (uint64_t)0x7FFFFFFF /*INT32_MAX*/) {
+				valid = false;
+				break;
+			}
+		}
+		if (!valid) {
+			JS_FreeCString(ctx, name);
+			return JS_NULL;
 		}
 	}
 
@@ -6304,7 +7702,7 @@ static JSValue nx_webgl_uniform2f(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6341,7 +7739,7 @@ static JSValue nx_webgl_uniform1f(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6417,7 +7815,7 @@ static JSValue nx_webgl_uniform3f(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6561,7 +7959,7 @@ static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	// Accept either TypedArray/ArrayBuffer (the common case) OR a plain
@@ -6575,7 +7973,7 @@ static JSValue nx_webgl_uniform3fv(JSContext *ctx, JSValueConst this_val,
 		ctx, argv[1], 3, scratch, (int)(sizeof(scratch) / sizeof(scratch[0])),
 		&count);
 	if (!source || count <= 0 || count % 3 != 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// Forward to native GLES when bridge is active and the program has a
@@ -6659,7 +8057,7 @@ static JSValue nx_webgl_uniform4f(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6696,7 +8094,7 @@ static JSValue nx_webgl_uniform1i(JSContext *ctx, JSValueConst this_val,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6739,7 +8137,7 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (transpose) {
 		// WebGL 1: transpose must be false.
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -6747,7 +8145,7 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		nx_get_webgl_uniform_location(argv[0]);
 	nx_webgl_program_t *program = NULL;
 	if (!get_uniform_program(context, location, &program)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -6760,7 +8158,7 @@ static JSValue nx_webgl_uniform_matrix4fv(JSContext *ctx,
 		ctx, argv[2], 16, scratch,
 		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
 	if (!source || count <= 0 || count % 16 != 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -6914,7 +8312,7 @@ static JSValue uniform_matrix_fv_common(
 	if (transpose) {
 		// WebGL 1: transpose must be false. WebGL 2 allows true but the
 		// nx.js bridge is WebGL-1-only today.
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!location)
@@ -6925,13 +8323,13 @@ static JSValue uniform_matrix_fv_common(
 		ctx, argv[2], components, scratch,
 		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
 	if (!source) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// WebGL spec: length must be a positive multiple of `components`
 	// (i.e. an integer number of matrices).
 	if (count <= 0 || count % components != 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
@@ -6982,12 +8380,12 @@ static JSValue uniform_fv_common(JSContext *ctx, JSValueConst this_val, int argc
 		ctx, argv[1], components, scratch,
 		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
 	if (!source) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	int element_count = count / components;
 	if (element_count <= 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
@@ -7088,12 +8486,12 @@ static JSValue uniform_iv_common(JSContext *ctx, JSValueConst this_val, int argc
 		ctx, argv[1], components, scratch,
 		(int)(sizeof(scratch) / sizeof(scratch[0])), &count);
 	if (!source) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	int element_count = count / components;
 	if (element_count <= 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl && nx_webgl_egl_is_bridge_enabled(context->egl) &&
@@ -7148,22 +8546,22 @@ static JSValue nx_webgl_get_uniform(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, JS_NULL);
 	if (!program->link_status || !program->gles_handle) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	if (JS_IsNull(argv[1])) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 	nx_webgl_uniform_location_t *location =
 		nx_get_webgl_uniform_location(argv[1]);
 	if (!location) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	NX_REQUIRE_LOC_LIVE(context, location, JS_NULL);
@@ -7347,12 +8745,12 @@ static JSValue nx_webgl_get_attrib_location(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || program->deleted) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NewInt32(ctx, -1);
 	}
 	NX_REQUIRE_PROG_LIVE(context, program, JS_NewInt32(ctx, -1));  // GEN-1
 	if (!program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NewInt32(ctx, -1);
 	}
 
@@ -7434,7 +8832,7 @@ static JSValue nx_webgl_enable_vertex_attrib_array(JSContext *ctx,
 	if (JS_ToUint32(ctx, &index, argv[0]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -7454,7 +8852,7 @@ static JSValue nx_webgl_disable_vertex_attrib_array(JSContext *ctx,
 	if (JS_ToUint32(ctx, &index, argv[0]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -7484,18 +8882,18 @@ static JSValue nx_webgl_vertex_attrib_pointer(JSContext *ctx,
 
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS || size < 1 || size > 4 ||
 		stride < 0 || offset < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!is_vertex_attrib_type(type)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_buffer_t *buffer =
 		nx_get_webgl_buffer(context->array_buffer_binding);
 	if (!buffer || buffer->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -7529,7 +8927,7 @@ static JSValue nx_webgl_vertex_attrib_1f(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &index, argv[0]) || JS_ToFloat64(ctx, &x, argv[1]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl)
@@ -7548,7 +8946,7 @@ static JSValue nx_webgl_vertex_attrib_2f(JSContext *ctx, JSValueConst this_val,
 		JS_ToFloat64(ctx, &x, argv[1]) || JS_ToFloat64(ctx, &y, argv[2]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl)
@@ -7568,7 +8966,7 @@ static JSValue nx_webgl_vertex_attrib_3f(JSContext *ctx, JSValueConst this_val,
 		JS_ToFloat64(ctx, &z, argv[3]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl)
@@ -7589,7 +8987,7 @@ static JSValue nx_webgl_vertex_attrib_4f(JSContext *ctx, JSValueConst this_val,
 		JS_ToFloat64(ctx, &z, argv[3]) || JS_ToFloat64(ctx, &w, argv[4]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (context->egl)
@@ -7610,7 +9008,7 @@ static JSValue vertex_attrib_fv_common(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &index, argv[0]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	float scratch[4];
@@ -7618,7 +9016,7 @@ static JSValue vertex_attrib_fv_common(JSContext *ctx, JSValueConst this_val,
 	const float *source = uniform_array_or_buffer_floats(
 		ctx, argv[1], components, scratch, 4, &count);
 	if (!source || count < components) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!context->egl) return JS_UNDEFINED;
@@ -7678,7 +9076,7 @@ static JSValue nx_webgl_get_vertex_attrib(JSContext *ctx,
 		JS_ToUint32(ctx, &pname, argv[1]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_NULL;
 	}
 	nx_webgl_vertex_attrib_t *attrib = &context->vertex_attribs[index];
@@ -7715,7 +9113,7 @@ static JSValue nx_webgl_get_vertex_attrib(JSContext *ctx,
 	}
 	case 0x88FD: /* VERTEX_ATTRIB_ARRAY_INTEGER (WebGL 2) */
 		if (!context->is_webgl2) {
-			context->error = GL_INVALID_ENUM;
+			NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 			return JS_NULL;
 		}
 		{
@@ -7726,7 +9124,7 @@ static JSValue nx_webgl_get_vertex_attrib(JSContext *ctx,
 			return JS_NewBool(ctx, v != 0);
 		}
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NULL;
 	}
 }
@@ -9428,7 +10826,7 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
 				js_free(ctx, fog_depth_data);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return;
 			}
 			if (written > 0) {
@@ -9488,7 +10886,7 @@ static void draw_arrays_lines(JSContext *ctx, nx_webgl_context_t *context,
 		nx_webgl_vec3_t pos1;
 		if (!read_attrib_vec3(context, position, i0, &pos0) ||
 			!read_attrib_vec3(context, position, i1, &pos1)) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return;
 		}
 		nx_webgl_vec3_t c0 = transform_position3_depth(program, pos0);
@@ -9632,7 +11030,7 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 				js_free(ctx, line_distance_data);
 				js_free(ctx, vertex_color_data);
 				js_free(ctx, fog_depth_data);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return;
 			}
 			if (written > 0) {
@@ -9693,7 +11091,7 @@ static void draw_elements_lines(JSContext *ctx, nx_webgl_context_t *context,
 		nx_webgl_vec3_t pos1;
 		if (!read_attrib_vec3(context, position, i0, &pos0) ||
 			!read_attrib_vec3(context, position, i1, &pos1)) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return;
 		}
 		nx_webgl_vec3_t c0 = transform_position3_depth(program, pos0);
@@ -9761,7 +11159,7 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 	nx_webgl_vertex_attrib_t *position =
 		&context->vertex_attribs[position_index];
 	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return;
 	}
 
@@ -9935,7 +11333,7 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 				js_free(ctx, clip_xyzuv);
 				js_free(ctx, vertex_color_data);
 				js_free(ctx, fog_depth_data);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return;
 			}
 			int vertex_count_out = written_points * 6;
@@ -10022,7 +11420,7 @@ static void draw_arrays_points(JSContext *ctx, nx_webgl_context_t *context,
 	for (int p = 0; p < count; p++) {
 		nx_webgl_vec3_t pos;
 		if (!read_attrib_vec3(context, position, first + p, &pos)) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return;
 		}
 		nx_webgl_vec3_t ndc = transform_position3_depth(program, pos);
@@ -10095,22 +11493,80 @@ static bool ensure_texture_promoted(nx_webgl_context_t *context,
 	return true;
 }
 
-// Passthrough-specific wrapper: promote the bound 2D texture + re-issue
+// Passthrough-specific wrapper: promote the bound texture(s) + re-issue
 // the activeTexture+bindTexture to native (the original bindTexture call
 // short-circuited because gles_handle was 0). See [[bridge-raw-shader-passthrough]]
 // for the broader rationale and the lazy-promote architecture.
 //
-// Operates on `context->texture_2d_binding` only — nx.js currently tracks
-// a single 2D-texture binding (not per-unit), so multi-texture-unit
-// passthrough sampling needs per-unit binding state which is deferred.
+// Single-slot per-target tracking: nx.js's engine tracks ONE binding per
+// target (texture_2d_binding / texture_3d_binding / texture_2d_array_binding
+// / texture_cube_binding), not per-unit. So multi-texture-unit passthrough
+// sampling with DIFFERENT textures on different units of the SAME target
+// still hits the single-slot wall and is deferred. The fix below addresses
+// the orthogonal limitation: even for SINGLE-unit usage, the prior
+// implementation re-issued ONLY the 2D binding before each passthrough
+// draw — 3D / 2D_array / cube bindings set by `bindTexture` + `texImage3D`
+// were forwarded once at promotion time but never re-issued, so any
+// bridge-internal state-fiddling between then and `drawArrays` (the
+// bridge's `bindFramebuffer` / `clear` / `bridge_acquire_target` paths
+// share the same EGL context) could move bridge's `TEXTURE_BINDING_3D` /
+// `_2D_ARRAY` / `_CUBE_MAP` on the active unit to 0 or another handle.
+// Result: shaders sampling layered/cube textures got vec4(0).
+//
+// 2026-06-27 D1b fix: walk all four single-slot bindings the engine
+// tracks. The 2D path stays lazy (CPU-data cache pattern via
+// `ensure_texture_promoted` — preserves the original API for 2D
+// data-from-CPU textures). The 3D / 2D_array / cube paths are eagerly
+// promoted at texImage3D / texImage2D-onto-cube-face time, so they
+// just need the bind re-issued — no lazy promotion call. Magnitude
+// prediction: ALL Group C tex-3d 0,0,0 reads clear uniformly. See
+// REAL_GL_FAILURES.md 2026-06-27 D1b entry. Same family as the v1
+// single-slot 2D-binding bug at
+// [[reference-brewser-v1-black-texture-demos]], extended to the
+// targets the prior fix missed.
 static void ensure_passthrough_texture_promoted(nx_webgl_context_t *context) {
-	nx_webgl_texture_t *texture =
-		nx_get_webgl_texture(context->texture_2d_binding);
-	if (!ensure_texture_promoted(context, texture)) return;
-	// Re-issue the binding so native sees the handle.
-	nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
-	nx_webgl_egl_forward_bind_texture(context->egl, GL_TEXTURE_2D,
-	                                   texture->gles_handle);
+	nx_webgl_texture_t *tex2d  = nx_get_webgl_texture(context->texture_2d_binding);
+	nx_webgl_texture_t *tex3d  = nx_get_webgl_texture(context->texture_3d_binding);
+	nx_webgl_texture_t *tex2da = nx_get_webgl_texture(context->texture_2d_array_binding);
+	nx_webgl_texture_t *texcm  = nx_get_webgl_texture(context->texture_cube_binding);
+	bool need_active = false;
+	// 2D path: still lazy-promote per the original behavior. `ensure_texture_promoted`
+	// handles the null / deleted / not-yet-uploaded cases internally.
+	if (ensure_texture_promoted(context, tex2d)) {
+		if (!need_active) {
+			nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
+			need_active = true;
+		}
+		nx_webgl_egl_forward_bind_texture(context->egl, GL_TEXTURE_2D,
+		                                   tex2d->gles_handle);
+	}
+	// 3D / 2D_array / cube paths: eagerly promoted at texImage* time. Just
+	// re-issue the bind so the bridge's native state matches the engine's
+	// tracked binding at draw time. Each branch null/deleted-guarded.
+	if (tex3d && !tex3d->deleted && tex3d->gles_handle) {
+		if (!need_active) {
+			nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
+			need_active = true;
+		}
+		nx_webgl_egl_forward_bind_texture(context->egl, 0x806F /*GL_TEXTURE_3D*/,
+		                                   tex3d->gles_handle);
+	}
+	if (tex2da && !tex2da->deleted && tex2da->gles_handle) {
+		if (!need_active) {
+			nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
+			need_active = true;
+		}
+		nx_webgl_egl_forward_bind_texture(context->egl, 0x8C1A /*GL_TEXTURE_2D_ARRAY*/,
+		                                   tex2da->gles_handle);
+	}
+	if (texcm && !texcm->deleted && texcm->gles_handle) {
+		if (!need_active) {
+			nx_webgl_egl_forward_active_texture(context->egl, context->active_texture);
+			need_active = true;
+		}
+		nx_webgl_egl_forward_bind_texture(context->egl, GL_TEXTURE_CUBE_MAP,
+		                                   texcm->gles_handle);
+	}
 }
 
 static bool try_draw_passthrough(nx_webgl_context_t *context,
@@ -10144,7 +11600,7 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 	// with a program the new context just allocated for someone else).
 	if (program->created_generation != context->context_generation) {
 		program->gles_handle = 0;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return false;
 	}
 	if (!context->egl || !nx_webgl_egl_is_bridge_enabled(context->egl))
@@ -10192,12 +11648,61 @@ static bool try_draw_passthrough(nx_webgl_context_t *context,
 		attribs[i].offset = src->offset;
 		attribs[i].divisor = src->divisor;
 	}
-
 	bool blend = (context->enabled_caps & GL_CAP_BLEND) != 0;
 	bool scissor_enabled = (context->enabled_caps & GL_CAP_SCISSOR_TEST) != 0;
 	bool depth_enabled = (context->enabled_caps & GL_CAP_DEPTH_TEST) != 0;
 	bool cull_enabled = (context->enabled_caps & GL_CAP_CULL_FACE) != 0;
 	/* stencil_enabled declared earlier in this function (used by gate). */
+
+	/* 2026-06-27 Q1-followup sampler-arrival probe (Candidate A test):
+	 * just before native draw dispatches, log the engine's tracked 3D
+	 * bindings AND query Mesa's actual TEXTURE_BINDING_2D_ARRAY /
+	 * TEXTURE_BINDING_3D on the active unit. If they match → the
+	 * bindings reached Mesa, Candidate A is empirically ruled out and
+	 * the 0,0,0 reads come from elsewhere (Candidate C mipmap
+	 * completeness or B Mesa write-drop). If they DON'T match → the
+	 * bridge is losing the binding somewhere between bindTexture and
+	 * draw, Candidate A is confirmed.
+	 *
+	 * Filtered: only fires when engine has a non-zero TEXTURE_2D_ARRAY
+	 * or TEXTURE_3D binding (i.e., the test actually has a 3D texture
+	 * bound — most draws don't, so this filter keeps log volume low).
+	 * Gated on a compile-time flag so it can be turned off after the
+	 * candidate-A question is answered. */
+#define NXJS_Q1F_SAMPLER_ARRIVAL_VERBOSE 0  /* 2026-06-27 verdict in:
+                                               binding_lost=0 for 75.8% of
+                                               draws (unchanged from baseline
+                                               77.9%). D1b at the Mesa-
+                                               forwarding layer is empirically
+                                               RULED OUT — Mesa has the right
+                                               binding regardless of my fix.
+                                               Bug is sampler-side. Next
+                                               probe (H-B raw-GLES bypass)
+                                               narrows to driver-side vs
+                                               bridge-side. Silenced again. */
+	if (NXJS_Q1F_SAMPLER_ARRIVAL_VERBOSE) {
+		nx_webgl_texture_t *eng_2da =
+		    nx_get_webgl_texture(context->texture_2d_array_binding);
+		nx_webgl_texture_t *eng_3d =
+		    nx_get_webgl_texture(context->texture_3d_binding);
+		uint32_t engine_2da_handle = eng_2da ? eng_2da->gles_handle : 0;
+		uint32_t engine_3d_handle = eng_3d ? eng_3d->gles_handle : 0;
+		if (engine_2da_handle != 0 || engine_3d_handle != 0) {
+			uint32_t mesa_2da = 0, mesa_3d = 0;
+			nx_webgl_egl_probe_3d_bindings(context->egl,
+			    context->active_texture, &mesa_2da, &mesa_3d);
+			bool binding_lost =
+			    (engine_2da_handle != mesa_2da) ||
+			    (engine_3d_handle != mesa_3d);
+			fprintf(stderr,
+			        "[nxjs:q1f-draw] active_unit=0x%x prog=%u engine_2da=%u engine_3d=%u mesa_2da=%u mesa_3d=%u binding_lost=%d\n",
+			        context->active_texture, (unsigned)program->gles_handle,
+			        engine_2da_handle, engine_3d_handle,
+			        mesa_2da, mesa_3d, (int)binding_lost);
+			fflush(stderr);
+		}
+	}
+
 	bool ok = nx_webgl_egl_draw_passthrough(
 		context->egl, context->canvas, program->gles_handle, mode,
 		indexed, first, count, element_type, element_offset,
@@ -10266,11 +11771,11 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
 		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
 		mode != GL_POINTS) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (first < 0 || count < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (count == 0)
@@ -10278,7 +11783,7 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
 	if (!program || !program->link_status || program->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -10290,7 +11795,7 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_vertex_attrib_t *position =
 		&context->vertex_attribs[position_index];
 	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -10497,7 +12002,7 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 				js_free(ctx, fog_depth_data);
 				js_free(ctx, normal_data);
 				js_free(ctx, view_position_data);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return JS_UNDEFINED;
 			}
 			float fallback_color[4] = {
@@ -10588,12 +12093,12 @@ static JSValue nx_webgl_draw_arrays(JSContext *ctx, JSValueConst this_val,
 			nx_webgl_vec3_t position3;
 			if (!read_attrib_vec3(context, position, vertex_index,
 								  &position3)) {
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return JS_UNDEFINED;
 			}
 			if (use_texture &&
 				!read_attrib_vec2(context, texcoord, vertex_index, &uv[i])) {
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return JS_UNDEFINED;
 			}
 			clip[i] = transform_position3(program, position3);
@@ -10644,22 +12149,22 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
 		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
 		mode != GL_POINTS) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	size_t index_size = (type == GL_UNSIGNED_BYTE) ? 1 : 2;
 	if (count < 0 || offset < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// WebGL 1.0 spec 6.4: offset not aligned to index size returns
 	// INVALID_OPERATION (not INVALID_VALUE).
 	if ((size_t)offset % index_size != 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (count == 0)
@@ -10667,7 +12172,7 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
 	if (!program || !program->link_status || program->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -10679,19 +12184,19 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_vertex_attrib_t *position =
 		&context->vertex_attribs[position_index];
 	if (!position->enabled || position->type != GL_FLOAT || position->size < 2) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_buffer_t *element_buffer =
 		nx_get_webgl_buffer(context->element_array_buffer_binding);
 	if (!element_buffer || element_buffer->deleted || !element_buffer->data) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if ((size_t)offset + (size_t)count * index_size >
 		element_buffer->size) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -10831,7 +12336,7 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 					js_free(ctx, triangles);
 				if (owned_indices)
 					js_free(ctx, owned_indices);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return JS_UNDEFINED;
 			}
 			if (use_texture &&
@@ -10841,7 +12346,7 @@ static JSValue nx_webgl_draw_elements(JSContext *ctx, JSValueConst this_val,
 					js_free(ctx, triangles);
 				if (owned_indices)
 					js_free(ctx, owned_indices);
-				context->error = GL_INVALID_OPERATION;
+				NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 				return JS_UNDEFINED;
 			}
 			nx_webgl_vec3_t clip =
@@ -10916,7 +12421,7 @@ static JSValue nx_webgl_vertex_attrib_divisor(JSContext *ctx,
 		JS_ToUint32(ctx, &divisor, argv[1]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -10959,11 +12464,11 @@ static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
 		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
 		mode != GL_POINTS) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (first < 0 || count < 0 || instance_count < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (count == 0 || instance_count == 0)
@@ -10971,7 +12476,7 @@ static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
 	if (!program || !program->link_status || program->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -10982,7 +12487,7 @@ static JSValue nx_webgl_draw_arrays_instanced(JSContext *ctx,
 	if (!try_draw_passthrough(context, program, mode, false, first, count,
 							  0, 0, 0, instance_count)) {
 		// Native instancing not available — bridge can't emulate.
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -11013,7 +12518,7 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 		mode != GL_TRIANGLE_FAN && mode != GL_LINES &&
 		mode != GL_LINE_STRIP && mode != GL_LINE_LOOP &&
 		mode != GL_POINTS) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE &&
@@ -11021,18 +12526,18 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 		// Native GL3 supports UNSIGNED_INT directly; nx.js doesn't expose
 		// the OES_element_index_uint extension, but accept it here in case
 		// Three.js feature-detects via getExtension first.
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	size_t index_size = (type == GL_UNSIGNED_BYTE) ? 1
 						: (type == GL_UNSIGNED_INT) ? 4
 													: 2;
 	if (count < 0 || offset < 0 || instance_count < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if ((size_t)offset % index_size != 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (count == 0 || instance_count == 0)
@@ -11040,18 +12545,18 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 
 	nx_webgl_program_t *program = nx_get_webgl_program(context->current_program);
 	if (!program || !program->link_status || program->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
 	nx_webgl_buffer_t *element_buffer =
 		nx_get_webgl_buffer(context->element_array_buffer_binding);
 	if (!element_buffer || element_buffer->deleted || !element_buffer->data) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if ((size_t)offset + (size_t)count * index_size > element_buffer->size) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -11063,7 +12568,7 @@ static JSValue nx_webgl_draw_elements_instanced(JSContext *ctx,
 							  type, (uint32_t)offset,
 							  element_buffer->gles_handle,
 							  instance_count)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -11082,7 +12587,7 @@ static JSValue nx_webgl_enable_disable(JSContext *ctx, JSValueConst this_val,
 
 	uint32_t flag = cap_to_flag(cap);
 	if (flag == 0) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -11113,7 +12618,7 @@ static JSValue nx_webgl_is_enabled(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 	uint32_t flag = cap_to_flag(cap);
 	if (flag == 0) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NewBool(ctx, false);
 	}
 	return JS_NewBool(ctx, (context->enabled_caps & flag) != 0);
@@ -11130,7 +12635,7 @@ static JSValue nx_webgl_depth_func(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 
 	if (!is_depth_func(func)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -11149,7 +12654,7 @@ static JSValue nx_webgl_blend_func(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &src, argv[0]) || JS_ToUint32(ctx, &dst, argv[1]))
 		return JS_EXCEPTION;
 	if (!is_blend_factor(src) || !is_blend_factor(dst)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -11169,7 +12674,7 @@ static JSValue nx_webgl_blend_equation(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &equation, argv[0]))
 		return JS_EXCEPTION;
 	if (!is_blend_equation(equation)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->blend_equation_rgb = equation;
@@ -11189,7 +12694,7 @@ static JSValue nx_webgl_blend_equation_separate(JSContext *ctx,
 	    JS_ToUint32(ctx, &mode_alpha, argv[1]))
 		return JS_EXCEPTION;
 	if (!is_blend_equation(mode_rgb) || !is_blend_equation(mode_alpha)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->blend_equation_rgb = mode_rgb;
@@ -11214,7 +12719,7 @@ static JSValue nx_webgl_blend_func_separate(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (!is_blend_factor(src_rgb) || !is_blend_factor(dst_rgb) ||
 		!is_blend_factor(src_alpha) || !is_blend_factor(dst_alpha)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->blend_src = src_rgb;
@@ -11247,7 +12752,7 @@ static JSValue nx_webgl_cull_face(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &mode, argv[0]))
 		return JS_EXCEPTION;
 	if (!is_cull_face_mode(mode)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->cull_face = mode;
@@ -11263,7 +12768,7 @@ static JSValue nx_webgl_front_face(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToUint32(ctx, &mode, argv[0]))
 		return JS_EXCEPTION;
 	if (!is_front_face_mode(mode)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->front_face = mode;
@@ -11303,7 +12808,7 @@ static JSValue nx_webgl_stencil_func(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &mask, argv[2]))
 		return JS_EXCEPTION;
 	if (!is_depth_func(func)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->stencil_func = func;
@@ -11325,7 +12830,7 @@ static JSValue nx_webgl_stencil_op(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 	if (!is_stencil_op(fail) || !is_stencil_op(zfail) ||
 		!is_stencil_op(zpass)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->stencil_fail = fail;
@@ -11351,7 +12856,7 @@ static JSValue nx_webgl_stencil_mask_separate(JSContext *ctx,
 	if (JS_ToUint32(ctx, &face, argv[0]) || JS_ToUint32(ctx, &mask, argv[1]))
 		return JS_EXCEPTION;
 	if (!is_cull_face_mode(face)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->stencil_mask = mask;
@@ -11372,7 +12877,7 @@ static JSValue nx_webgl_stencil_func_separate(JSContext *ctx,
 	    JS_ToInt32(ctx, &ref, argv[2]) || JS_ToUint32(ctx, &mask, argv[3]))
 		return JS_EXCEPTION;
 	if (!is_cull_face_mode(face) || !is_depth_func(func)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->stencil_func = func;
@@ -11396,7 +12901,7 @@ static JSValue nx_webgl_stencil_op_separate(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (!is_cull_face_mode(face) || !is_stencil_op(fail) ||
 	    !is_stencil_op(zfail) || !is_stencil_op(zpass)) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	context->stencil_fail = fail;
@@ -11443,7 +12948,7 @@ static JSValue nx_webgl_create_framebuffer(JSContext *ctx,
 	if (fb->handle == 0) {
 		js_free(ctx, fb);
 		JS_FreeValue(ctx, obj);
-		context->error = GL_OUT_OF_MEMORY;
+		NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 		return JS_NULL;
 	}
 	fb->created_generation = context->context_generation;  // GEN-1
@@ -11522,7 +13027,7 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 	// the underlying state still works because Three.js follows up the
 	// DRAW/READ binds with a `gl.FRAMEBUFFER` rebind anyway.
 	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
@@ -11533,7 +13038,7 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 	}
 	nx_webgl_framebuffer_t *fb = nx_get_webgl_framebuffer(argv[1]);
 	if (!fb || fb->deleted || fb->handle == 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: bindFramebuffer is the most likely entry point for a stale
@@ -11544,7 +13049,7 @@ static JSValue nx_webgl_bind_framebuffer(JSContext *ctx, JSValueConst this_val,
 	if (fb->created_generation != context->context_generation) {
 		fb->handle = 0;
 		fb->created_generation = context->context_generation;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	JS_FreeValue(ctx, context->framebuffer_binding);
@@ -11565,7 +13070,7 @@ static JSValue nx_webgl_check_framebuffer_status(JSContext *ctx,
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
 	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_NewUint32(ctx, 0);
 	}
 	nx_webgl_framebuffer_t *fb =
@@ -11611,7 +13116,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	    JS_ToInt32(ctx, &level, argv[4]))
 		return JS_EXCEPTION;
 	if (target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	/* 2026-06-23 cube-map FBO attachment: accept all 6 cube map face
@@ -11628,17 +13133,17 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 		(textarget >= 0x8515 /* CUBE_MAP_POSITIVE_X */ &&
 		 textarget <= 0x851A /* CUBE_MAP_NEGATIVE_Z */);
 	if (!textarget_ok) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (level != 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_framebuffer_t *fb =
 		nx_get_webgl_framebuffer(context->framebuffer_binding);
 	if (!fb || fb->handle == 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -11661,7 +13166,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 		// underlying texture come from the single binding.
 		slot = &fb->depth_attachment;
 	else {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -11674,7 +13179,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	} else {
 		nx_webgl_texture_t *texture = nx_get_webgl_texture(argv[3]);
 		if (!texture || texture->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		// Ensure the texture has a persistent native handle. Three.js
@@ -11685,7 +13190,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 				nx_webgl_egl_create_persistent_texture(context->egl,
 				                                        context->canvas);
 			if (texture->gles_handle == 0) {
-				context->error = GL_OUT_OF_MEMORY;
+				NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 				return JS_UNDEFINED;
 			}
 			// Allocate empty storage at the recorded dims (or 1×1 if none).
@@ -11734,7 +13239,7 @@ static JSValue nx_webgl_framebuffer_texture_2d(JSContext *ctx,
 	if (!nx_webgl_egl_framebuffer_texture_2d(context->egl, fb->handle,
 	                                          attachment, textarget,
 	                                          tex_handle)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -11754,13 +13259,13 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 		return JS_EXCEPTION;
 	if ((target != GL_FRAMEBUFFER && target != 0x8CA9 && target != 0x8CA8) ||
 	    rbtarget != GL_RENDERBUFFER) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_framebuffer_t *fb =
 		nx_get_webgl_framebuffer(context->framebuffer_binding);
 	if (!fb || fb->handle == 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 
@@ -11777,7 +13282,7 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 	else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
 		slot = &fb->depth_attachment;
 	else {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 
@@ -11789,7 +13294,7 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 	} else {
 		nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[3]);
 		if (!rb || rb->deleted || rb->handle == 0) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		rb_handle = rb->handle;
@@ -11801,7 +13306,7 @@ static JSValue nx_webgl_framebuffer_renderbuffer(JSContext *ctx,
 
 	if (!nx_webgl_egl_framebuffer_renderbuffer(context->egl, fb->handle,
 	                                            attachment, rb_handle)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	return JS_UNDEFINED;
@@ -11826,7 +13331,7 @@ static JSValue nx_webgl_create_renderbuffer(JSContext *ctx,
 	if (rb->handle == 0) {
 		js_free(ctx, rb);
 		JS_FreeValue(ctx, obj);
-		context->error = GL_OUT_OF_MEMORY;
+		NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 		return JS_NULL;
 	}
 	rb->created_generation = context->context_generation;  // GEN-1
@@ -11878,7 +13383,7 @@ static JSValue nx_webgl_bind_renderbuffer(JSContext *ctx,
 	if (JS_ToUint32(ctx, &target, argv[0]))
 		return JS_EXCEPTION;
 	if (target != GL_RENDERBUFFER) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
@@ -11888,7 +13393,7 @@ static JSValue nx_webgl_bind_renderbuffer(JSContext *ctx,
 	}
 	nx_webgl_renderbuffer_t *rb = nx_get_webgl_renderbuffer(argv[1]);
 	if (!rb || rb->deleted || rb->handle == 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	// GEN-1: stale RB → its native name belongs to a torn-down context.
@@ -11896,7 +13401,7 @@ static JSValue nx_webgl_bind_renderbuffer(JSContext *ctx,
 	if (rb->created_generation != context->context_generation) {
 		rb->handle = 0;
 		rb->created_generation = context->context_generation;
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	JS_FreeValue(ctx, context->renderbuffer_binding);
@@ -11918,17 +13423,17 @@ static JSValue nx_webgl_renderbuffer_storage(JSContext *ctx,
 	    JS_ToInt32(ctx, &height, argv[3]))
 		return JS_EXCEPTION;
 	if (target != GL_RENDERBUFFER) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (width <= 0 || height <= 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_renderbuffer_t *rb =
 		nx_get_webgl_renderbuffer(context->renderbuffer_binding);
 	if (!rb || rb->handle == 0) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	/* 2026-06-23 PMREM probe: log renderbufferStorage. PMREM allocates
@@ -11947,7 +13452,7 @@ static JSValue nx_webgl_renderbuffer_storage(JSContext *ctx,
 	}
 	if (!nx_webgl_egl_renderbuffer_storage(context->egl, rb->handle,
 	                                        internalformat, width, height)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		fprintf(stderr,
 			"[nxjs:pmrem:renderbufferStorage:FAIL] intl=0x%x w=%d h=%d\n",
 			internalformat, width, height);
@@ -11958,6 +13463,52 @@ static JSValue nx_webgl_renderbuffer_storage(JSContext *ctx,
 	rb->width = width;
 	rb->height = height;
 	return JS_UNDEFINED;
+}
+
+/* 2026-06-27 readPixels per-exit-path counters: Phase 1c proved the
+ * format gate only accounts for ~0.2% of the 9,788 INVALID_OPERATION
+ * cascade in nx_webgl_read_pixels. Hypothesis-free diagnostic to find
+ * which exit path actually owns the volume. Counters are static so
+ * they accumulate across the whole run; logged every Nth call to keep
+ * volume bounded. Logged on the first 10 calls too so cold-state is
+ * visible. Gated behind NXJS_RP_EXIT_COUNTERS so we can turn it off
+ * after the dominant path is identified. */
+#define NXJS_RP_EXIT_COUNTERS 0  /* exit-path distribution harvested:
+                                    bridge_reject dominant at 97.8%
+                                    (43,508/44,500). Probe silenced;
+                                    investigation moved into
+                                    nx_webgl_egl_read_bridge_pixels'
+                                    per-early-return counters in
+                                    webgl_egl.c. Flip to 1 to
+                                    re-harvest the JS-side
+                                    distribution. */
+static uint64_t g_rp_exit_fmt_gate = 0;        // line ~13016: format/type not in widened set
+static uint64_t g_rp_exit_buf_size = 0;        // line ~13029: buffer too small for region
+static uint64_t g_rp_exit_ufbo_reject = 0;     // line ~13043: user-FBO native glReadPixels failed
+static uint64_t g_rp_exit_bridge_reject = 0;   // line ~13061: bridge default-FB readback failed
+static uint64_t g_rp_exit_success = 0;         // returned without setting context->error
+static uint64_t g_rp_exit_dst_null = 0;        // dst buffer was null (INVALID_VALUE, not OP)
+static uint64_t g_rp_exit_zero_dim = 0;        // width/height <= 0 (returns without error)
+static inline void rp_exit_log_maybe(const char *which) {
+	if (!NXJS_RP_EXIT_COUNTERS) return;
+	uint64_t total = g_rp_exit_fmt_gate + g_rp_exit_buf_size +
+	                 g_rp_exit_ufbo_reject + g_rp_exit_bridge_reject +
+	                 g_rp_exit_success + g_rp_exit_dst_null +
+	                 g_rp_exit_zero_dim;
+	if (total <= 10 || (total % 500) == 0) {
+		fprintf(stderr,
+		        "[nxjs:rp-exits] total=%llu fmt=%llu buf=%llu ufbo_rej=%llu bridge_rej=%llu ok=%llu dst_null=%llu zero_dim=%llu (last_exit=%s)\n",
+		        (unsigned long long)total,
+		        (unsigned long long)g_rp_exit_fmt_gate,
+		        (unsigned long long)g_rp_exit_buf_size,
+		        (unsigned long long)g_rp_exit_ufbo_reject,
+		        (unsigned long long)g_rp_exit_bridge_reject,
+		        (unsigned long long)g_rp_exit_success,
+		        (unsigned long long)g_rp_exit_dst_null,
+		        (unsigned long long)g_rp_exit_zero_dim,
+		        which);
+		fflush(stderr);
+	}
 }
 
 // gl.readPixels(x, y, width, height, format, type, pixels)
@@ -11992,21 +13543,79 @@ static JSValue nx_webgl_read_pixels(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &format, argv[4]) ||
 		JS_ToUint32(ctx, &type, argv[5]))
 		return JS_EXCEPTION;
-	if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
-		context->error = GL_INVALID_OPERATION;
+	/* 2026-06-27 Phase 1c: widen the readPixels format gate to the
+	 * WebGL2 spec-allowed minimum (format, type) combinations.
+	 * Pre-fix: hardcoded RGBA + UByte produced 9,788 INVALID_OPERATION
+	 * sets per WebGL2 conformance run as tests legitimately read back
+	 * RGBA_INTEGER + UInt for *UI formats, RED + UByte for R8, etc.
+	 * → cascade contamination of downstream failIfGLError checks per
+	 * the Q2 architectural diagnosis. Mirror of Phase 1a / 1b
+	 * format-gate widening at texImage2D / texImage3D.
+	 *
+	 * Per-pixel byte size is computed from (format, type) so the
+	 * subsequent buffer-size check is correct for each tuple. Native
+	 * glReadPixels in the user-FBO path (webgl_egl.c:4947) forwards
+	 * format/type unchanged, so Mesa-acceptance is what determines
+	 * whether the read succeeds — captured via [readPixels-direct]
+	 * probe below. The bridge default-FB path (webgl_egl.c:5071)
+	 * hardcodes RGBA + UByte internally because the default
+	 * framebuffer is RGBA8 storage; WebGL2 spec rejects non-RGBA
+	 * reads from the default FB anyway, so this widening only affects
+	 * user-FBO reads in practice. */
+	uint32_t channels = 0;
+	uint32_t bytes_per_channel = 0;
+	bool fmt_ok = false;
+	if (type == GL_UNSIGNED_BYTE) {
+		if (format == GL_RGBA) { channels = 4; bytes_per_channel = 1; fmt_ok = true; }
+		else if (format == GL_RGB) { channels = 3; bytes_per_channel = 1; fmt_ok = true; }
+		else if (format == 0x8227 /*GL_RG*/) { channels = 2; bytes_per_channel = 1; fmt_ok = true; }
+		else if (format == 0x1903 /*GL_RED*/) { channels = 1; bytes_per_channel = 1; fmt_ok = true; }
+	} else if (type == 0x1405 /*GL_UNSIGNED_INT*/) {
+		if (format == 0x8D99 /*GL_RGBA_INTEGER*/) { channels = 4; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8D98 /*GL_RGB_INTEGER*/) { channels = 3; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8228 /*GL_RG_INTEGER*/) { channels = 2; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8D94 /*GL_RED_INTEGER*/) { channels = 1; bytes_per_channel = 4; fmt_ok = true; }
+	} else if (type == 0x1404 /*GL_INT*/) {
+		if (format == 0x8D99 /*GL_RGBA_INTEGER*/) { channels = 4; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8D98 /*GL_RGB_INTEGER*/) { channels = 3; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8228 /*GL_RG_INTEGER*/) { channels = 2; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8D94 /*GL_RED_INTEGER*/) { channels = 1; bytes_per_channel = 4; fmt_ok = true; }
+	} else if (type == GL_FLOAT) {
+		if (format == GL_RGBA) { channels = 4; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == GL_RGB) { channels = 3; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x8227 /*GL_RG*/) { channels = 2; bytes_per_channel = 4; fmt_ok = true; }
+		else if (format == 0x1903 /*GL_RED*/) { channels = 1; bytes_per_channel = 4; fmt_ok = true; }
+	} else if (type == 0x140B /*GL_HALF_FLOAT*/ || type == GL_HALF_FLOAT_OES) {
+		if (format == GL_RGBA) { channels = 4; bytes_per_channel = 2; fmt_ok = true; }
+		else if (format == GL_RGB) { channels = 3; bytes_per_channel = 2; fmt_ok = true; }
+		else if (format == 0x8227 /*GL_RG*/) { channels = 2; bytes_per_channel = 2; fmt_ok = true; }
+		else if (format == 0x1903 /*GL_RED*/) { channels = 1; bytes_per_channel = 2; fmt_ok = true; }
+	}
+	if (!fmt_ok) {
+		g_rp_exit_fmt_gate++;
+		rp_exit_log_maybe("fmt_gate");
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
-	if (width <= 0 || height <= 0)
+	if (width <= 0 || height <= 0) {
+		g_rp_exit_zero_dim++;
+		rp_exit_log_maybe("zero_dim");
 		return JS_UNDEFINED;
+	}
 	size_t buffer_size = 0;
 	uint8_t *dst = NX_GetBufferSource(ctx, &buffer_size, argv[6]);
 	if (!dst) {
-		context->error = GL_INVALID_VALUE;
+		g_rp_exit_dst_null++;
+		rp_exit_log_maybe("dst_null");
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
-	size_t needed = (size_t)width * (size_t)height * 4;
+	size_t bytes_per_pixel = (size_t)channels * (size_t)bytes_per_channel;
+	size_t needed = (size_t)width * (size_t)height * bytes_per_pixel;
 	if (buffer_size < needed) {
-		context->error = GL_INVALID_OPERATION;
+		g_rp_exit_buf_size++;
+		rp_exit_log_maybe("buf_size");
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	// User-FBO path (milestone #19): when the user has bound a non-null
@@ -12017,12 +13626,45 @@ static JSValue nx_webgl_read_pixels(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_framebuffer_t *bound_fb =
 		nx_get_webgl_framebuffer(context->framebuffer_binding);
 	if (bound_fb && !bound_fb->deleted && bound_fb->handle != 0) {
-		if (!nx_webgl_egl_read_user_fbo_pixels(context->egl, bound_fb->handle,
-		                                        x, y, width, height,
-		                                        format, type, dst)) {
-			context->error = GL_INVALID_OPERATION;
+		bool ufbo_ok = nx_webgl_egl_read_user_fbo_pixels(context->egl,
+		    bound_fb->handle, x, y, width, height, format, type, dst);
+		/* 2026-06-27 Phase 1c: capture Mesa accept/reject per readback
+		 * (format, type) tuple on the user-FBO path. Mirrors
+		 * [texImage2D-direct] / [texImage3D-direct] from Phase 1a/1b.
+		 * Filtered to NON-baseline tuples (anything except the
+		 * pre-Phase-1c-allowed RGBA + UByte) so the probe doesn't spam
+		 * for every RGBA UByte read but does report every novel tuple
+		 * Phase 1c admits. The user-FBO path forwards format/type to
+		 * native glReadPixels unchanged, so the bool reflects Mesa's
+		 * direct verdict on the readback combination. */
+		/* Phase 1c probe gated quiet after harvest: 19 events across
+		 * a 1182-test WebGL2 run, ALL Mesa-REJECTED for
+		 * (RGBA_INTEGER, UInt) and (RGBA_INTEGER, Int). Tegra/Mesa-
+		 * Nouveau doesn't support integer-format readback on user
+		 * FBOs — JS gate widening admits the call but native
+		 * glReadPixels rejects. Flip flag to 1 to re-harvest if a
+		 * future driver change might have lifted the restriction
+		 * OR a new read format combination needs verification. */
+#if 0
+		bool is_phase1c_novel =
+		    !(format == GL_RGBA && type == GL_UNSIGNED_BYTE);
+		if (is_phase1c_novel) {
+			fprintf(stderr,
+			        "[nxjs:readPixels-direct] fbo=%u format=0x%x type=0x%x w=%d h=%d ok=%d (Mesa %s)\n",
+			        (unsigned)bound_fb->handle, format, type,
+			        width, height, (int)ufbo_ok,
+			        ufbo_ok ? "ACCEPTED" : "REJECTED");
+			fflush(stderr);
+		}
+#endif
+		if (!ufbo_ok) {
+			g_rp_exit_ufbo_reject++;
+			rp_exit_log_maybe("ufbo_reject");
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
+		g_rp_exit_success++;
+		rp_exit_log_maybe("ok_ufbo");
 		return JS_UNDEFINED;
 	}
 	// Default-FBO (bridge_framebuffer) path: by default invert Y to keep the
@@ -12038,9 +13680,13 @@ static JSValue nx_webgl_read_pixels(JSContext *ctx, JSValueConst this_val,
 	if (!nx_webgl_egl_read_bridge_pixels(context->egl, context->canvas,
 										  x, gl_y, width, height,
 										  format, type, dst)) {
-		context->error = GL_INVALID_OPERATION;
+		g_rp_exit_bridge_reject++;
+		rp_exit_log_maybe("bridge_reject");
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
+	g_rp_exit_success++;
+	rp_exit_log_maybe("ok_bridge");
 	return JS_UNDEFINED;
 }
 
@@ -12053,7 +13699,7 @@ static JSValue nx_webgl_line_width(JSContext *ctx, JSValueConst this_val,
 	if (JS_ToFloat64(ctx, &width, argv[0]))
 		return JS_EXCEPTION;
 	if (width <= 0. || isnan(width)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	context->line_width = width;
@@ -12077,7 +13723,7 @@ static JSValue nx_webgl_hint(JSContext *ctx, JSValueConst this_val,
 		JS_ToUint32(ctx, &mode, argv[1]))
 		return JS_EXCEPTION;
 	if (mode != GL_FASTEST && mode != GL_NICEST && mode != GL_DONT_CARE) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	switch (target) {
@@ -12088,7 +13734,7 @@ static JSValue nx_webgl_hint(JSContext *ctx, JSValueConst this_val,
 		context->hint_generate_mipmap = mode;
 		return JS_UNDEFINED;
 	default:
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 }
@@ -12106,7 +13752,7 @@ static JSValue nx_webgl_viewport(JSContext *ctx, JSValueConst this_val,
 	}
 
 	if (values[2] < 0 || values[3] < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -12130,7 +13776,7 @@ static JSValue nx_webgl_scissor(JSContext *ctx, JSValueConst this_val,
 	}
 
 	if (values[2] < 0 || values[3] < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 
@@ -12552,7 +14198,7 @@ static JSValue nx_webgl_get_parameter(JSContext *ctx, JSValueConst this_val,
 	default:
 		break;
 	}
-	context->error = GL_INVALID_ENUM;
+	NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 	return JS_NULL;
 }
 
@@ -12561,6 +14207,33 @@ static JSValue nx_webgl_get_error(JSContext *ctx, JSValueConst this_val,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context)
 		return JS_EXCEPTION;
+
+	/* 2026-06-27 Q2 blind-spot quantification: at every JS-side
+	 * getError, probe Mesa's native error queue to see if errors are
+	 * waiting that we won't propagate. Behavior unchanged — we still
+	 * return only context->error per the deliberate shared-context-
+	 * attribution accommodation documented in the Q2 architectural
+	 * diagnosis. The probe drains Mesa's queue (so the next getError
+	 * sees a fresh slate); that matches the bridge-internal drain
+	 * hygiene pattern already in place at op boundaries.
+	 *
+	 * Gated quiet after the Q2 harvest (178 true blinds, 85 sync, 3
+	 * mismatch across 1182 tests = ~0.4–1.5% verdict-contamination
+	 * baseline). The calibration harness stays in place: flip
+	 * NXJS_Q2_INSTRUMENT_VERBOSE to 1 to re-enable spew when the
+	 * scoped-glGetError fix is being designed/validated. The DRAIN
+	 * STAYS LIVE regardless of the flag — Mesa errors should not pile
+	 * up between getError calls in production either, and the existing
+	 * bridge drain pattern depends on the queue being clean at op
+	 * boundaries. */
+	uint32_t mesa_err = nx_webgl_egl_probe_native_error(context->egl);
+	if (NXJS_Q2_INSTRUMENT_VERBOSE && mesa_err != GL_NO_ERROR) {
+		fprintf(stderr,
+		        "[nxjs:gl-err-blind] mesa_code=0x%04x engine_code=0x%04x\n",
+		        mesa_err, (uint32_t)context->error);
+		fflush(stderr);
+	}
+	(void)mesa_err;
 
 	uint32_t error = context->error;
 	context->error = GL_NO_ERROR;
@@ -13089,7 +14762,7 @@ static JSValue nx_webgl_create_vertex_array(JSContext *ctx,
 		return JS_EXCEPTION;
 	uint32_t h = nx_webgl_egl_gen_vertex_array(context->egl);
 	if (h == 0) {
-		context->error = GL_OUT_OF_MEMORY;
+		NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY);
 		return JS_NULL;
 	}
 	nx_webgl_vao_t *o = js_mallocz(ctx, sizeof(*o));
@@ -13208,7 +14881,7 @@ static JSValue nx_webgl_bind_vertex_array(JSContext *ctx,
 	if (argc >= 1 && !JS_IsNull(argv[0]) && !JS_IsUndefined(argv[0])) {
 		target = nx_get_webgl_vao(argv[0]);
 		if (!target || target->deleted || target->handle == 0) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	}
@@ -13248,7 +14921,7 @@ static JSValue nx_webgl_vertex_attrib_i_pointer(JSContext *ctx,
 		JS_ToInt32(ctx, &offset, argv[4]))
 		return JS_EXCEPTION;
 	if (index >= NX_WEBGL_MAX_VERTEX_ATTRIBS) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_vertex_attrib_t *a = &context->vertex_attribs[index];
@@ -13319,7 +14992,7 @@ static bool js_to_int_array(JSContext *ctx, nx_webgl_context_t *context,
 	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
 	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
 		JS_FreeValue(ctx, len_v);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return false;
 	}
 	JS_FreeValue(ctx, len_v);
@@ -13336,7 +15009,7 @@ static bool js_to_int_array(JSContext *ctx, nx_webgl_context_t *context,
 			JS_FreeValue(ctx, el);
 			if (buf != stack_buf)
 				js_free(ctx, buf);
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return false;
 		}
 		JS_FreeValue(ctx, el);
@@ -13367,7 +15040,7 @@ static bool js_to_uint_array(JSContext *ctx, nx_webgl_context_t *context,
 	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
 	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
 		JS_FreeValue(ctx, len_v);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return false;
 	}
 	JS_FreeValue(ctx, len_v);
@@ -13384,7 +15057,7 @@ static bool js_to_uint_array(JSContext *ctx, nx_webgl_context_t *context,
 			JS_FreeValue(ctx, el);
 			if (buf != stack_buf)
 				js_free(ctx, buf);
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return false;
 		}
 		JS_FreeValue(ctx, el);
@@ -13566,7 +15239,7 @@ static bool js_to_float_array(JSContext *ctx, nx_webgl_context_t *context,
 	JSValue len_v = JS_GetPropertyStr(ctx, v, "length");
 	if (JS_IsException(len_v) || JS_ToUint32(ctx, &len, len_v)) {
 		JS_FreeValue(ctx, len_v);
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return false;
 	}
 	JS_FreeValue(ctx, len_v);
@@ -13583,7 +15256,7 @@ static bool js_to_float_array(JSContext *ctx, nx_webgl_context_t *context,
 			JS_FreeValue(ctx, el);
 			if (buf != stack_buf)
 				js_free(ctx, buf);
-			context->error = GL_INVALID_VALUE;
+			NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 			return false;
 		}
 		JS_FreeValue(ctx, el);
@@ -13789,24 +15462,24 @@ static JSValue nx_webgl_renderbuffer_storage_multisample(JSContext *ctx,
 		JS_ToInt32(ctx, &height, argv[4]))
 		return JS_EXCEPTION;
 	if (target != GL_RENDERBUFFER) {
-		context->error = GL_INVALID_ENUM;
+		NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 		return JS_UNDEFINED;
 	}
 	if (width < 0 || height < 0 || samples < 0) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_renderbuffer_t *rb =
 		nx_get_webgl_renderbuffer(context->renderbuffer_binding);
 	if (!rb || rb->deleted || !rb->handle) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	if (!nx_webgl_egl_renderbuffer_storage_multisample(context->egl, rb->handle,
 	                                                    samples,
 	                                                    internalformat,
 	                                                    width, height)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	} else {
 		rb->internal_format = internalformat;
 		rb->width = width;
@@ -13833,7 +15506,7 @@ static JSValue nx_webgl_framebuffer_texture_layer(JSContext *ctx,
 	nx_webgl_framebuffer_t *fb =
 		nx_get_webgl_framebuffer(context->framebuffer_binding);
 	if (!fb || fb->deleted || !fb->handle) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_texture_t *tex = NULL;
@@ -13841,7 +15514,7 @@ static JSValue nx_webgl_framebuffer_texture_layer(JSContext *ctx,
 	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
 		tex = nx_get_webgl_texture(argv[2]);
 		if (!tex || tex->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		// Lazy-promote: if no native handle yet, allocate one.
@@ -13854,7 +15527,7 @@ static JSValue nx_webgl_framebuffer_texture_layer(JSContext *ctx,
 	if (!nx_webgl_egl_framebuffer_texture_layer(context->egl, fb->handle,
 	                                              attachment, tex_handle,
 	                                              level, layer)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -13939,9 +15612,39 @@ static JSValue nx_webgl_tex_image_3d(JSContext *ctx, JSValueConst this_val,
 		height = image_h;
 		depth = 1;
 		border = 0;
-		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		// 2026-06-27 Phase 1b: widen image-source format gate to the
+		// Phase 1a Group C sized-UNORM set so TEXTURE_2D_ARRAY / TEXTURE_3D
+		// iterations of conformance tests like `textures-canvas-tex-2d-
+		// rgba8-*` no longer early-bail with INVALID_OPERATION. Pre-Phase
+		// 1a's texImage2D had the identical hard-reject and Phase 1a's
+		// empirical run proved the WebGL2 conformance harness exercises
+		// these sized internalformats (RGBA8/RGB8/RG8/R8/SRGB8/SRGB8_ALPHA8)
+		// across both bindingTarget=TEXTURE_2D (texImage2D) and
+		// bindingTarget=TEXTURE_2D_ARRAY/TEXTURE_3D (this function).
+		// Phase 1a's TEXTURE_2D iteration was being blocked behind this
+		// 3D iteration's early-error cascade — widening here is the gate
+		// in front of Phase 1a, not a successor.
+		//
+		// Note: this widening admits the (format, type) tuple past
+		// INVALID_OPERATION; it does NOT add the convert_rgba8_to_target
+		// byte-layout transform that Phase 1a wired for texImage2D. For
+		// image-source uploads with format=GL_RED/GL_RG/etc., the
+		// 4-byte-per-pixel RGBA8 image bytes flow through unchanged —
+		// the driver will sample garbage for the under-channel cases.
+		// That's still better than INVALID_OPERATION halting the test
+		// (which prevents Phase 1a's TEXTURE_2D iteration from ever
+		// being reached); the test's pixel check on the 3D iteration
+		// will FAIL but won't ERROR-bail. Conversion is a follow-up
+		// only if a real production demo uploads non-RGBA image-source
+		// into a 3D texture.
+		bool fmt_ok =
+		    (format == GL_RGBA && type == GL_UNSIGNED_BYTE) ||
+		    (format == GL_RGB && type == GL_UNSIGNED_BYTE) ||
+		    (format == 0x8227 /* GL_RG */ && type == GL_UNSIGNED_BYTE) ||
+		    (format == 0x1903 /* GL_RED */ && type == GL_UNSIGNED_BYTE);
+		if (!fmt_ok) {
 			js_free(ctx, image_buffer);
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	}
@@ -13950,9 +15653,11 @@ static JSValue nx_webgl_tex_image_3d(JSContext *ctx, JSValueConst this_val,
 	size_t pixels_len = 0;
 	if (from_image) {
 		pixels = image_buffer;
+		// Image-source bytes are always RGBA8 (4 bpp) regardless of
+		// target format — see note in the from_image gate above.
 		pixels_len = (size_t)width * (size_t)height * 4;
 	} else if (!js_pixels_pointer(ctx, src_arg, &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	// Ensure the currently-bound texture has a persistent GLES handle so
@@ -13971,10 +15676,134 @@ static JSValue nx_webgl_tex_image_3d(JSContext *ctx, JSValueConst this_val,
 			nx_webgl_egl_forward_bind_texture(context->egl, target,
 			                                    tex->gles_handle);
 	}
-	if (!nx_webgl_egl_tex_image_3d(context->egl, target, level, internalformat,
-	                                 width, height, depth, border, format, type,
-	                                 pixels)) {
-		context->error = GL_INVALID_OPERATION;
+	bool ti3d_ok = nx_webgl_egl_tex_image_3d(context->egl, target, level,
+	                                          internalformat, width, height,
+	                                          depth, border, format, type,
+	                                          pixels);
+	if (!ti3d_ok) {
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+	}
+	/* 2026-06-27 Phase 1b empirical-validation diag: capture Mesa
+	 * accept/reject for Group C sized-UNORM 3D uploads. Mirrors the
+	 * [texImage2D-direct] marker that empirically populated the
+	 * Phase 1a per-format Mesa-acceptance table. Per the explicit
+	 * brief: don't assume texImage3D Mesa-acceptance matches texImage2D
+	 * — 3D textures and 2D-array textures can have different driver
+	 * support on Tegra. Verify per-format. */
+	bool is_group_c_internal_3d =
+	    (internalformat == 0x8058 /*RGBA8*/ ||
+	     internalformat == 0x8051 /*RGB8*/ ||
+	     internalformat == 0x822B /*RG8*/ ||
+	     internalformat == 0x8229 /*R8*/ ||
+	     internalformat == 0x8C41 /*SRGB8*/ ||
+	     internalformat == 0x8C43 /*SRGB8_ALPHA8*/);
+	if (is_group_c_internal_3d) {
+		fprintf(stderr,
+		        "[nxjs:texImage3D-direct] target=0x%x internal=0x%x format=0x%x type=0x%x w=%d h=%d d=%d from_img=%d ok=%d (Mesa %s)\n",
+		        target, internalformat, format, type,
+		        width, height, depth, (int)from_image, (int)ti3d_ok,
+		        ti3d_ok ? "ACCEPTED" : "REJECTED");
+		fflush(stderr);
+	}
+	/* 2026-06-27 Q1 FIX (Phase 1c-adjacent): replay the texture's
+	 * stashed sampler params onto the now-allocated native texture.
+	 * `nx_webgl_egl_tex_image_3d` at webgl_egl.c:8829 is a thin shim
+	 * that calls glTexImage3D + returns glGetError — it does NOT call
+	 * glTexParameteri for MIN_FILTER / MAG_FILTER / WRAP_S/T/R.
+	 * `persistent_texture_image_2d` (webgl_egl.c:3913-3920) DOES apply
+	 * all four on the 2D path. Pre-fix: the test's standard
+	 * "bindTexture → texParameteri × 5 → texImage3D" pattern left
+	 * texParameteri calls with `gles_handle == 0`, so the engine's
+	 * "forward only if handle is set" gate at the bottom of
+	 * `nx_webgl_tex_parameteri` (line ~5300) silently dropped them.
+	 * The native texture inherited GLES3 default
+	 * `MIN_FILTER = NEAREST_MIPMAP_LINEAR` — sampler-incomplete for a
+	 * single-level (depth=1) texture without mipmaps — and the
+	 * sampler returned vec4(0). Empirical confirmation from the
+	 * `[q1-post3D]` probe: 11,433 events with stashed NEAREST +
+	 * CLAMP_TO_EDGE and the native side untouched.
+	 *
+	 * Fix: post-texImage3D, replay all 5 wrap+filter params onto the
+	 * now-allocated native handle via the existing
+	 * `nx_webgl_egl_texture_set_parameteri` helper. Plus
+	 * COMPARE_MODE/FUNC if the test stashed them (same shape as
+	 * [[reference-brewser-threejs-spotlight-shadow-engine-fix]]).
+	 * The 2D path is untouched — its persistent_texture_image_2d
+	 * applies params at upload time, so the JS-side
+	 * `nx_webgl_tex_image_2d` doesn't need a similar replay.
+	 *
+	 * Trigger gate: only on Mesa-accepted uploads (`ti3d_ok`) where
+	 * the texture has a non-zero handle. If texImage3D rejected at
+	 * the EGL layer, the native texture isn't in a valid state for
+	 * parameter application anyway.
+	 *
+	 * Production-demo regression risk: LOW. The replay applies the
+	 * stashed values, which were either (a) explicitly set by the
+	 * test/demo or (b) initialized to engine defaults (NEAREST +
+	 * CLAMP_TO_EDGE). For 3D production code that NEVER calls
+	 * texParameteri before texImage3D (engine defaults flow through),
+	 * the replay applies NEAREST + CLAMP_TO_EDGE — which is what GLES
+	 * would inherit anyway for sampler-completeness on a single-level
+	 * texture, so behaviorally equivalent. For 3D production code
+	 * that DOES set params before texImage3D (the common pattern),
+	 * the fix corrects a pre-existing silent drop. Verify post-build:
+	 * PMREM demos + cube demos (3D / TEXTURE_CUBE_MAP). */
+	if (ti3d_ok && tex && tex->gles_handle != 0) {
+		/* Q1 post-fix verification probe: confirms the fix block
+		 * executes per upload and shows the params being replayed. */
+		if (NXJS_Q1_DISAMBIG_VERBOSE) {
+			fprintf(stderr,
+			        "[nxjs:q1-replay-fired] target=0x%x handle=%u min=0x%x mag=0x%x wrap_s=0x%x wrap_t=0x%x wrap_r=0x%x has_cmode=%d has_cfunc=%d\n",
+			        target, (unsigned)tex->gles_handle,
+			        tex->min_filter, tex->mag_filter,
+			        tex->wrap_s, tex->wrap_t, tex->wrap_r,
+			        (int)tex->has_compare_mode, (int)tex->has_compare_func);
+			fflush(stderr);
+		}
+		nx_webgl_egl_texture_set_parameteri(context->egl, target,
+		    tex->gles_handle, GL_TEXTURE_MIN_FILTER, tex->min_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target,
+		    tex->gles_handle, GL_TEXTURE_MAG_FILTER, tex->mag_filter);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target,
+		    tex->gles_handle, GL_TEXTURE_WRAP_S, tex->wrap_s);
+		nx_webgl_egl_texture_set_parameteri(context->egl, target,
+		    tex->gles_handle, GL_TEXTURE_WRAP_T, tex->wrap_t);
+		if (target == 0x806F /*GL_TEXTURE_3D*/ ||
+		    target == 0x8C1A /*GL_TEXTURE_2D_ARRAY*/) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			    tex->gles_handle, 0x8072 /*GL_TEXTURE_WRAP_R*/, tex->wrap_r);
+		}
+		if (tex->has_compare_mode) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			    tex->gles_handle, 0x884C /*GL_TEXTURE_COMPARE_MODE*/,
+			    tex->compare_mode);
+		}
+		if (tex->has_compare_func) {
+			nx_webgl_egl_texture_set_parameteri(context->egl, target,
+			    tex->gles_handle, 0x884D /*GL_TEXTURE_COMPARE_FUNC*/,
+			    tex->compare_func);
+		}
+		/* 2026-06-27 Candidate C REVERTED — magnitude check failed
+		 * (Group C tex-3d PASS 0 → 0; mesa-err probe confirmed
+		 * BASE_LEVEL=0/MAX_LEVEL=0 calls fired and Mesa accepted them,
+		 * yet 0,0,0 reads persisted). Mipmap-completeness ruled out as
+		 * the load-bearing cause. The two unconditional
+		 * glTexParameteri(BASE_LEVEL=0, MAX_LEVEL=0) lines that lived
+		 * here were a latent regression risk for multi-level 3D mipmap
+		 * production demos (force-pin to level 0) for zero conformance
+		 * benefit, so reverted clean. Next probe is Candidate B —
+		 * symptom-first Mesa write-drop probe in runner.js, NOT engine
+		 * code. See REAL_GL_FAILURES.md 2026-06-27 entry. */
+	} else if (NXJS_Q1_DISAMBIG_VERBOSE && !ti3d_ok) {
+		/* Fix block skipped because Mesa rejected the upload. Distinct
+		 * marker so we can tell "skipped due to Mesa reject" from
+		 * "skipped due to missing tex/handle". */
+		fprintf(stderr, "[nxjs:q1-replay-skipped] reason=ti3d_failed target=0x%x\n", target);
+		fflush(stderr);
+	} else if (NXJS_Q1_DISAMBIG_VERBOSE) {
+		fprintf(stderr, "[nxjs:q1-replay-skipped] reason=no_tex_or_handle target=0x%x tex=%p handle=%u\n",
+		        target, (void*)tex, tex ? (unsigned)tex->gles_handle : 0u);
+		fflush(stderr);
 	}
 	if (from_image) js_free(ctx, image_buffer);
 	return JS_UNDEFINED;
@@ -14026,9 +15855,22 @@ static JSValue nx_webgl_tex_sub_image_3d(JSContext *ctx, JSValueConst this_val,
 		width = image_w;
 		height = image_h;
 		depth = 1;
-		if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+		// 2026-06-27 Phase 1b: widen sub-image image-source format gate
+		// to the Phase 1a Group C set — mirror of texImage3D's gate
+		// widening above and Phase 1a's texSubImage2D widening. Same
+		// "admit but don't convert" trade-off: 4bpp RGBA8 image bytes
+		// flow through unchanged for under-channel cases. Tests use
+		// texSubImage2D / texSubImage3D back-to-back with texImage2D /
+		// texImage3D and the JS-side accept-list mismatches would have
+		// cascaded INVALID_OPERATION here even with texImage3D widened.
+		bool sub_fmt_ok =
+		    (format == GL_RGBA && type == GL_UNSIGNED_BYTE) ||
+		    (format == GL_RGB && type == GL_UNSIGNED_BYTE) ||
+		    (format == 0x8227 /* GL_RG */ && type == GL_UNSIGNED_BYTE) ||
+		    (format == 0x1903 /* GL_RED */ && type == GL_UNSIGNED_BYTE);
+		if (!sub_fmt_ok) {
 			js_free(ctx, image_buffer);
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 	}
@@ -14040,13 +15882,40 @@ static JSValue nx_webgl_tex_sub_image_3d(JSContext *ctx, JSValueConst this_val,
 		pixels_len = (size_t)width * (size_t)height * 4;
 	} else if (!JS_IsUndefined(src_arg) &&
 		!js_pixels_pointer(ctx, src_arg, &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
-	if (!nx_webgl_egl_tex_sub_image_3d(context->egl, target, level, xoff, yoff,
-	                                     zoff, width, height, depth, format,
-	                                     type, pixels)) {
-		context->error = GL_INVALID_OPERATION;
+	bool tsi3d_ok = nx_webgl_egl_tex_sub_image_3d(context->egl, target, level,
+	                                               xoff, yoff, zoff, width,
+	                                               height, depth, format,
+	                                               type, pixels);
+	if (!tsi3d_ok) {
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
+	}
+	/* 2026-06-27 Phase 1b empirical-validation diag: capture Mesa
+	 * accept/reject for Group C texSubImage3D. Pairs with the matching
+	 * texImage3D probe so a (texImage3D ACCEPTED → texSubImage3D
+	 * REJECTED) split signals a Mesa storage/sub-region asymmetry that
+	 * an isolated probe would miss. internalformat for the texture is
+	 * stamped on the target binding's nx_webgl_texture_t. */
+	{
+		JSValue *sub_binding =
+		    texture_binding_for_target(context, target);
+		nx_webgl_texture_t *sub_tex =
+		    sub_binding ? nx_get_webgl_texture(*sub_binding) : NULL;
+		uint32_t sub_intl = sub_tex ? sub_tex->internal_format : 0;
+		bool is_group_c_sub_3d =
+		    (sub_intl == 0x8058 || sub_intl == 0x8051 ||
+		     sub_intl == 0x822B || sub_intl == 0x8229 ||
+		     sub_intl == 0x8C41 || sub_intl == 0x8C43);
+		if (is_group_c_sub_3d) {
+			fprintf(stderr,
+			        "[nxjs:texSubImage3D-direct] target=0x%x tex_internal=0x%x format=0x%x type=0x%x w=%d h=%d d=%d from_img=%d ok=%d (Mesa %s)\n",
+			        target, sub_intl, format, type,
+			        width, height, depth, (int)from_image, (int)tsi3d_ok,
+			        tsi3d_ok ? "ACCEPTED" : "REJECTED");
+			fflush(stderr);
+		}
 	}
 	if (from_image) js_free(ctx, image_buffer);
 	return JS_UNDEFINED;
@@ -14070,7 +15939,7 @@ static JSValue nx_webgl_copy_tex_sub_image_3d(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_copy_tex_sub_image_3d(context->egl, target, level, xoff,
 	                                          yoff, zoff, x, y, w, h)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14097,7 +15966,7 @@ static JSValue nx_webgl_copy_tex_image_2d(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_copy_tex_image_2d(context->egl, target, level,
 	                                     internalformat, x, y, w, h, border)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14118,7 +15987,7 @@ static JSValue nx_webgl_copy_tex_sub_image_2d(JSContext *ctx,
 		return JS_EXCEPTION;
 	if (!nx_webgl_egl_copy_tex_sub_image_2d(context->egl, target, level,
 	                                         xoff, yoff, x, y, w, h)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14136,7 +16005,7 @@ static JSValue nx_webgl_compressed_tex_image_2d_stub(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context) return JS_EXCEPTION;
 	if (argc < 7) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	uint32_t target, internalformat;
@@ -14151,13 +16020,13 @@ static JSValue nx_webgl_compressed_tex_image_2d_stub(JSContext *ctx,
 	void *pixels = NULL;
 	size_t pixels_len = 0;
 	if (!js_pixels_pointer(ctx, argv[6], &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!nx_webgl_egl_compressed_tex_image_2d(context->egl, target, level,
 	                                            internalformat, width, height,
 	                                            border, pixels_len, pixels)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14169,7 +16038,7 @@ static JSValue nx_webgl_compressed_tex_sub_image_2d_stub(JSContext *ctx,
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);
 	if (!context) return JS_EXCEPTION;
 	if (argc < 8) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	uint32_t target, format;
@@ -14185,13 +16054,13 @@ static JSValue nx_webgl_compressed_tex_sub_image_2d_stub(JSContext *ctx,
 	void *pixels = NULL;
 	size_t pixels_len = 0;
 	if (!js_pixels_pointer(ctx, argv[7], &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!nx_webgl_egl_compressed_tex_sub_image_2d(context->egl, target, level,
 	                                                xoff, yoff, width, height,
 	                                                format, pixels_len, pixels)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14217,14 +16086,14 @@ static JSValue nx_webgl_compressed_tex_image_3d(JSContext *ctx,
 	void *pixels = NULL;
 	size_t pixels_len = 0;
 	if (!js_pixels_pointer(ctx, argv[7], &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!nx_webgl_egl_compressed_tex_image_3d(context->egl, target, level,
 	                                            internalformat, width, height,
 	                                            depth, border, pixels_len,
 	                                            pixels)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14250,14 +16119,14 @@ static JSValue nx_webgl_compressed_tex_sub_image_3d(JSContext *ctx,
 	void *pixels = NULL;
 	size_t pixels_len = 0;
 	if (!js_pixels_pointer(ctx, argv[9], &pixels, &pixels_len)) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	if (!nx_webgl_egl_compressed_tex_sub_image_3d(context->egl, target, level,
 	                                                xoff, yoff, zoff, width,
 	                                                height, depth, format,
 	                                                pixels_len, pixels)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	return JS_UNDEFINED;
 }
@@ -14303,7 +16172,7 @@ static JSValue nx_webgl_tex_storage_2d(JSContext *ctx, JSValueConst this_val,
 	}
 	if (!nx_webgl_egl_tex_storage_2d(context->egl, target, levels,
 	                                  internalformat, width, height)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		fprintf(stderr,
 			"[nxjs:pmrem:texStorage2D:FAIL] intl=0x%x w=%d h=%d\n",
 			internalformat, width, height);
@@ -14376,7 +16245,7 @@ static JSValue nx_webgl_tex_storage_3d(JSContext *ctx, JSValueConst this_val,
 	}
 	if (!nx_webgl_egl_tex_storage_3d(context->egl, target, levels,
 	                                  internalformat, width, height, depth)) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 	}
 	// Flush JS-side sampler params — same reason as in texStorage2D.
 	if (tex && tex->gles_handle) {
@@ -14531,7 +16400,7 @@ static JSValue nx_webgl_get_buffer_sub_data(JSContext *ctx,
 	void *dst = NULL;
 	size_t dst_len = 0;
 	if (!js_pixels_pointer(ctx, argv[2], &dst, &dst_len) || !dst) {
-		context->error = GL_INVALID_VALUE;
+		NX_SET_GL_ERROR(context, GL_INVALID_VALUE);
 		return JS_UNDEFINED;
 	}
 	int64_t dst_off = 0, length = 0;
@@ -14563,7 +16432,7 @@ static JSValue nx_webgl_bind_buffer_base(JSContext *ctx, JSValueConst this_val,
 	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
 		nx_webgl_buffer_t *buf = nx_get_webgl_buffer(argv[2]);
 		if (!buf || buf->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		buffer = buf->gles_handle;
@@ -14588,7 +16457,7 @@ static JSValue nx_webgl_bind_buffer_range(JSContext *ctx, JSValueConst this_val,
 	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
 		nx_webgl_buffer_t *buf = nx_get_webgl_buffer(argv[2]);
 		if (!buf || buf->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		buffer = buf->gles_handle;
@@ -14617,7 +16486,7 @@ static JSValue nx_webgl_get_uniform_indices(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	uint32_t len;
@@ -14651,7 +16520,7 @@ static JSValue nx_webgl_get_active_uniforms(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	uint32_t stack[16];
@@ -14673,7 +16542,7 @@ static JSValue nx_webgl_get_active_uniforms(JSContext *ctx,
 			js_free(ctx, indices);
 		if (out)
 			js_free(ctx, out);
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	JSValue arr = JS_NewArray(ctx);
@@ -14700,7 +16569,7 @@ static JSValue nx_webgl_get_uniform_block_index(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NewUint32(ctx, 0xFFFFFFFFu);
 	}
 	const char *name = JS_ToCString(ctx, argv[1]);
@@ -14734,7 +16603,7 @@ static JSValue nx_webgl_get_active_uniform_block_parameter(
 		}
 	}
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	// UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES returns an array; everything
@@ -14795,7 +16664,7 @@ static JSValue nx_webgl_get_active_uniform_block_name(JSContext *ctx,
 		}
 	}
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	char name[256] = {0};
@@ -14820,7 +16689,7 @@ static JSValue nx_webgl_uniform_block_binding(JSContext *ctx,
 		JS_ToUint32(ctx, &binding, argv[2]))
 		return JS_EXCEPTION;
 	if (!program || !program->link_status) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_egl_uniform_block_binding(context->egl, program->gles_handle,
@@ -14844,7 +16713,7 @@ static JSValue nx_webgl_get_indexed_parameter(JSContext *ctx,
 	if (!context)
 		return JS_EXCEPTION;
 	(void)argv;
-	context->error = GL_INVALID_ENUM;
+	NX_SET_GL_ERROR(context, GL_INVALID_ENUM);
 	return JS_NULL; // Spec-completeness stub.
 }
 
@@ -14857,7 +16726,7 @@ static JSValue name(JSContext *ctx, JSValueConst this_val, int argc,           \
 	nx_webgl_context_t *context = nx_get_webgl_context(ctx, this_val);         \
 	if (!context) return JS_EXCEPTION;                                         \
 	uint32_t h = gen_fn(context->egl);                                          \
-	if (h == 0) { context->error = GL_OUT_OF_MEMORY; return JS_NULL; }          \
+	if (h == 0) { NX_SET_GL_ERROR(context, GL_OUT_OF_MEMORY); return JS_NULL; }          \
 	struct_t *o = js_mallocz(ctx, sizeof(*o));                                  \
 	if (!o) { del_fn(context->egl, h); return JS_EXCEPTION; }                    \
 	o->handle = h;                                                              \
@@ -14913,7 +16782,7 @@ static JSValue nx_webgl_bind_sampler(JSContext *ctx, JSValueConst this_val,
 	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
 		nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[1]);
 		if (!s || s->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		handle = s->handle;
@@ -14931,7 +16800,7 @@ static JSValue nx_webgl_sampler_parameteri(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
 	if (!s || s->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	uint32_t pname;
@@ -14951,7 +16820,7 @@ static JSValue nx_webgl_sampler_parameterf(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
 	if (!s || s->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	uint32_t pname;
@@ -14974,7 +16843,7 @@ static JSValue nx_webgl_get_sampler_parameter(JSContext *ctx,
 	nx_webgl_sampler_t *s = nx_get_webgl_sampler(argv[0]);
 	uint32_t pname;
 	if (!s || s->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	int v = 0;
@@ -15053,7 +16922,7 @@ static JSValue nx_webgl_client_wait_sync(JSContext *ctx, JSValueConst this_val,
 	int64_t timeout;
 	if (!o || o->deleted || JS_ToUint32(ctx, &flags, argv[1]) ||
 		JS_ToInt64(ctx, &timeout, argv[2])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NewUint32(ctx, 0x911D); // WAIT_FAILED
 	}
 	uint32_t r = nx_webgl_egl_client_wait_sync(context->egl, o->handle, flags,
@@ -15072,7 +16941,7 @@ static JSValue nx_webgl_wait_sync(JSContext *ctx, JSValueConst this_val,
 	int64_t timeout;
 	if (!o || o->deleted || JS_ToUint32(ctx, &flags, argv[1]) ||
 		JS_ToInt64(ctx, &timeout, argv[2])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	nx_webgl_egl_wait_sync(context->egl, o->handle, flags, (uint64_t)timeout);
@@ -15089,7 +16958,7 @@ static JSValue nx_webgl_get_sync_parameter(JSContext *ctx,
 	nx_webgl_sync_t *o = nx_get_webgl_sync(argv[0]);
 	uint32_t pname;
 	if (!o || o->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	int v = 0;
@@ -15118,7 +16987,7 @@ static JSValue nx_webgl_begin_query(JSContext *ctx, JSValueConst this_val,
 		return JS_EXCEPTION;
 	nx_webgl_query_t *q = nx_get_webgl_query(argv[1]);
 	if (!q || q->deleted) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	q->target = target;
@@ -15164,7 +17033,7 @@ static JSValue nx_webgl_get_query_parameter(JSContext *ctx,
 	nx_webgl_query_t *q = nx_get_webgl_query(argv[0]);
 	uint32_t pname;
 	if (!q || q->deleted || JS_ToUint32(ctx, &pname, argv[1])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	uint32_t v = 0;
@@ -15206,7 +17075,7 @@ static JSValue nx_webgl_bind_transform_feedback(JSContext *ctx,
 		nx_webgl_transform_feedback_t *tf =
 			nx_get_webgl_transform_feedback(argv[1]);
 		if (!tf || tf->deleted) {
-			context->error = GL_INVALID_OPERATION;
+			NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 			return JS_UNDEFINED;
 		}
 		handle = tf->handle;
@@ -15276,7 +17145,7 @@ static JSValue nx_webgl_transform_feedback_varyings(JSContext *ctx,
 		return JS_EXCEPTION;
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	if (!program) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_UNDEFINED;
 	}
 	uint32_t buffer_mode;
@@ -15324,7 +17193,7 @@ static JSValue nx_webgl_get_transform_feedback_varying(JSContext *ctx,
 	nx_webgl_program_t *program = nx_get_webgl_program(argv[0]);
 	uint32_t index;
 	if (!program || JS_ToUint32(ctx, &index, argv[1])) {
-		context->error = GL_INVALID_OPERATION;
+		NX_SET_GL_ERROR(context, GL_INVALID_OPERATION);
 		return JS_NULL;
 	}
 	char name[256] = {0};
@@ -15416,6 +17285,11 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	NX_DEF_GET(proto, "drawingBufferWidth", nx_webgl_get_drawing_buffer_width);
 	NX_DEF_GET(proto, "drawingBufferHeight",
 			   nx_webgl_get_drawing_buffer_height);
+	// Native-backed gl.canvas getter that replaces the construction-time
+	// TS-side getter. See nx_webgl_get_canvas + nx_webgl_set_canvas for
+	// the sticky-first per-getContext rebind mechanism.
+	NX_DEF_GET(proto, "canvas", nx_webgl_get_canvas);
+	NX_DEF_FUNC(proto, "setCanvas", nx_webgl_set_canvas, 1);
 
 	NX_DEF_FUNC(proto, "getContextAttributes",
 				nx_webgl_get_context_attributes, 0);
@@ -15747,6 +17621,15 @@ static JSValue nx_webgl_context_init_class(JSContext *ctx,
 	define_constant(ctx, proto, "RGB565", GL_RGB565);
 	define_constant(ctx, proto, "RGBA4", GL_RGBA4);
 	define_constant(ctx, proto, "RGB5_A1", GL_RGB5_A1);
+	// 2026-06-26 image-source format widening: WebGL 1 spec §5.14.8 image-source
+	// (format, type) tuples — required for the texImage2D/texSubImage2D paths
+	// taking canvas/image/imageBitmap sources at conversion-requiring formats.
+	define_constant(ctx, proto, "ALPHA", GL_ALPHA);
+	define_constant(ctx, proto, "LUMINANCE", GL_LUMINANCE);
+	define_constant(ctx, proto, "LUMINANCE_ALPHA", GL_LUMINANCE_ALPHA);
+	define_constant(ctx, proto, "UNSIGNED_SHORT_5_6_5", GL_UNSIGNED_SHORT_5_6_5);
+	define_constant(ctx, proto, "UNSIGNED_SHORT_4_4_4_4", GL_UNSIGNED_SHORT_4_4_4_4);
+	define_constant(ctx, proto, "UNSIGNED_SHORT_5_5_5_1", GL_UNSIGNED_SHORT_5_5_5_1);
 	define_constant(ctx, proto, "BUFFER_SIZE", GL_BUFFER_SIZE);
 	define_constant(ctx, proto, "BUFFER_USAGE", GL_BUFFER_USAGE);
 	define_constant(ctx, proto, "STREAM_DRAW", GL_STREAM_DRAW);

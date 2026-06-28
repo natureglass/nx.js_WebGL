@@ -75,8 +75,28 @@ export class Blob implements globalThis.Blob {
 			);
 		}
 
+		// Blob-probe instrumentation (session 7) — pinpointing
+		// loader→Blob→decoder size=0 pathology. Gated on the same
+		// __nxjsBlobProbe global as Body.arrayBuffer for one-shot traces.
+		const probe = (globalThis as { __nxjsBlobProbe?: boolean }).__nxjsBlobProbe;
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Blob.ctor:enter] blobParts.length=${blobParts.length}`,
+		);
+		let partIdx = 0;
 		for (const element of blobParts) {
 			let part;
+			if (probe) {
+				const desc = element instanceof ArrayBuffer
+					? `ArrayBuffer(${element.byteLength})`
+					: ArrayBuffer.isView(element)
+					? `${element.constructor.name}(byteLength=${element.byteLength}, byteOffset=${element.byteOffset})`
+					: element instanceof Blob
+					? `Blob(size=${element.size})`
+					: `${typeof element}(${String(element).length} chars)`;
+				console.debug(
+					`[nxjs:blob-probe:Blob.ctor:part] idx=${partIdx} type=${desc}`,
+				);
+			}
 			if (ArrayBuffer.isView(element)) {
 				part = new Uint8Array(
 					element.buffer.slice(
@@ -93,12 +113,19 @@ export class Blob implements globalThis.Blob {
 			}
 
 			const size = ArrayBuffer.isView(part) ? part.byteLength : part.size;
+			if (probe) console.debug(
+				`[nxjs:blob-probe:Blob.ctor:partResult] idx=${partIdx} partSize=${size}`,
+			);
 			// Avoid pushing empty parts into the array to better GC them
 			if (size) {
 				this.#size += size;
 				this.#parts.push(part);
 			}
+			partIdx++;
 		}
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Blob.ctor:exit] #parts.length=${this.#parts.length} #size=${this.#size}`,
+		);
 
 
 		const type = options.type === undefined ? '' : String(options.type);
@@ -141,13 +168,25 @@ export class Blob implements globalThis.Blob {
 	 * Returns a promise that resolves with an ArrayBuffer representing the Blob's data.
 	 */
 	async arrayBuffer(): Promise<ArrayBuffer> {
+		// Blob-probe instrumentation (session 7).
+		const probe = (globalThis as { __nxjsBlobProbe?: boolean }).__nxjsBlobProbe;
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Blob.arrayBuffer:enter] this.size=${this.size} #parts.length=${this.#parts.length}`,
+		);
 		const data = new Uint8Array(this.size);
 		let offset = 0;
+		let chunkIdx = 0;
 		for await (const chunk of toIterator(this.#parts, false)) {
 			data.set(chunk, offset);
 			offset += chunk.length;
+			if (probe) console.debug(
+				`[nxjs:blob-probe:Blob.arrayBuffer:chunk] idx=${chunkIdx} chunk.length=${chunk.length} runningOffset=${offset}`,
+			);
+			chunkIdx++;
 		}
-
+		if (probe) console.debug(
+			`[nxjs:blob-probe:Blob.arrayBuffer:exit] returned ArrayBuffer.byteLength=${data.buffer.byteLength}`,
+		);
 		return data.buffer;
 	}
 

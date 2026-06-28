@@ -59,6 +59,11 @@ void close_image(JSRuntime *rt, nx_image_t *image) {
 		image->data_needs_js_free = false;
 	}
 
+	if (image->straight_data) {
+		js_free_rt(rt, image->straight_data);
+		image->straight_data = NULL;
+	}
+
 	/* Multi-frame (animated GIF) cleanup. `image->data` was a fresh
 	 * "active framebuffer" memcpy'd from frames[current_frame]; the
 	 * per-frame arrays own their own buffers and must be freed
@@ -1101,7 +1106,157 @@ JSValue nx_image_write_rgba(JSContext *ctx, JSValueConst this_val, int argc,
 		}
 	}
 
+	/* Optional 3rd arg: `preserveStraight` boolean. When true, also
+	 * stash the original straight RGBA source bytes in
+	 * `image->straight_data` for the WebGL extractor's STRAIGHT-mode
+	 * (premultiplyAlpha:'none') path to use directly — sidesteps the
+	 * lossy premul→un-premul roundtrip for a=0 pixels which would
+	 * otherwise read (0,0,0,0) regardless of original color. The
+	 * polyfill's createImageBitmap(ImageData) branch passes true so
+	 * conformance tests upholding the WHATWG ImageBitmapOptions
+	 * 'premultiplyAlpha:none' semantic see correct straight pixels. */
+	bool preserve_straight = false;
+	if (argc >= 3 && JS_ToBool(ctx, argv[2])) {
+		preserve_straight = true;
+	}
+	if (preserve_straight) {
+		if (image->straight_data) {
+			js_free(ctx, image->straight_data);
+			image->straight_data = NULL;
+		}
+		image->straight_data = js_malloc(ctx, expected);
+		if (image->straight_data) {
+			memcpy(image->straight_data, src, expected);
+		}
+	}
+
 	cairo_surface_mark_dirty(image->surface);
+	return JS_UNDEFINED;
+}
+
+// 2026-06-27 Layer-2 createImageBitmap fast path: clone a source Image's
+// pixel buffer into a fresh ImageBitmap-shaped Image without the
+// OffscreenCanvas → convertToBlob → PNG → decode roundtrip the polyfill
+// previously used. Allocates a new `nx_image_t` sized to the source's
+// dimensions and memcpy's the BGRA-premultiplied cairo-format buffer
+// verbatim. Used by `createImageBitmap(Image)` and
+// `createImageBitmap(ImageBitmap)` — both share the same nx_image_t
+// backing (both register via $.imageInit), so the source's `data`
+// pointer is the canonical cairo BGRA-premul payload, and a direct
+// memcpy preserves byte-equivalence (the prior PNG roundtrip would
+// un-premultiply via libpng's encoder + re-premultiply via the decoder,
+// lossy for non-{0,255} alpha — for the conformance tests' canonical
+// {0,64,128,192,255} alpha values both paths round-trip identically).
+//
+// Two correctness invariants:
+//   1. Source MUST have `data` and `surface` populated. If the source
+//      was constructed via `$.imageNew()` without dims (the decode-path
+//      shape) and never had pixels written, return JS_NULL so the
+//      caller falls through to the convertToBlob roundtrip.
+//   2. The destination is allocated via the same path `$.imageNew(w, h)`
+//      uses, so its `data` buffer is js_malloc'd and tracked by
+//      `data_needs_js_free`. The cairo surface is constructed identically
+//      so subsequent drawImage(bitmap, ...) calls hit the same fast cairo
+//      blit path.
+JSValue nx_image_clone_from(JSContext *ctx, JSValueConst this_val, int argc,
+                            JSValueConst *argv) {
+	if (argc < 1) {
+		return JS_ThrowTypeError(ctx,
+			"imageCloneFrom: expected 1 argument (src Image)");
+	}
+	nx_image_t *src = nx_get_image(ctx, argv[0]);
+	if (!src) {
+		return JS_ThrowTypeError(ctx,
+			"imageCloneFrom: source is not an Image / ImageBitmap");
+	}
+	if (!src->data || !src->surface || src->width == 0 || src->height == 0) {
+		// Source isn't realized (decode in flight or never decoded);
+		// caller should fall back to the roundtrip path.
+		return JS_NULL;
+	}
+
+	JSValue dst_val = JS_NewObjectClass(ctx, nx_image_class_id);
+	if (JS_IsException(dst_val)) {
+		return dst_val;
+	}
+	nx_image_t *dst = js_mallocz(ctx, sizeof(nx_image_t));
+	if (!dst) {
+		JS_FreeValue(ctx, dst_val);
+		return JS_EXCEPTION;
+	}
+	JS_SetOpaque(dst_val, dst);
+
+	dst->width = src->width;
+	dst->height = src->height;
+
+	size_t bytes = (size_t)dst->width * (size_t)dst->height * 4;
+	dst->data = js_malloc(ctx, bytes);
+	if (!dst->data) {
+		JS_FreeValue(ctx, dst_val);
+		return JS_EXCEPTION;
+	}
+	dst->data_needs_js_free = true;
+	memcpy(dst->data, src->data, bytes);
+
+	/* Copy preserved straight-RGBA bytes if the source has them. Keeps
+	 * the lossy-roundtrip workaround usable through createImageBitmap(
+	 * sourceBitmap, opts) chains — the conformance from_image_bitmap
+	 * test creates a source bitmap from ImageData (which populates
+	 * `straight_data`), then derives 4 bitmaps from it; without
+	 * propagating `straight_data` here, the derived STRAIGHT bitmaps
+	 * would fall back to the lossy cairo storage. Skip clone failure
+	 * here as non-fatal: if the small allocation fails, the WebGL
+	 * extractor falls back to the cairo path (correct for non-a=0
+	 * pixels, lossy only for the alpha=0 right column in the
+	 * conformance test). */
+	if (src->straight_data) {
+		dst->straight_data = js_malloc(ctx, bytes);
+		if (dst->straight_data) {
+			memcpy(dst->straight_data, src->straight_data, bytes);
+		}
+	}
+
+	dst->surface = cairo_image_surface_create_for_data(
+		dst->data, CAIRO_FORMAT_ARGB32, dst->width, dst->height,
+		dst->width * 4);
+	if (cairo_surface_status(dst->surface) != CAIRO_STATUS_SUCCESS) {
+		JS_FreeValue(ctx, dst_val);
+		return JS_ThrowInternalError(ctx,
+			"imageCloneFrom: cairo surface creation failed");
+	}
+
+	return dst_val;
+}
+
+/* createImageBitmap-options setter. Captures the `imageOrientation` and
+ * `premultiplyAlpha` values supplied to `createImageBitmap(src, opts)`
+ * onto the bitmap's nx_image_t so the WebGL texImage2D extractor can
+ * compute the effective flip / un-premultiply transform when the
+ * bitmap is later uploaded. The bitmap's pixel buffer itself stays in
+ * cairo's canonical BGRA-premultiplied byte order; these are intent
+ * flags, applied at upload time.
+ *
+ * Args:
+ *   argv[0] — ImageBitmap
+ *   argv[1] — flipY: boolean (imageOrientation === 'flipY')
+ *   argv[2] — alphaMode: integer 0=unspecified, 1=straight, 2=premultiplied
+ */
+JSValue nx_image_set_bitmap_options(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+	if (argc < 3) {
+		return JS_ThrowTypeError(ctx,
+			"imageSetBitmapOptions: expected 3 args (bm, flipY, alphaMode)");
+	}
+	nx_image_t *image = nx_get_image(ctx, argv[0]);
+	if (!image) {
+		return JS_ThrowTypeError(ctx,
+			"imageSetBitmapOptions: first arg must be an Image / ImageBitmap");
+	}
+	image->bitmap_orientation_flip_y = JS_ToBool(ctx, argv[1]) ? true : false;
+	int32_t mode = 0;
+	if (JS_ToInt32(ctx, &mode, argv[2])) return JS_EXCEPTION;
+	if (mode < 0 || mode > 2) mode = 0;
+	image->bitmap_alpha_mode = (uint8_t)mode;
 	return JS_UNDEFINED;
 }
 
@@ -1208,6 +1363,8 @@ static const JSCFunctionListEntry function_list[] = {
 	JS_CFUNC_DEF("imageDecode", 0, nx_image_decode),
 	JS_CFUNC_DEF("imageClose", 0, nx_image_close),
 	JS_CFUNC_DEF("imageWriteRGBA", 2, nx_image_write_rgba),
+	JS_CFUNC_DEF("imageCloneFrom", 1, nx_image_clone_from),
+	JS_CFUNC_DEF("imageSetBitmapOptions", 3, nx_image_set_bitmap_options),
 	JS_CFUNC_DEF("imageFrameCount", 1, nx_image_frame_count),
 	JS_CFUNC_DEF("imageFrameDelay", 2, nx_image_frame_delay),
 	JS_CFUNC_DEF("imageSetFrame", 2, nx_image_set_frame),

@@ -1993,6 +1993,446 @@ nx_webgl_egl_t *nx_webgl_egl_create(JSContext *ctx, nx_canvas_t *canvas) {
 #endif
 }
 
+/* 2026-06-27 H-B raw-GLES probe — D1b was empirically ruled out
+ * (Q1F binding_lost=0 unchanged by my re-issue fix), so the
+ * remaining hypothesis is either Mesa-Nouveau driver-side
+ * (sampler3D / sampler2DArray / samplerCube silently return
+ * vec4(0)) OR bridge-internal state-fiddling. This probe bypasses
+ * the bridge ENTIRELY — direct glXXX calls, no nx_webgl_*
+ * plumbing, no ensure_passthrough_texture_promoted, no
+ * nx_webgl_egl_draw_passthrough, no tracked nx_webgl_texture_t /
+ * program / FBO. If THIS returns 0,0,0 for layered/cube samplers,
+ * H-B is confirmed (driver limit, not bridge bug); if it returns
+ * the uploaded bytes, the bug is in the bridge and H-A or H-C is
+ * the remaining hypothesis.
+ *
+ * Runs ONCE per process via a static gate. State saved + restored
+ * so subsequent draws aren't disturbed. Output is per-tag lines
+ * (`[hb-probe:2D|3D|2DA|Cube]`) showing upload_err, FBO status,
+ * uniform location, draw_err, read_err, the actual readback bytes,
+ * and `present`/`allzero` booleans. */
+#if NXJS_HAS_EGL_GLES
+static GLuint hb_compile_shader(GLenum type, const char *src, const char *tag) {
+	GLuint s = glCreateShader(type);
+	glShaderSource(s, 1, &src, NULL);
+	glCompileShader(s);
+	GLint ok = 0;
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[512];
+		GLsizei wlen = 0;
+		glGetShaderInfoLog(s, sizeof(log), &wlen, log);
+		fprintf(stderr, "[hb-probe:compile-fail/%s] %s\n", tag, log);
+		fflush(stderr);
+		glDeleteShader(s);
+		return 0;
+	}
+	return s;
+}
+static GLuint hb_link_program(GLuint vs, GLuint fs, const char *tag) {
+	GLuint p = glCreateProgram();
+	glAttachShader(p, vs);
+	glAttachShader(p, fs);
+	glBindAttribLocation(p, 0, "a_pos");
+	glLinkProgram(p);
+	GLint ok = 0;
+	glGetProgramiv(p, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char log[512];
+		GLsizei wlen = 0;
+		glGetProgramInfoLog(p, sizeof(log), &wlen, log);
+		fprintf(stderr, "[hb-probe:link-fail/%s] %s\n", tag, log);
+		fflush(stderr);
+		glDeleteProgram(p);
+		return 0;
+	}
+	return p;
+}
+static void nx_webgl_egl_hb_probe(nx_webgl_egl_t *backend) {
+	static bool fired = false;
+	if (fired || !backend || !backend->fn_tex_image_3d) return;
+	fired = true;
+
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context)) {
+		fprintf(stderr, "[hb-probe:abort] eglMakeCurrent failed\n");
+		fflush(stderr);
+		return;
+	}
+	while (glGetError() != GL_NO_ERROR) {}
+
+	/* Save state we touch so the probe doesn't perturb subsequent
+	 * bridge operations. */
+	GLint saved_active = 0;
+	GLint saved_program = 0;
+	GLint saved_fbo = 0;
+	GLint saved_vao = 0;
+	GLint saved_viewport[4] = {0};
+	GLint saved_tex2d = 0;
+	GLint saved_tex3d = 0;
+	GLint saved_tex2da = 0;
+	GLint saved_texcube = 0;
+	GLboolean was_scissor = GL_FALSE;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+	glGetIntegerv(GL_CURRENT_PROGRAM, &saved_program);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
+	if (backend->fn_bind_vertex_array) {
+		glGetIntegerv(0x85B5 /*GL_VERTEX_ARRAY_BINDING*/, &saved_vao);
+	}
+	glGetIntegerv(GL_VIEWPORT, saved_viewport);
+	glActiveTexture(GL_TEXTURE0);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_tex2d);
+	glGetIntegerv(0x806A /*GL_TEXTURE_BINDING_3D*/, &saved_tex3d);
+	glGetIntegerv(0x8C1D /*GL_TEXTURE_BINDING_2D_ARRAY*/, &saved_tex2da);
+	glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &saved_texcube);
+	was_scissor = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	while (glGetError() != GL_NO_ERROR) {}
+
+	/* Destination FBO: 1×1 RGBA8 texture color attachment. */
+	GLuint dstTex = 0;
+	GLuint dstFbo = 0;
+	GLuint vbo = 0;
+	GLuint vao = 0;
+	GLuint vs = 0;
+	GLuint progs[4] = {0, 0, 0, 0};
+	glGenTextures(1, &dstTex);
+	glGenFramebuffers(1, &dstFbo);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, dstTex);
+	glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /*GL_RGBA8*/, 1, 1, 0, GL_RGBA,
+	             GL_UNSIGNED_BYTE, NULL);
+	glActiveTexture(GL_TEXTURE0);
+	glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D, dstTex, 0);
+	GLenum dst_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	fprintf(stderr, "[hb-probe:dst-fbo] status=0x%x\n", (unsigned)dst_status);
+	fflush(stderr);
+	glViewport(0, 0, 1, 1);
+
+	/* VBO + VAO for fullscreen quad. */
+	const GLfloat quad_verts[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts,
+	             GL_STATIC_DRAW);
+	if (backend->fn_gen_vertex_arrays && backend->fn_bind_vertex_array) {
+		typedef void (*pfn_gen_t)(GLsizei, GLuint *);
+		typedef void (*pfn_bind_t)(GLuint);
+		((pfn_gen_t)backend->fn_gen_vertex_arrays)(1, &vao);
+		((pfn_bind_t)backend->fn_bind_vertex_array)(vao);
+	}
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+	/* Shaders. */
+	static const char *vs_src =
+	    "#version 300 es\n"
+	    "in vec2 a_pos;\n"
+	    "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+	static const char *fs_2d_src =
+	    "#version 300 es\nprecision highp float;\n"
+	    "uniform sampler2D u_tex;\nout vec4 o;\n"
+	    "void main() { o = texture(u_tex, vec2(0.5)); }\n";
+	static const char *fs_3d_src =
+	    "#version 300 es\nprecision highp float;\nprecision highp sampler3D;\n"
+	    "uniform sampler3D u_tex;\nout vec4 o;\n"
+	    "void main() { o = texture(u_tex, vec3(0.5)); }\n";
+	static const char *fs_2da_src =
+	    "#version 300 es\nprecision highp float;\nprecision highp sampler2DArray;\n"
+	    "uniform sampler2DArray u_tex;\nout vec4 o;\n"
+	    "void main() { o = texture(u_tex, vec3(0.5, 0.5, 0.0)); }\n";
+	static const char *fs_cube_src =
+	    "#version 300 es\nprecision highp float;\n"
+	    "uniform samplerCube u_tex;\nout vec4 o;\n"
+	    "void main() { o = texture(u_tex, vec3(1.0, 0.0, 0.0)); }\n";
+	vs = hb_compile_shader(GL_VERTEX_SHADER, vs_src, "vs");
+	if (vs) {
+		const char *fs_srcs[4] = { fs_2d_src, fs_3d_src, fs_2da_src, fs_cube_src };
+		const char *tags[4] = { "2D", "3D", "2DA", "Cube" };
+		for (int i = 0; i < 4; i++) {
+			GLuint fs = hb_compile_shader(GL_FRAGMENT_SHADER, fs_srcs[i], tags[i]);
+			if (fs) {
+				progs[i] = hb_link_program(vs, fs, tags[i]);
+				glDeleteShader(fs);
+			}
+		}
+	}
+
+	const GLenum bind_targets[4] = {
+	    GL_TEXTURE_2D,
+	    0x806F /*GL_TEXTURE_3D*/,
+	    0x8C1A /*GL_TEXTURE_2D_ARRAY*/,
+	    GL_TEXTURE_CUBE_MAP
+	};
+	const char *tags[4] = { "2D", "3D", "2DA", "Cube" };
+	static const GLenum CUBE_FACES[6] = {
+	    GL_TEXTURE_CUBE_MAP_POSITIVE_X,
+	    GL_TEXTURE_CUBE_MAP_NEGATIVE_X,
+	    GL_TEXTURE_CUBE_MAP_POSITIVE_Y,
+	    GL_TEXTURE_CUBE_MAP_NEGATIVE_Y,
+	    GL_TEXTURE_CUBE_MAP_POSITIVE_Z,
+	    GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+	};
+	const GLubyte KNOWN[4] = { 170, 85, 51, 255 };
+	typedef void (*pfn_tex_image_3d_t)(GLenum, GLint, GLint, GLsizei,
+	                                    GLsizei, GLsizei, GLint, GLenum,
+	                                    GLenum, const void *);
+	pfn_tex_image_3d_t fn_tex_image_3d =
+	    (pfn_tex_image_3d_t)backend->fn_tex_image_3d;
+
+	int present_mask = 0;
+	int allzero_mask = 0;
+	for (int i = 0; i < 4; i++) {
+		if (!progs[i]) {
+			fprintf(stderr, "[hb-probe:%s/skip] no program\n", tags[i]);
+			fflush(stderr);
+			continue;
+		}
+		GLenum target = bind_targets[i];
+		GLuint srcTex = 0;
+		glGenTextures(1, &srcTex);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(target, srcTex);
+		glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		GLenum upload_err = GL_NO_ERROR;
+		if (target == 0x806F || target == 0x8C1A) {
+			glTexParameteri(target, 0x8072 /*GL_TEXTURE_WRAP_R*/,
+			                GL_CLAMP_TO_EDGE);
+			fn_tex_image_3d(target, 0, 0x8058 /*GL_RGBA8*/, 1, 1, 1, 0,
+			                GL_RGBA, GL_UNSIGNED_BYTE, KNOWN);
+			upload_err = glGetError();
+		} else if (target == GL_TEXTURE_CUBE_MAP) {
+			for (int f = 0; f < 6; f++) {
+				glTexImage2D(CUBE_FACES[f], 0, 0x8058 /*GL_RGBA8*/, 1, 1, 0,
+				             GL_RGBA, GL_UNSIGNED_BYTE, KNOWN);
+			}
+			upload_err = glGetError();
+		} else {
+			glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /*GL_RGBA8*/, 1, 1, 0,
+			             GL_RGBA, GL_UNSIGNED_BYTE, KNOWN);
+			upload_err = glGetError();
+		}
+
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		glUseProgram(progs[i]);
+		GLint loc = glGetUniformLocation(progs[i], "u_tex");
+		glUniform1i(loc, 0);
+		glBindBuffer(GL_ARRAY_BUFFER, vbo);
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+		while (glGetError() != GL_NO_ERROR) {}
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		GLenum draw_err = glGetError();
+
+		GLubyte out_bytes[4] = {0, 0, 0, 0};
+		glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, out_bytes);
+		GLenum read_err = glGetError();
+		int present = (out_bytes[0] == 170 && out_bytes[1] == 85 &&
+		               out_bytes[2] == 51 && out_bytes[3] == 255);
+		int allzero = (out_bytes[0] == 0 && out_bytes[1] == 0 &&
+		               out_bytes[2] == 0 && out_bytes[3] == 0);
+		if (present) present_mask |= (1 << i);
+		if (allzero) allzero_mask |= (1 << i);
+		fprintf(stderr,
+		        "[hb-probe:%s] upload_err=0x%x fbo_status=0x%x loc=%d "
+		        "draw_err=0x%x read_err=0x%x bytes=%u,%u,%u,%u "
+		        "present=%d allzero=%d\n",
+		        tags[i], (unsigned)upload_err, (unsigned)fbo_status, loc,
+		        (unsigned)draw_err, (unsigned)read_err,
+		        (unsigned)out_bytes[0], (unsigned)out_bytes[1],
+		        (unsigned)out_bytes[2], (unsigned)out_bytes[3],
+		        present, allzero);
+		fflush(stderr);
+
+		glBindTexture(target, 0);
+		glDeleteTextures(1, &srcTex);
+	}
+
+	/* 2026-06-27 extended H-B probe — additional sampler3D variants
+	 * for float / packed-float formats. The first 4 sub-tests cover
+	 * sampler2D + RGBA8 for sampler3D / sampler2DArray / samplerCube.
+	 * The following sub-tests stay on sampler3D + TEXTURE_3D but vary
+	 * the internal format to confirm whether the H-B failure is
+	 * UNORM-specific or sampler-type-specific (all of sampler3D for
+	 * any format).
+	 *
+	 * Upload values: (1.0, 1.0, 1.0, 1.0) so any successful sample
+	 * returns vec4(1) → written to RGBA8 dst FBO → readback bytes
+	 * (255, 255, 255, 255). Failure (driver returns vec4(0)) = bytes
+	 * (0, 0, 0, 0). Distinct from the (170, 85, 51, 255) check used
+	 * above so no confusion between sub-tests.
+	 *
+	 * Internal formats tested:
+	 *   - RGBA16F (0x881A): half-float — most common HDR format.
+	 *   - RGBA32F (0x8814): full float — extended-precision case.
+	 *
+	 * Skipped: R11F_G11F_B10F (packed float, non-trivial encoding);
+	 * R8UI / R8I (integer samplers require usampler3D / isampler3D
+	 * + integer FBO — different infrastructure). If these sub-tests
+	 * show H-B for float too, the layered-sampling limitation is
+	 * driver-wide for sampler3D, not format-specific. If they pass,
+	 * float-format tex-3d tests have a different blocker we'd need
+	 * to investigate. */
+	{
+		static const uint8_t HALF_ONE_RGBA[8] = {
+		    0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C
+		};
+		static const uint8_t FLOAT_ONE_RGBA[16] = {
+		    0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F,
+		    0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F
+		};
+		struct float_variant {
+			const char *tag;
+			GLenum internalformat;
+			GLenum type;
+			const uint8_t *data;
+		};
+		struct float_variant variants[2] = {
+		    { "3D-RGBA16F", 0x881A, 0x140B /*GL_HALF_FLOAT*/, HALF_ONE_RGBA },
+		    { "3D-RGBA32F", 0x8814, GL_FLOAT, FLOAT_ONE_RGBA },
+		};
+		for (int v = 0; v < 2; v++) {
+			if (!progs[1]) {
+				fprintf(stderr, "[hb-probe:%s/skip] no sampler3D program\n",
+				        variants[v].tag);
+				fflush(stderr);
+				continue;
+			}
+			GLuint srcTex = 0;
+			glGenTextures(1, &srcTex);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(0x806F /*GL_TEXTURE_3D*/, srcTex);
+			glTexParameteri(0x806F, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(0x806F, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(0x806F, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(0x806F, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexParameteri(0x806F, 0x8072 /*WRAP_R*/, GL_CLAMP_TO_EDGE);
+			fn_tex_image_3d(0x806F, 0, variants[v].internalformat,
+			                1, 1, 1, 0, GL_RGBA, variants[v].type,
+			                variants[v].data);
+			GLenum upload_err = glGetError();
+
+			glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+			GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+
+			glUseProgram(progs[1]);
+			GLint loc = glGetUniformLocation(progs[1], "u_tex");
+			glUniform1i(loc, 0);
+			glBindBuffer(GL_ARRAY_BUFFER, vbo);
+			glEnableVertexAttribArray(0);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+			while (glGetError() != GL_NO_ERROR) {}
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			GLenum draw_err = glGetError();
+
+			GLubyte ob[4] = {0, 0, 0, 0};
+			glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, ob);
+			GLenum read_err = glGetError();
+			/* Expected for upload (1.0, 1.0, 1.0, 1.0): readback
+			 * (255, 255, 255, 255). Allow ±1 for rounding. */
+			int present = (ob[0] >= 254 && ob[1] >= 254 &&
+			               ob[2] >= 254 && ob[3] >= 254);
+			int allzero = (ob[0] == 0 && ob[1] == 0 &&
+			               ob[2] == 0 && ob[3] == 0);
+			fprintf(stderr,
+			        "[hb-probe:%s] upload_err=0x%x fbo_status=0x%x loc=%d "
+			        "draw_err=0x%x read_err=0x%x bytes=%u,%u,%u,%u "
+			        "present=%d allzero=%d (expected=255,255,255,255)\n",
+			        variants[v].tag, (unsigned)upload_err, (unsigned)fbo_status,
+			        loc, (unsigned)draw_err, (unsigned)read_err,
+			        (unsigned)ob[0], (unsigned)ob[1], (unsigned)ob[2],
+			        (unsigned)ob[3], present, allzero);
+			fflush(stderr);
+
+			glBindTexture(0x806F, 0);
+			glDeleteTextures(1, &srcTex);
+		}
+	}
+
+	/* Verdict — names H-A vs H-B vs H-C in one line. */
+	bool oracle_ok = (present_mask & 1) != 0;
+	if (!oracle_ok) {
+		fprintf(stderr, "[hb-probe:VERDICT] oracle-broken — raw-GLES 2D-sampler "
+		                "draw doesn't return uploaded bytes. The probe's own "
+		                "infrastructure is broken; STOP and fix before "
+		                "interpreting 3D/2DA/Cube results.\n");
+	} else {
+		bool all_layered_ok = ((present_mask >> 1) & 0x7) == 0x7;
+		bool all_layered_zero = ((allzero_mask >> 1) & 0x7) == 0x7;
+		if (all_layered_ok) {
+			fprintf(stderr, "[hb-probe:VERDICT] H-B-RULED-OUT — raw-GLES "
+			                "sampler3D / sampler2DArray / samplerCube all "
+			                "return uploaded bytes WITHOUT the bridge. Mesa-"
+			                "Nouveau CAN direct-sample layered/cube textures. "
+			                "The bug is INSIDE the bridge — H-A or H-C remain. "
+			                "Next: probe inside nx_webgl_egl_draw_passthrough.\n");
+		} else if (all_layered_zero) {
+			fprintf(stderr, "[hb-probe:VERDICT] H-B-CONFIRMED — raw-GLES "
+			                "sampler3D / sampler2DArray / samplerCube ALL "
+			                "return 0,0,0 with the bridge bypassed entirely. "
+			                "Mesa-Nouveau cannot direct-sample layered/cube "
+			                "textures on this Tegra. Document as capability-map "
+			                "entry; BUILTIN_SKIP affected conformance tests. "
+			                "Bridge is exonerated.\n");
+		} else {
+			fprintf(stderr, "[hb-probe:VERDICT] H-B-MIXED (present_mask=0x%x "
+			                "allzero_mask=0x%x) — some layered targets work raw, "
+			                "others don't. Inspect per-tag lines for the per-"
+			                "target verdict.\n",
+			        present_mask, allzero_mask);
+		}
+	}
+	fflush(stderr);
+
+	/* Cleanup. */
+	for (int i = 0; i < 4; i++) {
+		if (progs[i]) glDeleteProgram(progs[i]);
+	}
+	if (vs) glDeleteShader(vs);
+	if (vbo) glDeleteBuffers(1, &vbo);
+	if (vao && backend->fn_delete_vertex_arrays) {
+		typedef void (*pfn_del_vao_t)(GLsizei, const GLuint *);
+		((pfn_del_vao_t)backend->fn_delete_vertex_arrays)(1, &vao);
+	}
+	glDeleteFramebuffers(1, &dstFbo);
+	glDeleteTextures(1, &dstTex);
+
+	/* Restore state. */
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)saved_fbo);
+	glViewport(saved_viewport[0], saved_viewport[1],
+	           saved_viewport[2], saved_viewport[3]);
+	if (was_scissor) glEnable(GL_SCISSOR_TEST);
+	glUseProgram((GLuint)saved_program);
+	if (saved_vao && backend->fn_bind_vertex_array) {
+		typedef void (*pfn_bind_t)(GLuint);
+		((pfn_bind_t)backend->fn_bind_vertex_array)((GLuint)saved_vao);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex2d);
+	glBindTexture(0x806F /*GL_TEXTURE_3D*/, (GLuint)saved_tex3d);
+	glBindTexture(0x8C1A /*GL_TEXTURE_2D_ARRAY*/, (GLuint)saved_tex2da);
+	glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)saved_texcube);
+	glActiveTexture((GLenum)saved_active);
+	while (glGetError() != GL_NO_ERROR) {}
+}
+#else
+static void nx_webgl_egl_hb_probe(nx_webgl_egl_t *backend) { (void)backend; }
+#endif
+
 static bool nx_webgl_egl_initialize(nx_webgl_egl_t *backend,
 									nx_canvas_t *canvas) {
 	if (!backend)
@@ -2006,6 +2446,9 @@ static bool nx_webgl_egl_initialize(nx_webgl_egl_t *backend,
 		if (backend->step == previous_step)
 			return false;
 	}
+	/* H-B probe fires ONCE per process right after bridge becomes
+	 * available. Diagnostic only; restores state. */
+	nx_webgl_egl_hb_probe(backend);
 	return true;
 }
 
@@ -4024,6 +4467,23 @@ bool nx_webgl_egl_persistent_texture_image_2d(nx_webgl_egl_t *backend,
 		native_format = GL_RGBA;
 	}
 
+	// 2026-06-26: force GL_UNPACK_ALIGNMENT=1 before every persistent-tex
+	// upload. nx_webgl_tex_image_2d's image-source path (post 2026-06-26
+	// format widening) emits TIGHTLY-PACKED bytes from convert_rgba8_to_target
+	// — w*h*target_bpp with NO row padding. The driver default UNPACK_ALIGNMENT
+	// is 4; for any (width × bytes_per_pixel) not divisible by 4 (e.g. 1×2 RGB
+	// UByte = 3-byte rows), the driver expects to read PADDED rows. It then
+	// over-reads past the tight buffer's end, returns NO_ERROR from
+	// glGetError, but corrupts an adjacent Mesa heap structure that crashes
+	// the next stateful GL call (glClear in the conformance image-tex tests).
+	// JS-side `pixelStorei(UNPACK_ALIGNMENT, …)` at webgl.c:6839 is validated
+	// but never forwarded to native — so no caller can compensate from JS.
+	// Setting it here is safe for every caller: our null-source, image-source,
+	// and JS-buffer paths all pass `expected`-sized tight buffers; mipmap
+	// chains are tight too. The corollary: any future caller that wants to
+	// upload row-aligned bytes must call `glPixelStorei(GL_UNPACK_ALIGNMENT, N)`
+	// AFTER this helper to override.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0,
 	             native_format, native_type, data);
 	return glGetError() == GL_NO_ERROR;
@@ -4197,6 +4657,11 @@ bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
 			err = GL_NO_ERROR;
 		}
 	}
+	// 2026-06-26: force UNPACK_ALIGNMENT=1 (tight rows) for the same reason
+	// as the 2D image-source path — convert_rgba8_to_target / null-source
+	// zero buffers / mipmap-chain dst all emit tight bytes. Cube faces would
+	// hit the identical crash class for any non-aligned width × bpp upload.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	if (!used_immutable) {
 		glTexImage2D((GLenum)face_target, 0, internal, width, height,
 		             0, (GLenum)format, (GLenum)type, data);
@@ -4269,6 +4734,42 @@ bool nx_webgl_egl_persistent_cube_texture_image_2d(nx_webgl_egl_t *backend,
 		if (src_alloc) free(src_alloc);
 	}
 	return true;
+#endif
+}
+
+bool nx_webgl_egl_persistent_cube_texture_sub_image_2d(
+    nx_webgl_egl_t *backend, uint32_t handle, uint32_t face_target,
+    int xoffset, int yoffset, int width, int height,
+    uint32_t format, uint32_t type, const void *pixels) {
+#if !NXJS_HAS_EGL_GLES
+	(void)backend; (void)handle; (void)face_target;
+	(void)xoffset; (void)yoffset; (void)width; (void)height;
+	(void)format; (void)type; (void)pixels;
+	return false;
+#else
+	if (!backend || !backend->available || handle == 0 ||
+	    width <= 0 || height <= 0)
+		return false;
+	if (face_target < 0x8515 /* GL_TEXTURE_CUBE_MAP_POSITIVE_X */ ||
+	    face_target > 0x851A /* GL_TEXTURE_CUBE_MAP_NEGATIVE_Z */)
+		return false;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return false;
+	(void)glGetError();
+	GLenum native_type = (GLenum)type;
+	if (native_type == 0x8D61 /* HALF_FLOAT_OES */)
+		native_type = 0x140B /* HALF_FLOAT */;
+	glBindTexture(GL_TEXTURE_CUBE_MAP, (GLuint)handle);
+	(void)glGetError();
+	// Same tight-pack rationale as the 2D sub-image path: image-source
+	// uploads emit tight rows; UNPACK_ALIGNMENT=4 would over-read past
+	// the buffer for narrow non-aligned widths and corrupt driver state.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexSubImage2D((GLenum)face_target, 0, xoffset, yoffset,
+	                (GLsizei)width, (GLsizei)height,
+	                (GLenum)format, native_type, pixels);
+	return glGetError() == GL_NO_ERROR;
 #endif
 }
 
@@ -4720,8 +5221,23 @@ void nx_webgl_egl_texture_set_parameteri(nx_webgl_egl_t *backend,
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 	                    backend->context))
 		return;
+	(void)glGetError(); /* drain residual */
 	glBindTexture((GLenum)target, (GLuint)handle);
+	GLenum bind_err = glGetError();
 	glTexParameteri((GLenum)target, (GLenum)pname, (GLint)param);
+	GLenum tpi_err = glGetError();
+	/* 2026-06-27 Q1 post-fix verification: log Mesa's response when
+	 * either the bind or tex-param fails. Errors are rare here so
+	 * unconditional logging is fine (no spam in normal operation).
+	 * If Mesa rejects either call, the texture's native sampler
+	 * state stays at GLES defaults (sampler-incomplete) regardless
+	 * of what the engine struct thinks is set. */
+	if (bind_err != GL_NO_ERROR || tpi_err != GL_NO_ERROR) {
+		fprintf(stderr,
+		        "[nxjs:q1-replay-mesa-err] target=0x%x handle=%u pname=0x%x param=0x%x bind_err=0x%x tpi_err=0x%x\n",
+		        target, handle, pname, param, bind_err, tpi_err);
+		fflush(stderr);
+	}
 #endif
 }
 
@@ -4949,6 +5465,65 @@ uint32_t nx_webgl_egl_get_last_draw_gl_error(nx_webgl_egl_t *backend) {
 #endif
 }
 
+/* 2026-06-27 Q2 blind-spot quantification: pop the Mesa-native error
+ * queue and return whatever was there. Used at the end of user-facing
+ * GL entry points (drawArrays/drawElements/readPixels/clear) to
+ * detect Mesa-flagged errors that the engine's existing
+ * context->error-only `getError` path can't surface to JS. NOT a fix —
+ * a probe. Calling this drains the error from Mesa's queue so it
+ * cannot be subsequently queried (matches existing bridge-internal
+ * drain hygiene at [webgl_egl.c:1940/3500/5502/6227/6422]). Quietly
+ * returns 0 in headless / no-GL builds. */
+uint32_t nx_webgl_egl_probe_native_error(nx_webgl_egl_t *backend) {
+	if (!backend)
+		return 0;
+#if NXJS_HAS_EGL_GLES
+	return (uint32_t)glGetError();
+#else
+	return 0;
+#endif
+}
+
+/* 2026-06-27 Q1-followup sampler-arrival probe: query Mesa's current
+ * TEXTURE_BINDING_2D_ARRAY and TEXTURE_BINDING_3D on the supplied
+ * active unit. Used at draw time to verify whether the engine's
+ * tracked 3D bindings actually reached the native GL state — which
+ * Candidate A (bridge compositor / sampler-unit mismatch) hypothesis
+ * predicts they may not, even though the bridge dispatch is now
+ * "native passthrough" per webgl.c:11260-11279's ROUND-39 gate-drop.
+ * Symptom-first: if engine binding != Mesa binding, the bridge is
+ * losing the binding somewhere between bindTexture and draw. If they
+ * match, candidate A is empirically ruled out and the next candidate
+ * (C: mipmap completeness) gets attention. NOT a fix. Calls
+ * eglMakeCurrent + glActiveTexture(active_unit_enum) + 2× glGetIntegerv,
+ * then drains any error. */
+void nx_webgl_egl_probe_3d_bindings(nx_webgl_egl_t *backend,
+                                     uint32_t active_unit_enum,
+                                     uint32_t *out_binding_2d_array,
+                                     uint32_t *out_binding_3d) {
+	if (out_binding_2d_array) *out_binding_2d_array = 0;
+	if (out_binding_3d) *out_binding_3d = 0;
+#if NXJS_HAS_EGL_GLES
+	if (!backend) return;
+	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
+	                    backend->context))
+		return;
+	(void)glGetError(); /* drain residual */
+	GLint prev_active = 0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+	glActiveTexture((GLenum)active_unit_enum);
+	GLint b_2da = 0, b_3d = 0;
+	glGetIntegerv(0x8C1D /*GL_TEXTURE_BINDING_2D_ARRAY*/, &b_2da);
+	glGetIntegerv(0x806A /*GL_TEXTURE_BINDING_3D*/, &b_3d);
+	glActiveTexture((GLenum)prev_active);
+	(void)glGetError(); /* drain probe-induced errors */
+	if (out_binding_2d_array) *out_binding_2d_array = (uint32_t)b_2da;
+	if (out_binding_3d) *out_binding_3d = (uint32_t)b_3d;
+#else
+	(void)backend; (void)active_unit_enum;
+#endif
+}
+
 bool nx_webgl_egl_has_pending_readback(nx_webgl_egl_t *backend) {
 	if (!backend)
 		return false;
@@ -5012,6 +5587,65 @@ bool nx_webgl_egl_clear_bridge(nx_webgl_egl_t *backend, nx_canvas_t *canvas) {
 		false, NULL, false);
 }
 
+/* 2026-06-27 read_bridge_pixels per-early-return counters. The
+ * read_pixels exit-path probe found bridge_reject owns 97.8% of the
+ * 9,788-ish readPixels cascade (43,508 false-returns in a 1182-test
+ * run). This drills into the 9 distinct false-return paths inside
+ * the helper to find which one fires the bulk. Gated on
+ * NXJS_BRP_EARLY_RETURN_COUNTERS; logs every 500th call to keep
+ * volume bounded, plus the first 10 to capture cold-state. */
+#define NXJS_BRP_EARLY_RETURN_COUNTERS 0  /* 2026-06-27 silenced after
+                                              * cascade investigation closed.
+                                              * read_err path own 99.1% of
+                                              * brp false-returns; cascade was
+                                              * test-concentrated, not engine-
+                                              * wide. Residual edge case (6
+                                              * events / clip=1x1@(0,719) /
+                                              * COMPLETE × INVALID_OPERATION)
+                                              * documented as Mesa-side reject
+                                              * — bridge math validated
+                                              * in-bounds (gl_y=719 is last
+                                              * valid row of 720-tall buffer).
+                                              * Flip to 1 to re-harvest if a
+                                              * future run sees brp-pair
+                                              * volume >> 6. */
+static uint64_t g_brp_arg_null = 0;          // backend / canvas / dst null
+static uint64_t g_brp_bridge_disabled = 0;   // bridge_enabled false
+static uint64_t g_brp_dim_invalid = 0;       // width / height <= 0
+static uint64_t g_brp_canvas_unready = 0;    // canvas->data null OR w/h zero
+static uint64_t g_brp_init_failed = 0;       // nx_webgl_egl_initialize false
+static uint64_t g_brp_egl_make_current = 0;  // eglMakeCurrent failed
+static uint64_t g_brp_resources_failed = 0;  // ensure_bridge_resources false
+static uint64_t g_brp_read_pixels_err = 0;   // glReadPixels glGetError != NO_ERROR
+static uint64_t g_brp_success = 0;           // returned true
+static inline void brp_log_maybe(const char *which) {
+#if NXJS_BRP_EARLY_RETURN_COUNTERS
+	uint64_t total = g_brp_arg_null + g_brp_bridge_disabled +
+	                 g_brp_dim_invalid + g_brp_canvas_unready +
+	                 g_brp_init_failed + g_brp_egl_make_current +
+	                 g_brp_resources_failed + g_brp_read_pixels_err +
+	                 g_brp_success;
+	if (total <= 10 || (total % 500) == 0) {
+		fprintf(stderr,
+		        "[nxjs:brp-exits] total=%llu arg_null=%llu bridge_off=%llu dim_inv=%llu canvas_unready=%llu init_fail=%llu egl_cur_fail=%llu res_fail=%llu read_err=%llu ok=%llu (last=%s)\n",
+		        (unsigned long long)total,
+		        (unsigned long long)g_brp_arg_null,
+		        (unsigned long long)g_brp_bridge_disabled,
+		        (unsigned long long)g_brp_dim_invalid,
+		        (unsigned long long)g_brp_canvas_unready,
+		        (unsigned long long)g_brp_init_failed,
+		        (unsigned long long)g_brp_egl_make_current,
+		        (unsigned long long)g_brp_resources_failed,
+		        (unsigned long long)g_brp_read_pixels_err,
+		        (unsigned long long)g_brp_success,
+		        which);
+		fflush(stderr);
+	}
+#else
+	(void)which;
+#endif
+}
+
 bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 									  nx_canvas_t *canvas,
 									  int x, int y, int width, int height,
@@ -5024,25 +5658,47 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 #else
 	(void)format;
 	(void)type;
-	if (!backend || !backend->bridge_enabled || !canvas || !dst)
+	if (!backend || !canvas || !dst) {
+		g_brp_arg_null++;
+		brp_log_maybe("arg_null");
 		return false;
-	if (width <= 0 || height <= 0)
+	}
+	if (!backend->bridge_enabled) {
+		g_brp_bridge_disabled++;
+		brp_log_maybe("bridge_off");
 		return false;
-	if (!canvas->data || canvas->width == 0 || canvas->height == 0)
+	}
+	if (width <= 0 || height <= 0) {
+		g_brp_dim_invalid++;
+		brp_log_maybe("dim_inv");
 		return false;
-	if (!nx_webgl_egl_initialize(backend, canvas))
+	}
+	if (!canvas->data || canvas->width == 0 || canvas->height == 0) {
+		g_brp_canvas_unready++;
+		brp_log_maybe("canvas_unready");
 		return false;
+	}
+	if (!nx_webgl_egl_initialize(backend, canvas)) {
+		g_brp_init_failed++;
+		brp_log_maybe("init_fail");
+		return false;
+	}
 	if (!eglMakeCurrent(backend->display, backend->surface, backend->surface,
 						backend->context)) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge readPixels: eglMakeCurrent() failed: 0x%x",
 				 eglGetError());
+		g_brp_egl_make_current++;
+		brp_log_maybe("egl_cur_fail");
 		return false;
 	}
 	int render_width = 0, render_height = 0;
 	bridge_render_size(backend, canvas, &render_width, &render_height);
-	if (!ensure_bridge_resources(backend, render_width, render_height))
+	if (!ensure_bridge_resources(backend, render_width, render_height)) {
+		g_brp_resources_failed++;
+		brp_log_maybe("res_fail");
 		return false;
+	}
 
 	// Clip the requested rect to the FBO bounds. Any rows/cols outside
 	// the FBO are zero-filled in `dst` — the caller's buffer must never
@@ -5066,8 +5722,11 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 	const size_t row_bytes = (size_t)width * 4;
 	memset(dst, 0, row_bytes * (size_t)height);
 
-	if (clip_w <= 0 || clip_h <= 0)
+	if (clip_w <= 0 || clip_h <= 0) {
+		g_brp_success++;
+		brp_log_maybe("ok_empty_rect");
 		return true;
+	}
 
 	// Defensive state: scissor must be off so reads aren't clipped to
 	// whatever the last bridge draw set; color mask must be all-on (it
@@ -5082,6 +5741,18 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 	glDisable(GL_SCISSOR_TEST);
 	glPixelStorei(GL_PACK_ALIGNMENT, 1);
 	(void)glGetError();
+	/* 2026-06-27 sub-probe (revised lazy): glCheckFramebufferStatus
+	 * moved into the err-only path below (line ~5217). Pre-fix called
+	 * it on every readPixels including successes — that triggered
+	 * Mesa-Nouveau hangs at FBO-attachment-heavy conformance tests
+	 * (`renderbuffers-framebuffer-object-attachment` #150 hung 2026-06-27,
+	 * `rendering-draw-buffers-driver-hang` #181 already known driver-hang).
+	 * FBO state is stable across glReadPixels (a read doesn't mutate FBO
+	 * completeness), so checking AFTER the read is semantically equivalent
+	 * for the diagnostic but avoids paying the Mesa-pathology risk on the
+	 * 0.9% successful path. Probe variable still declared here so the
+	 * post-read branch is concise. */
+	GLenum fbo_status_pre_read = 0; /* populated below in err path only */
 	uint8_t *clipped_start = NULL;
 	size_t clipped_row_bytes = 0;
 	size_t clipped_stride = 0;
@@ -5121,8 +5792,34 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 	if (err != GL_NO_ERROR) {
 		snprintf(backend->status, sizeof(backend->status),
 				 "GPU bridge readPixels failed: 0x%x", err);
+		g_brp_read_pixels_err++;
+		/* 2026-06-27 sub-probe pair-log: lazy FBO-status query — only
+		 * on failure paths, since calling glCheckFramebufferStatus on
+		 * every readPixels (including the 99%+ success-from-fail
+		 * inverted-success path) tripped Mesa-Nouveau hangs at
+		 * FBO-attachment-heavy tests. Capturing status AFTER glReadPixels
+		 * is semantically equivalent for the (fbo_status, read_err)
+		 * decode because glReadPixels doesn't mutate FBO completeness.
+		 * Throttled to first 20 + every 100th read_err. */
+		fbo_status_pre_read = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		(void)glGetError(); /* drain any status-induced err */
+		if (g_brp_read_pixels_err <= 20 ||
+		    (g_brp_read_pixels_err % 100) == 0) {
+			fprintf(stderr,
+			        "[nxjs:brp-pair] err=0x%04x fbo_status=0x%04x "
+			        "(clip=%dx%d@%d,%d render=%dx%d) brp_read_err_n=%llu\n",
+			        (unsigned)err, (unsigned)fbo_status_pre_read,
+			        clip_w, clip_h, clip_x, clip_y,
+			        render_width, render_height,
+			        (unsigned long long)g_brp_read_pixels_err);
+			fflush(stderr);
+		}
+		brp_log_maybe("read_err");
 		return false;
 	}
+	/* No success-path FBO-status query — Mesa-Nouveau hang risk and
+	 * the success path doesn't need diagnostic data anyway. The
+	 * `[nxjs:brp-pair-ok]` probe from the prior pass was dropped here. */
 	// In-place row reverse to convert glReadPixels's GL bottom-up rows
 	// to canvas-y top-down — the convention nx.js's bridge already uses
 	// for `gl.viewport` / `gl.scissor` x/y inputs. Doing this here
@@ -5153,6 +5850,8 @@ bool nx_webgl_egl_read_bridge_pixels(nx_webgl_egl_t *backend,
 			free(scratch_row);
 		}
 	}
+	g_brp_success++;
+	brp_log_maybe("ok_full");
 	return true;
 #endif
 }
@@ -8559,6 +9258,12 @@ bool nx_webgl_egl_persistent_texture_sub_image_2d(nx_webgl_egl_t *backend,
 		native_type = 0x140B;
 	glBindTexture(GL_TEXTURE_2D, (GLuint)handle);
 	(void)glGetError();
+	// 2026-06-26: same tight-pack rationale as nx_webgl_egl_persistent_texture_image_2d.
+	// The conformance test pattern texImage2D(target, 0, RGB, 1, 2, 0, RGB, UByte, NULL)
+	// + texSubImage2D(target, 0, 0, 0, RGB, UByte, image) hit this — the
+	// driver silently over-read past our 6-byte tight buffer, corrupted Mesa
+	// heap state, and the next glClear crashed natively.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexSubImage2D(GL_TEXTURE_2D, level, xoffset, yoffset, (GLsizei)width,
 	                (GLsizei)height, (GLenum)format, native_type, pixels);
 	return glGetError() == GL_NO_ERROR;
