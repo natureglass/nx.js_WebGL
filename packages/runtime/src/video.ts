@@ -2,13 +2,25 @@ import { $, type AudioNodeHandle, type VideoHandle, type VideoMetadata } from '.
 import { getSharedAudioContext } from './audio';
 import { ctxInternal, nodeInternal } from './audio/internal';
 import { DOMException } from './dom-exception';
-import { fetch } from './fetch/fetch';
 import { ErrorEvent, Event } from './polyfills/event';
 import { EventTarget } from './polyfills/event-target';
 import { URL } from './polyfills/url';
 import { clearInterval, setInterval } from './timers';
 import { createInternal, def, proto } from './utils';
 import type { GainNode } from './audio/gain-node';
+
+// Late-bound (call-time) globalThis.fetch wrapper — see image.ts for the
+// full rationale + the "CRITICAL: late-bound" gotcha. video.ts already
+// short-circuits FILE_SCHEMES (romfs/sdmc/file/nxjs) to a direct native
+// decode (`$.videoLoad`), so this fetch only fires for the
+// http/https/blob/data branch — and now also `brewser://` and any other
+// embedder-extended scheme.
+function fetch(
+	input: string | URL | Request,
+	init?: RequestInit,
+): Promise<Response> {
+	return globalThis.fetch(input, init);
+}
 
 const HAVE_NOTHING = 0;
 const HAVE_METADATA = 1;
@@ -368,7 +380,12 @@ export class Video extends EventTarget {
 		i.errorFired = false;
 		i.streamNode = null;
 
-		const url = new URL(i.src, $.entrypoint);
+		// Late-bound base URL: prefer `document.baseURI` (per-session URL set
+		// by embedders like brewser-runtime). Same pattern as image.ts:src.
+		const baseUrl =
+			(globalThis as { document?: { baseURI?: string } }).document
+				?.baseURI ?? $.entrypoint;
+		const url = new URL(i.src, baseUrl);
 		i.currentSrc = url.href;
 
 		const loadPromise = FILE_SCHEMES.has(url.protocol)

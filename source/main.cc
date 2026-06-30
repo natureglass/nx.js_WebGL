@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <ada.h>
@@ -21,6 +22,7 @@
 #include <zstd.h>
 #include FT_FREETYPE_H
 
+#include "detect.h"
 #include "error.h"
 #include "hidsys.h"
 #include "module.h"
@@ -28,6 +30,7 @@
 #include "types.h"
 #include "util.h"
 #include "webgl.h"
+#include "webgl_bridge.h"
 
 #include "include/core/SkMilestone.h"
 #include "include/core/SkSurface.h"
@@ -268,6 +271,9 @@ static void nx_emergency_teardown(void) {
 	if (nx_webgl_active()) {
 		nx_webgl_exit();
 	} else if (screen_is_gpu) {
+		// Bridge owns GL handles on Skia's shared context; tear it down
+		// BEFORE the context goes away. Idempotent + no-op when not init.
+		nx_webgl_bridge_exit();
 		nx_skia_gpu_screen_exit();
 		screen_is_gpu = false;
 	} else if (framebuffer != NULL) {
@@ -361,6 +367,9 @@ void nx_screen_release_for_webgl(Isolate *iso, Local<Value> screen) {
 		if (canvas) {
 			nx_canvas_release_gpu_surface(canvas);
 		}
+		// Bridge owns GL handles on Skia's shared context; tear it down
+		// BEFORE the context goes away. Idempotent + no-op when not init.
+		nx_webgl_bridge_exit();
 		nx_skia_gpu_screen_exit();
 		screen_is_gpu = false;
 	} else {
@@ -604,6 +613,19 @@ static void nx_framebuffer_init(const FunctionCallbackInfo<Value> &info) {
 		nx_canvas_set_gpu_surface(canvas, gpu);
 		screen_is_gpu = true;
 		js_framebuffer = nullptr;
+		// Phase 2.B coexistence smoke driver. Opt-in via `[webgl] test_fbo =
+		// true` in nxjs.ini (or the SD override). Stands up an offscreen FBO
+		// on Skia's shared ES3 context + a state save/restore primitive that
+		// 2.C will reuse, then composes a hand-written GL triangle into the
+		// screen surface every frame. Defaults off — shell renders normally.
+		if (ctx->config.webgl_test_fbo) {
+			if (!nx_webgl_bridge_init(640, 360)) {
+				fprintf(stderr,
+				        "[webgl-bridge] init failed; test_fbo disabled "
+				        "for this run\n");
+				fflush(stderr);
+			}
+		}
 		// Bringing up EGL/Mesa (which claims the NWindow + nvidia driver
 		// resources) can leave HID not delivering input when it runs AFTER the
 		// pads were configured — notably for async entry modules (top-level
@@ -1373,8 +1395,31 @@ static void resolve_entrypoint(nx_context_t *nx_ctx, int argc, char *argv[],
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// Boot timing anchor for the boot-splash residual diagnostic. Captured at
+// the very start of main() (after the variable declaration that follows)
+// so every subsequent boot-time log can print a (+%llu ms since t0)
+// delta. The pre-Skia black ceiling that the splash hoist CAN'T cover
+// (engine boot + V8 init + module eval before the runtime calls
+// `screen.getContext`) is exactly `[skia] ... ready`'s reported delta.
+// Defined here so skia_gpu.cc can read it via an `extern` declaration.
+uint64_t g_boot_t0_ns = 0;
+
 int main(int argc, char *argv[]) {
 	Result rc;
+
+	{
+		struct timespec _ts;
+		clock_gettime(CLOCK_MONOTONIC, &_ts);
+		g_boot_t0_ns = (uint64_t)_ts.tv_sec * 1000000000ull + (uint64_t)_ts.tv_nsec;
+	}
+	// Anchor log so any reader of nxjs-debug.log knows the (+Nms) deltas
+	// below are measured from THIS line. Stderr is rerouted to the SD
+	// debug log a few lines down (g_debug_fd = freopen LOG_FILENAME);
+	// this fprintf goes to the boot console (the libnx framebuffer
+	// console pre-Skia) which is fine — we only need ONE anchor line in
+	// the final log; the [skia] (+Nms) line is the load-bearing one.
+	fprintf(stderr, "[boot] t0 captured\n");
+	fflush(stderr);
 
 	nx_context_t *nx_ctx = (nx_context_t *)calloc(1, sizeof(nx_context_t));
 	g_nx_ctx = nx_ctx;
@@ -1455,6 +1500,17 @@ int main(int argc, char *argv[]) {
 	// Parse `nxjs.ini` (next to the entrypoint) into the per-isolate config.
 	// Missing/unreadable file -> defaults, silently. Done before socket init +
 	// V8 init so every setting can take effect.
+	//
+	// Two passes, with later settings overriding earlier:
+	//   1. App-bundled `nxjs.ini` (next to the entrypoint; baked into romfs
+	//      for fat NROs).
+	//   2. User-side override at `sdmc:/switch/nxjs-override.ini` (separate
+	//      filename so it never collides with an app-bundled `nxjs.ini`).
+	//      The user-side path exists so fat NROs can still be reconfigured
+	//      without rebuilding — needed for the [v8] target=... Citron/HW
+	//      override, which the user must be able to flip across both
+	//      targets cross-platform (argv-based overrides don't work on
+	//      Citron, which doesn't populate argv).
 	nx_config_defaults(&nx_ctx->config);
 	if (user_code_path) {
 		char *ini_path = nx_config_ini_path_for(user_code_path);
@@ -1463,6 +1519,7 @@ int main(int argc, char *argv[]) {
 			free(ini_path);
 		}
 	}
+	nx_config_load(&nx_ctx->config, "sdmc:/switch/nxjs-override.ini");
 
 	// libuv worker thread pool: initialized lazily inside libuv on the FIRST
 	// async native op (fs/crypto/zstd/image/dns), and a failed worker thread
@@ -1564,6 +1621,68 @@ int main(int argc, char *argv[]) {
 		can_jit = !tight_memory;
 		break;
 	}
+	// Citron-vs-hardware target gating, layered on top of the regime decision.
+	// Only applies when `jit = auto`; explicit `jit = on/off` takes
+	// responsibility for the JIT decision and skips target detection. See
+	// detect.h for the 2-of-3 vote + hardware-bias rationale.
+	if (nx_ctx->config.jit == NX_JIT_AUTO) {
+		bool force_jitless = false;
+		const char *how = "auto";
+		const char *target_label = NULL;
+		nx_target_detection det = {};
+		switch (nx_ctx->config.target) {
+		case NX_TARGET_HARDWARE:
+			how = "override=hardware";
+			target_label = "hardware";
+			// Don't force jitless; leave can_jit at the regime decision.
+			break;
+		case NX_TARGET_CITRON:
+			how = "override=citron";
+			target_label = "citron";
+			force_jitless = true;
+			break;
+		case NX_TARGET_AUTO:
+		default:
+			det = nx_detect_citron();
+			target_label = det.detected_citron ? "citron" : "hardware";
+			force_jitless = det.detected_citron;
+			break;
+		}
+		if (force_jitless) can_jit = false;
+		// Always log the decision in a greppable shape: target=, mode=, how.
+		if (nx_ctx->config.target == NX_TARGET_AUTO) {
+			fprintf(stderr,
+			        "[detect] target=%s (auto: A=%d B=%d C=%d score=%d/3) -> "
+			        "mode=%s\n",
+			        target_label,
+			        (int)det.sig_hbloader_absent,
+			        (int)det.sig_core3_unreserved,
+			        (int)det.sig_spl_unavailable,
+			        det.score,
+			        can_jit ? "jit" : "jitless");
+			if (det.score == 2) {
+				// A signal disagreed — worth surfacing so a Citron update or
+				// hardware quirk that drifts a vector gets noticed early.
+				const char *disagreed =
+				    det.detected_citron
+				        ? (!det.sig_hbloader_absent  ? "A (hbloader env-block)"
+				           : !det.sig_core3_unreserved ? "B (core-3 mask)"
+				                                      : "C (spl availability)")
+				        : (det.sig_hbloader_absent   ? "A (hbloader env-block)"
+				           : det.sig_core3_unreserved  ? "B (core-3 mask)"
+				                                       : "C (spl availability)");
+				fprintf(stderr,
+				        "[detect] WARN auto score=2/3 (signal %s disagreed) "
+				        "- a detection signal may have drifted\n",
+				        disagreed);
+			}
+		} else {
+			fprintf(stderr, "[detect] target=%s (%s) -> mode=%s\n",
+			        target_label, how, can_jit ? "jit" : "jitless");
+		}
+		fflush(stderr);
+	}
+
 	nx_ctx->config.effective_jit = can_jit;
 	if (nx_ctx->config.jit == NX_JIT_ON && tight_memory &&
 	    nx_ctx->config.renderer == NX_RENDER_GPU) {
@@ -1789,6 +1908,32 @@ int main(int argc, char *argv[]) {
 	nx_ctx->iso = iso;
 	iso->SetData(0, nx_ctx);
 	iso->SetPromiseRejectCallback(nx_promise_rejection_handler);
+	// V8's automatic stack-limit detection assumes a Node-/desktop-sized
+	// stack; the libnx main-thread stack is the size declared in
+	// npdm.json (currently 0x100000 = 1 MiB). Without configuring V8's
+	// StackGuard against the real bounds, normal-depth JS recursion
+	// (~15 frames in some Promise/async chains; well within QuickJS's
+	// observed budget on the same hardware) walks off the 1 MiB stack
+	// and the OS hard-faults at a function-prologue stp instead of V8
+	// throwing the catchable RangeError("Maximum call stack size
+	// exceeded") that JS author code can handle.
+	//
+	// Derivation: ARM64 stack grows down. threadGetSelf()->stack_mem is
+	// the lowest valid address (stack end); stack_sz is the total. V8's
+	// limit = stack_end + headroom, so the guard fires before SP falls
+	// past stack_end. Headroom = 256 KiB to cover the deepest run of
+	// V8 native frames between the limit check and unwind — the
+	// --single-threaded --predictable build (BINDINGS.md §0) still
+	// compiles via Ignition+Sparkplug+Maglev+TurboFan, all of which can
+	// recurse during compilation.
+	{
+		Thread *t = threadGetSelf();
+		if (t && t->stack_mem && t->stack_sz > 256 * 1024) {
+			uintptr_t stack_end = reinterpret_cast<uintptr_t>(t->stack_mem);
+			constexpr uintptr_t kStackHeadroom = 256 * 1024;
+			iso->SetStackLimit(stack_end + kStackHeadroom);
+		}
+	}
 	// ES module loading (import.meta + static/dynamic import); see module.cc.
 	nx_init_modules(iso);
 	// Microtasks are pumped explicitly from the loop.
@@ -1970,6 +2115,21 @@ int main(int argc, char *argv[]) {
 					// since the last present.
 					nx_webgl_present();
 				} else if (screen_is_gpu) {
+					// Phase 2.C present-hook: if a WebGL context is driving
+					// the tenant FBO, close the per-frame bracket (restore
+					// Skia's GL state + grCtx->resetContext) and compose the
+					// FBO into the persistent canvas surface. Cheap no-op on
+					// frames where no WebGL traffic happened.
+					nx_webgl_compose_if_active(nx_skia_gpu_canvas_surface());
+					// Phase 2.B coexistence smoke driver (still active behind
+					// [webgl] test_fbo when no WebGL context owns the FBO):
+					// the test driver renders its own triangle and composes
+					// with a 2D overlay. Yields to WebGL when one exists.
+					if (nx_webgl_bridge_is_initialized() &&
+					    !nx_webgl_bridge_is_webgl_owned()) {
+						nx_webgl_bridge_compose_test(
+						    nx_skia_gpu_canvas_surface());
+					}
 					// Composite the persistent canvas surface into the EGL back
 					// buffer + swap. Presenting every frame is correct because
 					// the persistent surface always holds full current content
@@ -2011,6 +2171,9 @@ int main(int argc, char *argv[]) {
 		if (nx_webgl_active()) {
 			nx_webgl_exit();
 		} else if (screen_is_gpu) {
+			// Bridge owns GL handles on Skia's shared context; tear it down
+			// BEFORE the context goes away. Idempotent + no-op when not init.
+			nx_webgl_bridge_exit();
 			nx_skia_gpu_screen_exit();
 		} else {
 			nx_framebuffer_exit();

@@ -2,6 +2,7 @@ import type { PromiseState } from '@nx.js/inspect';
 import type { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
 import type { ImageBitmap } from './canvas/image-bitmap';
 import type { WebGL2RenderingContext } from './canvas/webgl2-rendering-context';
+import type { WebGLRenderingContext } from './canvas/webgl-rendering-context';
 import type { OffscreenCanvas } from './canvas/offscreen-canvas';
 import type { OffscreenCanvasRenderingContext2D } from './canvas/offscreen-canvas-rendering-context-2d';
 import type { Crypto, CryptoKey } from './crypto';
@@ -554,9 +555,13 @@ export interface Init {
 	 * Initializes EGL + an OpenGL ES 3 context on the screen. Returns the
 	 * native context carrier object, or `undefined` when GL init fails.
 	 */
-	webglContextNew(screen: Screen): WebGL2RenderingContext | undefined;
+	webglContextNew(screen: Screen): WebGLRenderingContext | WebGL2RenderingContext | undefined;
+	// Accepts BOTH WebGLRenderingContext (v1, Phase 2.C) and
+	// WebGL2RenderingContext (v2, Phase 2.G) class constructors. The engine
+	// stashes the prototype carrier + installs the methods on whichever class
+	// was passed.
 	webglInitClass(
-		c: ClassOf<WebGL2RenderingContext>,
+		c: ClassOf<WebGLRenderingContext> | ClassOf<WebGL2RenderingContext>,
 		classes: Record<string, unknown>,
 	): void;
 

@@ -4,12 +4,24 @@ import type { AudioBufferSourceNode } from './audio/audio-buffer-source-node';
 import { AudioContext } from './audio/audio-context';
 import type { GainNode } from './audio/gain-node';
 import { DOMException } from './dom-exception';
-import { fetch } from './fetch/fetch';
 import { ErrorEvent, Event } from './polyfills/event';
 import { EventTarget } from './polyfills/event-target';
 import { URL } from './polyfills/url';
 import { clearInterval, setInterval } from './timers';
 import { def } from './utils';
+
+// Late-bound (call-time) globalThis.fetch wrapper — see image.ts for the
+// full rationale + the "CRITICAL: late-bound" gotcha. Same patch reason:
+// `<audio src="brewser://...">` reaches this module, and the package-
+// local ./fetch/fetch only knows http/https/blob/data/file/sdmc/romfs.
+// The fact that boot logs show click.wav loading fine is consistent —
+// click.wav is sdmc:/-rooted, which the local fetch handles.
+function fetch(
+	input: string | URL | Request,
+	init?: RequestInit,
+): Promise<Response> {
+	return globalThis.fetch(input, init);
+}
 
 const HAVE_NOTHING = 0;
 const HAVE_METADATA = 1;
@@ -211,7 +223,12 @@ export class Audio extends EventTarget {
 		this.#readyState = HAVE_NOTHING;
 		this.#buffer = null;
 
-		const url = new URL(this.#src, $.entrypoint);
+		// Late-bound base URL: prefer `document.baseURI` (per-session URL set
+		// by embedders like brewser-runtime). Same pattern as image.ts:src.
+		const baseUrl =
+			(globalThis as { document?: { baseURI?: string } }).document
+				?.baseURI ?? $.entrypoint;
+		const url = new URL(this.#src, baseUrl);
 		this.#currentSrc = url.href;
 
 		fetch(url)

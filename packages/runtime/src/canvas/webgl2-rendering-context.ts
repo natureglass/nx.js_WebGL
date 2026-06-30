@@ -1091,12 +1091,23 @@ export interface WebGL2RenderingContext {
 }
 
 // The numeric GL constants exist on both the class and every instance,
-// matching browser behavior.
+// matching browser behavior. Built as ONE bulk Object.defineProperties
+// call per target (instead of per-key Object.defineProperty in a
+// for-of-destructuring loop over Object.entries) to avoid a V8/aarch64
+// Tegra JIT codegen issue that crashed the engine when ~1160 such
+// installs ran across the v1+v2 module bodies — see
+// NXJS_PATCHES_NEEDED.md #8.
 export interface WebGL2RenderingContext extends Readonly<typeof GL_CONSTANTS> {}
 
-for (const [k, v] of Object.entries(GL_CONSTANTS)) {
-	Object.defineProperty(WebGL2RenderingContext, k, { value: v });
-	Object.defineProperty(WebGL2RenderingContext.prototype, k, { value: v });
+{
+	const keys = Object.keys(GL_CONSTANTS);
+	const descs: PropertyDescriptorMap = {};
+	for (let i = 0; i < keys.length; i++) {
+		const k = keys[i];
+		descs[k] = { value: (GL_CONSTANTS as Record<string, number>)[k] };
+	}
+	Object.defineProperties(WebGL2RenderingContext, descs);
+	Object.defineProperties(WebGL2RenderingContext.prototype, descs);
 }
 def(WebGL2RenderingContext);
 

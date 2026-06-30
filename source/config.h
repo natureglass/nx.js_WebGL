@@ -76,6 +76,20 @@ typedef enum {
 	NX_JIT_OFF,
 } nx_jit_mode_t;
 
+// `[v8] target = auto | hardware | citron`. When `jit = auto` (i.e. the user
+// hasn't pinned JIT mode), the runtime decides whether to force --jitless
+// based on whether it's running on Citron (which suffers phantom JIT-execute
+// faults). `auto` runs the multi-signal detector at boot (see detect.h);
+// `hardware` skips detection and lets regime-based JIT proceed; `citron`
+// skips detection and forces jitless. Explicit override always wins over
+// auto-detect. `jit = on/off` overrides `target` entirely (the user has
+// asked for a specific JIT mode and takes responsibility for it).
+typedef enum {
+	NX_TARGET_AUTO = 0,
+	NX_TARGET_HARDWARE,
+	NX_TARGET_CITRON,
+} nx_target_mode_t;
+
 // Sentinel for nx_config_t::code_headroom_mb meaning "unset — pick a regime
 // default" (application: 64 MiB WASM headroom; applet: 0). UINT32_MAX so an
 // explicit `code_headroom_mb = 0` (disable) is distinguishable from unset.
@@ -165,6 +179,7 @@ typedef struct {
 
 typedef struct {
 	nx_jit_mode_t jit;
+	nx_target_mode_t target; // [v8] target — see nx_target_mode_t doc above
 	char *v8_flags;       // strdup'd app-provided flag string, or NULL
 	uint64_t heap_limit;  // requested heap max in bytes; 0 = use computed default
 	// Extra MiB of JIT code-arena space reserved for WebAssembly (WASM compiles
@@ -185,6 +200,14 @@ typedef struct {
 	// would starve Mesa). An explicit value (incl. 0 = force Skia default)
 	// overrides the regime default.
 	uint32_t gpu_cache_mib;
+	// [webgl] test_fbo: Phase 2.B coexistence smoke driver. When true, the
+	// engine wires the WebGL↔Skia bridge (offscreen FBO + state save/restore
+	// primitive) and per-frame composites a hand-written GL triangle from the
+	// tenant FBO into the screen surface with a 2D overlay on top. Proves the
+	// Phase 0 fbo-spike recipe survives as engine code before Phase 2.C grows
+	// the JS-visible WebGL bridge on top. Defaults false so shell renders
+	// normally with no bridge touched.
+	bool webgl_test_fbo;
 	nx_socket_config_t socket;
 	nx_threadpool_config_t threadpool; // [threadpool] libuv pool overrides
 	nx_console_config_t console; // [console] styling, exposed on $.config.console

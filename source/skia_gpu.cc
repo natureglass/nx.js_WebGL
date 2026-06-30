@@ -2,8 +2,17 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <stdio.h>
+#include <time.h>
+
+#include "cursor.h"
+
+// Boot timing anchor defined in main.cc; populated at the very start of
+// main() so the [skia] (+Nms) log below can report the pre-Skia black
+// ceiling without needing an extra IPC/getter layer. Pure logging hook;
+// no behavior impact when not read.
+extern uint64_t g_boot_t0_ns;
 
 #include "include/core/SkBlendMode.h"
 #include "include/core/SkCanvas.h"
@@ -47,20 +56,34 @@ bool init_egl(NWindow *win) {
 	eglBindAPI(EGL_OPENGL_ES_API);
 	EGLConfig cfg;
 	EGLint num = 0;
-	const EGLint attrs[] = {EGL_RED_SIZE,   8, EGL_GREEN_SIZE,   8,
+	// V8 migration Phase 2.A: bump context to ES3 so the WebGL bridge (Phase
+	// 2.B+) can attach to this single shared context. EGL_RENDERABLE_TYPE =
+	// EGL_OPENGL_ES3_BIT (0x0040) is REQUIRED — without it eglChooseConfig may
+	// hand back an ES2-only config and eglCreateContext(ES3) then fails. Magic
+	// number matches the fbo-spike + upstream webgl.cc pattern so this is
+	// robust to header version drift.
+	const EGLint attrs[] = {EGL_RENDERABLE_TYPE, 0x0040, // EGL_OPENGL_ES3_BIT
+	                        EGL_RED_SIZE,   8, EGL_GREEN_SIZE,   8,
 	                        EGL_BLUE_SIZE,  8, EGL_ALPHA_SIZE,   8,
 	                        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
 	                        EGL_NONE};
 	eglChooseConfig(s_dpy, attrs, &cfg, 1, &num);
-	if (!num)
+	if (!num) {
+		fprintf(stderr, "[skia] eglChooseConfig: no ES3 config\n");
+		fflush(stderr);
 		return false;
+	}
 	s_surf = eglCreateWindowSurface(s_dpy, cfg, win, nullptr);
 	if (!s_surf)
 		return false;
-	const EGLint ca[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+	const EGLint ca[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
 	s_ctx = eglCreateContext(s_dpy, cfg, EGL_NO_CONTEXT, ca);
-	if (!s_ctx)
+	if (!s_ctx) {
+		fprintf(stderr, "[skia] eglCreateContext (ES3) failed: 0x%x\n",
+		        eglGetError());
+		fflush(stderr);
 		return false;
+	}
 	if (eglMakeCurrent(s_dpy, s_surf, s_surf, s_ctx) != EGL_TRUE) {
 		// Without a current context nothing later (swap interval, GL interface,
 		// Ganesh) can work; fail init so the caller falls back to raster.
@@ -95,6 +118,20 @@ sk_sp<SkSurface> nx_skia_gpu_screen_init(u32 width, u32 height, int samples,
 		nx_skia_gpu_screen_exit();
 		return nullptr;
 	}
+	// Smoke confirmation of the ES3 bringup. ES3 advertises GL_VERSION starting
+	// with "OpenGL ES 3" (e.g. "OpenGL ES 3.2 Mesa ..."); if Mesa silently gave
+	// us ES2 the second token reads "2." and the WebGL bridge in 2.B would
+	// later fail to find ES3 entry points. Logged once for the auditor;
+	// Ganesh-GL init below is the load-bearing check.
+	const GLubyte *gl_version = glGetString(GL_VERSION);
+	const GLubyte *gl_vendor = glGetString(GL_VENDOR);
+	const GLubyte *gl_renderer = glGetString(GL_RENDERER);
+	fprintf(stderr, "[skia] GL version=%s vendor=%s renderer=%s\n",
+	        gl_version ? (const char *)gl_version : "(null)",
+	        gl_vendor ? (const char *)gl_vendor : "(null)",
+	        gl_renderer ? (const char *)gl_renderer : "(null)");
+	fflush(stderr);
+
 	SkGraphics::Init();
 	auto iface = GrGLInterfaces::MakeEGL();
 	s_gr = GrDirectContexts::MakeGL(iface);
@@ -167,8 +204,26 @@ sk_sp<SkSurface> nx_skia_gpu_screen_init(u32 width, u32 height, int samples,
 	}
 	s_w = width;
 	s_h = height;
-	fprintf(stderr, "[skia] GPU screen surface %ux%u ready\n", width, height);
-	fflush(stderr);
+	{
+		// Boot-splash residual diagnostic: report ms since main()'s t0.
+		// This delta is T_Skia — the pre-Skia black ceiling that no JS-
+		// side splash can cover (no GPU surface exists before this
+		// line). The splash hoist closes the post-Skia gap; T_Skia is
+		// what's left and the number the user uses to decide whether
+		// to design a C-side framebuffer-splash-before-Skia patch.
+		uint64_t _ms = 0;
+		if (g_boot_t0_ns != 0) {
+			struct timespec _ts;
+			clock_gettime(CLOCK_MONOTONIC, &_ts);
+			uint64_t _now = (uint64_t)_ts.tv_sec * 1000000000ull +
+			                (uint64_t)_ts.tv_nsec;
+			_ms = (_now - g_boot_t0_ns) / 1000000ull;
+		}
+		fprintf(stderr,
+		        "[skia] GPU screen surface %ux%u ready (+%llums since t0)\n",
+		        width, height, (unsigned long long)_ms);
+		fflush(stderr);
+	}
 	return s_canvas;
 }
 
@@ -194,12 +249,26 @@ void nx_skia_gpu_present(void) {
 		paint.setBlendMode(SkBlendMode::kSrc);
 		c->drawImage(img, 0, 0, SkSamplingOptions(), &paint);
 	}
+	// Cursor compositor (re-port of QuickJS-era composite_cursor_overlay,
+	// NXJS_PATCHES_NEEDED.md #4). Blends the current cursor SkImage onto the
+	// EGL back-buffer ONLY — s_canvas is never touched, so the next frame's
+	// canvas blit above gives a clean surface and the cursor doesn't trail.
+	// Animated cursors advance via armGetSystemTick() inside the call, so
+	// the wait/progress spinner stays smooth even when JS is fully blocked
+	// on a synchronous chunk (e.g. navigateTo's grid build). No-op when no
+	// JS code has pushed an overlay via screen.setCursorOverlay et al.
+	nx_cursor_composite(s_fbo.get());
 	s_gr->flush(s_fbo.get());
 	s_gr->submit();
 	eglSwapBuffers(s_dpy, s_surf);
 }
 
 void nx_skia_gpu_screen_exit(void) {
+	// Release any cached cursor SkImages BEFORE the GrDirectContext goes
+	// away — the SkImage handles reference GPU-uploaded raster textures
+	// that the context owns. Free order matters: cursor → canvas → fbo →
+	// gr_context. Idempotent (safe to call again at teardown).
+	nx_cursor_exit();
 	s_canvas.reset();
 	s_fbo.reset();
 	if (s_gr) {
@@ -222,3 +291,20 @@ void nx_skia_gpu_screen_exit(void) {
 		s_dpy = nullptr;
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Shared-context accessors (V8 migration Phase 2.A).
+//
+// Phase 2.A only EXPOSES these — the WebGL stub does not yet call them. Phase
+// 2.B grows the bridge into the stub and attaches via these handles per the
+// fbo-spike recipe (gl_state_save → webgl → restore → grCtx->resetContext).
+//
+// All four return null before init or after exit; treat that as "GPU path not
+// available" the same way the rest of the engine treats nx_skia_gpu_screen_init
+// returning nullptr (caller falls back to raster).
+
+EGLDisplay nx_skia_gpu_egl_display(void) { return s_dpy; }
+EGLSurface nx_skia_gpu_egl_surface(void) { return s_surf; }
+EGLContext nx_skia_gpu_egl_context(void) { return s_ctx; }
+GrDirectContext *nx_skia_gpu_gr_context(void) { return s_gr.get(); }
+SkSurface *nx_skia_gpu_canvas_surface(void) { return s_canvas.get(); }

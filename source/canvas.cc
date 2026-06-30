@@ -11,6 +11,7 @@
 #include "canvas.h"
 #include "async.h"
 #include "canvas_path.h"
+#include "cursor.h"
 #include "dommatrix.h"
 #include "error.h"
 #include "font.h"
@@ -1695,6 +1696,24 @@ void nx_canvas_context_2d_fill_text(const FunctionCallbackInfo<Value> &info) {
 	if (!*text)
 		return;
 	double scale = 1., font_size = context->state->font_size;
+	// 2026-06-30 fuzz fix: pin the SHARED ft_face / hb_font scale to this
+	// ctx's font_size right before shaping + drawing. nx.js uses a 1:1
+	// mapping between FontFace and nx_font_face_t — so two 2D contexts
+	// that both set font="...system-ui" share the same FT_Face and
+	// hb_font. The shell painter does save() / set font to a different
+	// system-ui FontFace / fillText / restore() — and restore() calls
+	// set_font_size(outer.font_size) where outer.font_face happens to
+	// be cube-status's FontFace (because both share the first-registered
+	// system-ui), with outer.font_size = 10 (the canvas-state default).
+	// Net effect: every shell restore() shrinks cube-status's ft_face
+	// to size 10. Next cube-status renderStatus's fillText sees ft_face
+	// at 10, rendering text at 10 px instead of 14 px — the "1 px
+	// smaller, fuzzy" symptom the user reported. Re-applying
+	// set_font_size here makes fillText invariant to whatever the
+	// shared ft_face's last state was. Cost: 1 FT_Set_Char_Size + 1
+	// hb_font_set_scale per fillText (~100 ns total — negligible vs the
+	// drawGlyphs cost below).
+	set_font_size(context, font_size);
 	if (info.Length() >= 4 && info[3]->IsNumber()) {
 		double max_width;
 		if (!info[3]->NumberValue(iso->GetCurrentContext()).To(&max_width))
@@ -1729,6 +1748,10 @@ void nx_canvas_context_2d_stroke_text(
 	if (!*text)
 		return;
 	double scale = 1., font_size = context->state->font_size;
+	// Pin the shared ft_face / hb_font scale to this ctx's font_size before
+	// shaping — same reason as the matching call in fill_text above (see
+	// extensive comment there for the cross-context state corruption story).
+	set_font_size(context, font_size);
 	if (info.Length() >= 4 && info[3]->IsNumber()) {
 		double max_width;
 		if (!info[3]->NumberValue(iso->GetCurrentContext()).To(&max_width))
@@ -1768,6 +1791,9 @@ void nx_canvas_context_2d_measure_text(
 		metrics->Set(jsctx, nx_str(iso, k), Number::New(iso, v)).Check();
 	};
 	double width = 0;
+	// Pin the shared ft_face / hb_font scale to this ctx's font_size before
+	// shaping — see the matching call in fill_text for the rationale.
+	set_font_size(context, context->state->font_size);
 	if (context->state->hb_font) {
 		String::Utf8Value text(iso, info[0]);
 		hb_buffer_t *buf = hb_buffer_create();
@@ -1904,6 +1930,116 @@ void nx_canvas_set_height(const FunctionCallbackInfo<Value> &info) {
 	canvas->surface_dirty = true;
 }
 
+// ---------------------------------------------------------------------------
+// Cursor overlay bindings — Screen prototype (NXJS_PATCHES_NEEDED.md #4
+// re-port). The runtime cursor in brewser-runtime-v8/src/input/page-mouse-
+// forwarder.ts calls these four methods on the screen object. The actual
+// composite lives in cursor.cc; we just marshal JS args into raw C buffers
+// and forward. Bindings are registered on the same Screen prototype as
+// width/height/getContext via nx_canvas_init_class below.
+//
+// JS signatures (matched verbatim against the runtime's syncCursorOverlay):
+//   screen.setCursorOverlay(x, y, rgba, w, h)
+//   screen.setAnimatedCursorOverlay(x, y, packedRgba, w, h, frameCount, delaysMs)
+//   screen.setCursorOverlayPosition(x, y)
+//   screen.clearCursorOverlay()
+//
+// rgba / packedRgba are Uint8ClampedArray or Uint8Array (both qualify as
+// ArrayBufferView); delaysMs is Uint16Array (the runtime registry packs
+// per-frame delays as Uint16). All bytes are non-premultiplied RGBA per
+// ImageData spec — cursor.cc premultiplies at upload for Skia's kPremul
+// drawImage path.
+
+namespace {
+
+// Mirrors view_bytes in webgl.cc — but webgl.cc's copy is in its own
+// anonymous namespace so we re-declare here rather than expose it
+// cross-module (each module owning its own arg-marshal helpers is the
+// existing convention).
+const uint8_t *u8_view_bytes(Local<Value> v, size_t *out_byte_len) {
+	if (v.IsEmpty() || !v->IsArrayBufferView()) {
+		if (out_byte_len) *out_byte_len = 0;
+		return nullptr;
+	}
+	Local<ArrayBufferView> view = v.As<ArrayBufferView>();
+	if (out_byte_len) *out_byte_len = view->ByteLength();
+	return (const uint8_t *)view->Buffer()->Data() + view->ByteOffset();
+}
+
+// Specifically for delays_ms (Uint16Array). Accepts any TypedArray whose
+// underlying buffer is 2-byte aligned — we treat the bytes as uint16_t
+// host-endian (little-endian on aarch64-Switch, matching what the
+// runtime's `new Uint16Array(...)` actually stores).
+const uint16_t *u16_view_count(Local<Value> v, size_t *out_count) {
+	if (v.IsEmpty() || !v->IsArrayBufferView()) {
+		if (out_count) *out_count = 0;
+		return nullptr;
+	}
+	Local<ArrayBufferView> view = v.As<ArrayBufferView>();
+	const size_t byte_len = view->ByteLength();
+	if (out_count) *out_count = byte_len / 2;
+	return (const uint16_t *)((const uint8_t *)view->Buffer()->Data()
+	                          + view->ByteOffset());
+}
+
+void js_set_cursor_overlay(const FunctionCallbackInfo<Value> &info) {
+	// (x, y, rgba, width, height) — 5 args.
+	Isolate *iso = info.GetIsolate();
+	Local<Context> ctx = iso->GetCurrentContext();
+	if (info.Length() < 5) return;
+	int32_t x = 0, y = 0;
+	uint32_t w = 0, h = 0;
+	if (!info[0]->Int32Value(ctx).To(&x)) return;
+	if (!info[1]->Int32Value(ctx).To(&y)) return;
+	if (!info[3]->Uint32Value(ctx).To(&w)) return;
+	if (!info[4]->Uint32Value(ctx).To(&h)) return;
+	size_t rgba_bytes = 0;
+	const uint8_t *rgba = u8_view_bytes(info[2], &rgba_bytes);
+	if (!rgba || rgba_bytes < (size_t)w * (size_t)h * 4) return;
+	nx_cursor_set_static(x, y, rgba, w, h);
+}
+
+void js_set_animated_cursor_overlay(const FunctionCallbackInfo<Value> &info) {
+	// (x, y, packedRgba, width, height, frameCount, delaysMs) — 7 args.
+	Isolate *iso = info.GetIsolate();
+	Local<Context> ctx = iso->GetCurrentContext();
+	if (info.Length() < 7) return;
+	int32_t x = 0, y = 0;
+	uint32_t w = 0, h = 0, fc = 0;
+	if (!info[0]->Int32Value(ctx).To(&x)) return;
+	if (!info[1]->Int32Value(ctx).To(&y)) return;
+	if (!info[3]->Uint32Value(ctx).To(&w)) return;
+	if (!info[4]->Uint32Value(ctx).To(&h)) return;
+	if (!info[5]->Uint32Value(ctx).To(&fc)) return;
+	size_t packed_bytes = 0;
+	const uint8_t *packed = u8_view_bytes(info[2], &packed_bytes);
+	if (!packed) return;
+	const size_t needed_packed = (size_t)fc * (size_t)w * (size_t)h * 4;
+	if (packed_bytes < needed_packed) return;
+	size_t delays_count = 0;
+	const uint16_t *delays = u16_view_count(info[6], &delays_count);
+	if (!delays || delays_count < fc) return;
+	nx_cursor_set_animated(x, y, packed, w, h, fc, delays);
+}
+
+void js_set_cursor_overlay_position(
+    const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Context> ctx = iso->GetCurrentContext();
+	if (info.Length() < 2) return;
+	int32_t x = 0, y = 0;
+	if (!info[0]->Int32Value(ctx).To(&x)) return;
+	if (!info[1]->Int32Value(ctx).To(&y)) return;
+	nx_cursor_set_position(x, y);
+}
+
+void js_clear_cursor_overlay(const FunctionCallbackInfo<Value> &info) {
+	(void)info;
+	nx_cursor_clear();
+}
+
+}  // namespace
+
 void nx_canvas_init_class(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	Local<Context> jsctx = iso->GetCurrentContext();
@@ -1915,6 +2051,14 @@ void nx_canvas_init_class(const FunctionCallbackInfo<Value> &info) {
 	NX_DEF_GETSET(proto, "width", nx_canvas_get_width, nx_canvas_set_width);
 	NX_DEF_GETSET(proto, "height", nx_canvas_get_height, nx_canvas_set_height);
 	NX_DEF_FUNC(proto, "toDataURL", nx_canvas_proto_to_data_url, 0);
+	// Cursor overlay bindings (NXJS_PATCHES_NEEDED.md #4 re-port). The
+	// runtime's probeNativeCursorOverlay feature-detects setCursorOverlay
+	// + clearCursorOverlay together, so registering all four atomically
+	// here makes the flip-to-engine-path single-commit.
+	NX_DEF_FUNC(proto, "setCursorOverlay",         js_set_cursor_overlay, 5);
+	NX_DEF_FUNC(proto, "setAnimatedCursorOverlay", js_set_animated_cursor_overlay, 7);
+	NX_DEF_FUNC(proto, "setCursorOverlayPosition", js_set_cursor_overlay_position, 2);
+	NX_DEF_FUNC(proto, "clearCursorOverlay",       js_clear_cursor_overlay, 0);
 }
 
 void nx_canvas_context_2d_new(const FunctionCallbackInfo<Value> &info) {

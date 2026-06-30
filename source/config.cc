@@ -133,6 +133,19 @@ static int ini_cb(void *user, const char *section, const char *name,
 				cfg_log("v8.jit=\"%s\" not honored: invalid (use auto|on|off), "
 				        "using auto",
 				        value);
+		} else if (str_ieq(name, "target")) {
+			if (str_ieq(value, "auto"))
+				cfg->target = NX_TARGET_AUTO;
+			else if (str_ieq(value, "hardware") || str_ieq(value, "hw") ||
+			         str_ieq(value, "switch"))
+				cfg->target = NX_TARGET_HARDWARE;
+			else if (str_ieq(value, "citron") || str_ieq(value, "emulator") ||
+			         str_ieq(value, "emu"))
+				cfg->target = NX_TARGET_CITRON;
+			else
+				cfg_log("v8.target=\"%s\" not honored: invalid "
+				        "(use auto|hardware|citron), using auto",
+				        value);
 		} else if (str_ieq(name, "flags")) {
 			free(cfg->v8_flags);
 			cfg->v8_flags = strdup(value);
@@ -215,6 +228,27 @@ static int ini_cb(void *user, const char *section, const char *name,
 			}
 		} else {
 			cfg_log("renderer.%s ignored: unknown key", name);
+		}
+		return 1;
+	}
+
+	if (str_ieq(section, "webgl")) {
+		if (str_ieq(name, "test_fbo")) {
+			// Phase 2.B coexistence smoke flag. Accept the same boolean spellings
+			// the rest of the engine uses elsewhere.
+			if (str_ieq(value, "true") || str_ieq(value, "on") ||
+			    str_ieq(value, "1") || str_ieq(value, "yes")) {
+				cfg->webgl_test_fbo = true;
+			} else if (str_ieq(value, "false") || str_ieq(value, "off") ||
+			           str_ieq(value, "0") || str_ieq(value, "no")) {
+				cfg->webgl_test_fbo = false;
+			} else {
+				cfg_log("webgl.test_fbo=\"%s\" not honored: invalid "
+				        "(use true|false|on|off|1|0|yes|no)",
+				        value);
+			}
+		} else {
+			cfg_log("webgl.%s ignored: unknown key", name);
 		}
 		return 1;
 	}
@@ -339,6 +373,7 @@ void nx_config_defaults(nx_config_t *cfg) {
 	cfg->heap_limit = 0;
 	cfg->code_headroom_mb = NX_CODE_HEADROOM_AUTO;
 	cfg->gpu_cache_mib = NX_GPU_CACHE_AUTO;
+	cfg->webgl_test_fbo = false;
 	cfg->loaded = false;
 }
 

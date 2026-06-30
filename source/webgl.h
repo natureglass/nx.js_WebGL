@@ -37,3 +37,13 @@ void nx_screen_release_for_webgl(v8::Isolate *iso,
 // builtin construction). webgl.cc returns null from getContext('webgl2') in
 // this regime unless `[renderer] mode = gpu` explicitly opts in.
 bool nx_tight_memory(void);
+
+// Phase 2.C present-hook integration. Called from main.cc's GPU canvas
+// present branch IMMEDIATELY BEFORE nx_skia_gpu_present(). Closes the WebGL
+// bridge's per-frame bracket if open (restores Skia's GL state +
+// grCtx->resetContext) and composes the tenant FBO into `target` (Skia's
+// persistent canvas surface). Both halves are dirty-gated — cheap no-op
+// when no WebGL frame happened. `target` is borrowed; the function does not
+// retain it.
+class SkSurface;
+void nx_webgl_compose_if_active(SkSurface *target);

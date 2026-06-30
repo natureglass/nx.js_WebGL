@@ -1,7 +1,30 @@
 import { $ } from './$';
 import { createInternal, def, proto } from './utils';
-import { fetch } from './fetch/fetch';
 import { URL } from './polyfills/url';
+
+// Late-bound (call-time) globalThis.fetch wrapper. This module DOES NOT
+// import `./fetch/fetch` directly: embedders (e.g. brewser-runtime's
+// BrowserResourceLoader for `brewser://` URLs) install their own
+// `globalThis.fetch` wrapper at app-session start to extend the set of
+// supported schemes beyond this package's built-in
+// http/https/blob/data/file/sdmc/romfs handlers. Recapitulates the
+// QuickJS-era patch that the V8 migration dropped — see
+// nxjs-source-v8/MIGRATION_PLAN.md "QuickJS-era engine patches to re-apply
+// on V8" catalog.
+//
+// CRITICAL: late-bound. The function body calls `globalThis.fetch` at
+// CALL TIME, not at module init. An import-time capture
+// (`const fetch = globalThis.fetch`) would freeze the pre-wrapper engine
+// fetch (this module loads at engine boot, embedders install the wrapper
+// at session start) and the deferral would do nothing. Any future
+// re-application of this style of patch must preserve the call-time
+// lookup.
+function fetch(
+	input: string | URL | Request,
+	init?: RequestInit,
+): Promise<Response> {
+	return globalThis.fetch(input, init);
+}
 import { Event, ErrorEvent } from './polyfills/event';
 import { EventTarget } from './polyfills/event-target';
 import type { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
@@ -84,7 +107,15 @@ export class Image extends EventTarget {
 	}
 
 	set src(val: string) {
-		const url = new URL(val, $.entrypoint);
+		// Late-bound base URL: prefer `document.baseURI` at call time (set
+		// per-session by embedders like brewser-runtime, so each app's
+		// `./assets/foo.png` resolves against the app's page URL, not the
+		// engine entrypoint). Falls back to `$.entrypoint` for standalone
+		// nx.js apps where no document is present.
+		const baseUrl =
+			(globalThis as { document?: { baseURI?: string } }).document
+				?.baseURI ?? $.entrypoint;
+		const url = new URL(val, baseUrl);
 		const internal = _(this);
 		internal.src = url;
 		internal.complete = false;

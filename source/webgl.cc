@@ -1,49 +1,83 @@
 /**
- * WebGL2 — V8 bindings over a real OpenGL ES 3 context (EGL + Mesa/nouveau).
+ * WebGL — Phase 2.C: WebGL1 context binding for inline canvases.
  *
- * The screen is the only canvas that can have a WebGL2 context. The app
- * renders into the EGL window surface's default framebuffer (FBO 0) and the
- * main loop presents with eglSwapBuffers (see nx_webgl_present). There is a
- * single module-global context (`st`); the JS context object is just a
- * prototype carrier — every binding operates on the current GL context.
+ * Phase 2.A laid the shared ES3 context (Skia owns EGL). Phase 2.B realized
+ * the coexistence primitive (state save/restore + tenant offscreen FBO +
+ * SkImages composite, hardware-proven on Tegra). Phase 2.C grows this file
+ * from a null stub into a real WebGL1 context factory: getContext('webgl')
+ * returns a non-null object backed by raw GLES3 dispatches into the 2.B
+ * tenant FBO, wrapped per-frame in the 2.B bracket.
  *
- * Design notes:
- *   - WebGL object types (WebGLBuffer, WebGLTexture, ...) are wrapped objects
- *     holding the GL name. The TS side passes the JS classes to
- *     $.webglInitClass so freshly-minted objects get the right prototype
- *     (instanceof works). GC finalizers free only the wrapper struct — GL
- *     resources are freed by the explicit delete*() calls (or context exit).
- *   - WebGL-only pixel store parameters (UNPACK_FLIP_Y_WEBGL,
- *     UNPACK_PREMULTIPLY_ALPHA_WEBGL) are emulated at texImage2D/texSubImage2D
- *     upload time for ArrayBufferView sources.
- *   - A synthetic error slot backs WebGL-level validation failures (e.g.
- *     too-small ArrayBufferView for an upload); getError() drains it before
- *     glGetError().
- *   - Uploads/readbacks are size-validated against the source/destination
- *     view so a short buffer can't make the driver read/write out of bounds.
+ * Architecture:
+ *   - One module-global WebGLState (`st`). The state matches upstream V8's
+ *     beta.5 pattern (commit fb0468f) — WebGL object types (Buffer, Texture,
+ *     Program, ...) are wrapped objects holding the GL name; the TS side
+ *     passes the JS classes to $.webglInitClass so freshly-minted objects
+ *     get the right prototype (instanceof works).
+ *   - Each method call lazily ENTERs the per-frame bracket: snapshots Skia's
+ *     GL state via nx_gl_state_save, binds the tenant FBO. Subsequent calls
+ *     in the same frame stay in the bracket.
+ *   - main.cc's present hook calls nx_webgl_compose_if_active() BEFORE
+ *     nx_skia_gpu_present(): if the bracket is open, exits it (restores
+ *     state + grCtx->resetContext()) then asks the bridge to compose the
+ *     FBO into Skia's persistent canvas surface (cheap no-op when the FBO
+ *     wasn't touched).
+ *   - WebGL-only pixel store flags (UNPACK_FLIP_Y_WEBGL, UNPACK_PREMULTIPLY)
+ *     are tracked here; emulation at upload time is a 2.E task — for 2.C
+ *     they're stored and otherwise ignored (geometry-cube sets them to
+ *     defaults).
+ *   - A synthetic error slot backs WebGL-level validation failures
+ *     (e.g. invalid object handles); getError() drains it before glGetError.
+ *
+ * Phase 2.C IS NOT the full 220-method surface. We implement what
+ * geometry-cube + Three.js's MeshBasic path empirically calls; 2.E is where
+ * the bulk semantics move to brewser-runtime TS and the rest of the surface
+ * grows in. Methods the demo doesn't call are not implemented — calling
+ * them throws TypeError ("foo is not a function"), which the diagnostic
+ * Proxy in webgl-shim.ts logs so the next iteration can add them.
+ *
+ * Phase 2.G adds WebGL2 (extends this class).
  */
 #include "webgl.h"
+#include "webgl_bridge.h"
+#include "skia_gpu.h"
 #include "error.h"
 #include "wrap.h"
 
 #include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <switch.h>
 
 #include <string>
 #include <vector>
 
+#include "include/gpu/ganesh/GrDirectContext.h"
+
 using namespace v8;
 
 // WebGL-specific enums (not part of GLES headers).
-#define NX_GL_UNPACK_FLIP_Y_WEBGL 0x9240
-#define NX_GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL 0x9241
-#define NX_GL_UNPACK_COLORSPACE_CONVERSION_WEBGL 0x9243
+#define NX_GL_UNPACK_FLIP_Y_WEBGL                  0x9240
+#define NX_GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL       0x9241
+#define NX_GL_UNPACK_COLORSPACE_CONVERSION_WEBGL   0x9243
+#define NX_GL_CONTEXT_LOST_WEBGL                   0x9242
+
+// Common WebGL1 pname values returned from getParameter (subset).
+#define NX_GL_MAX_VERTEX_ATTRIBS                   0x8869
+#define NX_GL_MAX_TEXTURE_SIZE                     0x0D33
+#define NX_GL_MAX_TEXTURE_IMAGE_UNITS              0x8872
+#define NX_GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS     0x8B4D
+#define NX_GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS       0x8B4C
+#define NX_GL_MAX_FRAGMENT_UNIFORM_VECTORS         0x8DFD
+#define NX_GL_MAX_VERTEX_UNIFORM_VECTORS           0x8DFB
+#define NX_GL_MAX_VARYING_VECTORS                  0x8DFC
+#define NX_GL_MAX_CUBE_MAP_TEXTURE_SIZE            0x851C
+#define NX_GL_MAX_RENDERBUFFER_SIZE                0x84E8
+#define NX_GL_MAX_VIEWPORT_DIMS                    0x0D3A
+#define NX_GL_ALIASED_LINE_WIDTH_RANGE             0x846E
+#define NX_GL_ALIASED_POINT_SIZE_RANGE             0x846D
 
 namespace {
 
@@ -55,14 +89,9 @@ enum ObjKind : uint8_t {
 	K_BUFFER,
 	K_FRAMEBUFFER,
 	K_PROGRAM,
-	K_QUERY,
 	K_RENDERBUFFER,
-	K_SAMPLER,
 	K_SHADER,
 	K_TEXTURE,
-	K_TRANSFORM_FEEDBACK,
-	K_VERTEX_ARRAY,
-	K_SYNC,
 	K_UNIFORM_LOCATION,
 	K_ACTIVE_INFO,
 	K_SHADER_PRECISION_FORMAT,
@@ -71,29 +100,32 @@ enum ObjKind : uint8_t {
 
 struct GLObj {
 	uint32_t id;
-	GLsync sync;
-	int32_t loc; // uniform location (K_UNIFORM_LOCATION)
+	int32_t loc; // uniform location for K_UNIFORM_LOCATION
 	uint8_t kind;
 };
 
 struct WebGLState {
-	EGLDisplay dpy = EGL_NO_DISPLAY;
-	EGLSurface surf = EGL_NO_SURFACE;
-	EGLContext ctx = EGL_NO_CONTEXT;
-	int width = 0;
-	int height = 0;
-	bool active = false;
-	// The default framebuffer was drawn to since the last present.
-	bool dirty = false;
+	bool bracket_open = false;
+	nx_gl_state_snap_t snap;
 	GLenum synthetic_error = GL_NO_ERROR;
-	// WebGL-only pixel store emulation state.
+	// WebGL-only pixel store emulation state (stored only; 2.E does the work).
 	bool unpack_flip_y = false;
 	bool unpack_premultiply = false;
 	int unpack_alignment = 4;
-	int unpack_row_length = 0;
 	int pack_alignment = 4;
-	// Currently bound DRAW_FRAMEBUFFER GL name (0 = default/back buffer).
-	uint32_t draw_fbo = 0;
+	// Currently bound DRAW_FRAMEBUFFER as the JS sees it. 0 = "default" =
+	// tenant FBO (the only difference from a browser WebGL where 0 = swap
+	// chain back buffer). When the user binds a non-null framebuffer object,
+	// we forward the FBO name directly.
+	uint32_t bound_fbo_js = 0;
+	// Bookkeeping for the per-frame "did we touch the FBO?" signal — set when
+	// the bound target IS the default (tenant) FBO. The bridge dirties on
+	// every draw/clear that lands in tenant; non-default-FBO writes don't.
+	bool draw_into_default = true;
+	// Drawing buffer dimensions (canvas w/h reported via drawingBufferWidth/
+	// drawingBufferHeight, also drives default viewport / scissor).
+	int width = 640;
+	int height = 360;
 	// Prototypes for the WebGL object classes (set by $.webglInitClass).
 	Global<Object> protos[K_COUNT];
 };
@@ -103,13 +135,13 @@ WebGLState *st = nullptr;
 void free_gl_obj(GLObj *o) { delete o; }
 
 Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
-                         GLsync sync = nullptr, GLint loc = -1) {
+                         GLint loc = -1) {
 	Local<Object> obj = nx::NewWrapped(iso);
 	if (st && !st->protos[kind].IsEmpty()) {
 		obj->SetPrototype(iso->GetCurrentContext(), st->protos[kind].Get(iso))
 		    .Check();
 	}
-	GLObj *o = new GLObj{id, sync, loc, kind};
+	GLObj *o = new GLObj{id, loc, kind};
 	nx::Wrap<GLObj>(iso, obj, o, free_gl_obj);
 	return obj;
 }
@@ -120,11 +152,14 @@ GLObj *get_gl_obj(Local<Value> v) {
 	return nx::Unwrap<GLObj>(v);
 }
 
-// GL name of a WebGL object argument (0 for null/undefined, matching GL's
-// "no object" semantics).
 GLuint obj_id(Local<Value> v) {
 	GLObj *o = get_gl_obj(v);
 	return o ? o->id : 0;
+}
+
+GLint uniform_loc(Local<Value> v) {
+	GLObj *o = get_gl_obj(v);
+	return (o && o->kind == K_UNIFORM_LOCATION) ? o->loc : -1;
 }
 
 void record_error(GLenum err) {
@@ -132,18 +167,11 @@ void record_error(GLenum err) {
 		st->synthetic_error = err;
 }
 
-// Mark the default framebuffer dirty (present needed) when it is the current
-// draw target.
-inline void mark_dirty() {
-	if (st && st->draw_fbo == 0)
-		st->dirty = true;
-}
-
-// ---------------------------------------------------------------------------
-// Argument helpers
-// ---------------------------------------------------------------------------
-
 inline Local<Context> cur(Isolate *iso) { return iso->GetCurrentContext(); }
+
+// ---------------------------------------------------------------------------
+// Argument unwrap helpers
+// ---------------------------------------------------------------------------
 
 inline uint32_t a_u32(const FunctionCallbackInfo<Value> &info, int i) {
 	return info[i]->Uint32Value(cur(info.GetIsolate())).FromMaybe(0);
@@ -164,2696 +192,1507 @@ inline int64_t a_i64(const FunctionCallbackInfo<Value> &info, int i) {
 	return info[i]->IntegerValue(cur(info.GetIsolate())).FromMaybe(0);
 }
 
-// Raw bytes of an ArrayBufferView (honoring byteOffset). Returns nullptr when
-// not a view. elem_size receives the per-element byte width (1 for DataView).
-uint8_t *view_bytes(Local<Value> v, size_t *len, size_t *elem_size = nullptr) {
+// Returns raw bytes of any ArrayBufferView (honoring byteOffset).
+uint8_t *view_bytes(Local<Value> v, size_t *len) {
 	if (v.IsEmpty() || !v->IsArrayBufferView()) {
-		if (len)
-			*len = 0;
+		if (len) *len = 0;
 		return nullptr;
 	}
 	Local<ArrayBufferView> view = v.As<ArrayBufferView>();
-	if (len)
-		*len = view->ByteLength();
-	if (elem_size) {
-		*elem_size = 1;
-		if (v->IsTypedArray()) {
-			Local<TypedArray> ta = v.As<TypedArray>();
-			size_t n = ta->Length();
-			if (n > 0)
-				*elem_size = ta->ByteLength() / n;
-		}
-	}
+	if (len) *len = view->ByteLength();
 	return (uint8_t *)view->Buffer()->Data() + view->ByteOffset();
 }
 
-// Numeric list helper: extracts a typed pointer + element count from either a
-// matching TypedArray (zero-copy) or a plain JS array (copied into `tmp`).
-// srcOffset/srcLength are in elements (WebGL2 overloads); 0/0 = whole list.
-template <typename T, typename TA>
-bool get_list(Isolate *iso, Local<Value> v, bool is_ta, std::vector<T> &tmp,
-              const T **ptr, size_t *count, uint32_t srcOffset = 0,
-              uint32_t srcLength = 0) {
-	if (!v.IsEmpty() && is_ta) {
-		Local<TA> ta = v.As<TA>();
-		size_t n = ta->Length();
-		if (srcOffset > n) {
-			record_error(GL_INVALID_VALUE);
-			return false;
-		}
-		size_t avail = n - srcOffset;
-		size_t want = srcLength ? srcLength : avail;
-		if (want > avail) {
-			record_error(GL_INVALID_VALUE);
-			return false;
-		}
-		*ptr = (const T *)((uint8_t *)ta->Buffer()->Data() + ta->ByteOffset()) +
-		       srcOffset;
-		*count = want;
+// Extract a contiguous f32 list from either Float32Array (zero-copy) or a
+// plain JS array (copied into `tmp`).
+bool f32_list(Isolate *iso, Local<Value> v, std::vector<float> &tmp,
+              const float **out, size_t *n) {
+	if (!v.IsEmpty() && v->IsFloat32Array()) {
+		Local<Float32Array> ta = v.As<Float32Array>();
+		*n = ta->Length();
+		*out = (const float *)((uint8_t *)ta->Buffer()->Data() + ta->ByteOffset());
 		return true;
 	}
 	if (!v.IsEmpty() && v->IsArray()) {
 		Local<Array> arr = v.As<Array>();
 		Local<Context> ctx = cur(iso);
-		uint32_t n = arr->Length();
-		if (srcOffset > n) {
-			record_error(GL_INVALID_VALUE);
-			return false;
-		}
-		uint32_t want = srcLength ? srcLength : (n - srcOffset);
-		if (srcOffset + want > n) {
-			record_error(GL_INVALID_VALUE);
-			return false;
-		}
-		tmp.resize(want);
-		for (uint32_t i = 0; i < want; i++) {
+		uint32_t len = arr->Length();
+		tmp.resize(len);
+		for (uint32_t i = 0; i < len; i++) {
 			Local<Value> el;
-			double d = 0;
-			if (arr->Get(ctx, srcOffset + i).ToLocal(&el))
-				d = el->NumberValue(ctx).FromMaybe(0.0);
-			tmp[i] = (T)d;
+			tmp[i] = 0.f;
+			if (arr->Get(ctx, i).ToLocal(&el))
+				tmp[i] = (float)el->NumberValue(ctx).FromMaybe(0.0);
 		}
-		*ptr = tmp.data();
-		*count = want;
+		*out = tmp.data();
+		*n = tmp.size();
 		return true;
 	}
-	record_error(GL_INVALID_VALUE);
 	return false;
 }
 
-inline bool get_f32_list(Isolate *iso, Local<Value> v, std::vector<float> &tmp,
-                         const float **ptr, size_t *count,
-                         uint32_t srcOffset = 0, uint32_t srcLength = 0) {
-	return get_list<float, Float32Array>(iso, v,
-	                                     !v.IsEmpty() && v->IsFloat32Array(),
-	                                     tmp, ptr, count, srcOffset, srcLength);
-}
-inline bool get_i32_list(Isolate *iso, Local<Value> v, std::vector<int32_t> &tmp,
-                         const int32_t **ptr, size_t *count,
-                         uint32_t srcOffset = 0, uint32_t srcLength = 0) {
-	return get_list<int32_t, Int32Array>(iso, v,
-	                                     !v.IsEmpty() && v->IsInt32Array(),
-	                                     tmp, ptr, count, srcOffset, srcLength);
-}
-inline bool get_u32_list(Isolate *iso, Local<Value> v,
-                         std::vector<uint32_t> &tmp, const uint32_t **ptr,
-                         size_t *count, uint32_t srcOffset = 0,
-                         uint32_t srcLength = 0) {
-	return get_list<uint32_t, Uint32Array>(iso, v,
-	                                       !v.IsEmpty() && v->IsUint32Array(),
-	                                       tmp, ptr, count, srcOffset,
-	                                       srcLength);
-}
-
-// Read a JS array of GLenums (e.g. drawBuffers / invalidateFramebuffer).
-bool get_enum_list(Isolate *iso, Local<Value> v, std::vector<GLenum> &out) {
-	if (v.IsEmpty() || !v->IsArray())
-		return false;
-	Local<Array> arr = v.As<Array>();
-	Local<Context> ctx = cur(iso);
-	uint32_t n = arr->Length();
-	out.resize(n);
-	for (uint32_t i = 0; i < n; i++) {
-		Local<Value> el;
-		out[i] = 0;
-		if (arr->Get(ctx, i).ToLocal(&el))
-			out[i] = el->Uint32Value(ctx).FromMaybe(0);
+// Extract an i32 list from Int32Array / plain JS array.
+bool i32_list(Isolate *iso, Local<Value> v, std::vector<int32_t> &tmp,
+              const int32_t **out, size_t *n) {
+	if (!v.IsEmpty() && v->IsInt32Array()) {
+		Local<Int32Array> ta = v.As<Int32Array>();
+		*n = ta->Length();
+		*out = (const int32_t *)((uint8_t *)ta->Buffer()->Data() + ta->ByteOffset());
+		return true;
 	}
-	return true;
-}
-
-Local<Value> make_f32_array(Isolate *iso, const float *data, size_t n) {
-	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
-	memcpy(ab->Data(), data, n * 4);
-	return Float32Array::New(ab, 0, n);
-}
-Local<Value> make_i32_array(Isolate *iso, const int32_t *data, size_t n) {
-	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
-	memcpy(ab->Data(), data, n * 4);
-	return Int32Array::New(ab, 0, n);
-}
-Local<Value> make_u32_array(Isolate *iso, const uint32_t *data, size_t n) {
-	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
-	memcpy(ab->Data(), data, n * 4);
-	return Uint32Array::New(ab, 0, n);
-}
-
-// ---------------------------------------------------------------------------
-// Pixel size math (upload/readback validation + flip-Y emulation)
-// ---------------------------------------------------------------------------
-
-size_t bytes_per_pixel(GLenum format, GLenum type) {
-	switch (type) {
-	case GL_UNSIGNED_SHORT_5_6_5:
-	case GL_UNSIGNED_SHORT_4_4_4_4:
-	case GL_UNSIGNED_SHORT_5_5_5_1:
-		return 2;
-	case GL_UNSIGNED_INT_2_10_10_10_REV:
-	case GL_UNSIGNED_INT_10F_11F_11F_REV:
-	case GL_UNSIGNED_INT_5_9_9_9_REV:
-	case GL_UNSIGNED_INT_24_8:
-		return 4;
-	case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
-		return 8;
-	}
-	size_t ts;
-	switch (type) {
-	case GL_UNSIGNED_BYTE:
-	case GL_BYTE:
-		ts = 1;
-		break;
-	case GL_UNSIGNED_SHORT:
-	case GL_SHORT:
-	case GL_HALF_FLOAT:
-		ts = 2;
-		break;
-	case GL_UNSIGNED_INT:
-	case GL_INT:
-	case GL_FLOAT:
-		ts = 4;
-		break;
-	default:
-		return 0;
-	}
-	size_t comps;
-	switch (format) {
-	case GL_RED:
-	case GL_RED_INTEGER:
-	case GL_ALPHA:
-	case GL_LUMINANCE:
-	case GL_DEPTH_COMPONENT:
-	case GL_STENCIL_INDEX8:
-		comps = 1;
-		break;
-	case GL_RG:
-	case GL_RG_INTEGER:
-	case GL_LUMINANCE_ALPHA:
-	case GL_DEPTH_STENCIL:
-		comps = 2;
-		break;
-	case GL_RGB:
-	case GL_RGB_INTEGER:
-		comps = 3;
-		break;
-	case GL_RGBA:
-	case GL_RGBA_INTEGER:
-		comps = 4;
-		break;
-	default:
-		return 0;
-	}
-	return ts * comps;
-}
-
-size_t row_stride(size_t width, size_t bpp, int alignment, int row_length) {
-	size_t w = row_length > 0 ? (size_t)row_length : width;
-	size_t row = w * bpp;
-	size_t a = alignment > 0 ? (size_t)alignment : 1;
-	return (row + a - 1) / a * a;
-}
-
-// Required source bytes for a (sub)image upload: full strides for all rows but
-// the last, which may be unpadded.
-size_t required_upload_bytes(size_t width, size_t height, size_t depth,
-                             size_t bpp, int alignment, int row_length) {
-	if (width == 0 || height == 0 || depth == 0 || bpp == 0)
-		return 0;
-	size_t stride = row_stride(width, bpp, alignment, row_length);
-	size_t rows = height * depth;
-	return stride * (rows - 1) + width * bpp;
-}
-
-// Apply UNPACK_FLIP_Y_WEBGL / UNPACK_PREMULTIPLY_ALPHA_WEBGL emulation to a
-// pixel upload. Returns the pointer to upload from (either `src` unchanged or
-// `tmp.data()` holding the converted copy).
-const uint8_t *apply_unpack_emulation(const uint8_t *src, size_t avail,
-                                      size_t width, size_t height, size_t bpp,
-                                      GLenum format, GLenum type,
-                                      std::vector<uint8_t> &tmp) {
-	if (!st || (!st->unpack_flip_y && !st->unpack_premultiply))
-		return src;
-	size_t stride =
-	    row_stride(width, bpp, st->unpack_alignment, st->unpack_row_length);
-	size_t needed = required_upload_bytes(width, height, 1, bpp,
-	                                      st->unpack_alignment,
-	                                      st->unpack_row_length);
-	if (needed == 0 || avail < needed)
-		return src; // caller validates; don't crash here
-	tmp.resize(stride * height);
-	for (size_t y = 0; y < height; y++) {
-		const uint8_t *in = src + y * stride;
-		size_t out_y = st->unpack_flip_y ? (height - 1 - y) : y;
-		uint8_t *out = tmp.data() + out_y * stride;
-		size_t row_bytes = width * bpp;
-		if (y == height - 1)
-			row_bytes = width * bpp; // last row may be short in src; same size
-		memcpy(out, in, row_bytes);
-	}
-	if (st->unpack_premultiply && format == GL_RGBA &&
-	    type == GL_UNSIGNED_BYTE) {
-		for (size_t y = 0; y < height; y++) {
-			uint8_t *row = tmp.data() + y * stride;
-			for (size_t x = 0; x < width; x++) {
-				uint8_t *p = row + x * 4;
-				uint32_t a = p[3];
-				p[0] = (uint8_t)((p[0] * a + 127) / 255);
-				p[1] = (uint8_t)((p[1] * a + 127) / 255);
-				p[2] = (uint8_t)((p[2] * a + 127) / 255);
-			}
+	if (!v.IsEmpty() && v->IsArray()) {
+		Local<Array> arr = v.As<Array>();
+		Local<Context> ctx = cur(iso);
+		uint32_t len = arr->Length();
+		tmp.resize(len);
+		for (uint32_t i = 0; i < len; i++) {
+			Local<Value> el;
+			tmp[i] = 0;
+			if (arr->Get(ctx, i).ToLocal(&el))
+				tmp[i] = el->Int32Value(ctx).FromMaybe(0);
 		}
+		*out = tmp.data();
+		*n = tmp.size();
+		return true;
 	}
-	return tmp.data();
+	return false;
+}
+
+// UTF-8 string from JS, owned by caller (free with delete[]).
+char *take_string(Isolate *iso, Local<Value> v) {
+	if (v.IsEmpty() || !v->IsString()) {
+		char *empty = new char[1];
+		empty[0] = 0;
+		return empty;
+	}
+	Local<String> s = v.As<String>();
+	int len = s->Utf8Length(iso);
+	char *buf = new char[len + 1];
+	s->WriteUtf8(iso, buf, len);
+	buf[len] = 0;
+	return buf;
 }
 
 // ---------------------------------------------------------------------------
-// Binding macros
+// Per-frame bracket — the 2.B contract
+// ---------------------------------------------------------------------------
+
+void enter_bracket() {
+	if (!st) return;
+	if (st->bracket_open) return;
+	if (!nx_webgl_bridge_is_initialized()) return;
+	nx_gl_state_save(&st->snap);
+	// Bind the user-currently-bound FBO if they switched; otherwise default
+	// (tenant FBO). Either way, our viewport / clear etc. go to the right
+	// target without the user noticing the redirect.
+	GLuint target_fbo = st->bound_fbo_js == 0
+	                        ? nx_webgl_bridge_fbo_id()
+	                        : st->bound_fbo_js;
+	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+	st->bracket_open = true;
+}
+
+void exit_bracket() {
+	if (!st || !st->bracket_open) return;
+	nx_gl_state_restore(&st->snap);
+	GrDirectContext *gr = nx_skia_gpu_gr_context();
+	if (gr) gr->resetContext();
+	st->bracket_open = false;
+}
+
+inline void touch_fbo() {
+	if (st && st->draw_into_default) nx_webgl_bridge_mark_fbo_dirty();
+}
+
+// ---------------------------------------------------------------------------
+// Method implementations — the 2.C allowlist.
+// Order matches upstream's table for easy diffing. Methods that the slice
+// demo provably doesn't call are NOT here; calling them throws TypeError
+// (caught + logged by the diagnostic Proxy). Each iteration adds whichever
+// methods the proxy log reveals are missing.
 // ---------------------------------------------------------------------------
 
 #define FN(name) static void name(const FunctionCallbackInfo<Value> &info)
-#define GUARD()                                                                \
-	do {                                                                       \
-		if (!st || !st->active)                                                \
-			return;                                                            \
-	} while (0)
 
-// ---------------------------------------------------------------------------
-// Simple state functions
-// ---------------------------------------------------------------------------
-
-FN(w_active_texture) { GUARD(); glActiveTexture(a_u32(info, 0)); }
-FN(w_blend_color) {
-	GUARD();
-	glBlendColor(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3));
+// ----- State / capability -----
+FN(w_viewport) {
+	enter_bracket();
+	glViewport(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
 }
-FN(w_blend_equation) { GUARD(); glBlendEquation(a_u32(info, 0)); }
-FN(w_blend_equation_separate) {
-	GUARD();
-	glBlendEquationSeparate(a_u32(info, 0), a_u32(info, 1));
+FN(w_scissor) {
+	enter_bracket();
+	glScissor(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
 }
-FN(w_blend_func) { GUARD(); glBlendFunc(a_u32(info, 0), a_u32(info, 1)); }
+FN(w_enable) { enter_bracket(); glEnable(a_u32(info, 0)); }
+FN(w_disable) { enter_bracket(); glDisable(a_u32(info, 0)); }
+FN(w_is_enabled) {
+	enter_bracket();
+	GLboolean b = glIsEnabled(a_u32(info, 0));
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), b == GL_TRUE));
+}
+FN(w_depth_func) { enter_bracket(); glDepthFunc(a_u32(info, 0)); }
+FN(w_depth_mask) { enter_bracket(); glDepthMask(a_bool(info, 0)); }
+FN(w_depth_range) { enter_bracket(); glDepthRangef(a_f32(info, 0), a_f32(info, 1)); }
+FN(w_cull_face) { enter_bracket(); glCullFace(a_u32(info, 0)); }
+FN(w_front_face) { enter_bracket(); glFrontFace(a_u32(info, 0)); }
+FN(w_blend_func) {
+	enter_bracket();
+	glBlendFunc(a_u32(info, 0), a_u32(info, 1));
+}
 FN(w_blend_func_separate) {
-	GUARD();
+	enter_bracket();
 	glBlendFuncSeparate(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
 	                    a_u32(info, 3));
 }
-FN(w_clear) {
-	GUARD();
-	glClear(a_u32(info, 0));
-	mark_dirty();
+FN(w_blend_equation) { enter_bracket(); glBlendEquation(a_u32(info, 0)); }
+FN(w_blend_equation_separate) {
+	enter_bracket();
+	glBlendEquationSeparate(a_u32(info, 0), a_u32(info, 1));
 }
-FN(w_clear_color) {
-	GUARD();
-	glClearColor(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3));
+FN(w_blend_color) {
+	enter_bracket();
+	glBlendColor(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3));
 }
-FN(w_clear_depth) { GUARD(); glClearDepthf(a_f32(info, 0)); }
-FN(w_clear_stencil) { GUARD(); glClearStencil(a_i32(info, 0)); }
 FN(w_color_mask) {
-	GUARD();
+	enter_bracket();
 	glColorMask(a_bool(info, 0), a_bool(info, 1), a_bool(info, 2),
 	            a_bool(info, 3));
 }
-FN(w_cull_face) { GUARD(); glCullFace(a_u32(info, 0)); }
-FN(w_depth_func) { GUARD(); glDepthFunc(a_u32(info, 0)); }
-FN(w_depth_mask) { GUARD(); glDepthMask(a_bool(info, 0)); }
-FN(w_depth_range) {
-	GUARD();
-	glDepthRangef(a_f32(info, 0), a_f32(info, 1));
-}
-FN(w_disable) { GUARD(); glDisable(a_u32(info, 0)); }
-FN(w_enable) { GUARD(); glEnable(a_u32(info, 0)); }
-FN(w_finish) { GUARD(); glFinish(); }
-FN(w_flush) { GUARD(); glFlush(); }
-FN(w_front_face) { GUARD(); glFrontFace(a_u32(info, 0)); }
-FN(w_hint) { GUARD(); glHint(a_u32(info, 0), a_u32(info, 1)); }
-FN(w_is_enabled) {
-	info.GetReturnValue().Set(false);
-	GUARD();
-	info.GetReturnValue().Set(glIsEnabled(a_u32(info, 0)) == GL_TRUE);
-}
-FN(w_line_width) { GUARD(); glLineWidth(a_f32(info, 0)); }
-FN(w_pixel_storei) {
-	GUARD();
-	GLenum pname = a_u32(info, 0);
-	GLint param = a_i32(info, 1);
-	switch (pname) {
-	case NX_GL_UNPACK_FLIP_Y_WEBGL:
-		st->unpack_flip_y = param != 0;
-		return;
-	case NX_GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL:
-		st->unpack_premultiply = param != 0;
-		return;
-	case NX_GL_UNPACK_COLORSPACE_CONVERSION_WEBGL:
-		return; // ignored (no colorspace conversion applied)
-	case GL_UNPACK_ALIGNMENT:
-		st->unpack_alignment = param;
-		break;
-	case GL_UNPACK_ROW_LENGTH:
-		st->unpack_row_length = param;
-		break;
-	case GL_PACK_ALIGNMENT:
-		st->pack_alignment = param;
-		break;
-	}
-	glPixelStorei(pname, param);
-}
-FN(w_polygon_offset) {
-	GUARD();
-	glPolygonOffset(a_f32(info, 0), a_f32(info, 1));
-}
-FN(w_sample_coverage) {
-	GUARD();
-	glSampleCoverage(a_f32(info, 0), a_bool(info, 1));
-}
-FN(w_scissor) {
-	GUARD();
-	glScissor(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
-}
 FN(w_stencil_func) {
-	GUARD();
+	enter_bracket();
 	glStencilFunc(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2));
 }
 FN(w_stencil_func_separate) {
-	GUARD();
+	enter_bracket();
 	glStencilFuncSeparate(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2),
 	                      a_u32(info, 3));
 }
-FN(w_stencil_mask) { GUARD(); glStencilMask(a_u32(info, 0)); }
-FN(w_stencil_mask_separate) {
-	GUARD();
-	glStencilMaskSeparate(a_u32(info, 0), a_u32(info, 1));
-}
 FN(w_stencil_op) {
-	GUARD();
+	enter_bracket();
 	glStencilOp(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2));
 }
 FN(w_stencil_op_separate) {
-	GUARD();
+	enter_bracket();
 	glStencilOpSeparate(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
 	                    a_u32(info, 3));
 }
-FN(w_viewport) {
-	GUARD();
-	glViewport(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
+FN(w_stencil_mask) { enter_bracket(); glStencilMask(a_u32(info, 0)); }
+FN(w_stencil_mask_separate) {
+	enter_bracket();
+	glStencilMaskSeparate(a_u32(info, 0), a_u32(info, 1));
 }
+FN(w_polygon_offset) {
+	enter_bracket();
+	glPolygonOffset(a_f32(info, 0), a_f32(info, 1));
+}
+FN(w_sample_coverage) {
+	enter_bracket();
+	glSampleCoverage(a_f32(info, 0), a_bool(info, 1));
+}
+FN(w_line_width) { enter_bracket(); glLineWidth(a_f32(info, 0)); }
+FN(w_hint) { enter_bracket(); glHint(a_u32(info, 0), a_u32(info, 1)); }
+
+FN(w_clear) {
+	enter_bracket();
+	glClear(a_u32(info, 0));
+	touch_fbo();
+}
+FN(w_clear_color) {
+	enter_bracket();
+	glClearColor(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3));
+}
+FN(w_clear_depth) { enter_bracket(); glClearDepthf(a_f32(info, 0)); }
+FN(w_clear_stencil) { enter_bracket(); glClearStencil(a_i32(info, 0)); }
+FN(w_finish) { enter_bracket(); glFinish(); }
+FN(w_flush) { enter_bracket(); glFlush(); }
+
+FN(w_pixel_storei) {
+	const GLenum pname = a_u32(info, 0);
+	const GLint val = a_i32(info, 1);
+	switch (pname) {
+	case NX_GL_UNPACK_FLIP_Y_WEBGL:
+		if (st) st->unpack_flip_y = (val != 0);
+		return;
+	case NX_GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL:
+		if (st) st->unpack_premultiply = (val != 0);
+		return;
+	case NX_GL_UNPACK_COLORSPACE_CONVERSION_WEBGL:
+		// Ignored; stored value irrelevant for the slice. 2.E can implement.
+		return;
+	case GL_UNPACK_ALIGNMENT:
+		if (st) st->unpack_alignment = val;
+		break;
+	case GL_PACK_ALIGNMENT:
+		if (st) st->pack_alignment = val;
+		break;
+	}
+	enter_bracket();
+	glPixelStorei(pname, val);
+}
+
+// ----- Query -----
 FN(w_get_error) {
-	info.GetReturnValue().Set((uint32_t)GL_NO_ERROR);
-	if (!st || !st->active)
-		return;
-	if (st->synthetic_error != GL_NO_ERROR) {
-		info.GetReturnValue().Set((uint32_t)st->synthetic_error);
-		st->synthetic_error = GL_NO_ERROR;
-		return;
-	}
-	info.GetReturnValue().Set((uint32_t)glGetError());
+	enter_bracket();
+	GLenum err = (st && st->synthetic_error != GL_NO_ERROR)
+	                 ? st->synthetic_error
+	                 : glGetError();
+	if (st) st->synthetic_error = GL_NO_ERROR;
+	info.GetReturnValue().Set(Uint32::NewFromUnsigned(info.GetIsolate(), err));
 }
 
-// ---------------------------------------------------------------------------
-// Object create / delete / is / bind
-// ---------------------------------------------------------------------------
-
-#define CREATE_OBJ(NAME, KIND, GENFN)                                          \
-	FN(NAME) {                                                                 \
-		GUARD();                                                               \
-		Isolate *iso = info.GetIsolate();                                      \
-		GLuint id = 0;                                                         \
-		GENFN(1, &id);                                                         \
-		info.GetReturnValue().Set(new_gl_obj(iso, KIND, id));                  \
-	}
-
-#define DELETE_OBJ(NAME, DELFN)                                                \
-	FN(NAME) {                                                                 \
-		GUARD();                                                               \
-		GLObj *o = get_gl_obj(info[0]);                                        \
-		if (!o || o->id == 0)                                                  \
-			return;                                                            \
-		GLuint id = o->id;                                                     \
-		DELFN(1, &id);                                                         \
-		o->id = 0;                                                             \
-	}
-
-#define IS_OBJ(NAME, ISFN)                                                     \
-	FN(NAME) {                                                                 \
-		info.GetReturnValue().Set(false);                                      \
-		GUARD();                                                               \
-		GLObj *o = get_gl_obj(info[0]);                                        \
-		if (!o || o->id == 0)                                                  \
-			return;                                                            \
-		info.GetReturnValue().Set(ISFN(o->id) == GL_TRUE);                     \
-	}
-
-CREATE_OBJ(w_create_buffer, K_BUFFER, glGenBuffers)
-CREATE_OBJ(w_create_framebuffer, K_FRAMEBUFFER, glGenFramebuffers)
-CREATE_OBJ(w_create_renderbuffer, K_RENDERBUFFER, glGenRenderbuffers)
-CREATE_OBJ(w_create_texture, K_TEXTURE, glGenTextures)
-CREATE_OBJ(w_create_query, K_QUERY, glGenQueries)
-CREATE_OBJ(w_create_sampler, K_SAMPLER, glGenSamplers)
-CREATE_OBJ(w_create_transform_feedback, K_TRANSFORM_FEEDBACK,
-           glGenTransformFeedbacks)
-CREATE_OBJ(w_create_vertex_array, K_VERTEX_ARRAY, glGenVertexArrays)
-
-DELETE_OBJ(w_delete_buffer, glDeleteBuffers)
-DELETE_OBJ(w_delete_framebuffer, glDeleteFramebuffers)
-DELETE_OBJ(w_delete_renderbuffer, glDeleteRenderbuffers)
-DELETE_OBJ(w_delete_texture, glDeleteTextures)
-DELETE_OBJ(w_delete_query, glDeleteQueries)
-DELETE_OBJ(w_delete_sampler, glDeleteSamplers)
-DELETE_OBJ(w_delete_transform_feedback, glDeleteTransformFeedbacks)
-DELETE_OBJ(w_delete_vertex_array, glDeleteVertexArrays)
-
-IS_OBJ(w_is_buffer, glIsBuffer)
-IS_OBJ(w_is_framebuffer, glIsFramebuffer)
-IS_OBJ(w_is_renderbuffer, glIsRenderbuffer)
-IS_OBJ(w_is_texture, glIsTexture)
-IS_OBJ(w_is_query, glIsQuery)
-IS_OBJ(w_is_sampler, glIsSampler)
-IS_OBJ(w_is_transform_feedback, glIsTransformFeedback)
-IS_OBJ(w_is_vertex_array, glIsVertexArray)
-IS_OBJ(w_is_program, glIsProgram)
-IS_OBJ(w_is_shader, glIsShader)
-
-FN(w_create_program) {
-	GUARD();
-	info.GetReturnValue().Set(
-	    new_gl_obj(info.GetIsolate(), K_PROGRAM, glCreateProgram()));
-}
-FN(w_create_shader) {
-	GUARD();
-	GLuint id = glCreateShader(a_u32(info, 0));
-	if (id == 0) {
-		info.GetReturnValue().SetNull();
-		return;
-	}
-	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_SHADER, id));
-}
-FN(w_delete_program) {
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || o->id == 0)
-		return;
-	glDeleteProgram(o->id);
-	o->id = 0;
-}
-FN(w_delete_shader) {
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || o->id == 0)
-		return;
-	glDeleteShader(o->id);
-	o->id = 0;
-}
-
-FN(w_bind_buffer) { GUARD(); glBindBuffer(a_u32(info, 0), obj_id(info[1])); }
-FN(w_bind_framebuffer) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLuint id = obj_id(info[1]);
-	if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
-		st->draw_fbo = id;
-	glBindFramebuffer(target, id);
-}
-FN(w_bind_renderbuffer) {
-	GUARD();
-	glBindRenderbuffer(a_u32(info, 0), obj_id(info[1]));
-}
-FN(w_bind_texture) { GUARD(); glBindTexture(a_u32(info, 0), obj_id(info[1])); }
-FN(w_bind_sampler) { GUARD(); glBindSampler(a_u32(info, 0), obj_id(info[1])); }
-FN(w_bind_transform_feedback) {
-	GUARD();
-	glBindTransformFeedback(a_u32(info, 0), obj_id(info[1]));
-}
-FN(w_bind_vertex_array) { GUARD(); glBindVertexArray(obj_id(info[0])); }
-FN(w_bind_buffer_base) {
-	GUARD();
-	glBindBufferBase(a_u32(info, 0), a_u32(info, 1), obj_id(info[2]));
-}
-FN(w_bind_buffer_range) {
-	GUARD();
-	glBindBufferRange(a_u32(info, 0), a_u32(info, 1), obj_id(info[2]),
-	                  (GLintptr)a_i64(info, 3), (GLsizeiptr)a_i64(info, 4));
-}
-
-// ---------------------------------------------------------------------------
-// Buffer data
-// ---------------------------------------------------------------------------
-
-FN(w_buffer_data) {
-	GUARD();
+FN(w_get_parameter) {
+	enter_bracket();
 	Isolate *iso = info.GetIsolate();
-	GLenum target = a_u32(info, 0);
-	GLenum usage = a_u32(info, 2);
-	Local<Value> src = info[1];
-	if (src->IsNumber()) {
-		glBufferData(target, (GLsizeiptr)a_i64(info, 1), nullptr, usage);
+	const GLenum pname = a_u32(info, 0);
+	switch (pname) {
+	case GL_VERSION:
+	case GL_VENDOR:
+	case GL_RENDERER:
+	case GL_SHADING_LANGUAGE_VERSION: {
+		const GLubyte *s = glGetString(pname);
+		const char *cs = s ? (const char *)s : "";
+		info.GetReturnValue().Set(
+		    String::NewFromUtf8(iso, cs, NewStringType::kNormal)
+		        .ToLocalChecked());
 		return;
 	}
-	if (src->IsNullOrUndefined()) {
-		glBufferData(target, 0, nullptr, usage);
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = nullptr;
-	if (src->IsArrayBuffer()) {
-		Local<ArrayBuffer> ab = src.As<ArrayBuffer>();
-		bytes = (uint8_t *)ab->Data();
-		len = ab->ByteLength();
-	} else {
-		bytes = view_bytes(src, &len, &elem);
-	}
-	if (!bytes && len > 0) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	// WebGL2 overload: bufferData(target, srcData, usage, srcOffset[, length])
-	if (info.Length() > 3) {
-		uint64_t srcOffset = (uint64_t)a_i64(info, 3) * elem;
-		uint64_t srcLen =
-		    info.Length() > 4 ? (uint64_t)a_i64(info, 4) * elem : 0;
-		if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-			record_error(GL_INVALID_VALUE);
-			return;
+	case GL_DEPTH_WRITEMASK:
+	case GL_COLOR_WRITEMASK: {
+		GLboolean v[4] = {0, 0, 0, 0};
+		glGetBooleanv(pname, v);
+		if (pname == GL_COLOR_WRITEMASK) {
+			Local<Array> arr = Array::New(iso, 4);
+			Local<Context> c = cur(iso);
+			for (int i = 0; i < 4; i++)
+				arr->Set(c, i, Boolean::New(iso, v[i] != 0)).Check();
+			info.GetReturnValue().Set(arr);
+		} else {
+			info.GetReturnValue().Set(Boolean::New(iso, v[0] != 0));
 		}
-		bytes += srcOffset;
-		len = srcLen ? srcLen : len - srcOffset;
-	}
-	(void)iso;
-	glBufferData(target, (GLsizeiptr)len, bytes, usage);
-}
-
-FN(w_buffer_sub_data) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLintptr dstOffset = (GLintptr)a_i64(info, 1);
-	Local<Value> src = info[2];
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = nullptr;
-	if (src->IsArrayBuffer()) {
-		Local<ArrayBuffer> ab = src.As<ArrayBuffer>();
-		bytes = (uint8_t *)ab->Data();
-		len = ab->ByteLength();
-	} else {
-		bytes = view_bytes(src, &len, &elem);
-	}
-	if (!bytes) {
-		record_error(GL_INVALID_VALUE);
 		return;
 	}
-	if (info.Length() > 3) {
-		uint64_t srcOffset = (uint64_t)a_i64(info, 3) * elem;
-		uint64_t srcLen =
-		    info.Length() > 4 ? (uint64_t)a_i64(info, 4) * elem : 0;
-		if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-			record_error(GL_INVALID_VALUE);
-			return;
-		}
-		bytes += srcOffset;
-		len = srcLen ? srcLen : len - srcOffset;
-	}
-	glBufferSubData(target, dstOffset, (GLsizeiptr)len, bytes);
-}
-
-FN(w_copy_buffer_sub_data) {
-	GUARD();
-	glCopyBufferSubData(a_u32(info, 0), a_u32(info, 1),
-	                    (GLintptr)a_i64(info, 2), (GLintptr)a_i64(info, 3),
-	                    (GLsizeiptr)a_i64(info, 4));
-}
-
-// getBufferSubData: ES3 has no glGetBufferSubData; emulate with
-// glMapBufferRange(GL_MAP_READ_BIT) + memcpy.
-FN(w_get_buffer_sub_data) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLintptr srcOffset = (GLintptr)a_i64(info, 1);
-	size_t len = 0, elem = 1;
-	uint8_t *dst = view_bytes(info[2], &len, &elem);
-	if (!dst) {
-		record_error(GL_INVALID_VALUE);
+	case GL_COLOR_CLEAR_VALUE:
+	case GL_BLEND_COLOR:
+	case GL_DEPTH_RANGE:
+	case NX_GL_ALIASED_LINE_WIDTH_RANGE:
+	case NX_GL_ALIASED_POINT_SIZE_RANGE: {
+		GLfloat v[4] = {0, 0, 0, 0};
+		glGetFloatv(pname, v);
+		int n = (pname == GL_DEPTH_RANGE || pname == NX_GL_ALIASED_LINE_WIDTH_RANGE ||
+		         pname == NX_GL_ALIASED_POINT_SIZE_RANGE) ? 2 : 4;
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
+		memcpy(ab->Data(), v, n * 4);
+		info.GetReturnValue().Set(Float32Array::New(ab, 0, n));
 		return;
 	}
-	uint64_t dstOffset =
-	    info.Length() > 3 ? (uint64_t)a_i64(info, 3) * elem : 0;
-	uint64_t copyLen = info.Length() > 4 ? (uint64_t)a_i64(info, 4) * elem : 0;
-	if (dstOffset > len || (copyLen && dstOffset + copyLen > len)) {
-		record_error(GL_INVALID_VALUE);
+	case NX_GL_MAX_VIEWPORT_DIMS: {
+		GLint v[2] = {0, 0};
+		glGetIntegerv(pname, v);
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, 8);
+		memcpy(ab->Data(), v, 8);
+		info.GetReturnValue().Set(Int32Array::New(ab, 0, 2));
 		return;
 	}
-	if (copyLen == 0)
-		copyLen = len - dstOffset;
-	if (copyLen == 0)
-		return;
-	void *mapped =
-	    glMapBufferRange(target, srcOffset, (GLsizeiptr)copyLen, GL_MAP_READ_BIT);
-	if (!mapped) {
-		record_error(GL_INVALID_OPERATION);
-		return;
-	}
-	memcpy(dst + dstOffset, mapped, copyLen);
-	glUnmapBuffer(target);
-}
-
-FN(w_get_buffer_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLenum pname = a_u32(info, 1);
-	if (pname == GL_BUFFER_SIZE) {
-		GLint64 v = 0;
-		glGetBufferParameteri64v(target, pname, &v);
-		info.GetReturnValue().Set((double)v);
-	} else {
+	default: {
 		GLint v = 0;
-		glGetBufferParameteriv(target, pname, &v);
-		info.GetReturnValue().Set(v);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Shaders & programs
-// ---------------------------------------------------------------------------
-
-FN(w_attach_shader) {
-	GUARD();
-	glAttachShader(obj_id(info[0]), obj_id(info[1]));
-}
-FN(w_detach_shader) {
-	GUARD();
-	glDetachShader(obj_id(info[0]), obj_id(info[1]));
-}
-FN(w_compile_shader) { GUARD(); glCompileShader(obj_id(info[0])); }
-FN(w_link_program) { GUARD(); glLinkProgram(obj_id(info[0])); }
-FN(w_use_program) { GUARD(); glUseProgram(obj_id(info[0])); }
-FN(w_validate_program) { GUARD(); glValidateProgram(obj_id(info[0])); }
-FN(w_shader_source) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint shader = obj_id(info[0]);
-	String::Utf8Value src(iso, info[1]);
-	if (!*src)
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
 		return;
-	const char *s = *src;
-	GLint len = (GLint)src.length();
-	glShaderSource(shader, 1, &s, &len);
-}
-FN(w_get_shader_source) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint shader = obj_id(info[0]);
-	GLint len = 0;
-	glGetShaderiv(shader, GL_SHADER_SOURCE_LENGTH, &len);
-	std::vector<char> buf((size_t)len + 1);
-	GLsizei out = 0;
-	glGetShaderSource(shader, (GLsizei)buf.size(), &out, buf.data());
-	info.GetReturnValue().Set(nx_str_lossy(iso, buf.data(), out));
-}
-FN(w_get_shader_info_log) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint shader = obj_id(info[0]);
-	GLint len = 0;
-	glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
-	std::vector<char> buf((size_t)len + 1);
-	GLsizei out = 0;
-	glGetShaderInfoLog(shader, (GLsizei)buf.size(), &out, buf.data());
-	info.GetReturnValue().Set(nx_str_lossy(iso, buf.data(), out));
-}
-FN(w_get_program_info_log) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint program = obj_id(info[0]);
-	GLint len = 0;
-	glGetProgramiv(program, GL_INFO_LOG_LENGTH, &len);
-	std::vector<char> buf((size_t)len + 1);
-	GLsizei out = 0;
-	glGetProgramInfoLog(program, (GLsizei)buf.size(), &out, buf.data());
-	info.GetReturnValue().Set(nx_str_lossy(iso, buf.data(), out));
-}
-FN(w_get_shader_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLuint shader = obj_id(info[0]);
-	GLenum pname = a_u32(info, 1);
-	GLint v = 0;
-	glGetShaderiv(shader, pname, &v);
-	switch (pname) {
-	case GL_DELETE_STATUS:
-	case GL_COMPILE_STATUS:
-		info.GetReturnValue().Set(v == GL_TRUE);
-		break;
-	default:
-		info.GetReturnValue().Set(v);
-		break;
+	}
 	}
 }
-FN(w_get_program_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLuint program = obj_id(info[0]);
-	GLenum pname = a_u32(info, 1);
-	GLint v = 0;
-	glGetProgramiv(program, pname, &v);
-	switch (pname) {
-	case GL_DELETE_STATUS:
-	case GL_LINK_STATUS:
-	case GL_VALIDATE_STATUS:
-		info.GetReturnValue().Set(v == GL_TRUE);
-		break;
-	default:
-		info.GetReturnValue().Set(v);
-		break;
-	}
-}
-FN(w_get_shader_precision_format) {
-	info.GetReturnValue().SetNull();
-	GUARD();
+
+FN(w_get_extension) {
 	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	GLint range[2] = {0, 0};
-	GLint precision = 0;
-	glGetShaderPrecisionFormat(a_u32(info, 0), a_u32(info, 1), range,
-	                           &precision);
-	Local<Object> o = Object::New(iso);
-	if (!st->protos[K_SHADER_PRECISION_FORMAT].IsEmpty()) {
-		o->SetPrototype(ctx, st->protos[K_SHADER_PRECISION_FORMAT].Get(iso))
-		    .Check();
+	if (info.Length() < 1 || !info[0]->IsString()) return;
+	String::Utf8Value name_utf8(iso, info[0]);
+	const char *name = *name_utf8;
+	if (!name) return;
+	Local<Context> c = cur(iso);
+	auto make_obj_with = [&](std::initializer_list<std::pair<const char *, uint32_t>> kvs) {
+		Local<Object> o = Object::New(iso);
+		for (const auto &kv : kvs) {
+			o->Set(c, String::NewFromUtf8(iso, kv.first).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, kv.second)).Check();
+		}
+		info.GetReturnValue().Set(o);
+	};
+	// WebGL1 extensions whose enum constants are numerically identical to
+	// ES3 core enums — returning an object exposes the constants Three.js
+	// queries; subsequent gl.<method>(EXT_CONST) calls reach native ES3
+	// (which already implements the underlying capability) transparently.
+	// No new engine GL plumbing needed.
+	if (strcmp(name, "EXT_blend_minmax") == 0) {
+		make_obj_with({{"MIN_EXT", 0x8007}, {"MAX_EXT", 0x8008}});
+		return;
 	}
-	o->Set(ctx, nx_str(iso, "rangeMin"), Integer::New(iso, range[0])).Check();
-	o->Set(ctx, nx_str(iso, "rangeMax"), Integer::New(iso, range[1])).Check();
-	o->Set(ctx, nx_str(iso, "precision"), Integer::New(iso, precision)).Check();
-	info.GetReturnValue().Set(o);
-}
-FN(w_get_attached_shaders) {
+	if (strcmp(name, "OES_element_index_uint") == 0) {
+		// No enum values — empty object is the standard signature. Indicates
+		// "you may use gl.UNSIGNED_INT (0x1405) with drawElements", which
+		// ES3 supports natively.
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	if (strcmp(name, "OES_standard_derivatives") == 0) {
+		make_obj_with({{"FRAGMENT_SHADER_DERIVATIVE_HINT_OES", 0x8B8B}});
+		return;
+	}
+	if (strcmp(name, "OES_texture_float") == 0 ||
+	    strcmp(name, "OES_texture_float_linear") == 0 ||
+	    strcmp(name, "OES_texture_half_float_linear") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	if (strcmp(name, "OES_texture_half_float") == 0) {
+		// HALF_FLOAT_OES = 0x8D61 in WebGL1's extension, vs 0x140B (HALF_FLOAT)
+		// in ES3 core. Three.js v1 code paths use the OES value. ES3 actually
+		// accepts BOTH (the driver treats 0x8D61 + 0x140B as aliases on Mesa
+		// Nouveau — confirmed in the fork's webgl_egl.c handling).
+		make_obj_with({{"HALF_FLOAT_OES", 0x8D61}});
+		return;
+	}
+	if (strcmp(name, "EXT_sRGB") == 0) {
+		// Three.js sets texture.colorSpace = SRGB and queries this extension
+		// on WebGL1 to know whether to use SRGB_EXT vs SRGB. The constants
+		// map cleanly to ES3 (SRGB8 / SRGB8_ALPHA8 internalformats are core).
+		make_obj_with({{"SRGB_EXT", 0x8C40},
+		                {"SRGB_ALPHA_EXT", 0x8C42},
+		                {"SRGB8_ALPHA8_EXT", 0x8C43},
+		                {"FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING_EXT", 0x8210}});
+		return;
+	}
+	if (strcmp(name, "WEBGL_depth_texture") == 0) {
+		make_obj_with({{"UNSIGNED_INT_24_8_WEBGL", 0x84FA}});
+		return;
+	}
+	// Everything else: not advertised yet. Return null (the spec value for
+	// "extension not supported"). 2.E will widen this list as the slice
+	// demos hit it.
 	info.GetReturnValue().SetNull();
-	GUARD();
+}
+FN(w_get_supported_extensions) {
 	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	GLuint program = obj_id(info[0]);
-	GLuint shaders[16];
-	GLsizei count = 0;
-	glGetAttachedShaders(program, 16, &count, shaders);
-	Local<Array> arr = Array::New(iso, count);
-	for (GLsizei i = 0; i < count; i++) {
-		arr->Set(ctx, i, new_gl_obj(iso, K_SHADER, shaders[i])).Check();
+	// Advertise the extensions that w_get_extension hands back. Three.js's
+	// WebGLCapabilities checks getSupportedExtensions().indexOf(name) before
+	// calling getExtension on a few of them.
+	static const char *const SUPPORTED[] = {
+	    "EXT_blend_minmax",
+	    "OES_element_index_uint",
+	    "OES_standard_derivatives",
+	    "OES_texture_float",
+	    "OES_texture_float_linear",
+	    "OES_texture_half_float",
+	    "OES_texture_half_float_linear",
+	    "EXT_sRGB",
+	    "WEBGL_depth_texture",
+	};
+	const int N = (int)(sizeof(SUPPORTED) / sizeof(SUPPORTED[0]));
+	Local<Array> arr = Array::New(iso, N);
+	Local<Context> c = cur(iso);
+	for (int i = 0; i < N; i++) {
+		arr->Set(c, i,
+		         String::NewFromUtf8(iso, SUPPORTED[i]).ToLocalChecked()).Check();
 	}
 	info.GetReturnValue().Set(arr);
 }
-FN(w_bind_attrib_location) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	String::Utf8Value name(iso, info[2]);
-	if (!*name)
-		return;
-	glBindAttribLocation(obj_id(info[0]), a_u32(info, 1), *name);
+FN(w_is_context_lost) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), false));
 }
-FN(w_get_attrib_location) {
-	info.GetReturnValue().Set(-1);
-	GUARD();
+FN(w_get_context_attributes) {
 	Isolate *iso = info.GetIsolate();
-	String::Utf8Value name(iso, info[1]);
-	if (!*name)
-		return;
-	info.GetReturnValue().Set(glGetAttribLocation(obj_id(info[0]), *name));
-}
-FN(w_get_frag_data_location) {
-	info.GetReturnValue().Set(-1);
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	String::Utf8Value name(iso, info[1]);
-	if (!*name)
-		return;
-	info.GetReturnValue().Set(glGetFragDataLocation(obj_id(info[0]), *name));
-}
-FN(w_get_uniform_location) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	String::Utf8Value name(iso, info[1]);
-	if (!*name)
-		return;
-	GLint loc = glGetUniformLocation(obj_id(info[0]), *name);
-	if (loc < 0)
-		return;
-	info.GetReturnValue().Set(new_gl_obj(iso, K_UNIFORM_LOCATION, 0, nullptr,
-	                                     loc));
-}
-
-static void active_info_common(const FunctionCallbackInfo<Value> &info,
-                               bool attrib) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	GLuint program = obj_id(info[0]);
-	GLuint index = a_u32(info, 1);
-	GLint count = 0;
-	glGetProgramiv(program, attrib ? GL_ACTIVE_ATTRIBUTES : GL_ACTIVE_UNIFORMS,
-	               &count);
-	if ((GLint)index >= count) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	char name[256];
-	GLsizei len = 0;
-	GLint size = 0;
-	GLenum type = 0;
-	if (attrib)
-		glGetActiveAttrib(program, index, sizeof(name), &len, &size, &type,
-		                  name);
-	else
-		glGetActiveUniform(program, index, sizeof(name), &len, &size, &type,
-		                   name);
+	Local<Context> c = cur(iso);
 	Local<Object> o = Object::New(iso);
-	if (!st->protos[K_ACTIVE_INFO].IsEmpty()) {
-		o->SetPrototype(ctx, st->protos[K_ACTIVE_INFO].Get(iso)).Check();
-	}
-	o->Set(ctx, nx_str(iso, "name"), nx_str_lossy(iso, name, len)).Check();
-	o->Set(ctx, nx_str(iso, "size"), Integer::New(iso, size)).Check();
-	o->Set(ctx, nx_str(iso, "type"), Integer::NewFromUnsigned(iso, type))
-	    .Check();
+	auto setb = [&](const char *k, bool v) {
+		o->Set(c, String::NewFromUtf8(iso, k).ToLocalChecked(),
+		       Boolean::New(iso, v)).Check();
+	};
+	setb("alpha", true);
+	setb("antialias", false);
+	setb("depth", true);
+	setb("stencil", true);
+	setb("premultipliedAlpha", true);
+	setb("preserveDrawingBuffer", false);
+	setb("desynchronized", false);
+	setb("failIfMajorPerformanceCaveat", false);
+	o->Set(c, String::NewFromUtf8(iso, "powerPreference").ToLocalChecked(),
+	       String::NewFromUtf8(iso, "default").ToLocalChecked()).Check();
 	info.GetReturnValue().Set(o);
 }
-FN(w_get_active_attrib) { active_info_common(info, true); }
-FN(w_get_active_uniform) { active_info_common(info, false); }
 
-// ---------------------------------------------------------------------------
-// Textures
-// ---------------------------------------------------------------------------
+FN(w_get_shader_precision_format) {
+	Isolate *iso = info.GetIsolate();
+	GLint range[2] = {0, 0};
+	GLint precision = 0;
+	glGetShaderPrecisionFormat(a_u32(info, 0), a_u32(info, 1), range, &precision);
+	Local<Object> obj = new_gl_obj(iso, K_SHADER_PRECISION_FORMAT, 0);
+	Local<Context> c = cur(iso);
+	obj->Set(c, String::NewFromUtf8(iso, "rangeMin").ToLocalChecked(),
+	         Int32::New(iso, range[0])).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "rangeMax").ToLocalChecked(),
+	         Int32::New(iso, range[1])).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "precision").ToLocalChecked(),
+	         Int32::New(iso, precision)).Check();
+	info.GetReturnValue().Set(obj);
+}
 
-FN(w_tex_parameterf) {
-	GUARD();
-	glTexParameterf(a_u32(info, 0), a_u32(info, 1), a_f32(info, 2));
+// ----- Shader -----
+FN(w_create_shader) {
+	enter_bracket();
+	GLuint s = glCreateShader(a_u32(info, 0));
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_SHADER, s));
 }
-FN(w_tex_parameteri) {
-	GUARD();
-	glTexParameteri(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2));
+FN(w_delete_shader) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteShader(id);
 }
-FN(w_get_tex_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLenum target = a_u32(info, 0);
+FN(w_is_shader) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsShader(obj_id(info[0])) == GL_TRUE));
+}
+
+// Phase 2.F.1: PMREMGGXConvolution FS replacement. Mesa-Nouveau on Tegra X1
+// aborts glDrawArrays when the original Three.js r184 PMREM convolution FS
+// (uint + bitwise Hammersley radicalInverse_VdC in the GGX importance-sample
+// loop) is compiled, even when the loop is statically unreachable. The
+// replacement keeps the cubeUV math (getFace, getUV, inline bilinearCubeUV)
+// but uses a 5-tap unrolled cross blur using a tangent/bitangent basis. No
+// uint, no bitwise, no for, no sin/cos, no early-return conditional — every
+// construct that crashed an iteration during the QuickJS-era 13-iteration
+// bisect is excluded. Verbatim re-port from
+// nxjs-source/source/webgl_egl.c:8629-8800 per
+// [[reference-pmrem-tegra-compiler-workaround]].
+//
+// Per-pass roughness scales the kernel radius; across PMREM's cumulative
+// passes this produces a widening hemisphere coverage in the cube_uv mip
+// chain — visually inferior to upstream's roughness-based GGX blur (perfect-
+// mirror-ish look at all roughness levels) but the only way to get PMREM
+// through Tegra/Mesa GLES without driver abort.
+//
+// Texel constants (CUBEUV_MAX_MIP / CUBEUV_TEXEL_WIDTH / CUBEUV_TEXEL_HEIGHT)
+// are PARSED from the Three.js-emitted source — hardcoding them only matched
+// cubeSize=256 (lodMax=8); for 2048-wide equirects → cubeSize=512 → lodMax=9
+// the hardcoded constants put UVs outside the texture and multi-tap writes
+// crashed Mesa.
+//
+// Gate: shader_type == GL_FRAGMENT_SHADER AND source contains
+// "PMREMGGXConvolution". Both conditions must hold; the substring guard
+// alone is r184-PMREM-specific (Three.js r162's PMREM FS doesn't contain
+// this name) and the type guard makes accidental match in a vertex shader
+// (extremely unlikely) safe.
+//
+// Returns a heap-allocated replacement source (caller delete[]) when the
+// substitution fires, or nullptr when the source should be passed through
+// unchanged.
+static char *maybe_replace_pmrem_fs(GLuint shader, const char *src) {
+	GLint shader_type = 0;
+	glGetShaderiv(shader, GL_SHADER_TYPE, &shader_type);
+	if (shader_type != GL_FRAGMENT_SHADER) return nullptr;
+	if (strstr(src, "PMREMGGXConvolution") == nullptr) return nullptr;
+
+	double max_mip = 8.0;
+	double texel_w = 1.0 / 1536.0;
+	double texel_h = 1.0 / 2048.0;
+	if (const char *p = strstr(src, "#define CUBEUV_MAX_MIP ")) {
+		max_mip = strtod(p + strlen("#define CUBEUV_MAX_MIP "), nullptr);
+	}
+	if (const char *p = strstr(src, "#define CUBEUV_TEXEL_WIDTH ")) {
+		texel_w = strtod(p + strlen("#define CUBEUV_TEXEL_WIDTH "), nullptr);
+	}
+	if (const char *p = strstr(src, "#define CUBEUV_TEXEL_HEIGHT ")) {
+		texel_h = strtod(p + strlen("#define CUBEUV_TEXEL_HEIGHT "), nullptr);
+	}
+
+	char *built = new char[16384];
+	const int n = snprintf(built, 16384,
+		"#version 300 es\n"
+		"precision highp float;\n"
+		"precision highp sampler2D;\n"
+		"in vec3 vOutputDirection;\n"
+		"layout(location = 0) out highp vec4 pc_fragColor;\n"
+		"uniform sampler2D envMap;\n"
+		"uniform float roughness;\n"
+		"uniform float mipInt;\n"
+		"#define cubeUV_minMipLevel 4.0\n"
+		"#define cubeUV_minTileSize 16.0\n"
+		"#define CUBEUV_TEXEL_WIDTH %.10f\n"
+		"#define CUBEUV_TEXEL_HEIGHT %.10f\n"
+		"#define CUBEUV_MAX_MIP %.4f\n"
+		"float getFace(vec3 d) {\n"
+		"  vec3 a = abs(d);\n"
+		"  if (a.x > a.z) {\n"
+		"    if (a.x > a.y) return d.x > 0.0 ? 0.0 : 3.0;\n"
+		"    return d.y > 0.0 ? 1.0 : 4.0;\n"
+		"  }\n"
+		"  if (a.z > a.y) return d.z > 0.0 ? 2.0 : 5.0;\n"
+		"  return d.y > 0.0 ? 1.0 : 4.0;\n"
+		"}\n"
+		"vec2 getUV(vec3 d, float f) {\n"
+		"  vec2 uv;\n"
+		"  if (f == 0.0) uv = vec2(d.z, d.y) / abs(d.x);\n"
+		"  else if (f == 1.0) uv = vec2(-d.x, -d.z) / abs(d.y);\n"
+		"  else if (f == 2.0) uv = vec2(-d.x, d.y) / abs(d.z);\n"
+		"  else if (f == 3.0) uv = vec2(-d.z, d.y) / abs(d.x);\n"
+		"  else if (f == 4.0) uv = vec2(-d.x, d.z) / abs(d.y);\n"
+		"  else uv = vec2(d.x, d.y) / abs(d.z);\n"
+		"  return 0.5 * (uv + 1.0);\n"
+		"}\n"
+		"void main() {\n"
+		"  vec3 N = normalize(vOutputDirection);\n"
+		"  vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);\n"
+		"  vec3 T = normalize(cross(up, N));\n"
+		"  vec3 B = cross(N, T);\n"
+		"  float blur = roughness * 5.0;\n"
+		"  vec3 D0 = N;\n"
+		"  vec3 D1 = normalize(N + T * blur);\n"
+		"  vec3 D2 = normalize(N - T * blur);\n"
+		"  vec3 D3 = normalize(N + B * blur);\n"
+		"  vec3 D4 = normalize(N - B * blur);\n"
+		"  vec3 acc = vec3(0.0);\n"
+		"  { vec3 d = D0; float mi = mipInt; float face = getFace(d);\n"
+		"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+		"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+		"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+		"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+		"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+		"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+		"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+		"    acc += texture(envMap, uv).rgb; }\n"
+		"  { vec3 d = D1; float mi = mipInt; float face = getFace(d);\n"
+		"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+		"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+		"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+		"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+		"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+		"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+		"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+		"    acc += texture(envMap, uv).rgb; }\n"
+		"  { vec3 d = D2; float mi = mipInt; float face = getFace(d);\n"
+		"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+		"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+		"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+		"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+		"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+		"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+		"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+		"    acc += texture(envMap, uv).rgb; }\n"
+		"  { vec3 d = D3; float mi = mipInt; float face = getFace(d);\n"
+		"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+		"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+		"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+		"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+		"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+		"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+		"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+		"    acc += texture(envMap, uv).rgb; }\n"
+		"  { vec3 d = D4; float mi = mipInt; float face = getFace(d);\n"
+		"    float fi = max(cubeUV_minMipLevel - mi, 0.0);\n"
+		"    mi = max(mi, cubeUV_minMipLevel); float fs = exp2(mi);\n"
+		"    vec2 uv = getUV(d, face) * (fs - 2.0) + 1.0;\n"
+		"    if (face > 2.0) { uv.y += fs; face -= 3.0; }\n"
+		"    uv.x += face * fs; uv.x += fi * 3.0 * cubeUV_minTileSize;\n"
+		"    uv.y += 4.0 * (exp2(CUBEUV_MAX_MIP) - fs);\n"
+		"    uv.x *= CUBEUV_TEXEL_WIDTH; uv.y *= CUBEUV_TEXEL_HEIGHT;\n"
+		"    acc += texture(envMap, uv).rgb; }\n"
+		"  pc_fragColor = vec4(acc * 0.2, 1.0);\n"
+		"}\n",
+		texel_w, texel_h, max_mip);
+	if (n <= 0 || n >= 16384) {
+		delete[] built;
+		return nullptr;
+	}
+	return built;
+}
+
+FN(w_shader_source) {
+	GLuint s = obj_id(info[0]);
+	char *src = take_string(info.GetIsolate(), info[1]);
+	char *pmrem_repl = maybe_replace_pmrem_fs(s, src);
+	const char *p = pmrem_repl ? pmrem_repl : src;
+	glShaderSource(s, 1, &p, nullptr);
+	delete[] src;
+	if (pmrem_repl) delete[] pmrem_repl;
+}
+FN(w_compile_shader) { enter_bracket(); glCompileShader(obj_id(info[0])); }
+FN(w_get_shader_parameter) {
+	GLuint s = obj_id(info[0]);
 	GLenum pname = a_u32(info, 1);
-	switch (pname) {
-	case GL_TEXTURE_MAX_LOD:
-	case GL_TEXTURE_MIN_LOD: {
-		GLfloat f = 0;
-		glGetTexParameterfv(target, pname, &f);
-		info.GetReturnValue().Set((double)f);
-		return;
-	}
-	case GL_TEXTURE_IMMUTABLE_FORMAT: {
-		GLint v = 0;
-		glGetTexParameteriv(target, pname, &v);
-		info.GetReturnValue().Set(v == GL_TRUE);
-		return;
-	}
-	}
 	GLint v = 0;
-	glGetTexParameteriv(target, pname, &v);
-	info.GetReturnValue().Set(v);
-}
-FN(w_generate_mipmap) { GUARD(); glGenerateMipmap(a_u32(info, 0)); }
-
-// texImage2D / texSubImage2D with an ArrayBufferView | null | PBO-offset
-// source. The TS wrapper normalizes TexImageSource objects (ImageData, Image,
-// ImageBitmap, canvases) into the ArrayBufferView form before calling this.
-static void tex_image_2d_common(const FunctionCallbackInfo<Value> &info,
-                                bool sub) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLint p2 = a_i32(info, 2); // internalformat (tex) / xoffset (sub)
-	GLint p3 = a_i32(info, 3); // yoffset (sub only)
-	GLsizei w, h;
-	GLint border = 0;
-	if (sub) {
-		w = a_i32(info, 4);
-		h = a_i32(info, 5);
+	glGetShaderiv(s, pname, &v);
+	if (pname == GL_DELETE_STATUS || pname == GL_COMPILE_STATUS) {
+		info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v != 0));
 	} else {
-		w = a_i32(info, 3);
-		h = a_i32(info, 4);
-		border = a_i32(info, 5);
+		info.GetReturnValue().Set(Int32::New(info.GetIsolate(), v));
 	}
-	GLenum format = a_u32(info, 6);
-	GLenum type = a_u32(info, 7);
-	Local<Value> src = info[8];
-	const void *ptr = nullptr;
-	std::vector<uint8_t> tmp;
-	if (src->IsNumber()) {
-		// PBO offset variant.
-		ptr = (const void *)(uintptr_t)a_i64(info, 8);
-	} else if (!src->IsNullOrUndefined()) {
-		size_t len = 0, elem = 1;
-		uint8_t *bytes = view_bytes(src, &len, &elem);
-		if (!bytes) {
-			record_error(GL_INVALID_VALUE);
-			return;
-		}
-		uint64_t srcOffset =
-		    info.Length() > 9 ? (uint64_t)a_i64(info, 9) * elem : 0;
-		if (srcOffset > len) {
-			record_error(GL_INVALID_VALUE);
-			return;
-		}
-		size_t bpp = bytes_per_pixel(format, type);
-		size_t need = required_upload_bytes(w, h, 1, bpp, st->unpack_alignment,
-		                                    st->unpack_row_length);
-		if (bpp == 0 || len - srcOffset < need) {
-			record_error(GL_INVALID_OPERATION);
-			return;
-		}
-		ptr = apply_unpack_emulation(bytes + srcOffset, len - srcOffset, w, h,
-		                             bpp, format, type, tmp);
-	}
-	if (sub)
-		glTexSubImage2D(target, level, p2, p3, w, h, format, type, ptr);
-	else
-		glTexImage2D(target, level, p2, w, h, border, format, type, ptr);
 }
-FN(w_tex_image_2d) { tex_image_2d_common(info, false); }
-FN(w_tex_sub_image_2d) { tex_image_2d_common(info, true); }
-
-// texImage3D(target, level, internalformat, w, h, depth, border, format, type,
-//            src[, srcOffset])
-FN(w_tex_image_3d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLint internalformat = a_i32(info, 2);
-	GLsizei w = a_i32(info, 3), h = a_i32(info, 4), d = a_i32(info, 5);
-	GLint border = a_i32(info, 6);
-	GLenum format = a_u32(info, 7);
-	GLenum type = a_u32(info, 8);
-	Local<Value> src = info[9];
-	const void *ptr = nullptr;
-	if (src->IsNumber()) {
-		ptr = (const void *)(uintptr_t)a_i64(info, 9);
-	} else if (!src->IsNullOrUndefined()) {
-		size_t len = 0, elem = 1;
-		uint8_t *bytes = view_bytes(src, &len, &elem);
-		if (!bytes) {
-			record_error(GL_INVALID_VALUE);
-			return;
-		}
-		uint64_t srcOffset =
-		    info.Length() > 10 ? (uint64_t)a_i64(info, 10) * elem : 0;
-		size_t bpp = bytes_per_pixel(format, type);
-		size_t need = required_upload_bytes(w, h, d, bpp, st->unpack_alignment,
-		                                    st->unpack_row_length);
-		if (srcOffset > len || bpp == 0 || len - srcOffset < need) {
-			record_error(GL_INVALID_OPERATION);
-			return;
-		}
-		ptr = bytes + srcOffset;
-	}
-	glTexImage3D(target, level, internalformat, w, h, d, border, format, type,
-	             ptr);
-}
-
-// texSubImage3D(target, level, xo, yo, zo, w, h, depth, format, type,
-//               src[, srcOffset])
-FN(w_tex_sub_image_3d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLint xo = a_i32(info, 2), yo = a_i32(info, 3), zo = a_i32(info, 4);
-	GLsizei w = a_i32(info, 5), h = a_i32(info, 6), d = a_i32(info, 7);
-	GLenum format = a_u32(info, 8);
-	GLenum type = a_u32(info, 9);
-	Local<Value> src = info[10];
-	const void *ptr = nullptr;
-	if (src->IsNumber()) {
-		ptr = (const void *)(uintptr_t)a_i64(info, 10);
-	} else if (!src->IsNullOrUndefined()) {
-		size_t len = 0, elem = 1;
-		uint8_t *bytes = view_bytes(src, &len, &elem);
-		if (!bytes) {
-			record_error(GL_INVALID_VALUE);
-			return;
-		}
-		uint64_t srcOffset =
-		    info.Length() > 11 ? (uint64_t)a_i64(info, 11) * elem : 0;
-		size_t bpp = bytes_per_pixel(format, type);
-		size_t need = required_upload_bytes(w, h, d, bpp, st->unpack_alignment,
-		                                    st->unpack_row_length);
-		if (srcOffset > len || bpp == 0 || len - srcOffset < need) {
-			record_error(GL_INVALID_OPERATION);
-			return;
-		}
-		ptr = bytes + srcOffset;
-	}
-	glTexSubImage3D(target, level, xo, yo, zo, w, h, d, format, type, ptr);
-}
-
-FN(w_tex_storage_2d) {
-	GUARD();
-	glTexStorage2D(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	               a_i32(info, 3), a_i32(info, 4));
-}
-FN(w_tex_storage_3d) {
-	GUARD();
-	glTexStorage3D(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	               a_i32(info, 3), a_i32(info, 4), a_i32(info, 5));
-}
-
-FN(w_copy_tex_image_2d) {
-	GUARD();
-	glCopyTexImage2D(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	                 a_i32(info, 3), a_i32(info, 4), a_i32(info, 5),
-	                 a_i32(info, 6), a_i32(info, 7));
-}
-FN(w_copy_tex_sub_image_2d) {
-	GUARD();
-	glCopyTexSubImage2D(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
-	                    a_i32(info, 3), a_i32(info, 4), a_i32(info, 5),
-	                    a_i32(info, 6), a_i32(info, 7));
-}
-FN(w_copy_tex_sub_image_3d) {
-	GUARD();
-	glCopyTexSubImage3D(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
-	                    a_i32(info, 3), a_i32(info, 4), a_i32(info, 5),
-	                    a_i32(info, 6), a_i32(info, 7), a_i32(info, 8));
-}
-
-// compressedTexImage2D(target, level, internalformat, w, h, border,
-//   srcData[, srcOffset, srcLengthOverride]) or (..., imageSize, offset)
-FN(w_compressed_tex_image_2d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLenum internalformat = a_u32(info, 2);
-	GLsizei w = a_i32(info, 3), h = a_i32(info, 4);
-	GLint border = a_i32(info, 5);
-	if (info[6]->IsNumber()) {
-		glCompressedTexImage2D(target, level, internalformat, w, h, border,
-		                       a_i32(info, 6),
-		                       (const void *)(uintptr_t)a_i64(info, 7));
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = view_bytes(info[6], &len, &elem);
-	if (!bytes) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	uint64_t srcOffset = info.Length() > 7 ? (uint64_t)a_i64(info, 7) * elem : 0;
-	uint64_t srcLen = info.Length() > 8 ? (uint64_t)a_i64(info, 8) * elem : 0;
-	if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	if (srcLen == 0)
-		srcLen = len - srcOffset;
-	glCompressedTexImage2D(target, level, internalformat, w, h, border,
-	                       (GLsizei)srcLen, bytes + srcOffset);
-}
-FN(w_compressed_tex_sub_image_2d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLint xo = a_i32(info, 2), yo = a_i32(info, 3);
-	GLsizei w = a_i32(info, 4), h = a_i32(info, 5);
-	GLenum format = a_u32(info, 6);
-	if (info[7]->IsNumber()) {
-		glCompressedTexSubImage2D(target, level, xo, yo, w, h, format,
-		                          a_i32(info, 7),
-		                          (const void *)(uintptr_t)a_i64(info, 8));
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = view_bytes(info[7], &len, &elem);
-	if (!bytes) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	uint64_t srcOffset = info.Length() > 8 ? (uint64_t)a_i64(info, 8) * elem : 0;
-	uint64_t srcLen = info.Length() > 9 ? (uint64_t)a_i64(info, 9) * elem : 0;
-	if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	if (srcLen == 0)
-		srcLen = len - srcOffset;
-	glCompressedTexSubImage2D(target, level, xo, yo, w, h, format,
-	                          (GLsizei)srcLen, bytes + srcOffset);
-}
-FN(w_compressed_tex_image_3d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLenum internalformat = a_u32(info, 2);
-	GLsizei w = a_i32(info, 3), h = a_i32(info, 4), d = a_i32(info, 5);
-	GLint border = a_i32(info, 6);
-	if (info[7]->IsNumber()) {
-		glCompressedTexImage3D(target, level, internalformat, w, h, d, border,
-		                       a_i32(info, 7),
-		                       (const void *)(uintptr_t)a_i64(info, 8));
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = view_bytes(info[7], &len, &elem);
-	if (!bytes) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	uint64_t srcOffset = info.Length() > 8 ? (uint64_t)a_i64(info, 8) * elem : 0;
-	uint64_t srcLen = info.Length() > 9 ? (uint64_t)a_i64(info, 9) * elem : 0;
-	if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	if (srcLen == 0)
-		srcLen = len - srcOffset;
-	glCompressedTexImage3D(target, level, internalformat, w, h, d, border,
-	                       (GLsizei)srcLen, bytes + srcOffset);
-}
-FN(w_compressed_tex_sub_image_3d) {
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLint level = a_i32(info, 1);
-	GLint xo = a_i32(info, 2), yo = a_i32(info, 3), zo = a_i32(info, 4);
-	GLsizei w = a_i32(info, 5), h = a_i32(info, 6), d = a_i32(info, 7);
-	GLenum format = a_u32(info, 8);
-	if (info[9]->IsNumber()) {
-		glCompressedTexSubImage3D(target, level, xo, yo, zo, w, h, d, format,
-		                          a_i32(info, 9),
-		                          (const void *)(uintptr_t)a_i64(info, 10));
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *bytes = view_bytes(info[9], &len, &elem);
-	if (!bytes) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	uint64_t srcOffset =
-	    info.Length() > 10 ? (uint64_t)a_i64(info, 10) * elem : 0;
-	uint64_t srcLen = info.Length() > 11 ? (uint64_t)a_i64(info, 11) * elem : 0;
-	if (srcOffset > len || (srcLen && srcOffset + srcLen > len)) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	if (srcLen == 0)
-		srcLen = len - srcOffset;
-	glCompressedTexSubImage3D(target, level, xo, yo, zo, w, h, d, format,
-	                          (GLsizei)srcLen, bytes + srcOffset);
-}
-
-// ---------------------------------------------------------------------------
-// Framebuffers & renderbuffers
-// ---------------------------------------------------------------------------
-
-FN(w_check_framebuffer_status) {
-	info.GetReturnValue().Set(0);
-	GUARD();
+FN(w_get_shader_info_log) {
+	GLuint s = obj_id(info[0]);
+	GLint len = 0;
+	glGetShaderiv(s, GL_INFO_LOG_LENGTH, &len);
+	std::vector<char> buf(len > 0 ? len : 1);
+	GLsizei written = 0;
+	if (len > 0) glGetShaderInfoLog(s, len, &written, buf.data());
 	info.GetReturnValue().Set(
-	    (uint32_t)glCheckFramebufferStatus(a_u32(info, 0)));
+	    String::NewFromUtf8(info.GetIsolate(),
+	                        buf.data(), NewStringType::kNormal,
+	                        written).ToLocalChecked());
 }
-FN(w_framebuffer_renderbuffer) {
-	GUARD();
-	glFramebufferRenderbuffer(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
-	                          obj_id(info[3]));
+FN(w_get_shader_source) {
+	GLuint s = obj_id(info[0]);
+	GLint len = 0;
+	glGetShaderiv(s, GL_SHADER_SOURCE_LENGTH, &len);
+	std::vector<char> buf(len > 0 ? len : 1);
+	GLsizei written = 0;
+	if (len > 0) glGetShaderSource(s, len, &written, buf.data());
+	info.GetReturnValue().Set(
+	    String::NewFromUtf8(info.GetIsolate(),
+	                        buf.data(), NewStringType::kNormal,
+	                        written).ToLocalChecked());
 }
-FN(w_framebuffer_texture_2d) {
-	GUARD();
-	glFramebufferTexture2D(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
-	                       obj_id(info[3]), a_i32(info, 4));
+
+// ----- Program -----
+FN(w_create_program) {
+	GLuint p = glCreateProgram();
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_PROGRAM, p));
 }
-FN(w_framebuffer_texture_layer) {
-	GUARD();
-	glFramebufferTextureLayer(a_u32(info, 0), a_u32(info, 1), obj_id(info[2]),
-	                          a_i32(info, 3), a_i32(info, 4));
+FN(w_delete_program) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteProgram(id);
 }
-FN(w_get_framebuffer_attachment_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLenum pname = a_u32(info, 2);
-	if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME)
-		return; // object identity not tracked; null
+FN(w_is_program) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsProgram(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_attach_shader) {
+	glAttachShader(obj_id(info[0]), obj_id(info[1]));
+}
+FN(w_detach_shader) {
+	glDetachShader(obj_id(info[0]), obj_id(info[1]));
+}
+FN(w_link_program) { enter_bracket(); glLinkProgram(obj_id(info[0])); }
+FN(w_validate_program) { enter_bracket(); glValidateProgram(obj_id(info[0])); }
+FN(w_use_program) { enter_bracket(); glUseProgram(obj_id(info[0])); }
+FN(w_get_program_parameter) {
+	GLuint p = obj_id(info[0]);
+	GLenum pname = a_u32(info, 1);
 	GLint v = 0;
-	glGetFramebufferAttachmentParameteriv(a_u32(info, 0), a_u32(info, 1),
-	                                      pname, &v);
-	info.GetReturnValue().Set(v);
-}
-FN(w_get_renderbuffer_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLint v = 0;
-	glGetRenderbufferParameteriv(a_u32(info, 0), a_u32(info, 1), &v);
-	info.GetReturnValue().Set(v);
-}
-FN(w_renderbuffer_storage) {
-	GUARD();
-	glRenderbufferStorage(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2),
-	                      a_i32(info, 3));
-}
-FN(w_renderbuffer_storage_multisample) {
-	GUARD();
-	glRenderbufferStorageMultisample(a_u32(info, 0), a_i32(info, 1),
-	                                 a_u32(info, 2), a_i32(info, 3),
-	                                 a_i32(info, 4));
-}
-FN(w_blit_framebuffer) {
-	GUARD();
-	glBlitFramebuffer(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2),
-	                  a_i32(info, 3), a_i32(info, 4), a_i32(info, 5),
-	                  a_i32(info, 6), a_i32(info, 7), a_u32(info, 8),
-	                  a_u32(info, 9));
-	mark_dirty();
-}
-FN(w_invalidate_framebuffer) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<GLenum> attachments;
-	if (!get_enum_list(iso, info[1], attachments))
-		return;
-	glInvalidateFramebuffer(a_u32(info, 0), (GLsizei)attachments.size(),
-	                        attachments.data());
-}
-FN(w_invalidate_sub_framebuffer) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<GLenum> attachments;
-	if (!get_enum_list(iso, info[1], attachments))
-		return;
-	glInvalidateSubFramebuffer(a_u32(info, 0), (GLsizei)attachments.size(),
-	                           attachments.data(), a_i32(info, 2),
-	                           a_i32(info, 3), a_i32(info, 4), a_i32(info, 5));
-}
-FN(w_read_buffer) { GUARD(); glReadBuffer(a_u32(info, 0)); }
-FN(w_draw_buffers) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<GLenum> bufs;
-	if (!get_enum_list(iso, info[0], bufs))
-		return;
-	glDrawBuffers((GLsizei)bufs.size(), bufs.data());
-}
-FN(w_get_internalformat_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLenum target = a_u32(info, 0);
-	GLenum internalformat = a_u32(info, 1);
-	GLenum pname = a_u32(info, 2);
-	if (pname != GL_SAMPLES)
-		return;
-	GLint count = 0;
-	glGetInternalformativ(target, internalformat, GL_NUM_SAMPLE_COUNTS, 1,
-	                      &count);
-	std::vector<GLint> samples((size_t)count);
-	if (count > 0)
-		glGetInternalformativ(target, internalformat, GL_SAMPLES, count,
-		                      samples.data());
-	info.GetReturnValue().Set(make_i32_array(iso, samples.data(), samples.size()));
-}
-
-FN(w_read_pixels) {
-	GUARD();
-	GLint x = a_i32(info, 0), y = a_i32(info, 1);
-	GLsizei w = a_i32(info, 2), h = a_i32(info, 3);
-	GLenum format = a_u32(info, 4), type = a_u32(info, 5);
-	if (info[6]->IsNumber()) {
-		// PBO offset variant.
-		glReadPixels(x, y, w, h, format, type,
-		             (void *)(uintptr_t)a_i64(info, 6));
-		return;
-	}
-	size_t len = 0, elem = 1;
-	uint8_t *dst = view_bytes(info[6], &len, &elem);
-	if (!dst) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	uint64_t dstOffset = info.Length() > 7 ? (uint64_t)a_i64(info, 7) * elem : 0;
-	if (dstOffset > len) {
-		record_error(GL_INVALID_VALUE);
-		return;
-	}
-	size_t bpp = bytes_per_pixel(format, type);
-	size_t need = required_upload_bytes(w, h, 1, bpp, st->pack_alignment, 0);
-	if (bpp == 0 || len - dstOffset < need) {
-		record_error(GL_INVALID_OPERATION);
-		return;
-	}
-	glReadPixels(x, y, w, h, format, type, dst + dstOffset);
-}
-
-// ---------------------------------------------------------------------------
-// Drawing
-// ---------------------------------------------------------------------------
-
-FN(w_draw_arrays) {
-	GUARD();
-	glDrawArrays(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2));
-	mark_dirty();
-}
-FN(w_draw_elements) {
-	GUARD();
-	glDrawElements(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	               (const void *)(uintptr_t)a_i64(info, 3));
-	mark_dirty();
-}
-FN(w_draw_arrays_instanced) {
-	GUARD();
-	glDrawArraysInstanced(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
-	                      a_i32(info, 3));
-	mark_dirty();
-}
-FN(w_draw_elements_instanced) {
-	GUARD();
-	glDrawElementsInstanced(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	                        (const void *)(uintptr_t)a_i64(info, 3),
-	                        a_i32(info, 4));
-	mark_dirty();
-}
-FN(w_draw_range_elements) {
-	GUARD();
-	glDrawRangeElements(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
-	                    a_i32(info, 3), a_u32(info, 4),
-	                    (const void *)(uintptr_t)a_i64(info, 5));
-	mark_dirty();
-}
-
-FN(w_clear_bufferfv) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<float> tmp;
-	const float *d;
-	size_t n;
-	uint32_t so = info.Length() > 3 ? a_u32(info, 3) : 0;
-	if (!get_f32_list(iso, info[2], tmp, &d, &n, so, 0))
-		return;
-	if (n < 1)
-		return;
-	glClearBufferfv(a_u32(info, 0), a_i32(info, 1), d);
-	mark_dirty();
-}
-FN(w_clear_bufferiv) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<int32_t> tmp;
-	const int32_t *d;
-	size_t n;
-	uint32_t so = info.Length() > 3 ? a_u32(info, 3) : 0;
-	if (!get_i32_list(iso, info[2], tmp, &d, &n, so, 0))
-		return;
-	if (n < 1)
-		return;
-	glClearBufferiv(a_u32(info, 0), a_i32(info, 1), d);
-	mark_dirty();
-}
-FN(w_clear_bufferuiv) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	std::vector<uint32_t> tmp;
-	const uint32_t *d;
-	size_t n;
-	uint32_t so = info.Length() > 3 ? a_u32(info, 3) : 0;
-	if (!get_u32_list(iso, info[2], tmp, &d, &n, so, 0))
-		return;
-	if (n < 1)
-		return;
-	glClearBufferuiv(a_u32(info, 0), a_i32(info, 1), d);
-	mark_dirty();
-}
-FN(w_clear_bufferfi) {
-	GUARD();
-	glClearBufferfi(a_u32(info, 0), a_i32(info, 1), a_f32(info, 2),
-	                a_i32(info, 3));
-	mark_dirty();
-}
-
-// ---------------------------------------------------------------------------
-// Uniforms
-// ---------------------------------------------------------------------------
-
-// Per WebGL spec, a null uniform location is silently ignored.
-#define UNIFORM_PREAMBLE                                                       \
-	GUARD();                                                                   \
-	GLObj *lo = get_gl_obj(info[0]);                                           \
-	if (!lo)                                                                   \
-		return;                                                                \
-	GLint loc = lo->loc;                                                       \
-	(void)loc;
-
-FN(w_uniform1f) { UNIFORM_PREAMBLE glUniform1f(loc, a_f32(info, 1)); }
-FN(w_uniform2f) {
-	UNIFORM_PREAMBLE glUniform2f(loc, a_f32(info, 1), a_f32(info, 2));
-}
-FN(w_uniform3f) {
-	UNIFORM_PREAMBLE glUniform3f(loc, a_f32(info, 1), a_f32(info, 2),
-	                             a_f32(info, 3));
-}
-FN(w_uniform4f) {
-	UNIFORM_PREAMBLE glUniform4f(loc, a_f32(info, 1), a_f32(info, 2),
-	                             a_f32(info, 3), a_f32(info, 4));
-}
-FN(w_uniform1i) { UNIFORM_PREAMBLE glUniform1i(loc, a_i32(info, 1)); }
-FN(w_uniform2i) {
-	UNIFORM_PREAMBLE glUniform2i(loc, a_i32(info, 1), a_i32(info, 2));
-}
-FN(w_uniform3i) {
-	UNIFORM_PREAMBLE glUniform3i(loc, a_i32(info, 1), a_i32(info, 2),
-	                             a_i32(info, 3));
-}
-FN(w_uniform4i) {
-	UNIFORM_PREAMBLE glUniform4i(loc, a_i32(info, 1), a_i32(info, 2),
-	                             a_i32(info, 3), a_i32(info, 4));
-}
-FN(w_uniform1ui) { UNIFORM_PREAMBLE glUniform1ui(loc, a_u32(info, 1)); }
-FN(w_uniform2ui) {
-	UNIFORM_PREAMBLE glUniform2ui(loc, a_u32(info, 1), a_u32(info, 2));
-}
-FN(w_uniform3ui) {
-	UNIFORM_PREAMBLE glUniform3ui(loc, a_u32(info, 1), a_u32(info, 2),
-	                              a_u32(info, 3));
-}
-FN(w_uniform4ui) {
-	UNIFORM_PREAMBLE glUniform4ui(loc, a_u32(info, 1), a_u32(info, 2),
-	                              a_u32(info, 3), a_u32(info, 4));
-}
-
-#define UNIFORM_VEC(NAME, N, TYPE, GETLIST, GLCALL)                            \
-	FN(NAME) {                                                                 \
-		UNIFORM_PREAMBLE;                                                      \
-		Isolate *iso = info.GetIsolate();                                      \
-		std::vector<TYPE> tmp;                                                 \
-		const TYPE *d;                                                         \
-		size_t n;                                                              \
-		uint32_t so = info.Length() > 2 ? a_u32(info, 2) : 0;                  \
-		uint32_t sl = info.Length() > 3 ? a_u32(info, 3) : 0;                  \
-		if (!GETLIST(iso, info[1], tmp, &d, &n, so, sl))                       \
-			return;                                                            \
-		if (n < N) {                                                           \
-			record_error(GL_INVALID_VALUE);                                    \
-			return;                                                            \
-		}                                                                      \
-		GLCALL(loc, (GLsizei)(n / N), d);                                      \
-	}
-
-UNIFORM_VEC(w_uniform1fv, 1, float, get_f32_list, glUniform1fv)
-UNIFORM_VEC(w_uniform2fv, 2, float, get_f32_list, glUniform2fv)
-UNIFORM_VEC(w_uniform3fv, 3, float, get_f32_list, glUniform3fv)
-UNIFORM_VEC(w_uniform4fv, 4, float, get_f32_list, glUniform4fv)
-UNIFORM_VEC(w_uniform1iv, 1, int32_t, get_i32_list, glUniform1iv)
-UNIFORM_VEC(w_uniform2iv, 2, int32_t, get_i32_list, glUniform2iv)
-UNIFORM_VEC(w_uniform3iv, 3, int32_t, get_i32_list, glUniform3iv)
-UNIFORM_VEC(w_uniform4iv, 4, int32_t, get_i32_list, glUniform4iv)
-UNIFORM_VEC(w_uniform1uiv, 1, uint32_t, get_u32_list, glUniform1uiv)
-UNIFORM_VEC(w_uniform2uiv, 2, uint32_t, get_u32_list, glUniform2uiv)
-UNIFORM_VEC(w_uniform3uiv, 3, uint32_t, get_u32_list, glUniform3uiv)
-UNIFORM_VEC(w_uniform4uiv, 4, uint32_t, get_u32_list, glUniform4uiv)
-
-// uniformMatrixNfv(location, transpose, data[, srcOffset, srcLength])
-#define UNIFORM_MATRIX(NAME, COMP, GLCALL)                                     \
-	FN(NAME) {                                                                 \
-		UNIFORM_PREAMBLE;                                                      \
-		Isolate *iso = info.GetIsolate();                                      \
-		bool transpose = a_bool(info, 1);                                      \
-		std::vector<float> tmp;                                                \
-		const float *d;                                                        \
-		size_t n;                                                              \
-		uint32_t so = info.Length() > 3 ? a_u32(info, 3) : 0;                  \
-		uint32_t sl = info.Length() > 4 ? a_u32(info, 4) : 0;                  \
-		if (!get_f32_list(iso, info[2], tmp, &d, &n, so, sl))                  \
-			return;                                                            \
-		if (n < COMP) {                                                        \
-			record_error(GL_INVALID_VALUE);                                    \
-			return;                                                            \
-		}                                                                      \
-		GLCALL(loc, (GLsizei)(n / COMP), transpose, d);                        \
-	}
-
-UNIFORM_MATRIX(w_uniform_matrix2fv, 4, glUniformMatrix2fv)
-UNIFORM_MATRIX(w_uniform_matrix3fv, 9, glUniformMatrix3fv)
-UNIFORM_MATRIX(w_uniform_matrix4fv, 16, glUniformMatrix4fv)
-UNIFORM_MATRIX(w_uniform_matrix2x3fv, 6, glUniformMatrix2x3fv)
-UNIFORM_MATRIX(w_uniform_matrix3x2fv, 6, glUniformMatrix3x2fv)
-UNIFORM_MATRIX(w_uniform_matrix2x4fv, 8, glUniformMatrix2x4fv)
-UNIFORM_MATRIX(w_uniform_matrix4x2fv, 8, glUniformMatrix4x2fv)
-UNIFORM_MATRIX(w_uniform_matrix3x4fv, 12, glUniformMatrix3x4fv)
-UNIFORM_MATRIX(w_uniform_matrix4x3fv, 12, glUniformMatrix4x3fv)
-
-// getUniform(program, location): find the uniform's type by scanning the
-// active uniforms (matching locations, including array elements), then read
-// back with the appropriately-typed glGetUniform*.
-FN(w_get_uniform) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint program = obj_id(info[0]);
-	GLObj *lo = get_gl_obj(info[1]);
-	if (!lo)
-		return;
-	GLint loc = lo->loc;
-	GLint count = 0;
-	glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
-	GLenum type = 0;
-	char name[256];
-	for (GLint i = 0; i < count && type == 0; i++) {
-		GLsizei len = 0;
-		GLint size = 0;
-		GLenum t = 0;
-		glGetActiveUniform(program, i, sizeof(name), &len, &size, &t, name);
-		if (len > 3 && strcmp(name + len - 3, "[0]") == 0)
-			name[len - 3] = '\0';
-		for (GLint e = 0; e < size; e++) {
-			char ename[300];
-			if (e == 0)
-				snprintf(ename, sizeof(ename), "%s", name);
-			else
-				snprintf(ename, sizeof(ename), "%s[%d]", name, e);
-			if (glGetUniformLocation(program, ename) == loc) {
-				type = t;
-				break;
-			}
-		}
-	}
-	if (type == 0)
-		return;
-	// Component count + base type per uniform type.
-	int comps = 1;
-	enum { BT_FLOAT, BT_INT, BT_UINT, BT_BOOL } bt = BT_INT;
-	switch (type) {
-	case GL_FLOAT: comps = 1; bt = BT_FLOAT; break;
-	case GL_FLOAT_VEC2: comps = 2; bt = BT_FLOAT; break;
-	case GL_FLOAT_VEC3: comps = 3; bt = BT_FLOAT; break;
-	case GL_FLOAT_VEC4: comps = 4; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT2: comps = 4; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT3: comps = 9; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT4: comps = 16; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT2x3: comps = 6; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT2x4: comps = 8; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT3x2: comps = 6; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT3x4: comps = 12; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT4x2: comps = 8; bt = BT_FLOAT; break;
-	case GL_FLOAT_MAT4x3: comps = 12; bt = BT_FLOAT; break;
-	case GL_INT: case GL_SAMPLER_2D: case GL_SAMPLER_3D:
-	case GL_SAMPLER_CUBE: case GL_SAMPLER_2D_SHADOW:
-	case GL_SAMPLER_2D_ARRAY: case GL_SAMPLER_2D_ARRAY_SHADOW:
-	case GL_SAMPLER_CUBE_SHADOW: case GL_INT_SAMPLER_2D:
-	case GL_INT_SAMPLER_3D: case GL_INT_SAMPLER_CUBE:
-	case GL_INT_SAMPLER_2D_ARRAY: case GL_UNSIGNED_INT_SAMPLER_2D:
-	case GL_UNSIGNED_INT_SAMPLER_3D: case GL_UNSIGNED_INT_SAMPLER_CUBE:
-	case GL_UNSIGNED_INT_SAMPLER_2D_ARRAY:
-		comps = 1; bt = BT_INT; break;
-	case GL_INT_VEC2: comps = 2; bt = BT_INT; break;
-	case GL_INT_VEC3: comps = 3; bt = BT_INT; break;
-	case GL_INT_VEC4: comps = 4; bt = BT_INT; break;
-	case GL_UNSIGNED_INT: comps = 1; bt = BT_UINT; break;
-	case GL_UNSIGNED_INT_VEC2: comps = 2; bt = BT_UINT; break;
-	case GL_UNSIGNED_INT_VEC3: comps = 3; bt = BT_UINT; break;
-	case GL_UNSIGNED_INT_VEC4: comps = 4; bt = BT_UINT; break;
-	case GL_BOOL: comps = 1; bt = BT_BOOL; break;
-	case GL_BOOL_VEC2: comps = 2; bt = BT_BOOL; break;
-	case GL_BOOL_VEC3: comps = 3; bt = BT_BOOL; break;
-	case GL_BOOL_VEC4: comps = 4; bt = BT_BOOL; break;
-	default:
-		return;
-	}
-	if (bt == BT_FLOAT) {
-		float v[16] = {0};
-		glGetUniformfv(program, loc, v);
-		if (comps == 1)
-			info.GetReturnValue().Set((double)v[0]);
-		else
-			info.GetReturnValue().Set(make_f32_array(iso, v, comps));
-	} else if (bt == BT_UINT) {
-		uint32_t v[4] = {0};
-		glGetUniformuiv(program, loc, v);
-		if (comps == 1)
-			info.GetReturnValue().Set(v[0]);
-		else
-			info.GetReturnValue().Set(make_u32_array(iso, v, comps));
+	glGetProgramiv(p, pname, &v);
+	if (pname == GL_DELETE_STATUS || pname == GL_LINK_STATUS ||
+	    pname == GL_VALIDATE_STATUS) {
+		info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v != 0));
 	} else {
-		int32_t v[4] = {0};
-		glGetUniformiv(program, loc, v);
-		if (bt == BT_BOOL) {
-			if (comps == 1) {
-				info.GetReturnValue().Set(v[0] != 0);
-			} else {
-				Local<Context> ctx = cur(iso);
-				Local<Array> arr = Array::New(iso, comps);
-				for (int i = 0; i < comps; i++)
-					arr->Set(ctx, i, Boolean::New(iso, v[i] != 0)).Check();
-				info.GetReturnValue().Set(arr);
-			}
-		} else if (comps == 1) {
-			info.GetReturnValue().Set(v[0]);
-		} else {
-			info.GetReturnValue().Set(make_i32_array(iso, v, comps));
-		}
+		info.GetReturnValue().Set(Int32::New(info.GetIsolate(), v));
 	}
 }
+FN(w_get_program_info_log) {
+	GLuint p = obj_id(info[0]);
+	GLint len = 0;
+	glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
+	std::vector<char> buf(len > 0 ? len : 1);
+	GLsizei written = 0;
+	if (len > 0) glGetProgramInfoLog(p, len, &written, buf.data());
+	info.GetReturnValue().Set(
+	    String::NewFromUtf8(info.GetIsolate(),
+	                        buf.data(), NewStringType::kNormal,
+	                        written).ToLocalChecked());
+}
+FN(w_get_attrib_location) {
+	GLuint p = obj_id(info[0]);
+	char *name = take_string(info.GetIsolate(), info[1]);
+	GLint loc = glGetAttribLocation(p, name);
+	delete[] name;
+	info.GetReturnValue().Set(Int32::New(info.GetIsolate(), loc));
+}
+FN(w_get_uniform_location) {
+	GLuint p = obj_id(info[0]);
+	char *name = take_string(info.GetIsolate(), info[1]);
+	GLint loc = glGetUniformLocation(p, name);
+	delete[] name;
+	if (loc < 0) {
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	info.GetReturnValue().Set(
+	    new_gl_obj(info.GetIsolate(), K_UNIFORM_LOCATION, 0, loc));
+}
+FN(w_bind_attrib_location) {
+	GLuint p = obj_id(info[0]);
+	GLuint idx = a_u32(info, 1);
+	char *name = take_string(info.GetIsolate(), info[2]);
+	glBindAttribLocation(p, idx, name);
+	delete[] name;
+}
+FN(w_get_active_attrib) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	GLuint p = obj_id(info[0]);
+	GLuint idx = a_u32(info, 1);
+	char name[256];
+	GLsizei nlen = 0;
+	GLint size = 0;
+	GLenum type = 0;
+	glGetActiveAttrib(p, idx, sizeof(name), &nlen, &size, &type, name);
+	Local<Object> obj = new_gl_obj(iso, K_ACTIVE_INFO, 0);
+	Local<Context> c = cur(iso);
+	obj->Set(c, String::NewFromUtf8(iso, "name").ToLocalChecked(),
+	         String::NewFromUtf8(iso, name, NewStringType::kNormal,
+	                              nlen).ToLocalChecked()).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "size").ToLocalChecked(),
+	         Int32::New(iso, size)).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "type").ToLocalChecked(),
+	         Uint32::NewFromUnsigned(iso, type)).Check();
+	info.GetReturnValue().Set(obj);
+}
+FN(w_get_active_uniform) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	GLuint p = obj_id(info[0]);
+	GLuint idx = a_u32(info, 1);
+	char name[256];
+	GLsizei nlen = 0;
+	GLint size = 0;
+	GLenum type = 0;
+	glGetActiveUniform(p, idx, sizeof(name), &nlen, &size, &type, name);
+	Local<Object> obj = new_gl_obj(iso, K_ACTIVE_INFO, 0);
+	Local<Context> c = cur(iso);
+	obj->Set(c, String::NewFromUtf8(iso, "name").ToLocalChecked(),
+	         String::NewFromUtf8(iso, name, NewStringType::kNormal,
+	                              nlen).ToLocalChecked()).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "size").ToLocalChecked(),
+	         Int32::New(iso, size)).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "type").ToLocalChecked(),
+	         Uint32::NewFromUnsigned(iso, type)).Check();
+	info.GetReturnValue().Set(obj);
+}
 
-// ---------------------------------------------------------------------------
-// Vertex attributes
-// ---------------------------------------------------------------------------
+// ----- Buffer -----
+FN(w_create_buffer) {
+	GLuint b = 0;
+	glGenBuffers(1, &b);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_BUFFER, b));
+}
+FN(w_delete_buffer) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteBuffers(1, &id);
+}
+FN(w_is_buffer) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsBuffer(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_buffer) {
+	enter_bracket();
+	glBindBuffer(a_u32(info, 0), obj_id(info[1]));
+}
+FN(w_buffer_data) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLenum usage = a_u32(info, 2);
+	if (info[1]->IsNumber()) {
+		// (target, size, usage) — allocate uninitialized storage.
+		const int64_t size = a_i64(info, 1);
+		glBufferData(target, (GLsizeiptr)size, nullptr, usage);
+		return;
+	}
+	size_t len = 0;
+	uint8_t *p = view_bytes(info[1], &len);
+	if (info[1]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[1].As<ArrayBuffer>();
+		p = (uint8_t *)ab->Data();
+		len = ab->ByteLength();
+	}
+	glBufferData(target, (GLsizeiptr)len, p, usage);
+}
+FN(w_buffer_sub_data) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLintptr offset = (GLintptr)a_i64(info, 1);
+	size_t len = 0;
+	uint8_t *p = view_bytes(info[2], &len);
+	if (info[2]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[2].As<ArrayBuffer>();
+		p = (uint8_t *)ab->Data();
+		len = ab->ByteLength();
+	}
+	if (p) glBufferSubData(target, offset, (GLsizeiptr)len, p);
+}
 
+// ----- Vertex attrib -----
 FN(w_enable_vertex_attrib_array) {
-	GUARD();
+	enter_bracket();
 	glEnableVertexAttribArray(a_u32(info, 0));
 }
 FN(w_disable_vertex_attrib_array) {
-	GUARD();
+	enter_bracket();
 	glDisableVertexAttribArray(a_u32(info, 0));
 }
 FN(w_vertex_attrib_pointer) {
-	GUARD();
+	enter_bracket();
 	glVertexAttribPointer(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	                      a_bool(info, 3), a_i32(info, 4),
-	                      (const void *)(uintptr_t)a_i64(info, 5));
+	                      a_bool(info, 3) ? GL_TRUE : GL_FALSE,
+	                      a_i32(info, 4),
+	                      (const void *)(intptr_t)a_i64(info, 5));
 }
-FN(w_vertex_attrib_i_pointer) {
-	GUARD();
-	glVertexAttribIPointer(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
-	                       a_i32(info, 3),
-	                       (const void *)(uintptr_t)a_i64(info, 4));
-}
-FN(w_vertex_attrib_divisor) {
-	GUARD();
-	glVertexAttribDivisor(a_u32(info, 0), a_u32(info, 1));
-}
-FN(w_vertex_attrib1f) {
-	GUARD();
-	glVertexAttrib1f(a_u32(info, 0), a_f32(info, 1));
-}
-FN(w_vertex_attrib2f) {
-	GUARD();
-	glVertexAttrib2f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2));
-}
-FN(w_vertex_attrib3f) {
-	GUARD();
-	glVertexAttrib3f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2),
-	                 a_f32(info, 3));
-}
-FN(w_vertex_attrib4f) {
-	GUARD();
-	glVertexAttrib4f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2),
-	                 a_f32(info, 3), a_f32(info, 4));
-}
-FN(w_vertex_attrib_i4i) {
-	GUARD();
-	glVertexAttribI4i(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
-	                  a_i32(info, 3), a_i32(info, 4));
-}
-FN(w_vertex_attrib_i4ui) {
-	GUARD();
-	glVertexAttribI4ui(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
-	                   a_u32(info, 3), a_u32(info, 4));
-}
+FN(w_vertex_attrib_1f) { enter_bracket(); glVertexAttrib1f(a_u32(info, 0), a_f32(info, 1)); }
+FN(w_vertex_attrib_2f) { enter_bracket(); glVertexAttrib2f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2)); }
+FN(w_vertex_attrib_3f) { enter_bracket(); glVertexAttrib3f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3)); }
+FN(w_vertex_attrib_4f) { enter_bracket(); glVertexAttrib4f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3), a_f32(info, 4)); }
 
-#define VATTR_VEC(NAME, N, TYPE, GETLIST, GLCALL)                              \
-	FN(NAME) {                                                                 \
-		GUARD();                                                               \
-		Isolate *iso = info.GetIsolate();                                      \
-		std::vector<TYPE> tmp;                                                 \
-		const TYPE *d;                                                         \
-		size_t n;                                                              \
-		if (!GETLIST(iso, info[1], tmp, &d, &n, 0, 0))                         \
-			return;                                                            \
-		if (n < N) {                                                           \
-			record_error(GL_INVALID_VALUE);                                    \
-			return;                                                            \
-		}                                                                      \
-		GLCALL(a_u32(info, 0), d);                                             \
-	}
+// ----- Uniform -----
+FN(w_uniform_1f) { enter_bracket(); glUniform1f(uniform_loc(info[0]), a_f32(info, 1)); }
+FN(w_uniform_2f) { enter_bracket(); glUniform2f(uniform_loc(info[0]), a_f32(info, 1), a_f32(info, 2)); }
+FN(w_uniform_3f) { enter_bracket(); glUniform3f(uniform_loc(info[0]), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3)); }
+FN(w_uniform_4f) { enter_bracket(); glUniform4f(uniform_loc(info[0]), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3), a_f32(info, 4)); }
+FN(w_uniform_1i) { enter_bracket(); glUniform1i(uniform_loc(info[0]), a_i32(info, 1)); }
+FN(w_uniform_2i) { enter_bracket(); glUniform2i(uniform_loc(info[0]), a_i32(info, 1), a_i32(info, 2)); }
+FN(w_uniform_3i) { enter_bracket(); glUniform3i(uniform_loc(info[0]), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3)); }
+FN(w_uniform_4i) { enter_bracket(); glUniform4i(uniform_loc(info[0]), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3), a_i32(info, 4)); }
 
-VATTR_VEC(w_vertex_attrib1fv, 1, float, get_f32_list, glVertexAttrib1fv)
-VATTR_VEC(w_vertex_attrib2fv, 2, float, get_f32_list, glVertexAttrib2fv)
-VATTR_VEC(w_vertex_attrib3fv, 3, float, get_f32_list, glVertexAttrib3fv)
-VATTR_VEC(w_vertex_attrib4fv, 4, float, get_f32_list, glVertexAttrib4fv)
-VATTR_VEC(w_vertex_attrib_i4iv, 4, int32_t, get_i32_list, glVertexAttribI4iv)
-VATTR_VEC(w_vertex_attrib_i4uiv, 4, uint32_t, get_u32_list,
-          glVertexAttribI4uiv)
+#define UNI_FV(N) \
+FN(w_uniform_##N##fv) { \
+	enter_bracket(); \
+	std::vector<float> tmp; \
+	const float *p = nullptr; \
+	size_t n = 0; \
+	if (!f32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return; \
+	glUniform##N##fv(uniform_loc(info[0]), (GLsizei)(n / N), p); \
+}
+UNI_FV(1)
+UNI_FV(2)
+UNI_FV(3)
+UNI_FV(4)
+#undef UNI_FV
 
-FN(w_get_vertex_attrib) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint index = a_u32(info, 0);
-	GLenum pname = a_u32(info, 1);
-	switch (pname) {
-	case GL_CURRENT_VERTEX_ATTRIB: {
-		float v[4] = {0};
-		glGetVertexAttribfv(index, pname, v);
-		info.GetReturnValue().Set(make_f32_array(iso, v, 4));
-		return;
-	}
-	case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING:
-		return; // object identity not tracked; null
-	case GL_VERTEX_ATTRIB_ARRAY_ENABLED:
-	case GL_VERTEX_ATTRIB_ARRAY_NORMALIZED:
-	case GL_VERTEX_ATTRIB_ARRAY_INTEGER: {
-		GLint v = 0;
-		glGetVertexAttribiv(index, pname, &v);
-		info.GetReturnValue().Set(v == GL_TRUE);
-		return;
-	}
-	}
-	GLint v = 0;
-	glGetVertexAttribiv(index, pname, &v);
-	info.GetReturnValue().Set(v);
+#define UNI_IV(N) \
+FN(w_uniform_##N##iv) { \
+	enter_bracket(); \
+	std::vector<int32_t> tmp; \
+	const int32_t *p = nullptr; \
+	size_t n = 0; \
+	if (!i32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return; \
+	glUniform##N##iv(uniform_loc(info[0]), (GLsizei)(n / N), p); \
 }
-FN(w_get_vertex_attrib_offset) {
-	info.GetReturnValue().Set(0);
-	GUARD();
-	void *ptr = nullptr;
-	glGetVertexAttribPointerv(a_u32(info, 0), a_u32(info, 1), &ptr);
-	info.GetReturnValue().Set((double)(uintptr_t)ptr);
-}
+UNI_IV(1)
+UNI_IV(2)
+UNI_IV(3)
+UNI_IV(4)
+#undef UNI_IV
 
-// ---------------------------------------------------------------------------
-// Queries, samplers, sync, transform feedback, uniform blocks
-// ---------------------------------------------------------------------------
+#define UNI_MAT_FV(N) \
+FN(w_uniform_matrix_##N##fv) { \
+	enter_bracket(); \
+	std::vector<float> tmp; \
+	const float *p = nullptr; \
+	size_t n = 0; \
+	if (!f32_list(info.GetIsolate(), info[2], tmp, &p, &n)) return; \
+	const GLsizei count = (GLsizei)(n / (N * N)); \
+	glUniformMatrix##N##fv(uniform_loc(info[0]), count, \
+	                        a_bool(info, 1) ? GL_TRUE : GL_FALSE, p); \
+}
+UNI_MAT_FV(2)
+UNI_MAT_FV(3)
+UNI_MAT_FV(4)
+#undef UNI_MAT_FV
 
-FN(w_begin_query) { GUARD(); glBeginQuery(a_u32(info, 0), obj_id(info[1])); }
-FN(w_end_query) { GUARD(); glEndQuery(a_u32(info, 0)); }
-FN(w_get_query) {
-	// Active query object identity is not tracked; null.
-	info.GetReturnValue().SetNull();
+// ----- Texture -----
+FN(w_create_texture) {
+	GLuint t = 0;
+	glGenTextures(1, &t);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_TEXTURE, t));
 }
-FN(w_get_query_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLuint query = obj_id(info[0]);
-	GLenum pname = a_u32(info, 1);
-	GLuint v = 0;
-	glGetQueryObjectuiv(query, pname, &v);
-	if (pname == GL_QUERY_RESULT_AVAILABLE)
-		info.GetReturnValue().Set(v == GL_TRUE);
-	else
-		info.GetReturnValue().Set(v);
+FN(w_delete_texture) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteTextures(1, &id);
 }
-FN(w_sampler_parameteri) {
-	GUARD();
-	glSamplerParameteri(obj_id(info[0]), a_u32(info, 1), a_i32(info, 2));
+FN(w_is_texture) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsTexture(obj_id(info[0])) == GL_TRUE));
 }
-FN(w_sampler_parameterf) {
-	GUARD();
-	glSamplerParameterf(obj_id(info[0]), a_u32(info, 1), a_f32(info, 2));
+FN(w_bind_texture) {
+	enter_bracket();
+	glBindTexture(a_u32(info, 0), obj_id(info[1]));
 }
-FN(w_get_sampler_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLuint sampler = obj_id(info[0]);
-	GLenum pname = a_u32(info, 1);
-	if (pname == GL_TEXTURE_MIN_LOD || pname == GL_TEXTURE_MAX_LOD) {
-		GLfloat f = 0;
-		glGetSamplerParameterfv(sampler, pname, &f);
-		info.GetReturnValue().Set((double)f);
-		return;
-	}
-	GLint v = 0;
-	glGetSamplerParameteriv(sampler, pname, &v);
-	info.GetReturnValue().Set(v);
+FN(w_active_texture) {
+	enter_bracket();
+	glActiveTexture(a_u32(info, 0));
 }
-
-FN(w_fence_sync) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLsync sync = glFenceSync(a_u32(info, 0), a_u32(info, 1));
-	if (!sync)
-		return;
-	info.GetReturnValue().Set(
-	    new_gl_obj(info.GetIsolate(), K_SYNC, 0, sync));
+FN(w_tex_parameteri) {
+	enter_bracket();
+	glTexParameteri(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2));
 }
-FN(w_is_sync) {
-	info.GetReturnValue().Set(false);
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || !o->sync)
-		return;
-	info.GetReturnValue().Set(glIsSync(o->sync) == GL_TRUE);
+FN(w_tex_parameterf) {
+	enter_bracket();
+	glTexParameterf(a_u32(info, 0), a_u32(info, 1), a_f32(info, 2));
 }
-FN(w_delete_sync) {
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || !o->sync)
-		return;
-	glDeleteSync(o->sync);
-	o->sync = nullptr;
+FN(w_generate_mipmap) {
+	enter_bracket();
+	glGenerateMipmap(a_u32(info, 0));
 }
-FN(w_client_wait_sync) {
-	info.GetReturnValue().Set((uint32_t)GL_WAIT_FAILED);
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || !o->sync)
-		return;
-	GLuint64 timeout = (GLuint64)a_f64(info, 2);
-	info.GetReturnValue().Set(
-	    (uint32_t)glClientWaitSync(o->sync, a_u32(info, 1), timeout));
-}
-FN(w_wait_sync) {
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || !o->sync)
-		return;
-	glWaitSync(o->sync, a_u32(info, 1), GL_TIMEOUT_IGNORED);
-}
-FN(w_get_sync_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLObj *o = get_gl_obj(info[0]);
-	if (!o || !o->sync)
-		return;
-	GLint v = 0;
-	GLsizei len = 0;
-	glGetSynciv(o->sync, a_u32(info, 1), 1, &len, &v);
-	info.GetReturnValue().Set(v);
-}
-
-FN(w_begin_transform_feedback) {
-	GUARD();
-	glBeginTransformFeedback(a_u32(info, 0));
-}
-FN(w_end_transform_feedback) { GUARD(); glEndTransformFeedback(); }
-FN(w_pause_transform_feedback) { GUARD(); glPauseTransformFeedback(); }
-FN(w_resume_transform_feedback) { GUARD(); glResumeTransformFeedback(); }
-FN(w_transform_feedback_varyings) {
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	if (!info[1]->IsArray())
-		return;
-	Local<Array> arr = info[1].As<Array>();
-	uint32_t n = arr->Length();
-	std::vector<std::string> strs(n);
-	std::vector<const char *> ptrs(n);
-	for (uint32_t i = 0; i < n; i++) {
-		Local<Value> el;
-		if (arr->Get(ctx, i).ToLocal(&el)) {
-			String::Utf8Value s(iso, el);
-			if (*s)
-				strs[i] = *s;
+// texImage2D — buffer-source overload only for 2.C
+//   (target, level, internalformat, width, height, border, format, type, pixels)
+//
+// Bucket E translate (re-applies dropped fork patches; see references in
+// auto-memory):
+//   * WebGL1 EXT_sRGB unsized formats → ES3 sized internalformat + unsized
+//     format. Three.js's WebGL1 path uses SRGB_EXT/SRGB_ALPHA_EXT (per the
+//     EXT_sRGB spec, which requires internalformat==format). ES3-core does
+//     not recognize 0x8C40/0x8C42 as internalformats and returns
+//     GL_INVALID_ENUM — confirmed empirically via the bucket-e:texImage2D
+//     diagnostic (err=0x0500 on 0x8C42 calls; 0x0000 on RGBA calls). Reapplies
+//     [[reference-brewser-v1-black-texture-demos]].
+//   * WebGL1 unsized internalformat + HALF_FLOAT/FLOAT type → ES3 sized
+//     internalformat (RGBA→RGBA16F/32F, RGB→RGB16F/32F, RG→RG16F/32F,
+//     R→R16F/32F). ES3 requires a sized internalformat for HALF_FLOAT/FLOAT
+//     types — unsized RGBA + HALF_FLOAT is INVALID_OPERATION in ES3. This is
+//     a precondition for Bucket F PMREM (cube→2D atlas intermediates upload
+//     half-float). Reapplies [[reference-dfglut-rg16f-accept-list-fix]] as a
+//     translate (the V8 engine has no accept-list to widen — the V8 analog
+//     is the unsized→sized translation).
+// Both translations are guarded by `internalformat == format` so we only
+// touch the WebGL1-style ES2 call shape; if a caller already passes a sized
+// internalformat, we leave it alone.
+static inline void bucket_e_translate_tex_image(
+    GLint *internalformat, GLenum *format, GLenum *type) {
+	if (*internalformat == *format) {
+		if (*internalformat == 0x8C42 /* SRGB_ALPHA_EXT */) {
+			*internalformat = 0x8C43; /* SRGB8_ALPHA8 */
+			*format         = 0x1908; /* GL_RGBA */
+			return;
 		}
-		ptrs[i] = strs[i].c_str();
-	}
-	glTransformFeedbackVaryings(obj_id(info[0]), (GLsizei)n, ptrs.data(),
-	                            a_u32(info, 2));
-}
-FN(w_get_transform_feedback_varying) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	char name[256];
-	GLsizei len = 0;
-	GLsizei size = 0;
-	GLenum type = 0;
-	glGetTransformFeedbackVarying(obj_id(info[0]), a_u32(info, 1),
-	                              sizeof(name), &len, &size, &type, name);
-	if (type == 0)
-		return;
-	Local<Object> o = Object::New(iso);
-	if (!st->protos[K_ACTIVE_INFO].IsEmpty()) {
-		o->SetPrototype(ctx, st->protos[K_ACTIVE_INFO].Get(iso)).Check();
-	}
-	o->Set(ctx, nx_str(iso, "name"), nx_str_lossy(iso, name, len)).Check();
-	o->Set(ctx, nx_str(iso, "size"), Integer::New(iso, size)).Check();
-	o->Set(ctx, nx_str(iso, "type"), Integer::NewFromUnsigned(iso, type))
-	    .Check();
-	info.GetReturnValue().Set(o);
-}
-
-FN(w_get_uniform_indices) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	if (!info[1]->IsArray())
-		return;
-	Local<Array> arr = info[1].As<Array>();
-	uint32_t n = arr->Length();
-	std::vector<std::string> strs(n);
-	std::vector<const char *> ptrs(n);
-	for (uint32_t i = 0; i < n; i++) {
-		Local<Value> el;
-		if (arr->Get(ctx, i).ToLocal(&el)) {
-			String::Utf8Value s(iso, el);
-			if (*s)
-				strs[i] = *s;
+		if (*internalformat == 0x8C40 /* SRGB_EXT */) {
+			*internalformat = 0x8C41; /* SRGB8 */
+			*format         = 0x1907; /* GL_RGB */
+			return;
 		}
-		ptrs[i] = strs[i].c_str();
-	}
-	std::vector<GLuint> indices(n);
-	glGetUniformIndices(obj_id(info[0]), (GLsizei)n, ptrs.data(),
-	                    indices.data());
-	Local<Array> out = Array::New(iso, n);
-	for (uint32_t i = 0; i < n; i++)
-		out->Set(ctx, i, Integer::NewFromUnsigned(iso, indices[i])).Check();
-	info.GetReturnValue().Set(out);
-}
-FN(w_get_active_uniforms) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	Local<Context> ctx = cur(iso);
-	if (!info[1]->IsArray())
-		return;
-	Local<Array> arr = info[1].As<Array>();
-	GLenum pname = a_u32(info, 2);
-	uint32_t n = arr->Length();
-	std::vector<GLuint> indices(n);
-	for (uint32_t i = 0; i < n; i++) {
-		Local<Value> el;
-		indices[i] = 0;
-		if (arr->Get(ctx, i).ToLocal(&el))
-			indices[i] = el->Uint32Value(ctx).FromMaybe(0);
-	}
-	std::vector<GLint> params(n);
-	glGetActiveUniformsiv(obj_id(info[0]), (GLsizei)n, indices.data(), pname,
-	                      params.data());
-	Local<Array> out = Array::New(iso, n);
-	bool is_bool = pname == GL_UNIFORM_IS_ROW_MAJOR;
-	for (uint32_t i = 0; i < n; i++) {
-		if (is_bool)
-			out->Set(ctx, i, Boolean::New(iso, params[i] != 0)).Check();
-		else
-			out->Set(ctx, i, Integer::New(iso, params[i])).Check();
-	}
-	info.GetReturnValue().Set(out);
-}
-FN(w_get_uniform_block_index) {
-	info.GetReturnValue().Set((uint32_t)GL_INVALID_INDEX);
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	String::Utf8Value name(iso, info[1]);
-	if (!*name)
-		return;
-	info.GetReturnValue().Set(
-	    (uint32_t)glGetUniformBlockIndex(obj_id(info[0]), *name));
-}
-FN(w_get_active_uniform_block_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLuint program = obj_id(info[0]);
-	GLuint index = a_u32(info, 1);
-	GLenum pname = a_u32(info, 2);
-	switch (pname) {
-	case GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES: {
-		GLint count = 0;
-		glGetActiveUniformBlockiv(program, index,
-		                          GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &count);
-		std::vector<GLint> v((size_t)count);
-		if (count > 0)
-			glGetActiveUniformBlockiv(program, index, pname, v.data());
-		info.GetReturnValue().Set(
-		    make_u32_array(iso, (const uint32_t *)v.data(), v.size()));
-		return;
-	}
-	case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:
-	case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: {
-		GLint v = 0;
-		glGetActiveUniformBlockiv(program, index, pname, &v);
-		info.GetReturnValue().Set(v == GL_TRUE);
-		return;
-	}
-	}
-	GLint v = 0;
-	glGetActiveUniformBlockiv(program, index, pname, &v);
-	info.GetReturnValue().Set(v);
-}
-FN(w_get_active_uniform_block_name) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	char name[256];
-	GLsizei len = 0;
-	glGetActiveUniformBlockName(obj_id(info[0]), a_u32(info, 1), sizeof(name),
-	                            &len, name);
-	info.GetReturnValue().Set(nx_str_lossy(iso, name, len));
-}
-FN(w_uniform_block_binding) {
-	GUARD();
-	glUniformBlockBinding(obj_id(info[0]), a_u32(info, 1), a_u32(info, 2));
-}
-
-FN(w_get_indexed_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	GLenum target = a_u32(info, 0);
-	GLuint index = a_u32(info, 1);
-	switch (target) {
-	case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
-	case GL_UNIFORM_BUFFER_BINDING:
-		return; // object identity not tracked; null
-	case GL_TRANSFORM_FEEDBACK_BUFFER_SIZE:
-	case GL_TRANSFORM_FEEDBACK_BUFFER_START:
-	case GL_UNIFORM_BUFFER_SIZE:
-	case GL_UNIFORM_BUFFER_START: {
-		GLint64 v = 0;
-		glGetInteger64i_v(target, index, &v);
-		info.GetReturnValue().Set((double)v);
-		return;
-	}
-	}
-	GLint v = 0;
-	glGetIntegeri_v(target, index, &v);
-	info.GetReturnValue().Set(v);
-}
-
-// ---------------------------------------------------------------------------
-// getParameter
-// ---------------------------------------------------------------------------
-
-FN(w_get_parameter) {
-	info.GetReturnValue().SetNull();
-	GUARD();
-	Isolate *iso = info.GetIsolate();
-	GLenum pname = a_u32(info, 0);
-	switch (pname) {
-	// ---- strings ----
-	case GL_VENDOR:
-	case GL_RENDERER: {
-		const char *s = (const char *)glGetString(pname);
-		info.GetReturnValue().Set(nx_str_lossy(iso, s ? s : ""));
-		return;
-	}
-	case GL_VERSION: {
-		const char *s = (const char *)glGetString(GL_VERSION);
-		std::string v = "WebGL 2.0 (";
-		v += s ? s : "unknown";
-		v += ")";
-		info.GetReturnValue().Set(nx_str_lossy(iso, v.c_str()));
-		return;
-	}
-	case GL_SHADING_LANGUAGE_VERSION: {
-		const char *s = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-		std::string v = "WebGL GLSL ES 3.00 (";
-		v += s ? s : "unknown";
-		v += ")";
-		info.GetReturnValue().Set(nx_str_lossy(iso, v.c_str()));
-		return;
-	}
-	// ---- single floats ----
-	case GL_DEPTH_CLEAR_VALUE:
-	case GL_LINE_WIDTH:
-	case GL_POLYGON_OFFSET_FACTOR:
-	case GL_POLYGON_OFFSET_UNITS:
-	case GL_SAMPLE_COVERAGE_VALUE:
-	case GL_MAX_TEXTURE_LOD_BIAS: {
-		GLfloat f = 0;
-		glGetFloatv(pname, &f);
-		info.GetReturnValue().Set((double)f);
-		return;
-	}
-	// ---- Float32Array(2) ----
-	case GL_ALIASED_LINE_WIDTH_RANGE:
-	case GL_ALIASED_POINT_SIZE_RANGE:
-	case GL_DEPTH_RANGE: {
-		float v[2] = {0};
-		glGetFloatv(pname, v);
-		info.GetReturnValue().Set(make_f32_array(iso, v, 2));
-		return;
-	}
-	// ---- Float32Array(4) ----
-	case GL_BLEND_COLOR:
-	case GL_COLOR_CLEAR_VALUE: {
-		float v[4] = {0};
-		glGetFloatv(pname, v);
-		info.GetReturnValue().Set(make_f32_array(iso, v, 4));
-		return;
-	}
-	// ---- Int32Array(2) ----
-	case GL_MAX_VIEWPORT_DIMS: {
-		GLint v[2] = {0};
-		glGetIntegerv(pname, v);
-		info.GetReturnValue().Set(make_i32_array(iso, v, 2));
-		return;
-	}
-	// ---- Int32Array(4) ----
-	case GL_SCISSOR_BOX:
-	case GL_VIEWPORT: {
-		GLint v[4] = {0};
-		glGetIntegerv(pname, v);
-		info.GetReturnValue().Set(make_i32_array(iso, v, 4));
-		return;
-	}
-	// ---- booleans ----
-	case GL_BLEND:
-	case GL_CULL_FACE:
-	case GL_DEPTH_TEST:
-	case GL_DEPTH_WRITEMASK:
-	case GL_DITHER:
-	case GL_POLYGON_OFFSET_FILL:
-	case GL_SAMPLE_ALPHA_TO_COVERAGE:
-	case GL_SAMPLE_COVERAGE_INVERT:
-	case GL_SCISSOR_TEST:
-	case GL_STENCIL_TEST:
-	case GL_RASTERIZER_DISCARD:
-	case GL_TRANSFORM_FEEDBACK_ACTIVE:
-	case GL_TRANSFORM_FEEDBACK_PAUSED: {
-		GLboolean b = GL_FALSE;
-		glGetBooleanv(pname, &b);
-		info.GetReturnValue().Set(b == GL_TRUE);
-		return;
-	}
-	// ---- bool[4] ----
-	case GL_COLOR_WRITEMASK: {
-		GLboolean v[4] = {0};
-		glGetBooleanv(pname, v);
-		Local<Context> ctx = cur(iso);
-		Local<Array> arr = Array::New(iso, 4);
-		for (int i = 0; i < 4; i++)
-			arr->Set(ctx, i, Boolean::New(iso, v[i] == GL_TRUE)).Check();
-		info.GetReturnValue().Set(arr);
-		return;
-	}
-	// ---- int64 ----
-	case GL_MAX_ELEMENT_INDEX:
-	case GL_MAX_SERVER_WAIT_TIMEOUT:
-	case GL_MAX_UNIFORM_BLOCK_SIZE:
-	case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:
-	case GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS: {
-		GLint64 v = 0;
-		glGetInteger64v(pname, &v);
-		info.GetReturnValue().Set((double)v);
-		return;
-	}
-	// ---- WebGL-specific ----
-	case NX_GL_UNPACK_FLIP_Y_WEBGL:
-		info.GetReturnValue().Set(st->unpack_flip_y);
-		return;
-	case NX_GL_UNPACK_PREMULTIPLY_ALPHA_WEBGL:
-		info.GetReturnValue().Set(st->unpack_premultiply);
-		return;
-	case NX_GL_UNPACK_COLORSPACE_CONVERSION_WEBGL:
-		info.GetReturnValue().Set(0x9244); // BROWSER_DEFAULT_WEBGL
-		return;
-	case 0x9245: // MAX_CLIENT_WAIT_TIMEOUT_WEBGL (EXT_disjoint... not used)
-		info.GetReturnValue().Set(0);
-		return;
-	// ---- object bindings (identity not tracked; null) ----
-	case GL_ARRAY_BUFFER_BINDING:
-	case GL_ELEMENT_ARRAY_BUFFER_BINDING:
-	case GL_COPY_READ_BUFFER_BINDING:
-	case GL_COPY_WRITE_BUFFER_BINDING:
-	case GL_PIXEL_PACK_BUFFER_BINDING:
-	case GL_PIXEL_UNPACK_BUFFER_BINDING:
-	case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
-	case GL_UNIFORM_BUFFER_BINDING:
-	case GL_CURRENT_PROGRAM:
-	case GL_FRAMEBUFFER_BINDING: // == DRAW_FRAMEBUFFER_BINDING
-	case GL_READ_FRAMEBUFFER_BINDING:
-	case GL_RENDERBUFFER_BINDING:
-	case GL_TEXTURE_BINDING_2D:
-	case GL_TEXTURE_BINDING_CUBE_MAP:
-	case GL_TEXTURE_BINDING_3D:
-	case GL_TEXTURE_BINDING_2D_ARRAY:
-	case GL_SAMPLER_BINDING:
-	case GL_TRANSFORM_FEEDBACK_BINDING:
-	case GL_VERTEX_ARRAY_BINDING:
-		return;
-	}
-	// Default: single integer (MAX_* limits, enum-valued state, etc).
-	GLint v = 0;
-	glGetIntegerv(pname, &v);
-	info.GetReturnValue().Set(v);
-}
-
-// ---------------------------------------------------------------------------
-// Context creation / initClass / present / teardown
-// ---------------------------------------------------------------------------
-
-bool init_egl_es3(NWindow *win) {
-	st->dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-	if (!st->dpy)
-		return false;
-	eglInitialize(st->dpy, nullptr, nullptr);
-	eglBindAPI(EGL_OPENGL_ES_API);
-	EGLConfig cfg;
-	EGLint num = 0;
-	const EGLint attrs[] = {EGL_RENDERABLE_TYPE,
-	                        0x0040, // EGL_OPENGL_ES3_BIT
-	                        EGL_RED_SIZE,
-	                        8,
-	                        EGL_GREEN_SIZE,
-	                        8,
-	                        EGL_BLUE_SIZE,
-	                        8,
-	                        EGL_ALPHA_SIZE,
-	                        8,
-	                        EGL_DEPTH_SIZE,
-	                        24,
-	                        EGL_STENCIL_SIZE,
-	                        8,
-	                        EGL_NONE};
-	eglChooseConfig(st->dpy, attrs, &cfg, 1, &num);
-	if (!num) {
-		fprintf(stderr, "[webgl] eglChooseConfig: no ES3 config\n");
-		return false;
-	}
-	st->surf = eglCreateWindowSurface(st->dpy, cfg, win, nullptr);
-	if (!st->surf) {
-		fprintf(stderr, "[webgl] eglCreateWindowSurface failed: 0x%x\n",
-		        eglGetError());
-		return false;
-	}
-	const EGLint ca[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-	st->ctx = eglCreateContext(st->dpy, cfg, EGL_NO_CONTEXT, ca);
-	if (!st->ctx) {
-		fprintf(stderr, "[webgl] eglCreateContext (ES3) failed: 0x%x\n",
-		        eglGetError());
-		return false;
-	}
-	if (eglMakeCurrent(st->dpy, st->surf, st->surf, st->ctx) != EGL_TRUE) {
-		fprintf(stderr, "[webgl] eglMakeCurrent failed: 0x%x\n", eglGetError());
-		return false;
-	}
-	// One swap per vblank (same policy as the Skia GPU path).
-	if (eglSwapInterval(st->dpy, 1) != EGL_TRUE) {
-		fprintf(stderr, "[webgl] eglSwapInterval(1) failed: 0x%x\n",
-		        eglGetError());
-	}
-	return true;
-}
-
-void webgl_teardown_egl() {
-	if (st && st->dpy) {
-		eglMakeCurrent(st->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-		if (st->ctx) {
-			eglDestroyContext(st->dpy, st->ctx);
-			st->ctx = EGL_NO_CONTEXT;
+		if (*type == 0x140B /* HALF_FLOAT */ ||
+		    *type == 0x8D61 /* HALF_FLOAT_OES */) {
+			switch (*internalformat) {
+			case 0x1908: *internalformat = 0x881A; break; /* RGBA→RGBA16F */
+			case 0x1907: *internalformat = 0x881B; break; /* RGB→RGB16F */
+			case 0x8227: *internalformat = 0x822F; break; /* RG→RG16F */
+			case 0x1903: *internalformat = 0x822D; break; /* RED→R16F */
+			}
 		}
-		if (st->surf) {
-			eglDestroySurface(st->dpy, st->surf);
-			st->surf = EGL_NO_SURFACE;
+		if (*type == 0x1406 /* GL_FLOAT */) {
+			switch (*internalformat) {
+			case 0x1908: *internalformat = 0x8814; break; /* RGBA→RGBA32F */
+			case 0x1907: *internalformat = 0x8815; break; /* RGB→RGB32F */
+			case 0x8227: *internalformat = 0x8230; break; /* RG→RG32F */
+			case 0x1903: *internalformat = 0x822E; break; /* RED→R32F */
+			}
 		}
-		eglTerminate(st->dpy);
-		st->dpy = EGL_NO_DISPLAY;
 	}
-	if (st)
-		st->active = false;
+	// F.1: Normalize HALF_FLOAT_OES (WebGL1 OES extension token, 0x8D61) to
+	// HALF_FLOAT (ES3-core token, 0x140B) when paired with a sized half-float
+	// internalformat (RGBA16F/RGB16F/RG16F/R16F). The QuickJS-era engine
+	// comment that said "Mesa Nouveau treats 0x8D61 and 0x140B as aliases"
+	// is true for the WebGL1 ES2-style unsized call (internalformat==format
+	// unsized), but ES3 spec REQUIRES type==HALF_FLOAT for sized half-float
+	// internalformats — pairing HALF_FLOAT_OES with sized internalformat
+	// returns INVALID_OPERATION on Mesa-Nouveau-on-Citron (confirmed via F.1
+	// `[f1:texImage2D-hf]` diagnostic on webgl-loader-gltf's r162 PMREM
+	// RGBA16F intermediate uploads). Three.js r162's PMREM passes already-
+	// sized RGBA16F + HALF_FLOAT_OES; this normalization makes that valid.
+	if (*type == 0x8D61 /* HALF_FLOAT_OES */) {
+		switch (*internalformat) {
+		case 0x881A /* RGBA16F */:
+		case 0x881B /* RGB16F */:
+		case 0x822F /* RG16F */:
+		case 0x822D /* R16F */:
+			*type = 0x140B; /* HALF_FLOAT */
+			break;
+		}
+	}
 }
 
-// $.webglContextNew(screen): bring up EGL + an OpenGL ES 3 context on the
-// default NWindow. Returns the context carrier object, or undefined when GL
-// init fails (the TS side then returns null from getContext).
-FN(nx_webgl_context_new) {
+// texSubImage2D has no internalformat parameter — storage was allocated by a
+// prior texImage2D/texStorage2D. The sub-upload's format should be unsized
+// (the storage carries the sizing). The only translation needed mirrors the
+// SRGB format-side normalization (in case Three.js passes SRGB_ALPHA_EXT as
+// the format here too, mirroring the texImage2D pattern).
+static inline void bucket_e_translate_tex_sub_image(
+    GLenum *format, GLenum *type) {
+	if (*format == 0x8C42 /* SRGB_ALPHA_EXT */) {
+		*format = 0x1908; /* GL_RGBA */
+	} else if (*format == 0x8C40 /* SRGB_EXT */) {
+		*format = 0x1907; /* GL_RGB */
+	}
+	// F.1: Normalize HALF_FLOAT_OES → HALF_FLOAT. texSubImage2D uploads
+	// against storage that was allocated by a prior texImage2D or
+	// texStorage2D — if the storage was sized half-float (RGBA16F/etc.),
+	// the sub-upload must use the ES3-core HALF_FLOAT token, not the
+	// WebGL1 OES alias. Safe to normalize unconditionally: HALF_FLOAT is
+	// the ES3-canonical token and Mesa accepts it for any half-float
+	// storage shape; the unsized-WebGL1 case still works post-normalize.
+	if (*type == 0x8D61 /* HALF_FLOAT_OES */) {
+		*type = 0x140B; /* HALF_FLOAT */
+	}
+}
+
+FN(w_tex_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	GLint internalformat = a_i32(info, 2);
+	const GLsizei width = a_i32(info, 3);
+	const GLsizei height = a_i32(info, 4);
+	const GLint border = a_i32(info, 5);
+	GLenum format = a_u32(info, 6);
+	GLenum type = a_u32(info, 7);
+	size_t len = 0;
+	void *pixels = view_bytes(info[8], &len);
+	if (info[8]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[8].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[8]->IsNullOrUndefined()) pixels = nullptr;
+	bucket_e_translate_tex_image(&internalformat, &format, &type);
+	glTexImage2D(target, level, internalformat, width, height, border, format,
+	             type, pixels);
+}
+FN(w_tex_sub_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xoff = a_i32(info, 2);
+	const GLint yoff = a_i32(info, 3);
+	const GLsizei width = a_i32(info, 4);
+	const GLsizei height = a_i32(info, 5);
+	GLenum format = a_u32(info, 6);
+	GLenum type = a_u32(info, 7);
+	size_t len = 0;
+	void *pixels = view_bytes(info[8], &len);
+	if (info[8]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[8].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	bucket_e_translate_tex_sub_image(&format, &type);
+	glTexSubImage2D(target, level, xoff, yoff, width, height, format, type,
+	                pixels);
+}
+
+// ----- Framebuffer / Renderbuffer -----
+FN(w_create_framebuffer) {
+	GLuint f = 0;
+	glGenFramebuffers(1, &f);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_FRAMEBUFFER, f));
+}
+FN(w_delete_framebuffer) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteFramebuffers(1, &id);
+}
+FN(w_is_framebuffer) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsFramebuffer(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_framebuffer) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	GLuint fbo = obj_id(info[1]);
+	if (st) {
+		st->bound_fbo_js = fbo;
+		st->draw_into_default = (fbo == 0);
+	}
+	// JS sees null/0 as "default" framebuffer; we redirect to tenant FBO.
+	GLuint actual = (fbo == 0) ? nx_webgl_bridge_fbo_id() : fbo;
+	glBindFramebuffer(target, actual);
+}
+FN(w_framebuffer_texture_2d) {
+	enter_bracket();
+	glFramebufferTexture2D(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
+	                       obj_id(info[3]), a_i32(info, 4));
+}
+FN(w_framebuffer_renderbuffer) {
+	enter_bracket();
+	glFramebufferRenderbuffer(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
+	                          obj_id(info[3]));
+}
+FN(w_check_framebuffer_status) {
+	enter_bracket();
+	info.GetReturnValue().Set(Uint32::NewFromUnsigned(info.GetIsolate(),
+	    glCheckFramebufferStatus(a_u32(info, 0))));
+}
+FN(w_create_renderbuffer) {
+	GLuint r = 0;
+	glGenRenderbuffers(1, &r);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_RENDERBUFFER, r));
+}
+FN(w_delete_renderbuffer) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteRenderbuffers(1, &id);
+}
+FN(w_is_renderbuffer) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsRenderbuffer(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_renderbuffer) {
+	enter_bracket();
+	glBindRenderbuffer(a_u32(info, 0), obj_id(info[1]));
+}
+FN(w_renderbuffer_storage) {
+	enter_bracket();
+	glRenderbufferStorage(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2),
+	                      a_i32(info, 3));
+}
+
+// ----- Draw -----
+FN(w_draw_arrays) {
+	enter_bracket();
+	glDrawArrays(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2));
+	touch_fbo();
+}
+FN(w_draw_elements) {
+	enter_bracket();
+	glDrawElements(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
+	               (const void *)(intptr_t)a_i64(info, 3));
+	touch_fbo();
+}
+
+// ----- Readback -----
+FN(w_read_pixels) {
+	enter_bracket();
+	const GLint x = a_i32(info, 0);
+	const GLint y = a_i32(info, 1);
+	const GLsizei width = a_i32(info, 2);
+	const GLsizei height = a_i32(info, 3);
+	const GLenum format = a_u32(info, 4);
+	const GLenum type = a_u32(info, 5);
+	size_t len = 0;
+	void *pixels = view_bytes(info[6], &len);
+	if (pixels) glReadPixels(x, y, width, height, format, type, pixels);
+}
+
+// ----- Fork-specific hooks required by brewser-runtime canvas-runner -----
+FN(w_enable_gpu_bridge_prototype) {
+	// Canvas-runner refuses to use the context if this method is absent
+	// (see brewser-runtime canvas-runner.ts:278). The QuickJS-era fork's
+	// bridge had this as a runtime toggle; the V8-migration bridge is always
+	// on (the only path that exists), so this is a no-op that returns true.
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), true));
+}
+FN(w_set_bridge_auto_flush) {
+	// brewser-runtime canvas-runner.ts calls gl.setBridgeAutoFlush(false) to
+	// tell the engine "I drive my own per-canvas paint via copyBridgeToCanvas
+	// at each <canvas>'s CSS layout slot — do NOT auto-stomp the whole FBO
+	// onto the screen on top of that". Forward the bool to the bridge;
+	// default-true (the no-arg / non-bool call) preserves the 2.B test-FBO
+	// smoke path that never calls this.
 	Isolate *iso = info.GetIsolate();
-	nx_context_t *ctx = nx_ctx(iso);
-	if (!st)
-		st = new WebGLState();
-	if (st->active)
-		return; // already created (TS guards against this)
-	// Applet (tight-memory) regime: the GL driver cannot run in the ~137 MiB
-	// grant — verified on-device: with JIT, Mesa fails to produce an EGL
-	// config (jitCreate starves it); jitless, the context comes up but the
-	// FIRST glCompileShader OOM-crashes inside Mesa's GLSL builtin
-	// construction (no way to fail gracefully from there). Return null
-	// (before touching EGL, so the NWindow stays usable for the raster
-	// fallback / error display). An explicit `[renderer] mode = gpu` opts in
-	// anyway, matching the Skia GPU path's applet policy.
-	if (nx_tight_memory() && ctx->config.renderer != NX_RENDER_GPU) {
-		fprintf(stderr,
-		        "[webgl] applet regime: not enough memory for the GL driver; "
-		        "getContext('webgl2') returns null ([renderer] mode = gpu "
-		        "overrides)\n");
-		fflush(stderr);
-		return;
-	}
-	// Release whatever currently owns the display path (PrintConsole, raster
-	// framebuffer, or a console-initialized Skia GPU screen) before EGL
-	// claims the NWindow.
-	nx_screen_release_for_webgl(iso, info[0]);
-	if (!init_egl_es3(nwindowGetDefault())) {
-		webgl_teardown_egl();
-		fprintf(stderr, "[webgl] EGL/ES3 init failed; getContext('webgl2') "
-		                "returns null\n");
-		fflush(stderr);
-		return;
-	}
-	const char *version = (const char *)glGetString(GL_VERSION);
-	if (!version || strncmp(version, "OpenGL ES 3.", 12) != 0) {
-		fprintf(stderr, "[webgl] driver is not ES3 (%s)\n",
-		        version ? version : "null");
-		fflush(stderr);
-		webgl_teardown_egl();
-		return;
-	}
-	// Drawing buffer dimensions: Mesa/nouveau's eglQuerySurface reports 0x0
-	// for the NWindow surface, but the spec-mandated *initial GL viewport*
-	// equals the surface size — read that instead, with EGL as a secondary
-	// source and the NWindow default (1280x720) as a last resort.
-	GLint vp[4] = {0, 0, 0, 0};
-	glGetIntegerv(GL_VIEWPORT, vp);
-	EGLint w = vp[2], h = vp[3];
-	if (w <= 0 || h <= 0) {
-		eglQuerySurface(st->dpy, st->surf, EGL_WIDTH, &w);
-		eglQuerySurface(st->dpy, st->surf, EGL_HEIGHT, &h);
-	}
-	if (w <= 0 || h <= 0) {
-		w = 1280;
-		h = 720;
-	}
-	st->width = w;
-	st->height = h;
-	st->active = true;
-	st->dirty = false;
-	st->draw_fbo = 0;
-	st->synthetic_error = GL_NO_ERROR;
-	st->unpack_flip_y = false;
-	st->unpack_premultiply = false;
-	st->unpack_alignment = 4;
-	st->unpack_row_length = 0;
-	st->pack_alignment = 4;
-	// Clear both swapchain buffers so no garbage is ever presented.
-	glClearColor(0, 0, 0, 1);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-	eglSwapBuffers(st->dpy, st->surf);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-	fprintf(stderr, "[webgl] ES3 context ready: %dx%d (%s)\n", w, h, version);
-	fflush(stderr);
-	// Bringing up EGL/Mesa can leave HID not delivering input when it runs
-	// after the pads were configured (same as the Skia GPU path in
-	// nx_framebuffer_init); re-configure + re-initialize the pads.
-	padConfigureInput(8, HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadGc);
-	padInitializeDefault(&ctx->pads[0]);
-	for (int i = 1; i < 8; i++) {
-		padInitialize(&ctx->pads[i], (HidNpadIdType)(HidNpadIdType_No1 + i));
-	}
-	// The main loop's CANVAS present branch dispatches to nx_webgl_present()
-	// when a WebGL context is active.
-	ctx->rendering_mode = NX_RENDERING_MODE_CANVAS;
-	info.GetReturnValue().Set(nx::NewWrapped(iso));
+	bool v = true;
+	if (info.Length() >= 1)
+		v = info[0]->BooleanValue(iso);
+	nx_webgl_bridge_set_auto_flush(v);
+	info.GetReturnValue().Set(Boolean::New(iso, true));
 }
 
-FN(w_drawing_buffer_width) {
-	info.GetReturnValue().Set(st ? st->width : 0);
-}
-FN(w_drawing_buffer_height) {
-	info.GetReturnValue().Set(st ? st->height : 0);
-}
-
-// $.webglInitClass(WebGL2RenderingContext, { WebGLBuffer, ... }): stamp the
-// native methods onto the context prototype + retain the WebGL object class
-// prototypes so C-minted objects get correct `instanceof` behavior.
-FN(nx_webgl_init_class) {
+FN(w_copy_bridge_to_canvas) {
+	// gl.copyBridgeToCanvas(srcX, srcY, srcW, srcH, dst_canvas, dstX, dstY)
+	//   → bool ok
+	//
+	// Engine-side half of the runtime's per-canvas paint path. The runtime
+	// (brewser-runtime canvas-runner.ts → overlayLiveAnimatedCanvases)
+	// computes each inline <canvas>'s CSS layout slot and calls this to blit
+	// that sub-rect of the shared bridge FBO onto the destination canvas
+	// surface at the slot's screen-coord position. Pair with
+	// setBridgeAutoFlush(false) so the engine's whole-FBO compose path stays
+	// out of the way.
+	//
+	// Phase 2.D scope: dst_canvas is ignored — the only destination the
+	// runtime passes is screen (nxScreen()), and the bridge composes onto
+	// the persistent canvas surface from nx_skia_gpu_canvas_surface(). When
+	// Phase 2.E / 2.G needs per-OffscreenCanvas destinations, extract the
+	// dst_canvas's Skia surface from info[4].
 	Isolate *iso = info.GetIsolate();
+	if (info.Length() < 7) {
+		info.GetReturnValue().Set(Boolean::New(iso, false));
+		return;
+	}
+	const int sx = a_i32(info, 0);
+	const int sy = a_i32(info, 1);
+	const int sw = a_i32(info, 2);
+	const int sh = a_i32(info, 3);
+	const int dx = a_i32(info, 5);
+	const int dy = a_i32(info, 6);
+
+	// Close any open per-frame WebGL bracket so Skia draws against its own
+	// cached GL state, not the WebGL pass's (FBO/viewport/program/etc. saved
+	// in st->snap). Same discipline nx_webgl_compose_if_active uses at
+	// present time.
+	if (st && st->bracket_open) exit_bracket();
+
+	SkSurface *target = nx_skia_gpu_canvas_surface();
+	if (!target) {
+		info.GetReturnValue().Set(Boolean::New(iso, false));
+		return;
+	}
+	const bool ok = nx_webgl_bridge_compose_rect(target, sx, sy, sw, sh, dx, dy);
+	info.GetReturnValue().Set(Boolean::New(iso, ok));
+}
+
+// ---------------------------------------------------------------------------
+// Class init: receive prototype carriers + install methods on them.
+// ---------------------------------------------------------------------------
+
+static void install_methods(Isolate *iso, Local<Object> proto) {
+	struct Spec { const char *name; FunctionCallback fn; };
+	static const Spec FUNCS[] = {
+	    {"viewport", w_viewport},
+	    {"scissor", w_scissor},
+	    {"enable", w_enable},
+	    {"disable", w_disable},
+	    {"isEnabled", w_is_enabled},
+	    {"depthFunc", w_depth_func},
+	    {"depthMask", w_depth_mask},
+	    {"depthRange", w_depth_range},
+	    {"cullFace", w_cull_face},
+	    {"frontFace", w_front_face},
+	    {"blendFunc", w_blend_func},
+	    {"blendFuncSeparate", w_blend_func_separate},
+	    {"blendEquation", w_blend_equation},
+	    {"blendEquationSeparate", w_blend_equation_separate},
+	    {"blendColor", w_blend_color},
+	    {"colorMask", w_color_mask},
+	    {"stencilFunc", w_stencil_func},
+	    {"stencilFuncSeparate", w_stencil_func_separate},
+	    {"stencilOp", w_stencil_op},
+	    {"stencilOpSeparate", w_stencil_op_separate},
+	    {"stencilMask", w_stencil_mask},
+	    {"stencilMaskSeparate", w_stencil_mask_separate},
+	    {"polygonOffset", w_polygon_offset},
+	    {"sampleCoverage", w_sample_coverage},
+	    {"lineWidth", w_line_width},
+	    {"hint", w_hint},
+	    {"clear", w_clear},
+	    {"clearColor", w_clear_color},
+	    {"clearDepth", w_clear_depth},
+	    {"clearStencil", w_clear_stencil},
+	    {"finish", w_finish},
+	    {"flush", w_flush},
+	    {"pixelStorei", w_pixel_storei},
+	    {"getError", w_get_error},
+	    {"getParameter", w_get_parameter},
+	    {"getExtension", w_get_extension},
+	    {"getSupportedExtensions", w_get_supported_extensions},
+	    {"isContextLost", w_is_context_lost},
+	    {"getContextAttributes", w_get_context_attributes},
+	    {"getShaderPrecisionFormat", w_get_shader_precision_format},
+	    {"createShader", w_create_shader},
+	    {"deleteShader", w_delete_shader},
+	    {"isShader", w_is_shader},
+	    {"shaderSource", w_shader_source},
+	    {"compileShader", w_compile_shader},
+	    {"getShaderParameter", w_get_shader_parameter},
+	    {"getShaderInfoLog", w_get_shader_info_log},
+	    {"getShaderSource", w_get_shader_source},
+	    {"createProgram", w_create_program},
+	    {"deleteProgram", w_delete_program},
+	    {"isProgram", w_is_program},
+	    {"attachShader", w_attach_shader},
+	    {"detachShader", w_detach_shader},
+	    {"linkProgram", w_link_program},
+	    {"validateProgram", w_validate_program},
+	    {"useProgram", w_use_program},
+	    {"getProgramParameter", w_get_program_parameter},
+	    {"getProgramInfoLog", w_get_program_info_log},
+	    {"getAttribLocation", w_get_attrib_location},
+	    {"getUniformLocation", w_get_uniform_location},
+	    {"bindAttribLocation", w_bind_attrib_location},
+	    {"getActiveAttrib", w_get_active_attrib},
+	    {"getActiveUniform", w_get_active_uniform},
+	    {"createBuffer", w_create_buffer},
+	    {"deleteBuffer", w_delete_buffer},
+	    {"isBuffer", w_is_buffer},
+	    {"bindBuffer", w_bind_buffer},
+	    {"bufferData", w_buffer_data},
+	    {"bufferSubData", w_buffer_sub_data},
+	    {"enableVertexAttribArray", w_enable_vertex_attrib_array},
+	    {"disableVertexAttribArray", w_disable_vertex_attrib_array},
+	    {"vertexAttribPointer", w_vertex_attrib_pointer},
+	    {"vertexAttrib1f", w_vertex_attrib_1f},
+	    {"vertexAttrib2f", w_vertex_attrib_2f},
+	    {"vertexAttrib3f", w_vertex_attrib_3f},
+	    {"vertexAttrib4f", w_vertex_attrib_4f},
+	    {"uniform1f", w_uniform_1f},
+	    {"uniform2f", w_uniform_2f},
+	    {"uniform3f", w_uniform_3f},
+	    {"uniform4f", w_uniform_4f},
+	    {"uniform1i", w_uniform_1i},
+	    {"uniform2i", w_uniform_2i},
+	    {"uniform3i", w_uniform_3i},
+	    {"uniform4i", w_uniform_4i},
+	    {"uniform1fv", w_uniform_1fv},
+	    {"uniform2fv", w_uniform_2fv},
+	    {"uniform3fv", w_uniform_3fv},
+	    {"uniform4fv", w_uniform_4fv},
+	    {"uniform1iv", w_uniform_1iv},
+	    {"uniform2iv", w_uniform_2iv},
+	    {"uniform3iv", w_uniform_3iv},
+	    {"uniform4iv", w_uniform_4iv},
+	    {"uniformMatrix2fv", w_uniform_matrix_2fv},
+	    {"uniformMatrix3fv", w_uniform_matrix_3fv},
+	    {"uniformMatrix4fv", w_uniform_matrix_4fv},
+	    {"createTexture", w_create_texture},
+	    {"deleteTexture", w_delete_texture},
+	    {"isTexture", w_is_texture},
+	    {"bindTexture", w_bind_texture},
+	    {"activeTexture", w_active_texture},
+	    {"texParameteri", w_tex_parameteri},
+	    {"texParameterf", w_tex_parameterf},
+	    {"generateMipmap", w_generate_mipmap},
+	    {"texImage2D", w_tex_image_2d},
+	    {"texSubImage2D", w_tex_sub_image_2d},
+	    {"createFramebuffer", w_create_framebuffer},
+	    {"deleteFramebuffer", w_delete_framebuffer},
+	    {"isFramebuffer", w_is_framebuffer},
+	    {"bindFramebuffer", w_bind_framebuffer},
+	    {"framebufferTexture2D", w_framebuffer_texture_2d},
+	    {"framebufferRenderbuffer", w_framebuffer_renderbuffer},
+	    {"checkFramebufferStatus", w_check_framebuffer_status},
+	    {"createRenderbuffer", w_create_renderbuffer},
+	    {"deleteRenderbuffer", w_delete_renderbuffer},
+	    {"isRenderbuffer", w_is_renderbuffer},
+	    {"bindRenderbuffer", w_bind_renderbuffer},
+	    {"renderbufferStorage", w_renderbuffer_storage},
+	    {"drawArrays", w_draw_arrays},
+	    {"drawElements", w_draw_elements},
+	    {"readPixels", w_read_pixels},
+	    // Fork-specific hooks (canvas-runner expects them).
+	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
+	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
+	    {"copyBridgeToCanvas", w_copy_bridge_to_canvas},
+	};
+	Local<Context> ctx = iso->GetCurrentContext();
+	for (const auto &s : FUNCS) {
+		proto->Set(ctx, nx_str(iso, s.name),
+		           FunctionTemplate::New(iso, s.fn)
+		               ->GetFunction(ctx).ToLocalChecked()).Check();
+	}
+}
+
+// $.webglInitClass(WebGLRenderingContext, {WebGLBuffer, WebGLProgram, ...})
+//   — receives the JS class + the helper-class map; stashes prototype
+//   carriers for new_gl_obj() to use, and installs the WebGL methods on
+//   the class's prototype.
+void nx_webgl_init_class(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (!st) st = new WebGLState();
+	if (info.Length() < 1 || !info[0]->IsFunction()) return;
+	Local<Function> cls = info[0].As<Function>();
 	Local<Context> ctx = cur(iso);
-	if (!st)
-		st = new WebGLState();
-	Local<Object> proto = info[0]
-	                          .As<Object>()
-	                          ->Get(ctx, nx_str(iso, "prototype"))
-	                          .ToLocalChecked()
-	                          .As<Object>();
-	static const struct {
-		const char *name;
-		ObjKind kind;
-	} kClasses[] = {
+	Local<Value> proto_v;
+	if (!cls->Get(ctx, nx_str(iso, "prototype")).ToLocal(&proto_v)) return;
+	if (!proto_v->IsObject()) return;
+	Local<Object> proto = proto_v.As<Object>();
+	install_methods(iso, proto);
+
+	if (info.Length() < 2 || !info[1]->IsObject()) return;
+	Local<Object> classes = info[1].As<Object>();
+	struct KV { const char *name; ObjKind kind; };
+	static const KV MAP[] = {
 	    {"WebGLBuffer", K_BUFFER},
 	    {"WebGLFramebuffer", K_FRAMEBUFFER},
 	    {"WebGLProgram", K_PROGRAM},
-	    {"WebGLQuery", K_QUERY},
 	    {"WebGLRenderbuffer", K_RENDERBUFFER},
-	    {"WebGLSampler", K_SAMPLER},
 	    {"WebGLShader", K_SHADER},
 	    {"WebGLTexture", K_TEXTURE},
-	    {"WebGLTransformFeedback", K_TRANSFORM_FEEDBACK},
-	    {"WebGLVertexArrayObject", K_VERTEX_ARRAY},
-	    {"WebGLSync", K_SYNC},
 	    {"WebGLUniformLocation", K_UNIFORM_LOCATION},
 	    {"WebGLActiveInfo", K_ACTIVE_INFO},
 	    {"WebGLShaderPrecisionFormat", K_SHADER_PRECISION_FORMAT},
 	};
-	if (info.Length() > 1 && info[1]->IsObject()) {
-		Local<Object> map = info[1].As<Object>();
-		for (size_t i = 0; i < countof(kClasses); i++) {
-			Local<Value> cls;
-			if (!map->Get(ctx, nx_str(iso, kClasses[i].name)).ToLocal(&cls) ||
-			    !cls->IsObject())
-				continue;
-			Local<Value> p;
-			if (!cls.As<Object>()
-			         ->Get(ctx, nx_str(iso, "prototype"))
-			         .ToLocal(&p) ||
-			    !p->IsObject())
-				continue;
-			st->protos[kClasses[i].kind].Reset(iso, p.As<Object>());
+	for (const auto &kv : MAP) {
+		Local<Value> jc;
+		if (!classes->Get(ctx, nx_str(iso, kv.name)).ToLocal(&jc)) continue;
+		if (!jc->IsFunction()) continue;
+		Local<Value> p;
+		if (!jc.As<Function>()->Get(ctx, nx_str(iso, "prototype")).ToLocal(&p))
+			continue;
+		if (!p->IsObject()) continue;
+		st->protos[kv.kind].Reset(iso, p.As<Object>());
+	}
+}
+
+// $.webglContextNew(canvas) — main factory. Returns a wrapped object that
+// the TS side adds the WebGLRenderingContext prototype to. Returns undefined
+// on failure (TS returns null from getContext).
+void nx_webgl_context_new(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (!st) st = new WebGLState();
+
+	// Skia must be up — without the shared ES3 context + GrDirectContext,
+	// the bridge can't init. Caller (TS) treats this as "no GL available".
+	if (!nx_skia_gpu_egl_context() || !nx_skia_gpu_gr_context()) {
+		fprintf(stderr, "[webgl] context_new refused: skia_gpu not ready\n");
+		fflush(stderr);
+		return;
+	}
+
+	// Read canvas dimensions if a canvas was passed.
+	int w = st->width, h = st->height;
+	if (info.Length() >= 1 && info[0]->IsObject()) {
+		Local<Object> canvas = info[0].As<Object>();
+		Local<Context> ctx = cur(iso);
+		Local<Value> vw, vh;
+		if (canvas->Get(ctx, nx_str(iso, "width")).ToLocal(&vw) &&
+		    vw->IsNumber())
+			w = vw->Int32Value(ctx).FromMaybe(w);
+		if (canvas->Get(ctx, nx_str(iso, "height")).ToLocal(&vh) &&
+		    vh->IsNumber())
+			h = vh->Int32Value(ctx).FromMaybe(h);
+	}
+	if (w <= 0) w = 640;
+	if (h <= 0) h = 360;
+	st->width = w;
+	st->height = h;
+
+	// Bring up the tenant FBO lazily (if 2.B's test_fbo opt-in hasn't
+	// already done so). The bridge is idempotent on init.
+	if (!nx_webgl_bridge_is_initialized()) {
+		if (!nx_webgl_bridge_init(w, h)) {
+			fprintf(stderr,
+			        "[webgl] context_new refused: bridge_init failed\n");
+			fflush(stderr);
+			return;
 		}
 	}
-	NX_DEF_GET(proto, "drawingBufferWidth", w_drawing_buffer_width);
-	NX_DEF_GET(proto, "drawingBufferHeight", w_drawing_buffer_height);
-	static const struct {
-		const char *name;
-		FunctionCallback fn;
-		int len;
-	} kFns[] = {
-	    {"activeTexture", w_active_texture, 1},
-	    {"attachShader", w_attach_shader, 2},
-	    {"beginQuery", w_begin_query, 2},
-	    {"beginTransformFeedback", w_begin_transform_feedback, 1},
-	    {"bindAttribLocation", w_bind_attrib_location, 3},
-	    {"bindBuffer", w_bind_buffer, 2},
-	    {"bindBufferBase", w_bind_buffer_base, 3},
-	    {"bindBufferRange", w_bind_buffer_range, 5},
-	    {"bindFramebuffer", w_bind_framebuffer, 2},
-	    {"bindRenderbuffer", w_bind_renderbuffer, 2},
-	    {"bindSampler", w_bind_sampler, 2},
-	    {"bindTexture", w_bind_texture, 2},
-	    {"bindTransformFeedback", w_bind_transform_feedback, 2},
-	    {"bindVertexArray", w_bind_vertex_array, 1},
-	    {"blendColor", w_blend_color, 4},
-	    {"blendEquation", w_blend_equation, 1},
-	    {"blendEquationSeparate", w_blend_equation_separate, 2},
-	    {"blendFunc", w_blend_func, 2},
-	    {"blendFuncSeparate", w_blend_func_separate, 4},
-	    {"blitFramebuffer", w_blit_framebuffer, 10},
-	    {"bufferData", w_buffer_data, 3},
-	    {"bufferSubData", w_buffer_sub_data, 3},
-	    {"checkFramebufferStatus", w_check_framebuffer_status, 1},
-	    {"clear", w_clear, 1},
-	    {"clearBufferfi", w_clear_bufferfi, 4},
-	    {"clearBufferfv", w_clear_bufferfv, 3},
-	    {"clearBufferiv", w_clear_bufferiv, 3},
-	    {"clearBufferuiv", w_clear_bufferuiv, 3},
-	    {"clearColor", w_clear_color, 4},
-	    {"clearDepth", w_clear_depth, 1},
-	    {"clearStencil", w_clear_stencil, 1},
-	    {"clientWaitSync", w_client_wait_sync, 3},
-	    {"colorMask", w_color_mask, 4},
-	    {"compileShader", w_compile_shader, 1},
-	    {"compressedTexImage2D", w_compressed_tex_image_2d, 7},
-	    {"compressedTexImage3D", w_compressed_tex_image_3d, 8},
-	    {"compressedTexSubImage2D", w_compressed_tex_sub_image_2d, 8},
-	    {"compressedTexSubImage3D", w_compressed_tex_sub_image_3d, 10},
-	    {"copyBufferSubData", w_copy_buffer_sub_data, 5},
-	    {"copyTexImage2D", w_copy_tex_image_2d, 8},
-	    {"copyTexSubImage2D", w_copy_tex_sub_image_2d, 8},
-	    {"copyTexSubImage3D", w_copy_tex_sub_image_3d, 9},
-	    {"createBuffer", w_create_buffer, 0},
-	    {"createFramebuffer", w_create_framebuffer, 0},
-	    {"createProgram", w_create_program, 0},
-	    {"createQuery", w_create_query, 0},
-	    {"createRenderbuffer", w_create_renderbuffer, 0},
-	    {"createSampler", w_create_sampler, 0},
-	    {"createShader", w_create_shader, 1},
-	    {"createTexture", w_create_texture, 0},
-	    {"createTransformFeedback", w_create_transform_feedback, 0},
-	    {"createVertexArray", w_create_vertex_array, 0},
-	    {"cullFace", w_cull_face, 1},
-	    {"deleteBuffer", w_delete_buffer, 1},
-	    {"deleteFramebuffer", w_delete_framebuffer, 1},
-	    {"deleteProgram", w_delete_program, 1},
-	    {"deleteQuery", w_delete_query, 1},
-	    {"deleteRenderbuffer", w_delete_renderbuffer, 1},
-	    {"deleteSampler", w_delete_sampler, 1},
-	    {"deleteShader", w_delete_shader, 1},
-	    {"deleteSync", w_delete_sync, 1},
-	    {"deleteTexture", w_delete_texture, 1},
-	    {"deleteTransformFeedback", w_delete_transform_feedback, 1},
-	    {"deleteVertexArray", w_delete_vertex_array, 1},
-	    {"depthFunc", w_depth_func, 1},
-	    {"depthMask", w_depth_mask, 1},
-	    {"depthRange", w_depth_range, 2},
-	    {"detachShader", w_detach_shader, 2},
-	    {"disable", w_disable, 1},
-	    {"disableVertexAttribArray", w_disable_vertex_attrib_array, 1},
-	    {"drawArrays", w_draw_arrays, 3},
-	    {"drawArraysInstanced", w_draw_arrays_instanced, 4},
-	    {"drawBuffers", w_draw_buffers, 1},
-	    {"drawElements", w_draw_elements, 4},
-	    {"drawElementsInstanced", w_draw_elements_instanced, 5},
-	    {"drawRangeElements", w_draw_range_elements, 6},
-	    {"enable", w_enable, 1},
-	    {"enableVertexAttribArray", w_enable_vertex_attrib_array, 1},
-	    {"endQuery", w_end_query, 1},
-	    {"endTransformFeedback", w_end_transform_feedback, 0},
-	    {"fenceSync", w_fence_sync, 2},
-	    {"finish", w_finish, 0},
-	    {"flush", w_flush, 0},
-	    {"framebufferRenderbuffer", w_framebuffer_renderbuffer, 4},
-	    {"framebufferTexture2D", w_framebuffer_texture_2d, 5},
-	    {"framebufferTextureLayer", w_framebuffer_texture_layer, 5},
-	    {"frontFace", w_front_face, 1},
-	    {"generateMipmap", w_generate_mipmap, 1},
-	    {"getActiveAttrib", w_get_active_attrib, 2},
-	    {"getActiveUniform", w_get_active_uniform, 2},
-	    {"getActiveUniformBlockName", w_get_active_uniform_block_name, 2},
-	    {"getActiveUniformBlockParameter",
-	     w_get_active_uniform_block_parameter, 3},
-	    {"getActiveUniforms", w_get_active_uniforms, 3},
-	    {"getAttachedShaders", w_get_attached_shaders, 1},
-	    {"getAttribLocation", w_get_attrib_location, 2},
-	    {"getBufferParameter", w_get_buffer_parameter, 2},
-	    {"getBufferSubData", w_get_buffer_sub_data, 3},
-	    {"getError", w_get_error, 0},
-	    {"getFragDataLocation", w_get_frag_data_location, 2},
-	    {"getFramebufferAttachmentParameter",
-	     w_get_framebuffer_attachment_parameter, 3},
-	    {"getIndexedParameter", w_get_indexed_parameter, 2},
-	    {"getInternalformatParameter", w_get_internalformat_parameter, 3},
-	    {"getParameter", w_get_parameter, 1},
-	    {"getProgramInfoLog", w_get_program_info_log, 1},
-	    {"getProgramParameter", w_get_program_parameter, 2},
-	    {"getQuery", w_get_query, 2},
-	    {"getQueryParameter", w_get_query_parameter, 2},
-	    {"getRenderbufferParameter", w_get_renderbuffer_parameter, 2},
-	    {"getSamplerParameter", w_get_sampler_parameter, 2},
-	    {"getShaderInfoLog", w_get_shader_info_log, 1},
-	    {"getShaderParameter", w_get_shader_parameter, 2},
-	    {"getShaderPrecisionFormat", w_get_shader_precision_format, 2},
-	    {"getShaderSource", w_get_shader_source, 1},
-	    {"getSyncParameter", w_get_sync_parameter, 2},
-	    {"getTexParameter", w_get_tex_parameter, 2},
-	    {"getTransformFeedbackVarying", w_get_transform_feedback_varying, 2},
-	    {"getUniform", w_get_uniform, 2},
-	    {"getUniformBlockIndex", w_get_uniform_block_index, 2},
-	    {"getUniformIndices", w_get_uniform_indices, 2},
-	    {"getUniformLocation", w_get_uniform_location, 2},
-	    {"getVertexAttrib", w_get_vertex_attrib, 2},
-	    {"getVertexAttribOffset", w_get_vertex_attrib_offset, 2},
-	    {"hint", w_hint, 2},
-	    {"invalidateFramebuffer", w_invalidate_framebuffer, 2},
-	    {"invalidateSubFramebuffer", w_invalidate_sub_framebuffer, 6},
-	    {"isBuffer", w_is_buffer, 1},
-	    {"isEnabled", w_is_enabled, 1},
-	    {"isFramebuffer", w_is_framebuffer, 1},
-	    {"isProgram", w_is_program, 1},
-	    {"isQuery", w_is_query, 1},
-	    {"isRenderbuffer", w_is_renderbuffer, 1},
-	    {"isSampler", w_is_sampler, 1},
-	    {"isShader", w_is_shader, 1},
-	    {"isSync", w_is_sync, 1},
-	    {"isTexture", w_is_texture, 1},
-	    {"isTransformFeedback", w_is_transform_feedback, 1},
-	    {"isVertexArray", w_is_vertex_array, 1},
-	    {"lineWidth", w_line_width, 1},
-	    {"linkProgram", w_link_program, 1},
-	    {"pauseTransformFeedback", w_pause_transform_feedback, 0},
-	    {"pixelStorei", w_pixel_storei, 2},
-	    {"polygonOffset", w_polygon_offset, 2},
-	    {"readBuffer", w_read_buffer, 1},
-	    {"readPixels", w_read_pixels, 7},
-	    {"renderbufferStorage", w_renderbuffer_storage, 4},
-	    {"renderbufferStorageMultisample", w_renderbuffer_storage_multisample,
-	     5},
-	    {"resumeTransformFeedback", w_resume_transform_feedback, 0},
-	    {"sampleCoverage", w_sample_coverage, 2},
-	    {"samplerParameterf", w_sampler_parameterf, 3},
-	    {"samplerParameteri", w_sampler_parameteri, 3},
-	    {"scissor", w_scissor, 4},
-	    {"shaderSource", w_shader_source, 2},
-	    {"stencilFunc", w_stencil_func, 3},
-	    {"stencilFuncSeparate", w_stencil_func_separate, 4},
-	    {"stencilMask", w_stencil_mask, 1},
-	    {"stencilMaskSeparate", w_stencil_mask_separate, 2},
-	    {"stencilOp", w_stencil_op, 3},
-	    {"stencilOpSeparate", w_stencil_op_separate, 4},
-	    {"texImage2D", w_tex_image_2d, 9},
-	    {"texImage3D", w_tex_image_3d, 10},
-	    {"texParameterf", w_tex_parameterf, 3},
-	    {"texParameteri", w_tex_parameteri, 3},
-	    {"texStorage2D", w_tex_storage_2d, 5},
-	    {"texStorage3D", w_tex_storage_3d, 6},
-	    {"texSubImage2D", w_tex_sub_image_2d, 9},
-	    {"texSubImage3D", w_tex_sub_image_3d, 11},
-	    {"transformFeedbackVaryings", w_transform_feedback_varyings, 3},
-	    {"uniform1f", w_uniform1f, 2},
-	    {"uniform1fv", w_uniform1fv, 2},
-	    {"uniform1i", w_uniform1i, 2},
-	    {"uniform1iv", w_uniform1iv, 2},
-	    {"uniform1ui", w_uniform1ui, 2},
-	    {"uniform1uiv", w_uniform1uiv, 2},
-	    {"uniform2f", w_uniform2f, 3},
-	    {"uniform2fv", w_uniform2fv, 2},
-	    {"uniform2i", w_uniform2i, 3},
-	    {"uniform2iv", w_uniform2iv, 2},
-	    {"uniform2ui", w_uniform2ui, 3},
-	    {"uniform2uiv", w_uniform2uiv, 2},
-	    {"uniform3f", w_uniform3f, 4},
-	    {"uniform3fv", w_uniform3fv, 2},
-	    {"uniform3i", w_uniform3i, 4},
-	    {"uniform3iv", w_uniform3iv, 2},
-	    {"uniform3ui", w_uniform3ui, 4},
-	    {"uniform3uiv", w_uniform3uiv, 2},
-	    {"uniform4f", w_uniform4f, 5},
-	    {"uniform4fv", w_uniform4fv, 2},
-	    {"uniform4i", w_uniform4i, 5},
-	    {"uniform4iv", w_uniform4iv, 2},
-	    {"uniform4ui", w_uniform4ui, 5},
-	    {"uniform4uiv", w_uniform4uiv, 2},
-	    {"uniformBlockBinding", w_uniform_block_binding, 3},
-	    {"uniformMatrix2fv", w_uniform_matrix2fv, 3},
-	    {"uniformMatrix2x3fv", w_uniform_matrix2x3fv, 3},
-	    {"uniformMatrix2x4fv", w_uniform_matrix2x4fv, 3},
-	    {"uniformMatrix3fv", w_uniform_matrix3fv, 3},
-	    {"uniformMatrix3x2fv", w_uniform_matrix3x2fv, 3},
-	    {"uniformMatrix3x4fv", w_uniform_matrix3x4fv, 3},
-	    {"uniformMatrix4fv", w_uniform_matrix4fv, 3},
-	    {"uniformMatrix4x2fv", w_uniform_matrix4x2fv, 3},
-	    {"uniformMatrix4x3fv", w_uniform_matrix4x3fv, 3},
-	    {"useProgram", w_use_program, 1},
-	    {"validateProgram", w_validate_program, 1},
-	    {"vertexAttrib1f", w_vertex_attrib1f, 2},
-	    {"vertexAttrib1fv", w_vertex_attrib1fv, 2},
-	    {"vertexAttrib2f", w_vertex_attrib2f, 3},
-	    {"vertexAttrib2fv", w_vertex_attrib2fv, 2},
-	    {"vertexAttrib3f", w_vertex_attrib3f, 4},
-	    {"vertexAttrib3fv", w_vertex_attrib3fv, 2},
-	    {"vertexAttrib4f", w_vertex_attrib4f, 5},
-	    {"vertexAttrib4fv", w_vertex_attrib4fv, 2},
-	    {"vertexAttribDivisor", w_vertex_attrib_divisor, 2},
-	    {"vertexAttribI4i", w_vertex_attrib_i4i, 5},
-	    {"vertexAttribI4iv", w_vertex_attrib_i4iv, 2},
-	    {"vertexAttribI4ui", w_vertex_attrib_i4ui, 5},
-	    {"vertexAttribI4uiv", w_vertex_attrib_i4uiv, 2},
-	    {"vertexAttribIPointer", w_vertex_attrib_i_pointer, 5},
-	    {"vertexAttribPointer", w_vertex_attrib_pointer, 6},
-	    {"viewport", w_viewport, 4},
-	    {"waitSync", w_wait_sync, 3},
-	};
-	for (size_t i = 0; i < countof(kFns); i++) {
-		NX_DEF_FUNC(proto, kFns[i].name, kFns[i].fn, kFns[i].len);
-	}
+	nx_webgl_bridge_set_webgl_owned(true);
+
+	// Mint the context carrier object. The TS factory sets its prototype to
+	// WebGLRenderingContext, so install_methods having populated the
+	// prototype is what makes instance methods reachable.
+	Local<Object> ctx_obj = nx::NewWrapped(iso);
+	// drawingBufferWidth / drawingBufferHeight as own data properties.
+	Local<Context> jctx = cur(iso);
+	ctx_obj->Set(jctx, nx_str(iso, "drawingBufferWidth"),
+	             Int32::New(iso, w)).Check();
+	ctx_obj->Set(jctx, nx_str(iso, "drawingBufferHeight"),
+	             Int32::New(iso, h)).Check();
+	fprintf(stderr, "[webgl] context_new ok %dx%d\n", w, h);
+	fflush(stderr);
+	info.GetReturnValue().Set(ctx_obj);
 }
 
 } // namespace
 
-bool nx_webgl_active(void) { return st && st->active; }
+// ---------------------------------------------------------------------------
+// Public API used by main.cc — the present-time integration.
+// ---------------------------------------------------------------------------
 
-void nx_webgl_present(void) {
-	if (!st || !st->active)
-		return;
-	if (st->dirty) {
-		eglSwapBuffers(st->dpy, st->surf);
-		st->dirty = false;
-	} else {
-		// Nothing new to present: sleep ~1 vblank so the main loop doesn't
-		// spin hot (eglSwapBuffers would otherwise provide the pacing).
-		svcSleepThread(16666667ULL);
-	}
-}
+// True only when this file owns the screen (legacy: WebGL2-screen path; in
+// 2.C we render INSIDE Skia's canvas, so this stays false — the per-frame
+// compose hook below is what 2.C uses, not the WebGL-owns-NWindow path).
+bool nx_webgl_active(void) { return false; }
+void nx_webgl_present(void) {}
+void nx_webgl_exit(void) {}
 
-void nx_webgl_exit(void) {
-	if (!st)
-		return;
-	webgl_teardown_egl();
-	for (int i = 0; i < K_COUNT; i++)
-		st->protos[i].Reset();
+// Called from main.cc's GPU canvas present branch, BEFORE nx_skia_gpu_present.
+// Closes the per-frame bracket if it's open (restores Skia's GL state +
+// resetContext), then asks the bridge to composite the tenant FBO into
+// Skia's persistent canvas surface. The bridge's compose is dirty-gated, so
+// the call is cheap on frames where WebGL didn't draw.
+void nx_webgl_compose_if_active(SkSurface *target) {
+	if (!st) return;
+	if (st->bracket_open) exit_bracket();
+	if (target) nx_webgl_bridge_compose(target);
 }
 
 void nx_init_webgl(v8::Isolate *iso, v8::Local<v8::Object> init_obj) {
