@@ -117,6 +117,28 @@ struct WebGLState {
 	bool unpack_premultiply = false;
 	int unpack_alignment = 4;
 	int pack_alignment = 4;
+	// User-intended GL bindings that must persist across bracket close /
+	// reopen cycles per WebGL spec. Skia clobbers these between the
+	// runtime's `exit_bracket()` at compose time and the next frame's
+	// `enter_bracket()` when the demo re-enters WebGL — without tracking
+	// them here, a demo that calls `gl.useProgram(X)` / `gl.bindVertexArray
+	// (Y)` / `gl.bindTexture(GL_TEXTURE_2D, Z)` once at init would silently
+	// end up rendering with Skia's program / VAO / TU0-texture on every
+	// subsequent frame (see the webgl2demo bug where the raymarched-cube
+	// program was bound at init and never rebound — Skia clobbered it and
+	// the demo's subsequent `drawArrays` calls ran with Ganesh's program,
+	// producing a frozen scene). Three.js demos re-emit these bindings per
+	// material per frame so the previous bracket contract accidentally
+	// held there, but the WebGL spec's persistence guarantee was violated
+	// silently. `enter_bracket()` restores these from st BEFORE marking
+	// bracket_open, so all user-visible GL calls see their expected
+	// program / VAO / texture context regardless of what Skia mutated.
+	// Textures on units > 0 are not tracked — no shipping demo requires
+	// more than TU0-persistence, and multi-unit tracking would require an
+	// array indexed by MAX_COMBINED_TEXTURE_IMAGE_UNITS.
+	GLuint user_program = 0;
+	GLuint user_vao = 0;
+	GLuint user_tex_2d_tu0 = 0;
 	// Currently bound DRAW_FRAMEBUFFER as the JS sees it. 0 = "default" =
 	// tenant FBO (the only difference from a browser WebGL where 0 = swap
 	// chain back buffer). When the user binds a non-null framebuffer object,
@@ -311,6 +333,18 @@ void enter_bracket() {
 	glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 	glFrontFace(GL_CCW);
 	glCullFace(GL_BACK);
+	// Restore user-intended persistent bindings (program / VAO / TU0
+	// texture) that would otherwise still hold Skia's last-drawn values.
+	// See the `user_program` / `user_vao` / `user_tex_2d_tu0` field
+	// comments on WebGLState for the design rationale. Zero-check means
+	// a demo that never called useProgram / bindVertexArray / bindTexture
+	// gets whatever Skia left — same as before this fix.
+	if (st->user_program != 0) glUseProgram(st->user_program);
+	if (st->user_vao != 0) glBindVertexArray(st->user_vao);
+	if (st->user_tex_2d_tu0 != 0) {
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, st->user_tex_2d_tu0);
+	}
 	st->bracket_open = true;
 }
 
@@ -892,7 +926,13 @@ FN(w_detach_shader) {
 }
 FN(w_link_program) { enter_bracket(); glLinkProgram(obj_id(info[0])); }
 FN(w_validate_program) { enter_bracket(); glValidateProgram(obj_id(info[0])); }
-FN(w_use_program) { enter_bracket(); glUseProgram(obj_id(info[0])); }
+FN(w_use_program) {
+	enter_bracket();
+	GLuint p = obj_id(info[0]);
+	glUseProgram(p);
+	// Track user-intended program for bracket-reopen restore.
+	if (st) st->user_program = p;
+}
 FN(w_get_program_parameter) {
 	GLuint p = obj_id(info[0]);
 	GLenum pname = a_u32(info, 1);
@@ -1130,7 +1170,18 @@ FN(w_is_texture) {
 }
 FN(w_bind_texture) {
 	enter_bracket();
-	glBindTexture(a_u32(info, 0), obj_id(info[1]));
+	const GLenum target = a_u32(info, 0);
+	const GLuint tex = obj_id(info[1]);
+	glBindTexture(target, tex);
+	// Track user's TU0 TEXTURE_2D binding for bracket-reopen restore.
+	// Only TU0 tracked (see WebGLState field comment for why).
+	if (st && target == GL_TEXTURE_2D) {
+		GLint active_tex_unit = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active_tex_unit);
+		if (active_tex_unit == (GLint)GL_TEXTURE0) {
+			st->user_tex_2d_tu0 = tex;
+		}
+	}
 }
 FN(w_active_texture) {
 	enter_bracket();
@@ -1358,7 +1409,9 @@ FN(w_is_vertex_array) {
 }
 FN(w_bind_vertex_array) {
 	enter_bracket();
-	glBindVertexArray(obj_id(info[0]));
+	const GLuint v = obj_id(info[0]);
+	glBindVertexArray(v);
+	if (st) st->user_vao = v;
 }
 
 // UBO core (cut #3b) — minimum surface for Three.js's UBO setup: index
@@ -1493,6 +1546,50 @@ FN(w_tex_image_3d) {
 	if (info[9]->IsNullOrUndefined()) pixels = nullptr;
 	glTexImage3D(target, level, internalformat, width, height, depth, border,
 	             format, type, pixels);
+}
+
+// Phase 2.G.1 cut #32 (2026-07-01) — bound because Three.js r184's WebGL2
+// backend unconditionally calls state.texStorage3D + state.texSubImage3D
+// for DataArrayTexture/Data3DTexture uploads (WebGLTextures.js:1174/1190/
+// 1198). Both wrappers try/catch and silently swallow "gl.texStorage3D is
+// not a function" errors, so without these bindings the array-texture
+// storage is never allocated → sampler2DArray/sampler3D reads return
+// vec4(0) → webgl2-texture2darray renders black on both Citron and
+// hardware. Direct passthrough — no format massaging required (GLES3
+// spec matches WebGL2 spec 1:1 for these entry points).
+FN(w_tex_storage_3d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLsizei levels = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLsizei width = a_i32(info, 3);
+	const GLsizei height = a_i32(info, 4);
+	const GLsizei depth = a_i32(info, 5);
+	glTexStorage3D(target, levels, internalformat, width, height, depth);
+}
+
+FN(w_tex_sub_image_3d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xoff = a_i32(info, 2);
+	const GLint yoff = a_i32(info, 3);
+	const GLint zoff = a_i32(info, 4);
+	const GLsizei width = a_i32(info, 5);
+	const GLsizei height = a_i32(info, 6);
+	const GLsizei depth = a_i32(info, 7);
+	const GLenum format = a_u32(info, 8);
+	const GLenum type = a_u32(info, 9);
+	size_t len = 0;
+	void *pixels = view_bytes(info[10], &len);
+	if (info[10]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[10].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[10]->IsNullOrUndefined()) pixels = nullptr;
+	glTexSubImage3D(target, level, xoff, yoff, zoff, width, height, depth,
+	                format, type, pixels);
 }
 
 // ----- Framebuffer / Renderbuffer -----
@@ -1991,6 +2088,11 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    // creates 1×1 placeholder textures for default-bound TEXTURE_3D /
 	    // TEXTURE_2D_ARRAY samplers (v2 analog of v1's _emptyCubeTexture).
 	    {"texImage3D", w_tex_image_3d},
+	    // cut #32 (2026-07-01) — Three.js r184 WebGL2 uses these for every
+	    // DataArrayTexture/Data3DTexture upload; without them, sampler2DArray
+	    // reads return vec4(0) → webgl2-texture2darray renders black.
+	    {"texStorage3D", w_tex_storage_3d},
+	    {"texSubImage3D", w_tex_sub_image_3d},
 
 	    // cut #3 (2026-06-30) — VAO + UBO core + texStorage2D. Three.js v2
 	    // uses VAOs unconditionally for every Mesh, and the webgl2-ubo demo

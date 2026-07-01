@@ -2191,6 +2191,62 @@ dependencies without verifying it's bound by 2.G.X's method-table cut.
 
 ---
 
+## #31 — Three.js WebGLState cache desyncs across bridge exit_bracket restore — DEMO-SIDE WORKAROUND SHIPPED 2026-07-01, ENGINE-SIDE FIX OPEN
+
+**File(s) (workaround, SHIPPED 2026-07-01, Phase 2.G.1 cut #31):**
+- [brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/gpgpu-water/assets/main.js](../brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/gpgpu-water/assets/main.js) — one line: `renderer.resetState()` right before `gpuCompute.compute()` in the animate loop.
+
+**File(s) (engine-side general fix target, DEFERRED):** [source/webgl.cc](source/webgl.cc) — `exit_bracket()` (~line 317). Need a mechanism to notify the runtime that Three.js's WebGLState/WebGLTextures cache is stale after state restore.
+
+**Root cause.** Bridge state save/restore lifecycle:
+1. First WebGL call of a frame → `enter_bracket()` saves current GL state (which includes whatever Skia left bound).
+2. Three.js runs its own draws → sets `state.bindTexture(TEXTURE_2D, RT[cur].__webglTexture, TU0)` etc.; Three.js's own JS-side `currentBoundTextures[0] = RT[cur].__webglTexture` cache is now populated.
+3. End of frame → `nx_webgl_compose_if_active` → `exit_bracket()` → `nx_gl_state_restore()` calls `glBindTexture` DIRECTLY (bypassing Three.js) to restore Skia's saved binding.
+4. Next frame → `enter_bracket()` saves the current GL state (still Skia's binding — unchanged if no Skia work between frames).
+5. Three.js compute pass: sets `uniforms.heightmap.value = RT[cur].texture`, `state.bindTexture(TEXTURE_2D, RT[cur].__webglTexture, TU0)` checks cache → `currentBoundTextures[0] === RT[cur].__webglTexture` (still remembers what THREE.JS last set it to) → cache short-circuits, SKIPS `gl.bindTexture`. But actual GL has Skia's texture bound on TU0. Compute shader samples the WRONG texture (Skia's) → deterministic identical output regardless of `currentTextureIndex` → both ping-pong RTs converge to the same value → wave equation appears static.
+
+**Symptom manifestations observed on gpgpu-water:**
+- Water heights stay locked at initial `fillTexture` amplitude — no propagation, no damping, no splash response.
+- Diag probe: both RT[0] and RT[1] hold IDENTICAL byte quartet at ALL 5 sampled pixel positions. Confirmed with:
+  - `RT[0].__webglFramebuffer !== RT[1].__webglFramebuffer` (distinct FBOs).
+  - `RT[0].__webglTexture !== RT[1].__webglTexture` (distinct color textures).
+  - Explicit `renderer.setRenderTarget(RT0)` + `gl.clear()` isolation test writes correctly to each RT independently.
+  - Manual `doRenderTarget(material, RT1)` with `uniforms.heightmap.value = RT0.texture` set right beforehand DOES produce the correct compute output on RT1, leaving RT0 untouched — so the write path is healthy.
+  - The ONLY variable between manual-works and regular-fails is that the regular compute alternates the uniform value across frames while Three.js's cache thinks the sampler is already bound.
+
+**Fix (demo-side workaround).** Call `renderer.resetState()` immediately before `gpuCompute.compute()`. This resets `state.reset()` + `bindingStates.reset()` in Three.js's WebGLState, forcing every binding to be re-emitted on the next draw. The next compute's `bindTexture` calls no longer short-circuit; the correct RT texture is bound on TU0 each frame.
+
+**Fix (engine-side general — DEFERRED).** Options in ascending order of scope:
+1. **Runtime hook**: expose a `nx.__afterExitBracket = callback` seam that `exit_bracket()` invokes after restore; brewser-runtime binds a callback that calls `renderer.resetState()` on all live WebGL contexts. Downside: needs to enumerate contexts and invoke a Three.js-specific API from runtime code.
+2. **Engine-side cache invalidation marker**: expose a `gl.__stateDirty` boolean the engine sets to `true` inside `exit_bracket()`. Runtime canvas-runner reads it before yielding each rAF; if set, calls `renderer.resetState()`. Same downside re: enumerating contexts.
+3. **State replay in `exit_bracket()`**: instead of restoring to Skia's saved state, restore to Three.js's LAST-SET state (which matches its cache). Downside: Skia's cache in `GrDirectContext::resetContext()` handles this on its side; needs testing to confirm no reverse breakage.
+
+**WHY DEFERRED (blast radius).** The cache desync affects ANY Three.js demo that:
+- Uses ping-pong render targets (GPUComputationRenderer, custom postprocessing loops, temporal-anti-aliasing histories).
+- Reuses the same sampler2D uniform across frames while alternating its texture value.
+
+Yet the following demos currently work without cut #31:
+- webgl-postprocessing-pixel — uses EffectComposer's own RT ping-pong.
+- webgl-postprocessing-unreal-bloom-selective — 13-quad mip-blur chain.
+- webgl2-ubo — single-frame UBO test.
+
+The empirical mystery: why don't THOSE break? Possible explanations (not yet verified):
+- EffectComposer explicitly rebinds textures per pass (doesn't rely on Three.js's `state.bindTexture` cache).
+- The material uniform pointer identity happens to CHANGE between frames (different Texture object each swap), so Three.js re-uploads via a different code path.
+- The sampler TU allocation cycles more than 1 unit, so cached TU0 binding isn't the sampler's target.
+
+Before landing the engine-side general fix, sweep every ping-pong or repeated-uniform-with-alternating-value demo to catalog which are affected. Then implement the least-invasive option that covers all of them.
+
+**DISPOSITION:** `brewser-specific` (workaround); `upstream-candidate` (engine-side general fix, once designed).
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify the workaround is still needed*: grep gpgpu-water/main.js for `renderer.resetState()` right before `gpuCompute.compute()`. If missing, water goes static again on load. *To upgrade to engine-side fix*: pick one of the three options above, implement, remove the demo-side `resetState()` call, re-verify gpgpu-water animates AND all other ping-pong demos still work.
+
+**Recurrence tell.** Any future demo that uses `GPUComputationRenderer` or a manual FBO ping-pong loop with a sampler2D uniform alternating between two RT.texture references, and shows "static content that ignores the compute" behavior, is this bug. First reflex: add `renderer.resetState()` before the compute call. If that fixes it, catalog under this patch and consider promoting to engine-side.
+
+---
+
 ## #24 — Cube-RT-readback rescue (runtime shim; Phase 2.G.1 cut #24) — SHIPPED 2026-07-01, HARDWARE-VERIFY PENDING
 
 **File(s):**
