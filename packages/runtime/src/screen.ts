@@ -11,7 +11,10 @@ import { Blob } from './polyfills/blob';
 import { EventTarget } from './polyfills/event-target';
 import { INTERNAL_SYMBOL } from './internal';
 import { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
-import { type WebGL2RenderingContext } from './canvas/webgl2-rendering-context';
+import {
+	createWebGL2Context,
+	type WebGL2RenderingContext,
+} from './canvas/webgl2-rendering-context';
 import {
 	createWebGLContext,
 	type WebGLRenderingContext,
@@ -125,24 +128,34 @@ export class Screen extends EventTarget implements globalThis.Screen {
 			markAppOwnsScreen();
 			return ensureContext(this);
 		}
-		// Phase 2.C: WebGL 1 path. Renders into the bridge's tenant offscreen
-		// FBO (Skia composites the result into the persistent canvas surface
-		// before present). Matches the WebGL 1 spec — `experimental-webgl` is
-		// the legacy alias the spec mandates we still honor.
+		// Phase 2.C/2.G: WebGL 1 + 2 paths. Both render into the SAME bridge
+		// tenant offscreen FBO on the SAME shared ES3 context (Phase 2.A); the
+		// engine-side WebGLState is process-wide. The two context objects
+		// differ ONLY in their JS prototype (WebGLRenderingContext vs
+		// WebGL2RenderingContext), which is what Three.js's
+		// `gl.constructor.name === 'WebGL2RenderingContext'` detection
+		// requires.
 		//
-		// IMPORTANT: this branch does NOT enforce v2's "2D-exclusive" check —
-		// brewser's screen always carries the shell's 2D context, and inline
-		// canvas WebGL demos depend on coexistence: 2D draws the shell UI
-		// into the persistent canvas surface, WebGL draws into the bridge
-		// tenant FBO, and the present-time compose stack writes WebGL on top
-		// of 2D into the same surface before swap. Forbidding co-acquisition
-		// (as the v2 branch below does) kills inline-canvas WebGL for every
-		// brewser app (canvas-runner.ts → getSharedScreenGL → here).
+		// IMPORTANT: cross-family co-existence is ALLOWED.
+		//
+		// Standard browsers enforce "one context kind per canvas" because a
+		// browser canvas is single-app and one-shot. The brewser screen is
+		// SHARED across multiple demos sequentially within a single brewser
+		// session — the shell's `canvas-runner.ts::getSharedScreenGL`
+		// acquires v1 the moment ANY page-canvas asks for it, and a later v2
+		// demo on a different page then asks for v2 on the same screen. The
+		// mutual-exclusion rule blocked the second acquisition (symptom:
+		// "WebGL 2 not supported" after any v1 demo had run earlier in the
+		// session). Both contexts share underlying engine state, so caching
+		// both is functionally fine: each returns a view of the same shared
+		// tenant FBO with the appropriate JS class.
+		//
+		// 2D also coexists with WebGL (the shell's 2D context carries the
+		// HTML overlay; the WebGL contexts draw into the tenant FBO; the
+		// engine composites both into the screen surface before present).
+		// So NO cross-family exclusions at all in the WebGL branches.
 		if (contextId === 'webgl' || contextId === 'experimental-webgl') {
 			if (!i.contextWebGL) {
-				// Only exclude the other WebGL family on the same canvas;
-				// 2D coexists.
-				if (i.contextWebGL2) return null;
 				const ctx = createWebGLContext(this);
 				if (!ctx) return null;
 				i.contextWebGL = ctx;
@@ -150,15 +163,21 @@ export class Screen extends EventTarget implements globalThis.Screen {
 			return i.contextWebGL;
 		}
 		if (contextId === 'webgl2') {
-			// Phase 2.C: 'webgl2' is deliberately null. The engine binding for
-			// the WebGL 2 surface (vertexAttribIPointer, drawElementsInstanced,
-			// getBufferSubData, ...) is Phase 2.G work. Three.js detects WebGL
-			// 2 via `gl.constructor.name === 'WebGL2RenderingContext'`, so
-			// returning a v2 instance with only v1 methods would silently route
-			// Three.js into its v2 code path and throw on the first v2 call.
-			// Better: stay null + force the v1 path (which is what the slice
-			// demo `geometry-cube` deliberately uses).
-			return null;
+			// Phase 2.G.0 — 'webgl2' returns a non-null context backed by the
+			// SEPARATE engine v2 factory ($.webgl2ContextNew + $.webgl2InitClass)
+			// sharing the SAME tenant FBO + shared ES3 context as v1. 2.G.0
+			// binds ZERO v2 methods: an empty-but-correctly-shaped v2 context
+			// for JIT install-shape verification. A v2 instance has all 387
+			// v2 constants on its prototype (instanceof / constructor.name
+			// detection works) but every method call throws `TypeError: X
+			// is not a function` until 2.G.1 lands the webgl2-ubo slice's
+			// method allowlist. See MIGRATION_PLAN.md Phase 2.G.0.
+			if (!i.contextWebGL2) {
+				const ctx = createWebGL2Context(this);
+				if (!ctx) return null;
+				i.contextWebGL2 = ctx;
+			}
+			return i.contextWebGL2;
 		}
 		return null;
 	}

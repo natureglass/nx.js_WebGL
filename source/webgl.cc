@@ -95,6 +95,10 @@ enum ObjKind : uint8_t {
 	K_UNIFORM_LOCATION,
 	K_ACTIVE_INFO,
 	K_SHADER_PRECISION_FORMAT,
+	// Phase 2.G.1 cut #3 — v2-only handle kinds. New entries MUST stay
+	// BEFORE K_COUNT (which sizes the protos[] array). New entries are
+	// stamped on v2 contexts by nx_webgl2_init_class's MAP[] extension.
+	K_VERTEX_ARRAY_OBJECT,
 	K_COUNT,
 };
 
@@ -289,6 +293,24 @@ void enter_bracket() {
 	                        ? nx_webgl_bridge_fbo_id()
 	                        : st->bound_fbo_js;
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+	// Phase 2.G.1 cut #15 — reset the WebGL default state that Skia's
+	// Ganesh might have left in a different configuration. Three.js's
+	// WebGLState cache initializes assuming these WebGL defaults; if
+	// Skia left GL in a different state, Three.js's cache is out of sync
+	// and cache short-circuits prevent Three.js from re-emitting the
+	// state. Cut #15v log confirmed depth_mask+color_mask+clear_depth
+	// are already correct at gl.clear time — meaning the depth CLEAR
+	// works. The rejection must be at depth TEST time (depth_func!=LESS,
+	// or depth_range inverted). Also reset cull/front-face and stencil
+	// state for completeness — these are all cheap.
+	glDepthMask(GL_TRUE);
+	glStencilMask(0xFF);
+	glDepthFunc(GL_LESS);
+	glDepthRangef(0.0f, 1.0f);
+	glStencilFunc(GL_ALWAYS, 0, 0xFF);
+	glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+	glFrontFace(GL_CCW);
+	glCullFace(GL_BACK);
 	st->bracket_open = true;
 }
 
@@ -1271,6 +1293,208 @@ FN(w_tex_sub_image_2d) {
 	                pixels);
 }
 
+// Phase 2.G.1 cut #25 (2026-07-01) — bound because cube-route-shim's
+// cube-RT-readback rescue needs it to blit scratch → atlas at face
+// offset (per NXJS_PATCHES_NEEDED.md #24). Never bound in QuickJS-era
+// either; not load-bearing for any current v1/v2 demo OTHER than the
+// runtime rescue's flush path, so this is a pure additive spec-hole
+// close. Same signature as glCopyTexSubImage2D core-GLES2 — reads from
+// current READ_FRAMEBUFFER (or FRAMEBUFFER on ES2) at (x,y) w×h and
+// writes to the currently-bound target texture at (xoffset,yoffset).
+FN(w_copy_tex_sub_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xoff = a_i32(info, 2);
+	const GLint yoff = a_i32(info, 3);
+	const GLint x = a_i32(info, 4);
+	const GLint y = a_i32(info, 5);
+	const GLsizei width = a_i32(info, 6);
+	const GLsizei height = a_i32(info, 7);
+	glCopyTexSubImage2D(target, level, xoff, yoff, x, y, width, height);
+}
+
+// Phase 2.G.1 cut #27 (2026-07-01) — cube-route-shim needs blitFramebuffer
+// to Y-flip the scratch → atlas copy in one GPU-side pass (avoids CPU
+// readPixels/texSubImage2D roundtrip and its per-format bpp mapping). WebGL2
+// only (glBlitFramebuffer is core GLES3, not ES2). Passed directly through
+// to the GLES3 entrypoint; Mesa-Nouveau supports Y-flip via reversed dst
+// rectangle (dstY0 > dstY1). Signature matches WebGL2 spec 1:1.
+FN(w_blit_framebuffer) {
+	enter_bracket();
+	const GLint sx0 = a_i32(info, 0);
+	const GLint sy0 = a_i32(info, 1);
+	const GLint sx1 = a_i32(info, 2);
+	const GLint sy1 = a_i32(info, 3);
+	const GLint dx0 = a_i32(info, 4);
+	const GLint dy0 = a_i32(info, 5);
+	const GLint dx1 = a_i32(info, 6);
+	const GLint dy1 = a_i32(info, 7);
+	const GLbitfield mask = a_u32(info, 8);
+	const GLenum filter = a_u32(info, 9);
+	glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+}
+
+// Phase 2.G.1 cut #3 — v2-only method impls. Grouped before texImage3D to
+// keep all v2-only additions in one contiguous block of the file.
+//
+// VAO (cut #3a) — Three.js v2 uses VAOs unconditionally for every Mesh.
+// Four spec methods: create / delete / is / bind. Direct GLES3 passthroughs;
+// the K_VERTEX_ARRAY_OBJECT handle kind (declared above K_COUNT) carries
+// the GL name through the JS object via the existing GLObj wrapper.
+FN(w_create_vertex_array) {
+	GLuint v = 0;
+	glGenVertexArrays(1, &v);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(),
+	                                      K_VERTEX_ARRAY_OBJECT, v));
+}
+FN(w_delete_vertex_array) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteVertexArrays(1, &id);
+}
+FN(w_is_vertex_array) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsVertexArray(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_vertex_array) {
+	enter_bracket();
+	glBindVertexArray(obj_id(info[0]));
+}
+
+// UBO core (cut #3b) — minimum surface for Three.js's UBO setup: index
+// query + binding-point assignment + buffer-to-binding bind. The webgl2-ubo
+// demo calls this pair after THREE.UniformsGroup creation:
+//   const idx = gl.getUniformBlockIndex(program, 'ViewData');
+//   gl.uniformBlockBinding(program, idx, 0);
+//   gl.bindBufferBase(GL_UNIFORM_BUFFER, 0, viewDataBuffer);
+// `bindBufferRange` is the offset+size variant; bound in case Three.js's
+// uniformsGroup uses it for sub-region UBO uploads (it doesn't by default
+// in r184 but cheap to ship together).
+FN(w_bind_buffer_base) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLuint index = a_u32(info, 1);
+	const GLuint buffer = obj_id(info[2]);
+	glBindBufferBase(target, index, buffer);
+}
+FN(w_bind_buffer_range) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLuint index = a_u32(info, 1);
+	const GLuint buffer = obj_id(info[2]);
+	const GLintptr offset = (GLintptr)a_i64(info, 3);
+	const GLsizeiptr size = (GLsizeiptr)a_i64(info, 4);
+	glBindBufferRange(target, index, buffer, offset, size);
+}
+FN(w_get_uniform_block_index) {
+	Isolate *iso = info.GetIsolate();
+	const GLuint prog = obj_id(info[0]);
+	String::Utf8Value name(iso, info[1]);
+	const char *cn = *name ? *name : "";
+	GLuint idx = glGetUniformBlockIndex(prog, cn);
+	info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, idx));
+}
+FN(w_uniform_block_binding) {
+	enter_bracket();
+	const GLuint prog = obj_id(info[0]);
+	const GLuint blockIndex = a_u32(info, 1);
+	const GLuint blockBinding = a_u32(info, 2);
+	glUniformBlockBinding(prog, blockIndex, blockBinding);
+}
+
+// texStorage2D (cut #3c) — Three.js v2 prefers immutable texture storage;
+// `texStorage2D` allocates ALL mip levels at once and freezes the dimensions.
+// Subsequent uploads must go through texSubImage2D. Five-arg passthrough.
+FN(w_tex_storage_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLsizei levels = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLsizei width = a_i32(info, 3);
+	const GLsizei height = a_i32(info, 4);
+	glTexStorage2D(target, levels, internalformat, width, height);
+}
+
+// Instanced drawing (cut #4) — Three.js's InstancedMesh path uses
+// drawElementsInstanced + vertexAttribDivisor for per-instance attribute
+// stepping. drawArraysInstanced is the unindexed sibling, shipped together.
+// All three are direct GLES3 passthroughs. Both draw impls use touch_fbo()
+// (defined above) to mark the bridge FBO dirty when drawing into the default
+// target — matches the v1 w_draw_arrays / w_draw_elements pattern.
+FN(w_draw_arrays_instanced) {
+	enter_bracket();
+	glDrawArraysInstanced(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
+	                      a_i32(info, 3));
+	touch_fbo();
+}
+FN(w_draw_elements_instanced) {
+	enter_bracket();
+	glDrawElementsInstanced(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
+	                        (const void *)(intptr_t)a_i64(info, 3),
+	                        a_i32(info, 4));
+	touch_fbo();
+}
+FN(w_vertex_attrib_divisor) {
+	enter_bracket();
+	glVertexAttribDivisor(a_u32(info, 0), a_u32(info, 1));
+}
+
+// drawBuffers (cut #5) — Three.js v2's WebGLState calls
+// `gl.drawBuffers([gl.BACK])` on the very first render's bindFramebuffer
+// transition (defaultDrawbuffers starts [] so the BACK-set is unconditional
+// on the first frame; subsequent frames are gated by needsUpdate). Without
+// this method, calling it through the demo's Proxy resolves to `undefined`
+// → TypeError "drawBuffers is not a function" → which Three.js's `state`
+// function does NOT wrap in try/catch (unlike texStorage2D/texImage2D/etc.
+// which ARE wrapped), so the throw propagates up out of renderer.render()
+// and aborts the render path; subsequent frames continue ticking the
+// animate loop (animation tween + fps counter), masking it. Symptom:
+// canvas shows the clear color only (the gl.clear that runs BEFORE
+// state.drawBuffers in the frame), no geometry rasterizes, no JS error
+// surfaces because the Three.js try/catch upstream isn't on this path.
+// GLES3 signature: glDrawBuffers(GLsizei n, const GLenum *bufs).
+FN(w_draw_buffers) {
+	enter_bracket();
+	std::vector<int32_t> tmp;
+	const int32_t *p = nullptr;
+	size_t n = 0;
+	if (!i32_list(info.GetIsolate(), info[0], tmp, &p, &n)) return;
+	glDrawBuffers((GLsizei)n, (const GLenum *)p);
+}
+
+// Phase 2.G.1 cut #2 — texImage3D for WebGL2. Three.js's v2 path calls this
+// at WebGLRenderer init time to create 1×1 placeholder textures for the
+// default-bound TEXTURE_3D / TEXTURE_2D_ARRAY samplers (the v2 analog of v1's
+// _emptyCubeTexture). Without this binding the demo throws before reaching
+// its scene setup. Signature: (target, level, internalformat, width, height,
+// depth, border, format, type, pixels). Mirrors w_tex_image_2d but with
+// `depth` between height and border. No bucket-E format widening yet — the
+// Three.js call site uses canonical RGBA+UByte which Mesa Nouveau accepts
+// directly; format-widening for v2 3D-texture uploads is a future cut if/
+// when a demo surfaces a probe-rejected format.
+FN(w_tex_image_3d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	GLint internalformat = a_i32(info, 2);
+	const GLsizei width = a_i32(info, 3);
+	const GLsizei height = a_i32(info, 4);
+	const GLsizei depth = a_i32(info, 5);
+	const GLint border = a_i32(info, 6);
+	GLenum format = a_u32(info, 7);
+	GLenum type = a_u32(info, 8);
+	size_t len = 0;
+	void *pixels = view_bytes(info[9], &len);
+	if (info[9]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[9].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[9]->IsNullOrUndefined()) pixels = nullptr;
+	glTexImage3D(target, level, internalformat, width, height, depth, border,
+	             format, type, pixels);
+}
+
 // ----- Framebuffer / Renderbuffer -----
 FN(w_create_framebuffer) {
 	GLuint f = 0;
@@ -1431,6 +1655,54 @@ FN(w_copy_bridge_to_canvas) {
 
 // ---------------------------------------------------------------------------
 // Class init: receive prototype carriers + install methods on them.
+//
+// Phase 2.G.0 — table-split shape DECISION: separate FUNCS[] tables for v1 and
+// v2 (this file holds the v1 table; install_methods_v2 below holds the v2
+// table). Rationale, against the JIT-safety lesson from NXJS_PATCHES_NEEDED.md
+// #8:
+//
+//   1. The v1 install path is hardware-verified clean (Phase 2.C hardware
+//      gate, jit=on default re-enabled by #8 fix). Leaving the v1 FUNCS[]
+//      table + install loop UNCHANGED means the JS shape that JIT-tier'd up
+//      successfully on Tegra is preserved byte-for-byte. A separate v2
+//      table cannot disturb v1's compiled code.
+//   2. The v2 install path is its OWN predictable JS shape: same install
+//      loop pattern (C++ for-each over a static-storage FUNCS[] with
+//      proto->Set + FunctionTemplate::New + GetFunction). The hardware
+//      verification step for 2.G.0 is "does this NEW shape JIT-compile
+//      clean too?" — and if it doesn't, the regression is bisectable
+//      because v1 is untouched.
+//   3. Shape mutation discipline. The #8 fix was about a TS-side
+//      Object.defineProperty pattern that compiled into a JIT codegen
+//      issue; that fix replaced ~1160 per-key calls with bulk
+//      Object.defineProperties on each target. v1 and v2 both already
+//      use that fixed install shape for constants (webgl-rendering-
+//      context.ts:577-585 and webgl2-rendering-context.ts:1102-1110).
+//      The METHOD install at install_methods() is engine-side, runs once
+//      at boot, NOT TS-JIT-hot — but the same discipline applies: keep
+//      shapes predictable, do not gate behavior at install time. Separate
+//      tables avoid a "select v1 vs v2 subset at install time" branch
+//      that could feed inconsistent function objects into V8's hidden
+//      class for the prototype.
+//   4. The 9 v2-only extensions (EXT_disjoint_timer_query_webgl2,
+//      EXT_texture_norm16, WEBGL_clip_cull_distance, EXT_float_blend,
+//      EXT_render_snorm, OES_sample_variables, OES_draw_buffers_indexed,
+//      WEBGL_blend_func_extended, WEBGL_compressed_texture_etc) belong
+//      in v2's table only; a shared table would have to gate them
+//      at runtime, growing the binding surface.
+//   5. Three.js detects v1/v2 via gl.constructor.name === 'WebGL{2}
+//      RenderingContext' — independent prototype chains match the
+//      runtime contract.
+//
+// COST: when 2.G.1+ ports the ~95 v2-only methods plus duplicates the ~95
+// v1-shared methods into the v2 table, the v2 FUNCS[] will be ~190 entries.
+// The duplicate v1 entries point at the SAME C++ impl functions; no code
+// duplication, only Spec-entry duplication.
+//
+// For 2.G.0 the v2 table is EMPTY (no methods bound). The v2 prototype
+// scaffolding is correct (the bulk-defineProperties constants install on
+// the TS side already populates 387 v2 constants on the prototype). Method
+// calls on a v2 instance throw `TypeError: X is not a function`.
 // ---------------------------------------------------------------------------
 
 static void install_methods(Isolate *iso, Local<Object> proto) {
@@ -1541,6 +1813,7 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"generateMipmap", w_generate_mipmap},
 	    {"texImage2D", w_tex_image_2d},
 	    {"texSubImage2D", w_tex_sub_image_2d},
+	    {"copyTexSubImage2D", w_copy_tex_sub_image_2d},
 	    {"createFramebuffer", w_create_framebuffer},
 	    {"deleteFramebuffer", w_delete_framebuffer},
 	    {"isFramebuffer", w_is_framebuffer},
@@ -1563,6 +1836,206 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
+		proto->Set(ctx, nx_str(iso, s.name),
+		           FunctionTemplate::New(iso, s.fn)
+		               ->GetFunction(ctx).ToLocalChecked()).Check();
+	}
+}
+
+// Phase 2.G.1 cut #1 — v2 method table = v1 95-method base (verbatim copy
+// of install_methods's FUNCS[]). All w_* impl functions operate on the
+// process-wide WebGLState `st` which is identical between v1 and v2 (one
+// bridge, one tenant FBO, one shared ES3 context per Phase 2.A), so binding
+// the same impl functions on the v2 prototype is semantically correct —
+// each call goes through the same lazy bracket enter / Skia composite
+// exit machinery a v1 call would. Entries duplicate the Spec rows; the
+// underlying C++ functions are SHARED (no impl duplication).
+//
+// 2.G.1 cut #2+ will add v2-only methods (VAO, UBO, sync, queries,
+// texStorage2D, ...) at the bottom of this table as the webgl2-ubo slice's
+// diag-proxy reports them. The intentional code duplication of the Spec
+// rows is the table-split-shape discipline from NXJS_PATCHES_NEEDED.md #15
+// — DO NOT refactor to dedup; refactoring re-introduces the JIT-safety
+// risk per the rationale block above install_methods().
+static void install_methods_v2(Isolate *iso, Local<Object> proto) {
+	struct Spec { const char *name; FunctionCallback fn; };
+	static const Spec FUNCS[] = {
+	    {"viewport", w_viewport},
+	    {"scissor", w_scissor},
+	    {"enable", w_enable},
+	    {"disable", w_disable},
+	    {"isEnabled", w_is_enabled},
+	    {"depthFunc", w_depth_func},
+	    {"depthMask", w_depth_mask},
+	    {"depthRange", w_depth_range},
+	    {"cullFace", w_cull_face},
+	    {"frontFace", w_front_face},
+	    {"blendFunc", w_blend_func},
+	    {"blendFuncSeparate", w_blend_func_separate},
+	    {"blendEquation", w_blend_equation},
+	    {"blendEquationSeparate", w_blend_equation_separate},
+	    {"blendColor", w_blend_color},
+	    {"colorMask", w_color_mask},
+	    {"stencilFunc", w_stencil_func},
+	    {"stencilFuncSeparate", w_stencil_func_separate},
+	    {"stencilOp", w_stencil_op},
+	    {"stencilOpSeparate", w_stencil_op_separate},
+	    {"stencilMask", w_stencil_mask},
+	    {"stencilMaskSeparate", w_stencil_mask_separate},
+	    {"polygonOffset", w_polygon_offset},
+	    {"sampleCoverage", w_sample_coverage},
+	    {"lineWidth", w_line_width},
+	    {"hint", w_hint},
+	    {"clear", w_clear},
+	    {"clearColor", w_clear_color},
+	    {"clearDepth", w_clear_depth},
+	    {"clearStencil", w_clear_stencil},
+	    {"finish", w_finish},
+	    {"flush", w_flush},
+	    {"pixelStorei", w_pixel_storei},
+	    {"getError", w_get_error},
+	    {"getParameter", w_get_parameter},
+	    {"getExtension", w_get_extension},
+	    {"getSupportedExtensions", w_get_supported_extensions},
+	    {"isContextLost", w_is_context_lost},
+	    {"getContextAttributes", w_get_context_attributes},
+	    {"getShaderPrecisionFormat", w_get_shader_precision_format},
+	    {"createShader", w_create_shader},
+	    {"deleteShader", w_delete_shader},
+	    {"isShader", w_is_shader},
+	    {"shaderSource", w_shader_source},
+	    {"compileShader", w_compile_shader},
+	    {"getShaderParameter", w_get_shader_parameter},
+	    {"getShaderInfoLog", w_get_shader_info_log},
+	    {"getShaderSource", w_get_shader_source},
+	    {"createProgram", w_create_program},
+	    {"deleteProgram", w_delete_program},
+	    {"isProgram", w_is_program},
+	    {"attachShader", w_attach_shader},
+	    {"detachShader", w_detach_shader},
+	    {"linkProgram", w_link_program},
+	    {"validateProgram", w_validate_program},
+	    {"useProgram", w_use_program},
+	    {"getProgramParameter", w_get_program_parameter},
+	    {"getProgramInfoLog", w_get_program_info_log},
+	    {"getAttribLocation", w_get_attrib_location},
+	    {"getUniformLocation", w_get_uniform_location},
+	    {"bindAttribLocation", w_bind_attrib_location},
+	    {"getActiveAttrib", w_get_active_attrib},
+	    {"getActiveUniform", w_get_active_uniform},
+	    {"createBuffer", w_create_buffer},
+	    {"deleteBuffer", w_delete_buffer},
+	    {"isBuffer", w_is_buffer},
+	    {"bindBuffer", w_bind_buffer},
+	    {"bufferData", w_buffer_data},
+	    {"bufferSubData", w_buffer_sub_data},
+	    {"enableVertexAttribArray", w_enable_vertex_attrib_array},
+	    {"disableVertexAttribArray", w_disable_vertex_attrib_array},
+	    {"vertexAttribPointer", w_vertex_attrib_pointer},
+	    {"vertexAttrib1f", w_vertex_attrib_1f},
+	    {"vertexAttrib2f", w_vertex_attrib_2f},
+	    {"vertexAttrib3f", w_vertex_attrib_3f},
+	    {"vertexAttrib4f", w_vertex_attrib_4f},
+	    {"uniform1f", w_uniform_1f},
+	    {"uniform2f", w_uniform_2f},
+	    {"uniform3f", w_uniform_3f},
+	    {"uniform4f", w_uniform_4f},
+	    {"uniform1i", w_uniform_1i},
+	    {"uniform2i", w_uniform_2i},
+	    {"uniform3i", w_uniform_3i},
+	    {"uniform4i", w_uniform_4i},
+	    {"uniform1fv", w_uniform_1fv},
+	    {"uniform2fv", w_uniform_2fv},
+	    {"uniform3fv", w_uniform_3fv},
+	    {"uniform4fv", w_uniform_4fv},
+	    {"uniform1iv", w_uniform_1iv},
+	    {"uniform2iv", w_uniform_2iv},
+	    {"uniform3iv", w_uniform_3iv},
+	    {"uniform4iv", w_uniform_4iv},
+	    {"uniformMatrix2fv", w_uniform_matrix_2fv},
+	    {"uniformMatrix3fv", w_uniform_matrix_3fv},
+	    {"uniformMatrix4fv", w_uniform_matrix_4fv},
+	    {"createTexture", w_create_texture},
+	    {"deleteTexture", w_delete_texture},
+	    {"isTexture", w_is_texture},
+	    {"bindTexture", w_bind_texture},
+	    {"activeTexture", w_active_texture},
+	    {"texParameteri", w_tex_parameteri},
+	    {"texParameterf", w_tex_parameterf},
+	    {"generateMipmap", w_generate_mipmap},
+	    {"texImage2D", w_tex_image_2d},
+	    {"texSubImage2D", w_tex_sub_image_2d},
+	    {"copyTexSubImage2D", w_copy_tex_sub_image_2d},
+	    {"createFramebuffer", w_create_framebuffer},
+	    {"deleteFramebuffer", w_delete_framebuffer},
+	    {"isFramebuffer", w_is_framebuffer},
+	    {"bindFramebuffer", w_bind_framebuffer},
+	    {"framebufferTexture2D", w_framebuffer_texture_2d},
+	    {"framebufferRenderbuffer", w_framebuffer_renderbuffer},
+	    {"checkFramebufferStatus", w_check_framebuffer_status},
+	    {"createRenderbuffer", w_create_renderbuffer},
+	    {"deleteRenderbuffer", w_delete_renderbuffer},
+	    {"isRenderbuffer", w_is_renderbuffer},
+	    {"bindRenderbuffer", w_bind_renderbuffer},
+	    {"renderbufferStorage", w_renderbuffer_storage},
+	    {"drawArrays", w_draw_arrays},
+	    {"drawElements", w_draw_elements},
+	    {"readPixels", w_read_pixels},
+	    // Fork-specific hooks (canvas-runner expects them).
+	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
+	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
+	    {"copyBridgeToCanvas", w_copy_bridge_to_canvas},
+
+	    // ---- v2-only adds (Phase 2.G.1 cut #2+) ----
+	    // cut #2 (2026-06-30) — texImage3D: Three.js v2 WebGLRenderer init
+	    // creates 1×1 placeholder textures for default-bound TEXTURE_3D /
+	    // TEXTURE_2D_ARRAY samplers (v2 analog of v1's _emptyCubeTexture).
+	    {"texImage3D", w_tex_image_3d},
+
+	    // cut #3 (2026-06-30) — VAO + UBO core + texStorage2D. Three.js v2
+	    // uses VAOs unconditionally for every Mesh, and the webgl2-ubo demo
+	    // exercises the UBO surface directly. texStorage2D is Three.js v2's
+	    // preferred immutable-allocation path for textures.
+	    {"createVertexArray", w_create_vertex_array},
+	    {"deleteVertexArray", w_delete_vertex_array},
+	    {"isVertexArray", w_is_vertex_array},
+	    {"bindVertexArray", w_bind_vertex_array},
+	    {"bindBufferBase", w_bind_buffer_base},
+	    {"bindBufferRange", w_bind_buffer_range},
+	    {"getUniformBlockIndex", w_get_uniform_block_index},
+	    {"uniformBlockBinding", w_uniform_block_binding},
+	    {"texStorage2D", w_tex_storage_2d},
+
+	    // cut #27 (2026-07-01) — blitFramebuffer for cube-route-shim's
+	    // Y-flipped scratch → atlas copy in the cube-RT-readback rescue.
+	    // WebGL2-only (glBlitFramebuffer is core GLES3, no ES2 equivalent).
+	    {"blitFramebuffer", w_blit_framebuffer},
+
+	    // cut #4 (2026-06-30) — instanced-drawing trio. Three.js's
+	    // InstancedMesh path uses drawElementsInstanced + vertexAttribDivisor
+	    // for per-instance attribute stepping; drawArraysInstanced is the
+	    // unindexed sibling.
+	    {"drawArraysInstanced", w_draw_arrays_instanced},
+	    {"drawElementsInstanced", w_draw_elements_instanced},
+	    {"vertexAttribDivisor", w_vertex_attrib_divisor},
+
+	    // cut #5 (2026-06-30) — drawBuffers. Three.js v2 WebGLState calls
+	    // gl.drawBuffers([gl.BACK]) on first-render bindFramebuffer transition
+	    // (un-try/catch'd in the upstream state.drawBuffers function);
+	    // silently aborts the render path when undefined. instancing-dynamic
+	    // surfaced this as "render fps stays 49 + clear color shows + nothing
+	    // else draws + demo error stays null" — gl.clear runs FIRST in the
+	    // frame so the clear color reaches the FBO; the throw from
+	    // state.drawBuffers after that loses everything downstream, but
+	    // Three.js's logging path (`error(...)`) was muted by the demo's
+	    // console.error override, so no surfaced error. See drawBuffers impl
+	    // comment above for the full chain.
+	    {"drawBuffers", w_draw_buffers},
+	    // Add sync / queries / etc. here as the diag-proxy reports them.
+	};
+	Local<Context> ctx = iso->GetCurrentContext();
+	for (const auto &s : FUNCS) {
+		if (!s.name || !s.fn) continue;
 		proto->Set(ctx, nx_str(iso, s.name),
 		           FunctionTemplate::New(iso, s.fn)
 		               ->GetFunction(ctx).ToLocalChecked()).Check();
@@ -1611,19 +2084,88 @@ void nx_webgl_init_class(const FunctionCallbackInfo<Value> &info) {
 	}
 }
 
-// $.webglContextNew(canvas) — main factory. Returns a wrapped object that
-// the TS side adds the WebGLRenderingContext prototype to. Returns undefined
-// on failure (TS returns null from getContext).
-void nx_webgl_context_new(const FunctionCallbackInfo<Value> &info) {
+// Phase 2.G.0 — $.webgl2InitClass(WebGL2RenderingContext, { handle map })
+// receives the JS WebGL2RenderingContext class + the helper-class map;
+// stashes prototype carriers (additive — v2 handle set is a superset of v1,
+// shares the same K_* slots) and installs the v2 method table on the class's
+// prototype. Separate symbol from nx_webgl_init_class to keep the v1 install
+// path byte-identical to its hardware-verified shape (see install_methods()'s
+// JIT-safety rationale block).
+void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
+	if (!st) st = new WebGLState();
+	if (info.Length() < 1 || !info[0]->IsFunction()) return;
+	Local<Function> cls = info[0].As<Function>();
+	Local<Context> ctx = cur(iso);
+	Local<Value> proto_v;
+	if (!cls->Get(ctx, nx_str(iso, "prototype")).ToLocal(&proto_v)) return;
+	if (!proto_v->IsObject()) return;
+	Local<Object> proto = proto_v.As<Object>();
+	install_methods_v2(iso, proto);
+
+	// Handle class map. v2 adds v2-only handle kinds (WebGLVertexArrayObject
+	// cut #3; WebGLQuery, WebGLSampler, WebGLSync, WebGLTransformFeedback
+	// in future cuts as the slice's diag-proxy reports each create*).
+	if (info.Length() < 2 || !info[1]->IsObject()) return;
+	Local<Object> classes = info[1].As<Object>();
+	struct KV { const char *name; ObjKind kind; };
+	static const KV MAP[] = {
+	    {"WebGLBuffer", K_BUFFER},
+	    {"WebGLFramebuffer", K_FRAMEBUFFER},
+	    {"WebGLProgram", K_PROGRAM},
+	    {"WebGLRenderbuffer", K_RENDERBUFFER},
+	    {"WebGLShader", K_SHADER},
+	    {"WebGLTexture", K_TEXTURE},
+	    {"WebGLUniformLocation", K_UNIFORM_LOCATION},
+	    {"WebGLActiveInfo", K_ACTIVE_INFO},
+	    {"WebGLShaderPrecisionFormat", K_SHADER_PRECISION_FORMAT},
+	    // v2-only handle kinds (cut #3+):
+	    {"WebGLVertexArrayObject", K_VERTEX_ARRAY_OBJECT},
+	};
+	for (const auto &kv : MAP) {
+		Local<Value> jc;
+		if (!classes->Get(ctx, nx_str(iso, kv.name)).ToLocal(&jc)) continue;
+		if (!jc->IsFunction()) continue;
+		Local<Value> p;
+		if (!jc.As<Function>()->Get(ctx, nx_str(iso, "prototype")).ToLocal(&p))
+			continue;
+		if (!p->IsObject()) continue;
+		// Additive-safe: WebGLBuffer / WebGLFramebuffer / etc. are EXPORTED
+		// from webgl2-rendering-context.ts and IMPORTED by v1's
+		// webgl-rendering-context.ts at line 24-46 — one class per kind,
+		// shared symbol. Module evaluation order is v2 first (v1 depends on
+		// it for the handle classes), v1 second. So when this runs at v2's
+		// init, the slot is still empty; when v1's init runs afterward, it
+		// unconditionally Reset()s the same slot to the SAME prototype
+		// pointer. Net effect: identical prototype stashed regardless of
+		// order. The IsEmpty() check here is a defensive no-op against
+		// future re-orderings (e.g. if v1 is ever decoupled from v2's
+		// handle exports and runs first).
+		if (st->protos[kv.kind].IsEmpty()) {
+			st->protos[kv.kind].Reset(iso, p.As<Object>());
+		}
+	}
+	fprintf(stderr, "[webgl2] init_class ok (empty v2 method table; "
+	                "shape verification only)\n");
+	fflush(stderr);
+}
+
+// Internal shared helper for both v1 and v2 context factories. Returns an
+// empty Local<Object>() on failure (caller sets info return to undefined ->
+// TS createWebGL*Context returns null). `is_v2` tags the carrier so engine-
+// side dispatchers added in 2.G.1+ can branch on context kind.
+static Local<Object> make_context_carrier(Isolate *iso,
+                                          const FunctionCallbackInfo<Value> &info,
+                                          bool is_v2) {
 	if (!st) st = new WebGLState();
 
 	// Skia must be up — without the shared ES3 context + GrDirectContext,
 	// the bridge can't init. Caller (TS) treats this as "no GL available".
 	if (!nx_skia_gpu_egl_context() || !nx_skia_gpu_gr_context()) {
-		fprintf(stderr, "[webgl] context_new refused: skia_gpu not ready\n");
+		fprintf(stderr, "[webgl%s] context_new refused: skia_gpu not ready\n",
+		        is_v2 ? "2" : "");
 		fflush(stderr);
-		return;
+		return Local<Object>();
 	}
 
 	// Read canvas dimensions if a canvas was passed.
@@ -1649,26 +2191,55 @@ void nx_webgl_context_new(const FunctionCallbackInfo<Value> &info) {
 	if (!nx_webgl_bridge_is_initialized()) {
 		if (!nx_webgl_bridge_init(w, h)) {
 			fprintf(stderr,
-			        "[webgl] context_new refused: bridge_init failed\n");
+			        "[webgl%s] context_new refused: bridge_init failed\n",
+			        is_v2 ? "2" : "");
 			fflush(stderr);
-			return;
+			return Local<Object>();
 		}
 	}
 	nx_webgl_bridge_set_webgl_owned(true);
 
 	// Mint the context carrier object. The TS factory sets its prototype to
-	// WebGLRenderingContext, so install_methods having populated the
+	// WebGL{2}RenderingContext, so install_methods{,_v2} having populated the
 	// prototype is what makes instance methods reachable.
 	Local<Object> ctx_obj = nx::NewWrapped(iso);
-	// drawingBufferWidth / drawingBufferHeight as own data properties.
 	Local<Context> jctx = cur(iso);
 	ctx_obj->Set(jctx, nx_str(iso, "drawingBufferWidth"),
 	             Int32::New(iso, w)).Check();
 	ctx_obj->Set(jctx, nx_str(iso, "drawingBufferHeight"),
 	             Int32::New(iso, h)).Check();
-	fprintf(stderr, "[webgl] context_new ok %dx%d\n", w, h);
+	if (is_v2) {
+		ctx_obj->Set(jctx, nx_str(iso, "__webgl2"),
+		             Boolean::New(iso, true)).Check();
+	}
+	fprintf(stderr, "[webgl%s] context_new ok %dx%d%s\n",
+	        is_v2 ? "2" : "", w, h,
+	        is_v2 ? " (v2 wrapper, empty methods — 2.G.0)" : "");
 	fflush(stderr);
-	info.GetReturnValue().Set(ctx_obj);
+	return ctx_obj;
+}
+
+// $.webglContextNew(canvas) — main factory. Returns a wrapped object that
+// the TS side adds the WebGLRenderingContext prototype to. Returns undefined
+// on failure (TS returns null from getContext).
+void nx_webgl_context_new(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Object> obj = make_context_carrier(iso, info, /*is_v2=*/false);
+	if (obj.IsEmpty()) return;
+	info.GetReturnValue().Set(obj);
+}
+
+// Phase 2.G.0 — $.webgl2ContextNew(canvas). Separate factory symbol from v1.
+// Currently shares engine state (WebGLState `st` is process-wide) with v1 —
+// there is no per-context state divergence in 2.G.0. The separate symbol is
+// the load-bearing structural choice: createWebGL2Context calls this,
+// createWebGLContext calls nx_webgl_context_new, and the install paths via
+// $.webgl{2}InitClass are wholly distinct. Returns undefined on failure.
+void nx_webgl2_context_new(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Object> obj = make_context_carrier(iso, info, /*is_v2=*/true);
+	if (obj.IsEmpty()) return;
+	info.GetReturnValue().Set(obj);
 }
 
 } // namespace
@@ -1698,4 +2269,8 @@ void nx_webgl_compose_if_active(SkSurface *target) {
 void nx_init_webgl(v8::Isolate *iso, v8::Local<v8::Object> init_obj) {
 	NX_SET_FUNC(init_obj, "webglContextNew", nx_webgl_context_new);
 	NX_SET_FUNC(init_obj, "webglInitClass", nx_webgl_init_class);
+	// Phase 2.G.0 — separate v2 factory + init pair. Empty method table
+	// for 2.G.0 (shape verification only); methods land in 2.G.1.
+	NX_SET_FUNC(init_obj, "webgl2ContextNew", nx_webgl2_context_new);
+	NX_SET_FUNC(init_obj, "webgl2InitClass", nx_webgl2_init_class);
 }

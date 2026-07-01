@@ -208,6 +208,24 @@ typedef struct {
 	// the JS-visible WebGL bridge on top. Defaults false so shell renders
 	// normally with no bridge touched.
 	bool webgl_test_fbo;
+	// [webgl] state_probe: Phase 2.G.0 state-contract probe. When true, the
+	// bridge queries 4 candidate GL states (UBO indexed bindings, sampler-
+	// unit-0 binding, READ_FRAMEBUFFER_BINDING separately from DRAW, and
+	// TRANSFORM_FEEDBACK_BINDING + RASTERIZER_DISCARD) at known hook points
+	// — init end, first/60th/600th compose, exit start — and logs the
+	// values to stderr with a `[webgl-bridge:probe]` prefix. Purpose:
+	// determine which (if any) of those four bindings ACTUALLY leak across
+	// the shared-context EGL boundary on real Tegra Mesa Nouveau hardware
+	// before extending the FROZEN 2.B nx_gl_state_snap_t. Defaults false
+	// so production runs don't pay the probe cost. Read-only — does NOT
+	// mutate GL state.
+	bool webgl_state_probe;
+	// #16-ACTIVE state-leak probe. Runs ONCE per launch (frame 1 SET, frame 2
+	// READ_BACK + interpret + RESTORE + CLEANUP). See NXJS_PATCHES_NEEDED.md
+	// #16 Active spec. Defaults false; opt-in via [webgl] state_probe_active =
+	// true. Depends on webgl_state_probe being true (active reuses passive's
+	// enable pathway for hook wiring).
+	bool webgl_state_probe_active;
 	nx_socket_config_t socket;
 	nx_threadpool_config_t threadpool; // [threadpool] libuv pool overrides
 	nx_console_config_t console; // [console] styling, exposed on $.config.console

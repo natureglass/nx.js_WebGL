@@ -79,6 +79,7 @@ NX_MODULE(udp);
 NX_MODULE(url);
 NX_MODULE(usb);
 NX_MODULE(video);
+NX_MODULE(video_decoder);
 NX_MODULE(web);
 NX_MODULE(window);
 #undef NX_MODULE
@@ -618,6 +619,15 @@ static void nx_framebuffer_init(const FunctionCallbackInfo<Value> &info) {
 		// on Skia's shared ES3 context + a state save/restore primitive that
 		// 2.C will reuse, then composes a hand-written GL triangle into the
 		// screen surface every frame. Defaults off — shell renders normally.
+		// Phase 2.G.0 — enable state-contract probe BEFORE bridge init so the
+		// init-end probe (inside nx_webgl_bridge_init) fires when the flag is
+		// set. Probe is read-only; enabling without test_fbo still works (the
+		// probe will run when the v2 context lazily inits the bridge via
+		// nx_webgl_context_new → nx_webgl_bridge_init).
+		nx_webgl_state_probe_enable(ctx->config.webgl_state_probe);
+		nx_webgl_state_probe_active_enable(
+		    ctx->config.webgl_state_probe_active);
+
 		if (ctx->config.webgl_test_fbo) {
 			if (!nx_webgl_bridge_init(640, 360)) {
 				fprintf(stderr,
@@ -1010,6 +1020,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_url(iso, init_obj);
 	nx_init_usb(iso, init_obj);
 	nx_init_video(iso, init_obj);
+	nx_init_video_decoder(iso, init_obj);
 	nx_init_web(iso, init_obj);
 	nx_init_webgl(iso, init_obj);
 	nx_init_window(iso, init_obj);

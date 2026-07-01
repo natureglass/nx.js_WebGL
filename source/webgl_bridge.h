@@ -68,13 +68,52 @@
 //                    glClear to the wrong color.
 //   blend_src/dst  — full glBlendFuncSeparate state.
 //
+// Phase 2.G.1 cut #15 (2026-07-01) — depth_mask + stencil_mask ADDED. The
+// original comment claimed "Ganesh resets these per-draw" — that IS true for
+// Skia's own draws, but when Three.js runs BETWEEN Skia frames, Three.js's
+// WebGLState cache assumes depth mask starts at TRUE (WebGL default) and
+// short-circuits gl.depthMask(TRUE) calls. If Ganesh left GL_DEPTH_WRITEMASK
+// at FALSE (Skia's 2D drawing doesn't want depth writes), Three.js's cache
+// is out of sync with the actual GL state; gl.clear(DEPTH_BUFFER_BIT)
+// silently becomes a no-op; the depth buffer stays at its previous frame's
+// values (or uninitialized 0); LESS depth test rejects every cube fragment.
+// Symptom: draws succeed with no GL error, all state introspection reports
+// clean, and yet no pixels land on the color texture. Cut #14h isolation
+// test confirmed the mechanism (disabling GL_DEPTH_TEST made the same
+// instanced draw produce cube pixels immediately). Instancing-dynamic is
+// the first v2 demo to depend on per-frame depth clear (webgl2-ubo and
+// webgl2-shaders-sky used depth_test=false custom shaders).
+//
 // NOT in the set (deliberately):
-//   - DEPTH_FUNC / DEPTH_WRITEMASK — Ganesh's per-draw setup resets these.
+//   - DEPTH_FUNC — Ganesh's per-draw setup resets it, AND Three.js re-emits
+//     gl.depthFunc calls per-material.
 //   - PIXEL_PACK/UNPACK alignment — irrelevant for the compose path.
-//   - STENCIL ops/mask — Ganesh resets these per-draw too, and the spike
-//     proved STENCIL_TEST enable + glDisable on restore is sufficient.
 //   - polygon_offset / line_width / point_size — Ganesh sets these per-draw.
-//   - active SAMPLER bindings — none used yet.
+//
+// Phase 2.G.1 patch #17 (2026-07-01) — sampler_unit0 + read_fbo ADDED per
+// authoritative hardware verdict from the #16-ACTIVE probe (real Switch
+// verdict, per NXJS_PATCHES_NEEDED.md #16-ACTIVE spec). SUMMARY line was:
+//   needs_snap={sampler_unit0, read_fbo}
+// Details:
+//   sampler_unit0 → NEEDS_SNAP_LEAVE: Skia mutated it (post=2 != our set=1)
+//                   and left it. Ganesh binds sampler object 2 to unit 0
+//                   and expects it to persist across frames. Passive probe
+//                   confirmed the steady-state value at every compose-pre
+//                   is sampler0=2.
+//   read_fbo      → NEEDS_SNAP_MUTATE_RESTORE: Skia unbound our probe RFB
+//                   back to 0 (its expected default) — meaning Ganesh
+//                   assumes GL_READ_FRAMEBUFFER_BINDING is 0 at start of
+//                   its frames and re-sets it. The 2.B snap saved via
+//                   GL_DRAW_FRAMEBUFFER_BINDING + restored via
+//                   glBindFramebuffer(GL_FRAMEBUFFER, ...) — which binds
+//                   BOTH targets — so this actually WAS covered for the
+//                   Skia-mutates-and-restores case; but adding an explicit
+//                   read_fbo save+restore path is defense in depth for the
+//                   WebGL2-only demos (MRT + gpgpu-water) that Three.js
+//                   split-binds READ vs DRAW.
+//   ubo_slot3/ubo_slot0/tf/rast_disc → all moot per probe. Ganesh doesn't
+//     touch UBO slots on this hardware; doesn't use transform feedback;
+//     doesn't toggle rasterizer discard.
 //
 // If 2.C/2.D surfaces "Skia renders garbage after WebGL draws" symptoms on
 // hardware, the FIRST place to look is this list — a missing entry under a
@@ -93,11 +132,16 @@ struct nx_gl_state_snap_t {
 	GLboolean scissor;
 	GLboolean stencil_test;
 	GLboolean color_mask[4];
+	GLboolean depth_mask;       // cut #15
+	GLint stencil_mask;          // cut #15
 	GLfloat clear_color[4];
 	GLint blend_src_rgb;
 	GLint blend_dst_rgb;
 	GLint blend_src_a;
 	GLint blend_dst_a;
+	// Patch #17 (from #16-ACTIVE hw probe SUMMARY needs_snap={sampler_unit0,read_fbo}):
+	GLint sampler_unit0;         // Skia binds sampler obj 2 to unit 0 + leaves it
+	GLint read_fbo;              // Ganesh assumes READ_FRAMEBUFFER = 0 at frame start
 };
 
 // Capture / restore the GL state contract. The caller owns the snap struct.
@@ -184,3 +228,53 @@ void nx_webgl_bridge_set_auto_flush(bool v);
 bool nx_webgl_bridge_compose_rect(SkSurface *target,
                                   int src_x, int src_y, int src_w, int src_h,
                                   int dst_x, int dst_y);
+
+// Phase 2.G.0 — state-contract probe controls + read-only logger.
+//
+// The probe is GATED by `[webgl] state_probe = true` (config.h::webgl_state_probe).
+// Call nx_webgl_state_probe_enable(cfg->webgl_state_probe) once at engine boot
+// after config load — main.cc does this just below the bridge init site. The
+// flag is process-wide; the bridge consults it via accessor at each hook point.
+//
+// When enabled, nx_webgl_state_probe_log(tag) issues a small batch of GL
+// queries for four bindings that the QuickJS-era impl serviced but the FROZEN
+// 2.B nx_gl_state_snap_t deliberately does NOT cover:
+//
+//   1. UBO indexed bindings — GL_UNIFORM_BUFFER_BINDING + indexed slots
+//      0..3 (sample of what Three.js v2 actually exercises; the full
+//      MAX_UNIFORM_BUFFER_BINDINGS sweep is overkill for a leak probe)
+//   2. Sampler-unit-0 binding — GL_SAMPLER_BINDING with active unit 0
+//   3. READ_FRAMEBUFFER vs DRAW_FRAMEBUFFER — already saved DRAW; probe
+//      READ to see whether Skia leaves them separable or always equal
+//   4. TRANSFORM_FEEDBACK_BINDING + RASTERIZER_DISCARD
+//
+// The probe is READ-ONLY (only glGetIntegerv / glIsEnabled), so calling it
+// from inside any GL-current path is safe (it does not perturb Skia's
+// cached state, but as a defensive measure the bridge still wraps probe
+// reads in a tiny bracket that records + restores GL_ACTIVE_TEXTURE — the
+// only state we touch indirectly via the GL_SAMPLER_BINDING probe).
+//
+// Hook points (all auto-fire when probe enabled):
+//   - tag "init"         — end of nx_webgl_bridge_init (baseline before any
+//                          WebGL or composite traffic)
+//   - tag "compose-pre"  — start of nx_webgl_bridge_compose, frames 1/60/600
+//   - tag "compose-post" — end   of nx_webgl_bridge_compose, frames 1/60/600
+//   - tag "exit"         — start of nx_webgl_bridge_exit
+//
+// Output: `[webgl-bridge:probe] tag=<tag> frame=<n> ubo0=X ubo1=X ubo2=X
+// ubo3=X ubo_base=X sampler0=X read_fbo=X draw_fbo=X tf=X rast_disc=X`
+// All values are GL handle ids / enables (0 = unbound / disabled).
+void nx_webgl_state_probe_enable(bool on);
+bool nx_webgl_state_probe_enabled(void);
+void nx_webgl_state_probe_log(const char *tag);
+
+// #16-ACTIVE state-leak probe. Runs ONCE per launch: SET four candidate
+// bindings to known non-default values on the FIRST compose call, yield
+// one Skia frame, READ back on the SECOND compose call, interpret and
+// log verdict per candidate, RESTORE + CLEANUP. Read the SUMMARY line
+// from `nxjs-debug.log` to drive #17 snap-extension decisions.
+//
+// Opt-in via [webgl] state_probe_active = true. Requires webgl_state_probe
+// also true (reuses passive probe's log wiring). Idempotent — after the
+// one-shot run, subsequent compose calls no-op.
+void nx_webgl_state_probe_active_enable(bool on);

@@ -1241,6 +1241,1195 @@ canvas-runner.ts. Verify the install fires by checking `gl[Symbol.for('brewserCu
 
 ---
 
+## #13 — canvas.cc: pin set_font_size at start of fillText/strokeText/measureText — SHIPPED 2026-06-30
+
+**File(s):** [source/canvas.cc](source/canvas.cc)
+
+**Exact change.** Add `set_font_size(context, context->state->font_size);`
+as the first statement (after argument parsing + early-return) in:
+
+- `nx_canvas_context_2d_fill_text` (~line 1698, right after
+  `double scale = 1., font_size = context->state->font_size;`)
+- `nx_canvas_context_2d_stroke_text` (~line 1758, same position)
+- `nx_canvas_context_2d_measure_text` (~line 1801, right before
+  the `if (context->state->hb_font)` shaping block)
+
+```cpp
+// Pin the shared ft_face / hb_font scale to this ctx's font_size
+// before shaping — re-apply per call, idempotent against cross-ctx
+// state corruption via save/restore on a SHARED nx_font_face_t.
+set_font_size(context, context->state->font_size);
+```
+
+The matching `set_font_size` definition (~line 333) is unchanged — it
+runs `FT_Set_Char_Size(ft_face, 0, font_size * 64, 0, 0)` and
+`hb_font_set_scale(hb_font, font_size * 64, font_size * 64)`.
+
+**Symptom it fixes.** Inline 2D canvas text drawn via `ctx.fillText`
+renders at the WRONG size (e.g., 10 px instead of 14 px) on any page
+where the shell painter draws HTML text concurrently to the same screen
+canvas. Most visible on `webgl-materials-cubemap`'s `#cube-status`
+panel: "1 px smaller, tighter letter spacing, fuzzy" text on every
+glyph; the FT_Face char_size is at 10 (the canvas-state default) while
+`state->font_size` is 14. Affects any demo with a `<canvas>` driven by
+a JS-side render loop that draws text via `'system-ui'` font, whenever
+the brewser shell concurrently paints HTML text using
+`ctx.save() / ctx.font / fillText / ctx.restore()`.
+
+**Why upstream-vanilla lacks it.** nx.js uses a 1:1 mapping from JS
+`FontFace` to the C-side `nx_font_face_t` (`packages/runtime/src/font/
+font-face.ts:40` builds the C struct once per JS FontFace construction;
+[source/font.cc:33-110](source/font.cc#L33-L110) allocates the
+FreeType `FT_Face` and HarfBuzz `hb_font` inside it). All 2D contexts
+that resolve to the SAME `FontFace` via
+[`findFont`](packages/runtime/src/font/font-face-set.ts#L96-L116)
+end up with `state->ft_face` and `state->hb_font` pointing at the
+SAME shared FreeType / HarfBuzz objects.
+
+The state stack save/restore preserves `state->font_size` (a value)
+but the `FT_Face`'s `char_size` is **device-global**: any
+`set_font_size` call (via `set_font` setter OR via the implicit
+`set_font_size(state->font_size)` at the end of
+`nx_canvas_context_2d_restore`, [canvas.cc:1822](source/canvas.cc#L1822))
+mutates the shared FT/HB state in place — visible to every other ctx
+holding the same `nx_font_face_t`.
+
+The brewser shell painter sequence is:
+1. `ctx.save()` — push state copy
+2. `ctx.font = '${size}px system-ui'` — `set_font` updates state.font_face
+   (possibly to a different `FontFace` if `findFont` returns a different
+   match) + `set_font_size(size)` on the inner state's ft_face
+3. `fillText(...)` — draws at `size`
+4. `ctx.restore()` — pops; **calls `set_font_size(outer.font_size)`**
+   where `outer.font_face` is the FIRST-registered `'system-ui'`
+   FontFace and `outer.font_size = 10` (the canvas-state default,
+   from `init_state_defaults`). Mutates the shared FT_Face's
+   char_size to 10.
+
+Cube-status's `renderStatus` runs every 200 ms via `setInterval`. Its
+`ctx.font = '14px system-ui'` is no-op'd by the JS-side setter's
+early-return (`if (this.font === v) return;` at canvas-rendering-
+context-2d.ts:91) on every call after the first — because the ctx's
+`state.font_string` is still `'14px system-ui'`. So `set_font_size(14)`
+does NOT get called again, and the next `fillText` reads the shared
+FT_Face at the size the shell left behind: **10**.
+
+**DISPOSITION:** `upstream-candidate`. General engine correctness —
+any nx.js embedder with concurrent 2D contexts sharing a system-ui
+FontFace hits this. A wider, structural fix would give each
+`nx_canvas_context_2d_t` its own `FT_Face` + `hb_font` clones rather
+than sharing the FontFace's instances, but that's a larger refactor
+with allocation-rate + memory implications; the per-text-op
+`set_font_size` re-pin is the minimal, surgical fix.
+
+**UPSTREAM STATUS:** `not-submitted` (2026-06-30). Worth a PR after a
+minimal repro is reduced — likely "two `OffscreenCanvas` instances,
+both set `ctx.font = '14px system-ui'`, one calls save/font('20px')/
+fillText/restore, the other does fillText and gets text at 10 px."
+Repro is trivial to extract from the user-reported case.
+
+**Cost.** One `FT_Set_Char_Size` + one `hb_font_set_scale` per
+`fillText` / `strokeText` / `measureText` call — sub-microsecond on
+the cached FT_Face (no font-data parse). Negligible vs the
+`SkCanvas::drawGlyphs` call that follows.
+
+**Diagnostic toolkit that found the bug** (removed after ship; re-add
+during future regression hunts):
+
+1. **In `fill_text` (engine):** every-Nth-call log of `state.font_size`,
+   `ft->size->metrics.x_ppem`, `hb_font_get_scale()` values, and the
+   `font_face` pointer. Surfaces ANY mismatch between `state.font_size`
+   and the actual FT/HB scale (`v8 fft` in our session's logs).
+2. **In `set_font_size` (engine):** every-call log of `font_face`
+   pointer + new size. With (1), pairs to identify WHO is calling
+   `set_font_size` on which `nx_font_face_t` (`v9 set_font_size`).
+3. **In `overlayLiveAnimatedCanvases` (brewser-runtime, scoped to
+   `el.id === 'cube-status'`):** log `box.x/y/w/h`, `screenX/Y`, and a
+   `getImageData(x, y, 1, 1)` sample at a known text position
+   (`fuzz-diag cube-status tick`).
+4. **Horizontal pixel strip (same scope):** read 30 contiguous pixels
+   across known glyphs, classify each by red channel into
+   `.` (bg) / `:` (AA edge) / `#` (text body), join into a string. Lets
+   you eyeball actual glyph widths in the offscreen — caught the
+   ~70 % scale that confirmed the offscreen content (not the
+   compositing) was wrong (`fuzz-diag cube-status strip`).
+
+**Recurrence tells:**
+
+- Any inline 2D canvas's `fillText` text appears smaller than its
+  `state.font_size` would imply, ON PAGES WHERE THE SHELL CONCURRENTLY
+  PAINTS HTML TEXT WITH `'system-ui'`.
+- Engine-level fillText probe (#1 above) shows `state.size=N` but
+  `ft.x_ppem` < N for the affected font_face.
+- `set_font_size` trace (#2 above) shows alternating `ff=` pointers
+  with one of them repeatedly getting set to 10 right after every
+  shell `ctx.restore()` call — the classic cross-context corruption
+  signature.
+
+**Cross-references:**
+
+- [[project-nxjs-canvas-shared-ft-face-fix]] — full investigation log
+  (false starts: Math.round on dst coords, putImageData isolation,
+  setSubpixel(false), single-source pixel path, double-draw
+  elimination — ALL refuted before the trace caught the actual cause).
+- [[project-v8-cursor-compositor-shipped]] — the cursor work surfaced
+  this bug because its restored canCanvasFastPath + paintCursorOverlay
+  hook added the `ctx.save() / set font / fillText / ctx.restore()`
+  pattern to the per-frame shell paint chain. The bug itself
+  PRE-EXISTED the cursor work (anywhere a shell does save/restore
+  around font changes triggers it); cursor work just made it
+  reproduce visibly on a hot path.
+
+---
+
+## #14 — WebGL2 context factory + screen.getContext('webgl2') wiring (Phase 2.G.0) — SHIPPED 2026-06-30
+
+**File(s):**
+[source/webgl.cc](source/webgl.cc) (nx_webgl2_context_new, nx_webgl2_init_class, make_context_carrier helper, NX_SET_FUNC registrations in nx_init_webgl);
+[packages/runtime/src/canvas/webgl2-rendering-context.ts](packages/runtime/src/canvas/webgl2-rendering-context.ts) (createWebGL2Context now calls `$.webgl2ContextNew`; the class install now calls `$.webgl2InitClass`);
+[packages/runtime/src/screen.ts](packages/runtime/src/screen.ts) (`getContext('webgl2')` branch flipped from `return null` to mint a v2 context via createWebGL2Context, mirroring the v1 branch's 2D-coexistence rule).
+
+**Exact change (Phase 2.G.0).** Add two new engine bindings beside the
+existing v1 pair (`$.webglContextNew` + `$.webglInitClass`):
+- `$.webgl2ContextNew(canvas)` → wraps an internal `make_context_carrier`
+  helper with `is_v2=true`. Shares engine `WebGLState` with v1 (one
+  process, one bridge, one tenant FBO); the v2 wrapper diverges from v1
+  only by an additional own-property `__webgl2 = true` for future engine-
+  side dispatchers in 2.G.1+ that need to branch on context kind
+  (getParameter pname tables, extension allowlists, etc.).
+- `$.webgl2InitClass(WebGL2RenderingContext, { handle map })` → calls a
+  SEPARATE `install_methods_v2` (currently an EMPTY FUNCS[] table) on the
+  v2 prototype, and additively populates the shared K_* handle-prototype
+  carriers without overwriting v1's entries.
+
+Runtime side: `createWebGL2Context` now calls `$.webgl2ContextNew` (not
+`$.webglContextNew`); the install at the bottom of
+`webgl2-rendering-context.ts` now calls `$.webgl2InitClass` (not
+`$.webglInitClass`). `screen.getContext('webgl2')` mirrors the `'webgl'`
+branch's behavior — mints a v2 context on first call, caches it in
+`ScreenInternal.contextWebGL2`, returns the cached value on subsequent
+calls, allows 2D-coexistence on the same canvas, excludes only the other
+WebGL family.
+
+**Why this change.** Upstream V8 nx.js v1.0.0-beta.5's webgl.cc exposes
+neither v1 nor v2 from `screen.getContext` — Phase 2.C grew the v1 path
+by adding `$.webglContextNew` + `$.webglInitClass` and flipping
+`screen.getContext('webgl')`. The v2 path was left null at 2.C (see #7's
+deliberate-null rationale) because returning a v2 context with only v1
+methods routes Three.js into its v2 codepath via `gl.constructor.name`
+detection and immediately throws on the first v2-only call. Phase 2.G.0
+ships the structural piece: a non-null v2 context with the CORRECT
+prototype shape (387 v2 constants + empty method table) and the SEPARATE
+factory + init symbols, so 2.G.1 can grow methods into the v2 path
+without re-litigating the structural question and without touching v1.
+
+**Symptom it fixes.** Before 2.G.0: `screen.getContext('webgl2')` returns
+`null`; Three.js's WebGL2-detection (`new WebGLRenderer({ canvas })`
+internal probe) fails, demos either fail entirely or downgrade to v1. After
+2.G.0: `screen.getContext('webgl2') instanceof WebGL2RenderingContext`
+returns true; the v2 detection succeeds. Calling any v2 method (or any
+v1 method on the v2 context, since v2's FUNCS[] is empty in 2.G.0) throws
+`TypeError: X is not a function` — EXPECTED until 2.G.1.
+
+**Why upstream-vanilla lacks it.** Upstream beta.5 ships a single 161-
+method WebGL2 table backed by the legacy "WebGL or Skia, not both" EGL-
+ownership model (see MIGRATION_PLAN.md "Architectural delta from
+upstream"). Our shared-context model + 2.B state save/restore + 2.C
+v1-with-empty-extension-table approach is structurally different, so the
+v2 introduction has to follow the same separate-binding-symbol pattern
+the v1 path uses.
+
+**DISPOSITION:** `upstream-candidate`. Any embedder running the V8 nx.js
+inside a Skia-bridged shared-context architecture benefits from the
+separate v1/v2 factory + init binding split. File a PR after 2.G is
+hardware-verified end-to-end.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** After upstream pull, `grep` engine
+`source/webgl.cc` for `webgl2ContextNew` and `webgl2InitClass`. If absent,
+re-apply the 4-symbol diff (helper `make_context_carrier`, two new public
+functions, two new `NX_SET_FUNC` registrations in `nx_init_webgl`).
+Re-apply the TS-side `createWebGL2Context` swap to `$.webgl2ContextNew` /
+`$.webgl2InitClass`. Re-apply the screen.ts:152-162 flip.
+
+**GOTCHA: v1 install path must stay byte-identical.** The v1 install
+path was hardware-verified clean (Phase 2.C hardware gate, full JIT after
+#8 fix). The 2.G.0 work is ADDITIVE only — `install_methods()` and
+`nx_webgl_init_class` are untouched. A regression that "fixes" v2 by
+sharing code with v1 (a single install_methods that selects by class) is
+the wrong shape; see the table-split rationale in #15.
+
+---
+
+## #15 — WebGL v1/v2 method-table split: separate FUNCS[] tables (Phase 2.G.0 shape decision)
+
+**File(s):**
+[source/webgl.cc](source/webgl.cc) (`install_methods()` for v1 + new
+`install_methods_v2()` — separate static-storage Spec FUNCS[] tables;
+multi-paragraph rationale block above `install_methods()`).
+
+**Exact change (Phase 2.G.0).** The v2 method install path uses its OWN
+`install_methods_v2(iso, proto)` function with its OWN `static const Spec
+FUNCS[]` table. NOT a single `install_methods(iso, proto, bool is_v2)`
+that selects a subset by flag, NOT a single FUNCS[] with per-entry
+`V1_BIT/V2_BIT` flags.
+
+**Why this shape.**
+
+1. **JIT safety against #8 lesson.** #8's root cause was a TS-side
+   `Object.defineProperty` pattern that compiled into a V8/aarch64 Tegra
+   JIT codegen issue (1160 per-key calls in `for (const [k,v] of
+   Object.entries(GL_CONSTANTS))` loops); the fix was bulk
+   `Object.defineProperties` per target. That fix discipline is "do not
+   gate behavior at install time; keep the install loop shape
+   predictable." Separate tables EXTEND that discipline to the engine-
+   side method install: a single FUNCS[] with select-subset-at-install
+   logic would feed conditional FunctionTemplate::New calls into V8's
+   prototype hidden class, growing the surface area for a new JIT
+   codegen edge case. Separate tables present V8 with two independent,
+   straightforward install paths.
+
+2. **v1 install path is hardware-verified clean.** The 95-entry v1
+   FUNCS[] + install loop compiled-and-JIT'd clean on real Tegra
+   (Phase 2.C hardware gate, jit=on default post-#8). Touching that loop
+   to add selection logic is a regression risk that 2.G.0 cannot afford
+   (the table-split shape MUST land before 2.G.1's webgl2-ubo slice can
+   sign off). Independent tables = v1 code path unchanged = v1 hardware
+   verification carries through.
+
+3. **9 v2-only extensions need v2-only registration.** EXT_disjoint_
+   timer_query_webgl2, EXT_texture_norm16, WEBGL_clip_cull_distance,
+   EXT_float_blend, EXT_render_snorm, OES_sample_variables, OES_draw_
+   buffers_indexed, WEBGL_blend_func_extended, WEBGL_compressed_texture_
+   etc — all gated by `is_webgl2=true` in the QuickJS-era fork. A shared
+   table would have to gate them at install time; separate tables make
+   them v2-only by location.
+
+4. **Three.js detection contract.** Three.js detects v1 vs v2 via
+   `gl.constructor.name === 'WebGL{2}RenderingContext'`. Independent
+   prototype chains with independent method sets match this contract.
+   No shared dispatch surface.
+
+5. **Bisectability.** If a future hardware regression appears on v2 but
+   not v1, it's attributable to the v2 install path (Spec entries OR
+   install-loop interaction with the table size). With separate tables
+   the regression is bisectable by toggling individual v2 entries off;
+   with a shared table the bisection has to disambiguate "is it the
+   entry or the gate".
+
+**Cost.** When 2.G.1+ ports the ~95 v2-only methods AND the ~95
+v1-shared methods (WebGL2 IS-A WebGL1), the v2 FUNCS[] grows to ~190
+entries. The shared method entries point at the SAME C++ impl
+functions (the `w_useProgram` etc. impls do not change); only the Spec
+entry duplicates. Code-size impact is ~95 extra Spec entries in the
+.cc file. Negligible.
+
+**Symptom it fixes.** This is a structural choice, not a bug fix. The
+alternative shape (shared FUNCS[] with selection) is what we are NOT
+doing. Recurrence tell: a future contributor sees the duplicate Spec
+entries between FUNCS[] (v1) and FUNCS_V2[] (v2) at 2.G.1+ and refactors
+to dedup → reintroduces the gate, regressing the JIT-safety discipline
+silently. If a future regression flips `jit = off` to be a workaround
+again, FIRST check whether the table-split shape got refactored out.
+
+**Why upstream-vanilla lacks it.** Upstream beta.5 has a single ~161-
+method table that registers WebGL2 only; no v1 path exists in upstream
+at all, so the question of split-shape never arose there.
+
+**DISPOSITION:** `upstream-candidate`. Any embedder splitting v1/v2 into
+separate exposed surfaces benefits. Bundle into the same PR as #14.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** After upstream pull, look for
+`install_methods_v2` next to `install_methods` in webgl.cc. If only one
+exists, re-apply the split. **GOTCHA: do not refactor to dedup.** The
+duplication between v1 FUNCS[] and v2 FUNCS[] is intentional per the
+JIT-safety discipline above. The rationale block above
+`install_methods()` documents this in detail; do not condense it on
+"cleanup" passes.
+
+---
+
+## #16 — WebGL state-contract probe (Phase 2.G.0 — read-only, gated by `[webgl] state_probe = true`) — SHIPPED 2026-06-30
+
+**File(s):**
+[source/config.h](source/config.h) (`webgl_state_probe` bool field);
+[source/config.cc](source/config.cc) (`[webgl] state_probe = true|false`
+parse + default-false init);
+[source/webgl_bridge.h](source/webgl_bridge.h) (probe enable/log
+declarations + multi-paragraph header comment on the four candidate
+bindings);
+[source/webgl_bridge.cc](source/webgl_bridge.cc) (`s_state_probe_on`
+gate, `s_probe_compose_n` frame counter, `probe_sample_this_frame`,
+`nx_webgl_state_probe_enable`, `nx_webgl_state_probe_log` with the four
+candidate reads + GL_ACTIVE_TEXTURE defensive restore; hook calls at
+`nx_webgl_bridge_init` end, `nx_webgl_bridge_compose` enter/exit on
+frames 1/60/600, `nx_webgl_bridge_exit` start);
+[source/main.cc](source/main.cc) (`nx_webgl_state_probe_enable(ctx->
+config.webgl_state_probe)` before bridge init).
+
+**Exact change (Phase 2.G.0).** Before extending the FROZEN 2.B
+`nx_gl_state_snap_t` even once, ship a READ-ONLY hardware probe that
+queries four candidate GL bindings at known hook points and logs them.
+The user reads the log on real CFW hardware; bindings whose values
+remain constant across all tags do NOT need to be added to the snap;
+bindings that mutate between `init` / `compose-pre` / `compose-post`
+tags are leakage candidates and become inputs to the proposed batched
+snap extension (#17 — proposed, awaiting probe results + sign-off).
+
+Four candidates probed:
+1. **UBO indexed bindings** — `GL_UNIFORM_BUFFER_BINDING` (base) +
+   indexed slots 0..3 via `glGetIntegeri_v`.
+2. **Sampler-unit-0 binding** — `GL_SAMPLER_BINDING` with active unit 0
+   (the only unit Ganesh-GL is documented to touch).
+3. **Read framebuffer separate from draw** — `GL_READ_FRAMEBUFFER_BINDING`
+   alongside the already-saved `GL_DRAW_FRAMEBUFFER_BINDING`.
+4. **Transform feedback + rasterizer-discard** — `GL_TRANSFORM_FEEDBACK_
+   BINDING` + `glIsEnabled(GL_RASTERIZER_DISCARD)`.
+
+Output format (one line per hook fire):
+```
+[webgl-bridge:probe] tag=<init|compose-pre|compose-post|exit>
+  frame=<n> ubo_base=<id> ubo0=<id> ubo1=<id> ubo2=<id> ubo3=<id>
+  sampler0=<id> read_fbo=<id> draw_fbo=<id> tf=<id> rast_disc=<0|1>
+```
+
+**Probe call sites (all auto-fire when probe enabled):**
+- `init` — end of `nx_webgl_bridge_init` (baseline before any WebGL or
+  composite traffic)
+- `compose-pre` + `compose-post` (or `compose-post-{noflush,skip,clean}`)
+  — start/end of `nx_webgl_bridge_compose` on frames 1, 60, 600 (1s and
+  10s of compose-path activity, plus the very first frame for an
+  immediate signal)
+- `exit` — start of `nx_webgl_bridge_exit`
+
+The probe is read-only: only `glGetIntegerv`, `glGetIntegeri_v`,
+`glIsEnabled`, and a defensive `glActiveTexture` save/restore for the
+sampler-unit-0 query. It does NOT mutate any state Skia or WebGL cares
+about. Safe to enable on any production run; only the log volume grows.
+
+**Why this change.** The QuickJS-era fork carried per-VAO attribute
+state save/restore (webgl.c:14820-14872) and additional EGL-side
+bookkeeping that implicitly serviced these four bindings; the V8
+2.B `nx_gl_state_snap_t` deliberately stopped at the 18 fields the
+Phase 0 fbo-spike empirically proved load-bearing on Citron + hardware.
+Phase 2.G's webgl2-ubo slice (2.G.1) introduces UBO indexed binding
+traffic; webgl2-multiple-rendertargets (2.G.2) introduces read/draw FB
+split; gpgpu-water (2.G.7) stresses every binding in the list. Before
+extending the snap (irreversible — every snap extension is hardware-
+revalidated), get empirical evidence for which bindings actually leak
+under our specific shared-context EGL architecture. The shared context
+may make some of the QuickJS-era assumptions moot.
+
+**Symptom it fixes.** Pre-probe: snap extension is a guess (extend
+based on the QuickJS-era impl's assumptions about a different EGL
+architecture). Post-probe: snap extension is bounded to bindings that
+empirically leak on the V8 substrate. Saves rework + hardware passes.
+
+**Why upstream-vanilla lacks it.** No state-contract probe; upstream
+has no bridge architecture.
+
+**DISPOSITION:** `fork-only`. Diagnostic-only feature specific to our
+shared-context WebGL↔Skia coexistence model. Can be removed once Phase
+2.G hardware-revalidates the extended snap; left in source as a
+diagnostic re-enable for future regressions.
+
+**UPSTREAM STATUS:** `n/a` (fork-only diagnostic).
+
+**RE-APPLY / VERIFY NOTE.** After upstream pull, grep for
+`nx_webgl_state_probe_log` in source/webgl_bridge.cc. If absent,
+re-apply the probe (config flag + 5 hook points). If absent and the
+batched snap extension (#17) has already shipped, the probe can stay
+removed unless a new state-contract question arises.
+
+**USAGE.** Drop into `sdmc:/switch/nxjs-override.ini`:
+```ini
+[webgl]
+state_probe = true
+```
+Boot brewser → trigger a WebGL2 path. Read the log; a binding whose
+value differs between adjacent tags is a passive-leak candidate.
+
+**LIMITATION of the read-only probe.** The passive form catches leaks
+that show up as VALUES Skia leaves bound — but a binding that Skia
+restores to its OWN expected state (which may be a default-zero) after
+its frame would read identically at `compose-pre` and `compose-post`
+even if Ganesh touched it mid-frame. To detect that class of leak the
+ACTIVE probe (see below) is required: SET the binding to a known
+non-default value BEFORE crossing Skia, then read back AFTER, and
+diff. Active probe spec lives in the design block at the bottom of
+this entry; implementation deferred to next-session-after-#16-passive-
+data.
+
+---
+
+### #16-ACTIVE — Active state-leak probe SPEC (Phase 2.G.0 — DESIGN, NOT IMPLEMENTED)
+
+**STATUS: DESIGN ONLY, NOT SHIPPED.** This is the spec for a
+follow-on probe pass after the passive #16 data is reviewed. Active
+probe code is not yet written; this block IS the spec for writing it.
+
+**Why active in addition to passive.** Shared-context EGL was the root
+cause across multiple prior bugs (cube-face aliasing, save/restore
+discipline). Skia's Ganesh-GL backend has its own state cache that
+assumes certain bindings stay where Ganesh put them between draws.
+There are FOUR distinct mutation patterns to detect:
+
+| Pattern | Passive-probe behavior | Active-probe behavior |
+|---|---|---|
+| Skia LEAVES binding mutated | catches | catches |
+| Skia mutates + RESTORES (to its own expected state) | misses | catches if our SET differs from Skia's expected |
+| Binding is read-only / never touched | catches no leak | catches no leak |
+| Binding semantics broken by shared context | misses | catches |
+
+The user's instruction: "shared-context EGL may make some moot or
+change their shape vs. QuickJS-era assumptions" — active probe
+distinguishes these cases.
+
+**Spec format per candidate.** Each probe = SET, CROSS, READ-BACK,
+INTERPRET. The CROSS is exactly ONE Skia frame (the engine present
+hook → `nx_skia_gpu_present` issues whatever GL traffic Ganesh-GL
+needs to paint the current canvas surface and swap buffers).
+
+**Active probe sequence (universal):**
+1. Acquire shared GL context (the bridge runs in it already; no
+   eglMakeCurrent needed if probe runs from inside the existing per-
+   frame compose path).
+2. SET: bind a known non-default value for the candidate. Detail
+   per-candidate below. ALSO: snapshot what Skia/Ganesh's expected
+   state was just before our SET (via `glGetIntegerv`) — call this
+   `pre`.
+3. RECORD: `glGetIntegerv` immediately after SET, confirm it stuck —
+   call this `set`. (Catches the case where the GL driver refused our
+   SET — INVALID_VALUE etc. — so we don't read a false leak result.)
+4. CROSS: yield to the engine's normal present flow. The bridge's
+   `compose-post` hook fires AFTER Skia has presented one frame.
+5. READ-BACK: at `compose-post` hook, `glGetIntegerv` again — call
+   this `post`.
+6. RESTORE: re-bind the candidate to `pre` to leave GL state as we
+   found it. Critical or we corrupt subsequent frames.
+7. INTERPRET (one log line per candidate per probe pass):
+   - `post == set` → Skia did NOT touch it. **Moot under shared
+     context.** Does not need snapshotting.
+   - `post == pre`  → Skia mutated AND restored. **Snap MUST cover it**
+     — but only if `pre != set` (i.e. Skia's restore target differs
+     from our SET, indicating Ganesh has a specific expected value
+     that conflicts with our WebGL traffic).
+   - `post != set && post != pre` → Skia mutated to a NEW value
+     and left it. **Snap MUST cover it.**
+   - `post == set && pre != set` → Skia restored OUR value (Skia's
+     internal save/restore already covers this binding). Boundary
+     between moot and needs-snapshotting depends on whether Skia's
+     internal save/restore is something we can rely on across Skia
+     versions; conservative interpretation = needs snapshotting.
+
+**Per-candidate detail.**
+
+#### (a) UBO indexed bindings
+
+- **SET:** `glGenBuffers(1, &probeUBO); glBindBuffer(GL_UNIFORM_BUFFER,
+  probeUBO); glBufferData(GL_UNIFORM_BUFFER, 256, NULL,
+  GL_DYNAMIC_DRAW); glBindBufferRange(GL_UNIFORM_BUFFER, /*index=*/3,
+  probeUBO, 0, 256);`. Slot 3 chosen because Ganesh-GL is documented
+  to use slots 0..2 for its own UBOs (Skia tess UBOs); 3 is the first
+  slot Three.js's webgl2-ubo demo would actually contend for (it uses
+  slots 0 + 1 for ViewData/LightingData).
+- **READ:** `glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 3, &v)`.
+  Also probe slot 0 for the Ganesh-touched case.
+- **INTERPRET:** Slot 3 mutation on its own = active Ganesh meddling
+  beyond its documented slots → snap MUST cover all `MAX_UNIFORM_BUFFER_
+  BINDINGS` slots (probe `MAX_UNIFORM_BUFFER_BINDINGS` via getParameter
+  once at init for sizing). Slot 3 stable + slot 0 mutated = Ganesh
+  stays in its documented lane → snap covers slots 0..N where N is the
+  highest slot Ganesh touches per the probe.
+- **CLEANUP:** `glDeleteBuffers(1, &probeUBO);` after RESTORE.
+
+#### (b) Sampler-unit-0 binding
+
+- **SET:** `glGenSamplers(1, &probeSamp); glSamplerParameteri(probeSamp,
+  GL_TEXTURE_MIN_FILTER, GL_NEAREST); glActiveTexture(GL_TEXTURE0);
+  glBindSampler(0, probeSamp);`. NEAREST filter deliberately
+  different from Ganesh's default (LINEAR) to catch a "Ganesh set
+  filter via texParameteri" leak too.
+- **READ:** `glGetIntegerv(GL_SAMPLER_BINDING, &v)` with unit 0 active.
+- **INTERPRET:** Mutated = snap MUST cover `sampler_unit0`. Unmutated
+  + filter unchanged in probeSamp queries = moot.
+- **CLEANUP:** `glBindSampler(0, 0); glDeleteSamplers(1, &probeSamp);`.
+
+#### (c) READ_FRAMEBUFFER (separate from DRAW)
+
+- **SET:** create a probe FBO, bind ONLY to GL_READ_FRAMEBUFFER:
+  `glGenFramebuffers(1, &probeRFB); glBindFramebuffer(GL_READ_FRAMEBUFFER,
+  probeRFB);`. DRAW_FRAMEBUFFER intentionally untouched to test the
+  split: existing 2.B snap saves `fbo` via `GL_DRAW_FRAMEBUFFER_
+  BINDING`, restores via `glBindFramebuffer(GL_FRAMEBUFFER, ...)`
+  (which sets BOTH targets). Hypothesis: Skia binds the same FBO to
+  both targets on its draws → READ side is restored implicitly.
+- **READ:** `glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &v)`.
+- **INTERPRET:** `post == probeRFB` → Skia didn't touch READ side →
+  moot. `post == 0` (default FB) → Skia explicitly unbound READ → snap
+  MUST cover. `post == draw_fbo_skia_uses` → Skia bound the same FBO
+  to both targets (current hypothesis) → snap MUST cover OR the
+  existing restore via `GL_FRAMEBUFFER` is sufficient (test by checking
+  whether 2.B's existing restore at webgl_bridge.cc:266 — `glBind-
+  Framebuffer(GL_FRAMEBUFFER, (GLuint)s->fbo)` — already covers it).
+- **CLEANUP:** `glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); glDelete-
+  Framebuffers(1, &probeRFB);`.
+
+#### (d) Transform feedback binding + rasterizer-discard
+
+- **SET:** `glGenTransformFeedbacks(1, &probeTF); glBindTransformFeedback(
+  GL_TRANSFORM_FEEDBACK, probeTF); glEnable(GL_RASTERIZER_DISCARD);`.
+- **READ:** `glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &tfV);
+  GLboolean rdV = glIsEnabled(GL_RASTERIZER_DISCARD);`.
+- **INTERPRET:** Ganesh-GL is not documented to use transform feedback
+  at all. **STRONGLY EXPECTED MOOT.** If either mutates, that's a
+  surprise — file it loudly. The likely outcome here is that
+  RASTERIZER_DISCARD passively REMAINS enabled into the next frame
+  (Skia doesn't know to disable it) → "post == set" → moot for SKIA
+  but **a Three.js DRAW after our enable would silently produce no
+  fragments**. The latter is a WebGL→Skia AND WebGL→WebGL concern,
+  not the snap's job — it's user-context discipline. Still: if active
+  probe shows RASTERIZER_DISCARD stays enabled, the snap should cover
+  it for defense in depth (cheap — one `glIsEnabled` + conditional
+  enable/disable).
+- **CLEANUP:** `glDisable(GL_RASTERIZER_DISCARD); glBindTransformFeed-
+  back(GL_TRANSFORM_FEEDBACK, 0); glDeleteTransformFeedbacks(1,
+  &probeTF);`.
+
+**Implementation skeleton (next session).** Same gate as the passive
+probe (`webgl_state_probe = true`), but a separate config flag
+`webgl_state_probe_active = true` opts into the active sequence. The
+active probe runs ONCE per launch (not per-frame — the SET introduces
+GL traffic that would otherwise mask the leak signal). Hook point:
+the FIRST `nx_webgl_bridge_compose` call where the bridge is
+initialized and Skia has rendered at least one frame (i.e. `s_probe_
+compose_n == 1` slot). One log line per candidate. After all 4
+candidates probe + cleanup, set a `s_active_probe_done` flag and
+short-circuit subsequent calls.
+
+**Output format (one block per launch):**
+```
+[webgl-bridge:probe-active] candidate=ubo_slot3 pre=0 set=42 post=42 verdict=moot
+[webgl-bridge:probe-active] candidate=ubo_slot0 pre=0 set=43 post=0 verdict=NEEDS_SNAP_LEAVE
+[webgl-bridge:probe-active] candidate=sampler_unit0 pre=0 set=51 post=51 verdict=moot
+[webgl-bridge:probe-active] candidate=read_fbo pre=0 set=44 post=0 verdict=NEEDS_SNAP_LEAVE
+[webgl-bridge:probe-active] candidate=tf pre=0 set=45 post=45 verdict=moot
+[webgl-bridge:probe-active] candidate=rast_disc pre=0 set=1 post=1 verdict=moot-but-defense-warranted
+[webgl-bridge:probe-active] SUMMARY needs_snap={ubo_slot0,read_fbo} moot={ubo_slot3,sampler_unit0,tf,rast_disc}
+```
+
+The SUMMARY line directly drives #17's cut: needs_snap set → fields
+added to `nx_gl_state_snap_t`; moot set → fields NOT added.
+
+**Citron caveat.** The active probe runs deterministically on Citron
+(host AMD Vulkan translation), but Skia's GL traffic differs from
+real Tegra Mesa-Nouveau (different GL extension set → different
+Ganesh codepaths). The active probe is hardware-required. Citron can
+be a sanity check that the probe code itself doesn't crash, but
+verdict lines from Citron are NOT authoritative.
+
+---
+
+## #17 — nx_gl_state_snap_t extension for sampler_unit0 + read_fbo (Phase 2.G.1) — SHIPPED 2026-07-01
+
+**STATUS: SHIPPED.** Extension driven by the authoritative #16-ACTIVE
+probe SUMMARY line captured on real Switch hardware (auto-detect said
+`target=hardware ... -> mode=jit`, WASM headroom 64 MiB, full JIT
+tier-up). Hardware verdict:
+
+```
+[webgl-bridge:probe-active] candidate=ubo_slot3 pre=0 set=1 post=1 verdict=moot
+[webgl-bridge:probe-active] candidate=ubo_slot0 pre=0 post=0 verdict=moot-passive
+[webgl-bridge:probe-active] candidate=sampler_unit0 pre=0 set=1 post=2 verdict=NEEDS_SNAP_LEAVE
+[webgl-bridge:probe-active] candidate=read_fbo pre=0 set=1 post=0 verdict=NEEDS_SNAP_MUTATE_RESTORE
+[webgl-bridge:probe-active] candidate=tf pre=0 set=1 post=1 verdict=moot
+[webgl-bridge:probe-active] candidate=rast_disc pre=0 set=1 post=1 verdict=moot
+[webgl-bridge:probe-active] SUMMARY needs_snap={sampler_unit0,read_fbo}
+```
+
+**File(s) (SHIPPED 2026-07-01):**
+[source/webgl_bridge.h](source/webgl_bridge.h) — `struct nx_gl_state_snap_t` extended with `GLint sampler_unit0` + `GLint read_fbo` fields + header comment updated with #17 rationale + verdict interpretation
+[source/webgl_bridge.cc](source/webgl_bridge.cc) — `nx_gl_state_save` reads `GL_SAMPLER_BINDING` on transiently-active unit 0 and `GL_READ_FRAMEBUFFER_BINDING`; `nx_gl_state_restore` binds them back in the correct order (READ_FRAMEBUFFER re-bind AFTER the `glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo)` call because the latter binds BOTH targets — only re-fire the READ bind if `read_fbo != draw_fbo`; skips the redundant call for the common case)
+
+**Moot fields (NOT added, per probe SUMMARY):**
+- `ubo_slot3`, `ubo_slot0` — Ganesh-GL doesn't touch UBO indexed bindings on this hardware; slot 3 stayed at our SET value, slot 0 stayed at pre-value 0. Save/restore would be dead code.
+- `tf`, `rast_disc` — Ganesh doesn't use transform feedback or toggle rasterizer discard. `rast_disc` has a passive concern (WebGL draws after a user's enable produce no fragments — but that's user-context discipline, not the snap's job).
+
+**Symptom it fixes (predicted, hardware verification pending).** Two v2 demos gated on this snap extension per the queue:
+- `webgl2-multiple-rendertargets` — Three.js's MRT setup binds read/draw FBOs separately for glReadBuffer/glDrawBuffers coordination. Without `read_fbo` snap coverage, Skia's read=0 assumption after WebGL's split-bind produces silently-wrong readback (or the MRT tail cosmetic artifact per [[project-v8-migration-phase2g1-more-demos]]).
+- `gpgpu-water` — heavy sampler_unit0 use (compute-like ping-pong with textureLookup + specific sampler objects per pass). Without `sampler_unit0` snap coverage, Ganesh's post-Three.js frame samples the WebGL demo's leftover sampler object, producing corrupt Skia paint until the next unit-0 rebind.
+
+**Why upstream-vanilla lacks it.** No bridge; no state contract to save/restore.
+
+**DISPOSITION:** `fork-only`. State-contract discipline specific to our shared-context WebGL↔Skia coexistence model.
+
+**UPSTREAM STATUS:** `n/a` (fork-only).
+
+**RE-APPLY / VERIFY NOTE.** If an upstream V8-fork pull loses these fields, grep `source/webgl_bridge.h` for `sampler_unit0`. Missing → re-apply save+restore per the SHIPPED code above. Recurrence tell: after a snap regression, WebGL2 MRT demos show cosmetic bleed at the compose boundary; gpgpu demos render wrong pixels one frame after each Skia paint.
+
+**Followups.**
+- If a future v2 demo lands on hardware and shows corrupt Skia paint AFTER working WebGL, that's a state-leak the probe didn't catch (either at a different active_texture unit than 0, or in a probe-moot binding whose semantics changed under a new demo). Re-enable the active probe with an extended candidate list — the shim's SET/READ/RESTORE pattern is now proven, just add candidates to `nx_active_probe_state_t`.
+- `rast_disc` passive concern (moot for snap, but WebGL draws after a demo-enable produce no fragments): if a future demo enables `GL_RASTERIZER_DISCARD` and then does draws expected to land on Skia's paint, look here.
+
+---
+
+## #17-superseded — original PROPOSED template (superseded by SHIPPED entry above)
+
+**File(s) (planned):**
+[source/webgl_bridge.h](source/webgl_bridge.h) (`struct nx_gl_state_snap_t`
++ FROZEN-contract header comment update);
+[source/webgl_bridge.cc](source/webgl_bridge.cc) (`nx_gl_state_save` /
+`nx_gl_state_restore` body extensions).
+
+### Template (apply ONLY the `#ifdef`-gated members the probe verdict elects)
+
+```c
+/* In webgl_bridge.h, REPLACING the existing struct:                       */
+
+/* Phase 2.G.0 — snap extension feature flags. Each defaults OFF; the
+ * user-signed-off probe-driven set defines exactly which flip on. The
+ * flag set is the LEGAL CUT of the extension; flags not flipped do not
+ * grow the struct, do not cost the save/restore roundtrip, and do not
+ * change the FROZEN 2.B contract's footprint.
+ *
+ * Probe-driven flags (set per #16-ACTIVE SUMMARY's needs_snap list):
+ *   NX_SNAP_UBO_INDEXED         — UBO indexed bindings 0..N
+ *   NX_SNAP_SAMPLER_UNIT0       — sampler-unit-0 binding
+ *   NX_SNAP_READ_FBO            — READ_FRAMEBUFFER separate from DRAW
+ *   NX_SNAP_TF_BINDING          — transform feedback object binding
+ *   NX_SNAP_RASTERIZER_DISCARD  — RASTERIZER_DISCARD enable
+ */
+
+/* Slot count for the UBO indexed array. Sized from MAX_UNIFORM_BUFFER_
+ * BINDINGS at engine init AT MOST; or hardcoded to the highest probed-
+ * leaky slot + 1 (whichever is smaller). Three.js v2 r182 webgl2-ubo
+ * uses slots 0+1; pad to 4 for headroom unless probe finds Ganesh
+ * touches beyond. */
+#ifndef NX_UBO_SAVE_SLOTS
+#define NX_UBO_SAVE_SLOTS 4
+#endif
+
+struct nx_gl_state_snap_t {
+    /* === Existing 18 fields preserved EXACTLY (do not reorder, do
+     *     not retype, do not rename — the 2.B FROZEN contract). === */
+    GLint fbo;
+    GLint viewport[4];
+    GLint program;
+    GLint vao;
+    GLint array_buffer;
+    GLint active_tex;
+    GLint tex2d_binding;
+    GLboolean blend;
+    GLboolean depth_test;
+    GLboolean cull;
+    GLboolean scissor;
+    GLboolean stencil_test;
+    GLboolean color_mask[4];
+    GLfloat clear_color[4];
+    GLint blend_src_rgb;
+    GLint blend_dst_rgb;
+    GLint blend_src_a;
+    GLint blend_dst_a;
+
+    /* === Phase 2.G.0 batched extension. Each member is gated on its
+     *     probe-driven feature flag. Members whose flag is off cost
+     *     zero (no struct growth, no save/restore GL roundtrip). === */
+
+#ifdef NX_SNAP_UBO_INDEXED
+    GLint ubo_base;                       /* GL_UNIFORM_BUFFER_BINDING */
+    GLint ubo_indexed[NX_UBO_SAVE_SLOTS]; /* glGetIntegeri_v slots 0..N */
+#endif
+
+#ifdef NX_SNAP_SAMPLER_UNIT0
+    GLint sampler_unit0;                  /* GL_SAMPLER_BINDING @ TU 0 */
+#endif
+
+#ifdef NX_SNAP_READ_FBO
+    GLint read_fbo;                       /* GL_READ_FRAMEBUFFER_BINDING */
+#endif
+
+#ifdef NX_SNAP_TF_BINDING
+    GLint tf_binding;                     /* GL_TRANSFORM_FEEDBACK_BINDING */
+#endif
+
+#ifdef NX_SNAP_RASTERIZER_DISCARD
+    GLboolean rasterizer_discard;         /* glIsEnabled(GL_RASTERIZER_DISCARD) */
+#endif
+};
+
+/* In webgl_bridge.cc, nx_gl_state_save body — APPEND to existing reads: */
+
+void nx_gl_state_save(nx_gl_state_snap_t *s) {
+    /* ... existing 18 saves preserved EXACTLY ... */
+
+#ifdef NX_SNAP_UBO_INDEXED
+    glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &s->ubo_base);
+    for (int i = 0; i < NX_UBO_SAVE_SLOTS; i++) {
+        glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, i, &s->ubo_indexed[i]);
+    }
+#endif
+
+#ifdef NX_SNAP_SAMPLER_UNIT0
+    {
+        GLint prev_active;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler_unit0);
+        glActiveTexture((GLenum)prev_active);
+    }
+#endif
+
+#ifdef NX_SNAP_READ_FBO
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->read_fbo);
+#endif
+
+#ifdef NX_SNAP_TF_BINDING
+    glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &s->tf_binding);
+#endif
+
+#ifdef NX_SNAP_RASTERIZER_DISCARD
+    s->rasterizer_discard = glIsEnabled(GL_RASTERIZER_DISCARD);
+#endif
+}
+
+/* In webgl_bridge.cc, nx_gl_state_restore body — APPEND to existing
+ * writes BEFORE the existing trailing glBlendFuncSeparate (the order
+ * matters: existing fields are restored first, then the extension): */
+
+void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
+    /* ... existing 18 restores preserved EXACTLY ... */
+
+#ifdef NX_SNAP_UBO_INDEXED
+    glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)s->ubo_base);
+    for (int i = 0; i < NX_UBO_SAVE_SLOTS; i++) {
+        /* glBindBufferBase is the right restore call when range/offset
+         * isn't tracked. The probe data tells us whether we ALSO need to
+         * track offset+size: if probe shows a non-0 binding, also
+         * snapshot GL_UNIFORM_BUFFER_START[i] and GL_UNIFORM_BUFFER_SIZE
+         * [i], and restore via glBindBufferRange instead. Final-final
+         * decision deferred to probe output. */
+        glBindBufferBase(GL_UNIFORM_BUFFER, i, (GLuint)s->ubo_indexed[i]);
+    }
+#endif
+
+#ifdef NX_SNAP_SAMPLER_UNIT0
+    {
+        GLint prev_active;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+        glActiveTexture(GL_TEXTURE0);
+        glBindSampler(0, (GLuint)s->sampler_unit0);
+        glActiveTexture((GLenum)prev_active);
+    }
+#endif
+
+#ifdef NX_SNAP_READ_FBO
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s->read_fbo);
+#endif
+
+#ifdef NX_SNAP_TF_BINDING
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, (GLuint)s->tf_binding);
+#endif
+
+#ifdef NX_SNAP_RASTERIZER_DISCARD
+    if (s->rasterizer_discard) glEnable(GL_RASTERIZER_DISCARD);
+    else                       glDisable(GL_RASTERIZER_DISCARD);
+#endif
+}
+```
+
+### Cut-decision rule (parameterized on #16-ACTIVE SUMMARY)
+
+For each candidate verdict in the active probe's SUMMARY line:
+
+| Verdict (#16-ACTIVE) | Action on #17 cut |
+|---|---|
+| `moot` | Do NOT define the corresponding `NX_SNAP_<X>` flag. Field stays out; save/restore unchanged. |
+| `NEEDS_SNAP_LEAVE` (post != set, Skia left it mutated) | DEFINE the flag. Field + save/restore lines fire. |
+| `NEEDS_SNAP_RESTORE` (post == pre != set, Skia restored to its own pre-state) | DEFINE the flag. Same code path; Skia's restore not relied on. |
+| `moot-but-defense-warranted` | DEFINE if the defense cost (one query + one conditional restore per frame) is judged worthwhile vs the risk. Default yes for RASTERIZER_DISCARD. |
+
+### Hardware re-validation checklist (post-extension)
+
+1. Boot brewser-v8 on real CFW Switch with `NX_SNAP_<X>` defines per probe.
+2. v1 demo regression set: `geometry-cube`, `webgl-materials-cubemap`,
+   `webgl-loader-gltf`, `webgl-shadowmap`, the v1 black-texture quartet
+   (post-#10 SRGB fix) — all must render unchanged.
+3. Sustained ≥ 60 s. With `state_probe = true`, the `[webgl-bridge:probe]`
+   lines (#16 passive) should show our snapshotted values correctly
+   restored across frames.
+4. NO new flicker / no Skia corruption / no FBO incomplete.
+
+**Why a single batched extension (not N increments).** Each snap
+extension is hardware-revalidated (the snap is FROZEN; touching it
+risks unmasking a Ganesh state-cache assumption). Batching all
+probe-positive fields into one extension means **one** hardware pass
+re-verifies the contract vs N if added incrementally. Hardware passes
+are the load-bearing cost.
+
+**Symptom it fixes.** Phase 2.G.X demos (webgl2-ubo at 2.G.1,
+webgl2-multiple-rendertargets at 2.G.2, gpgpu-water at 2.G.7) would
+exhibit "Skia renders garbage after WebGL2 draws" symptoms on
+hardware if any of the candidate bindings leak across the WebGL→Skia
+handoff and the snap doesn't cover them. The parameterized template +
+probe-driven cut means we extend by the MINIMUM correct set, not by
+guesswork.
+
+**DISPOSITION:** `upstream-candidate`. Engine-correctness: the
+snap-set should cover all leakable state under shared-context EGL.
+The `#ifdef`-gated shape is for documentation + reversibility; can be
+cleaned up to unconditional members once the cut is final and the
+gates are no longer needed for audit.
+
+**UPSTREAM STATUS:** `not-submitted` (template only).
+
+**RE-APPLY / VERIFY NOTE.** Wait for #16 + #16-ACTIVE probe data +
+user sign-off. Apply the template with the gate set per SUMMARY.
+Hardware-revalidate per the checklist above. Update webgl_bridge.h's
+FROZEN-contract header comment to enumerate the new fields + reasons
+(copy the relevant "INTERPRET" bullet from the #16-ACTIVE per-
+candidate spec into the header doc for each landed field).
+
+---
+
+## #18 — cube-route-shim per-method capability guards (Phase 2.G.0 — runtime-side, unblocks empty/partial v2 from canvas-runner) — SHIPPED 2026-06-30
+
+**File(s):**
+[brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts)
+(`installCubeRouting` — `safeBind` helper introduced; every wrap
+`target.X = function(...)` site wrapped in `if (origDep1 && origDep2
+&& ...) { ... } else if (diagOn()) { console.debug('[f2a:guard]',
+'skip wrap X') }`).
+
+**Exact change (Phase 2.G.0).** Replace the 14 unconditional
+`gl.X.bind(gl)` calls at the top of `installCubeRouting` with a
+`safeBind(name)` helper that returns `null` when the named method is
+missing on `gl`. Then wrap each of the 12 `target.X = function ...`
+assignments in an `if (origDep1 && origDep2 && ...)` gate listing
+EVERY `origX` ref the wrapper invokes at runtime. When any required
+ref is null, the wrap is silently skipped; the raw `gl.X` (whether
+present or missing) is preserved unchanged.
+
+**Method-dependency map (every wrap → its required-orig set):**
+
+| Wrap | Required origs |
+|---|---|
+| `activeTexture` | `origActiveTexture` |
+| `bindTexture` | `origBindTexture` |
+| `texImage2D` | `origTexImage2D`, `origBindTexture`, `origTexParameteri`, `origTexSubImage2D`, `gl.createTexture` (runtime check) |
+| `texSubImage2D` | `origTexSubImage2D`, `origBindTexture` |
+| `texParameteri` | `origTexParameteri`, `origBindTexture` |
+| `texParameterf` | `origTexParameterf`, `origBindTexture` |
+| `generateMipmap` | `origGenerateMipmap` |
+| `createShader` | `origCreateShader` |
+| `shaderSource` | `origShaderSource` |
+| `attachShader` | `origAttachShader` |
+| `getActiveUniform` | `origGetActiveUniform` |
+| `compileShader` | `origCompileShader`, `origGetShaderParameter`, `origGetShaderInfoLog` (all 3 diag-only) |
+
+**Symptom it fixes.** Before guard: `screen.getContext('webgl2')` on
+a Phase 2.G.0 empty v2 context succeeded engine-side (`[webgl2]
+context_new ok ...` in log), but `canvas-runner.ts::getSharedScreenGL2`
+then called `installCubeRouting(gl)` whose unconditional
+`gl.activeTexture.bind(gl)` at line 132 dereferenced `undefined.bind`
+→ `TypeError` → caught at `getSharedScreenGL2`'s try/catch → returned
+`null` → Three.js's `WebGL.isWebGL2Available()` saw null on its probe
+canvas → reported **"WebGL 2 not supported"**.
+
+After guard: empty v2 → every wrap's deps are null → every wrap is
+silently skipped → `installCubeRouting` returns cleanly →
+`getSharedScreenGL2` returns the empty v2 → Three.js's probe sees a
+valid `WebGL2RenderingContext` → `isWebGL2Available()` passes.
+**Calling any GL method on the empty context throws `TypeError`
+later** — that's correct 2.G.0 behavior (the demo's first GL call
+fails, but the WebGL2 capability gate passes).
+
+After 2.G.1 binds SOME but not all v2 methods (partial population),
+the guard fires per-wrap: wraps whose deps are now bound install
+normally; wraps whose deps are still missing skip silently. Every
+state from empty → full is correct.
+
+**Hooks are method-set DISJOINT, no ordering dependency.**
+`installBridgeDirtyHooks` wraps `drawArrays`/`drawElements`/`clear`
+and is ALREADY per-method-guarded (canvas-runner.ts:795 `if (typeof
+orig !== 'function') return`). `installCubeRouting` wraps the
+texture/shader set. No method is wrapped by both. Install order is
+indifferent.
+
+**Open question deliberately NOT settled here.** cube-route-shim is
+the v1-era Bucket F.2a #12 rescue for the Mesa-Nouveau samplerCube
+driver limit. v2 cube routing applicability is a Phase 2.G.4 re-
+verify — see #19. The guard makes cube-route-shim NON-CRASHING on
+v2; it does NOT decide whether v2 SHOULD have cube routing at all.
+If 2.G.4 determines v2 should not, gate the `installCubeRouting`
+CALL at canvas-runner.ts:361, not the function itself.
+
+**Why upstream-vanilla lacks it.** cube-route-shim is fork-only
+runtime code (#12). The guard is a fork-only refinement of fork-only
+code.
+
+**DISPOSITION:** `brewser-specific`. Runtime-side; fixes a
+brewser-runtime-v8 / nx.js V8 fork integration corner. Stays in the
+runtime fork.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RE-APPLY / VERIFY NOTE.** After upstream pull (or
+brewser-runtime-v8 refactor), grep `cube-route-shim.ts` for `safeBind`.
+If absent, re-apply the guard pattern: replace the 14 `.bind(gl)`
+calls with `safeBind` and wrap each `target.X = function` in an
+`if (origDeps)` gate. Diagnostic `[f2a:guard]` log lines surface
+every skipped wrap when `__f2aDiag` is on.
+
+**Recurrence tell.** If a future contributor reverts to unconditional
+`.bind(gl)` because the codebase "looks cleaner without the if-blocks",
+v2 instantiation re-breaks on 2.G.0 (empty) AND on any 2.G.X partial
+state where the contributor adds a method to cube-route-shim's
+dependencies without verifying it's bound by 2.G.X's method-table cut.
+
+---
+
+## #24 — Cube-RT-readback rescue (runtime shim; Phase 2.G.1 cut #24) — SHIPPED 2026-07-01, HARDWARE-VERIFY PENDING
+
+**File(s):**
+- MODIFIED [brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts) (~150 lines added)
+
+**Root cause.** cube-route-shim (#12) atlases USER cube uploads (`texImage2D(POSITIVE_X+i, ..., image)`) into a 2D strip. WebGLCubeRenderTarget-populated cubes (Three.js's `CubemapFromEquirect` for `scene.background = equirectTex` + `CubeCamera` for `materials-cubemap-dynamic`) bypass that path: face storage is allocated via nullally-source `texImage2D(POSITIVE_X+i, ..., null)`, then the FBO writes to face N via `framebufferTexture2D`. The shim previously skipped null uploads entirely, so no atlas was allocated. Also, Mesa-Nouveau's driver silently aliases FBO writes to face N>0 → face 0 storage anyway ([[reference-mesa-cube-face-aliasing-rescue]]), so even if the shim COULD sample the raw cube, it would sample garbage. Result before this cut: the shim's `bindTexture(CUBE_MAP)` re-bind leaves TEXTURE_2D at whatever was last there (Skia glyph atlas / DOM compose surface), and the rewritten sampler2D envMap samples HTML content as the skybox.
+
+**Fix (runtime, per-context).** In `installCubeRouting`:
+1. Extend `CubeState` with `scratchTex?`, `scratchAllocated?`, `rtInternalformat?`, `rtFormat?`, `rtType?`, `isRenderTarget?`.
+2. Add `fboCubeStates: WeakMap<WebGLFramebuffer, {cubeTex, faceIdx, hasContent}>` + `currentDrawFBO: WebGLFramebuffer | null`.
+3. New helper `allocateCubeRTAtlas(cubeTex, w, h, intl, fmt, type)` — allocates 6×w × h atlas + w × h scratch, both LINEAR/CLAMP_TO_EDGE; sets `isRenderTarget = true`.
+4. New helpers `flushCubeFaceToAtlas(cubeTex, faceIdx)` (bind atlas as TEXTURE_2D + `copyTexSubImage2D` from current FBO at `faceIdx * faceW` offset) and `flushPendingCubeFace(fb)` (idempotent flush of the FBO's pending face).
+5. Existing `texImage2D` null-source path: after forwarding to engine, if `source === null && w >= 8 && h >= 8`, call `allocateCubeRTAtlas`.
+6. NEW wrap: `framebufferTexture2D(FRAMEBUFFER/DRAW_FRAMEBUFFER, ..., POSITIVE_X+i, cubeTex, level)` → if the cube is RT-marked with a scratch, flush any pending face on the same FBO with a different face, then redirect to `framebufferTexture2D(fbTarget, attachment, TEXTURE_2D, cubeState.scratchTex, level)` + record `fboCubeStates[fbo] = {cubeTex, i, hasContent: true}`.
+7. NEW wrap: `bindFramebuffer(target, fb)` — if switching away from `currentDrawFBO` and it has a pending cube face, flush BEFORE switching (`copyTexSubImage2D` reads from the CURRENT framebuffer, so it must still be bound).
+
+**Why this bypasses the Mesa-Nouveau alias bug.** No cube-face writes ever happen. All FBO writes hit `TEXTURE_2D + scratchTex`, which is a normal 2D attachment that the driver handles correctly. The scratch → atlas copy is a `TEXTURE_2D → TEXTURE_2D` `copyTexSubImage2D`, which the QuickJS-era rescue confirmed reaches sampler-visible storage (`glCopyTexSubImage2D` was broken only for cube-face writes).
+
+**Depth attachment.** Three.js allocates a face-size 2D depth renderbuffer for cube RTs and shares it across the 6 face passes. Since scratchTex is also face-size, `FRAMEBUFFER_COMPLETE` after our redirect. No wrap of `framebufferRenderbuffer` needed.
+
+**Sampling path.** Unchanged — existing `bindTexture(TEXTURE_CUBE_MAP, cubeTex)` wrap redirects TEXTURE_2D[activeTU] to the atlas, existing shader rewrite converts samplerCube reads to `cubeUVSample(sampler2D, dir)` on the atlas.
+
+**DISPOSITION:** `brewser-specific` (runtime-side). Zero engine delta.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**Unlocks (after hardware verify).**
+- `scene.background = equirectTex` natural path (materials-envmaps + gpgpu-water) — replaces cut #17 / cut #23 pmremRT.texture workarounds. Slight HDR range preserved on Citron; on Mesa-Nouveau limited to LDR because Three.js's `CubemapFromEquirect` uses RGBA8 internal by default.
+- `materials-cubemap-dynamic` (CubeCamera per-frame cube renders) — first demo that CAN'T be worked around by pmremRT.texture (per-frame content), so this is the load-bearing unlock.
+
+**Not covered (yet).**
+- `framebufferTextureLayer(target, attachment, cubeTex, level, layer)` — WebGL2's alternate cube-face attachment API. Not currently seen in Three.js r184's cube RT path (uses framebufferTexture2D), but any demo that goes through it will bypass our redirect. Add a parallel wrap if a demo trips this.
+- HDR (RGBA16F) cube RTs — `copyTexSubImage2D` should handle the internal format transparently, but not exercised by current v2 demos (Mesa-Nouveau's PMREM path forces LDR downgrade upstream). Verify separately if HDR cube RT demo lands.
+
+**RE-APPLY / VERIFY NOTE.**
+
+*To verify still needed*: revert cut #17 in materials-envmaps to `scene.background = equirectTex`; the demo should render the equirect skybox without HTML/Skia bleed. If HTML shows again, rescue regressed — grep `cube-route-shim.ts` for `allocateCubeRTAtlas`, `flushPendingCubeFace`, `framebufferTexture2D` (should have TWO occurrences: the wrap install + the origBindFramebuffer/origFramebufferTexture2D safeBind block).
+
+*Recurrence tell*: any demo using CubeCamera / WebGLCubeRenderTarget showing solid-color, HTML, or Skia glyph atlas content on any cube surface. First check that the shim's diag markers fire (`__f2aDiag = true` → `[f2a:rt-atlas-alloc]`, `[f2a:rt-redirect]`, `[f2a:rt-flush]` should all appear in nxjs-debug.log; missing = the wrap install skipped due to a safeBind guard fail).
+
+---
+
+## #19 — Cube-routing applicability under WebGL2 — OPEN, Phase 2.G.4 re-verify required
+
+**STATUS: OPEN.** The guard in #18 makes `installCubeRouting` non-
+crashing on v2 contexts. It deliberately does NOT settle whether
+cube-route-shim is the right behavior for v2 at all.
+
+**Background.** cube-route-shim (#12 — SHIPPED 2026-06-29) is the
+Bucket F.2a runtime-side rescue for Tegra/Mesa-Nouveau's samplerCube
+driver limit ([[reference-mesa-nouveau-layered-sampling-unsupported]]).
+It rewrites GLSL `samplerCube` declarations + `textureCube` calls in
+v1 (and currently v2, by canvas-runner.ts:361 + 1505 installing it
+unconditionally) shaders into `sampler2D` + 6×1 strip atlas reads.
+
+**The Phase 2.G.4 question.** Does v2 need the SAME shim, a DIFFERENT
+shim, or NO shim?
+
+Arguments FOR re-using the v1 shim on v2:
+- The Mesa-Nouveau samplerCube driver limit applies regardless of
+  WebGL version (it's a GLES3 driver layer issue, not a WebGL spec
+  issue).
+- Three.js's v2 codepath still emits `samplerCube` uniforms in its
+  GLSL (the WebGL2 backend produces GLSL ES 300 which uses
+  `samplerCube` and `texture(samplerCube, vec3)` calls — the shim
+  already handles the GLSL ES 300 branch at cube-route-shim.ts:647).
+- Re-using means zero new code.
+
+Arguments AGAINST re-using as-is:
+- The v1 shim was VERIFIED on v1 demos (`webgl-materials-cubemap`
+  green on Citron + hardware) — v2 demos may have subtly different
+  Three.js codepaths (e.g. `WebGLRenderer.outputColorSpace`, `lib.glsl
+  preludes` for v2) that need different rewriting.
+- The shim wraps `texImage2D` to atlas-route cube faces — but v2 also
+  has `texImage3D` / `texSubImage3D`. If a v2 demo uploads cube faces
+  via 3D texture API, the shim misses them. (Likely not the case for
+  Three.js's CubeTexture path which uses 2D, but worth verifying
+  per-demo.)
+- v2 has `samplerCubeShadow` (cube depth sampling). NOT in v1. Shim
+  has no path for it.
+- The 2.G.0 method-table for v2 is currently empty; even when 2.G.1
+  starts populating it, the cube-shim's depended-on methods (texImage2D,
+  bindTexture, shaderSource, etc.) need to be bound BEFORE the shim's
+  wraps become functional. This is naturally handled by #18's guards,
+  but the question of whether ANY v2 method gets cube-routed is
+  separate.
+
+**Required validation (Phase 2.G.4 work).** Run each of:
+- `materials-cubemap-dynamic` — CubeCamera dynamic cubemap; FBO writes
+  to cube faces. Shim's `texImage2D` hook handles uploads, but FBO
+  writes go via `framebufferTexture2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X,
+  ...)` which the shim does NOT wrap.
+- `materials-envmaps` — static envmap usage. Closest to v1
+  `webgl-materials-cubemap` the shim was verified on.
+- `webgl-loader-gltf` (v1 cross-demo regression check post-#18 —
+  PMREM path with cube-uv envMap that the shim's dual-decl gate
+  handles).
+
+For each, run with `__f2aDiag = true` and observe whether `[f2a:*]`
+markers fire as expected and the demo renders correctly.
+
+**Open subquestion.** If v2 cube-routing IS needed but currently
+breaks something, the patch hierarchy is:
+1. Gate the `installCubeRouting(gl)` CALL at canvas-runner.ts:361 +
+   1505 on a separate v1-vs-v2 check (probe `gl.constructor.name` or
+   check for v2-only methods).
+2. Add v2-specific wraps (e.g., `framebufferTexture2D` + cube-face
+   target → 2D atlas attachment) inside the shim, gated by v2
+   detection.
+3. Write a parallel `installCubeRouting2(gl)` for v2 that diverges
+   structurally from v1's shim. Worst case; only if v2 needs are
+   fundamentally different.
+
+**DISPOSITION:** `brewser-specific` (runtime-side).
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RESOLUTION TIMING.** Block this open question on Phase 2.G.4
+(materials-cubemap-dynamic + materials-envmaps demo passes). Do NOT
+attempt to resolve in 2.G.1 (webgl2-ubo slice — no cube usage) or
+2.G.2 (webgl2-multiple-rendertargets — no cube usage).
+
+---
+
+## #20 — UNPACK_FLIP_Y_WEBGL honor for typed-array texImage2D uploads — OPEN, Phase 2.G.4+ engine fix deferred
+
+**STATUS: OPEN.** Current workaround in RGBELoader (both v1 + v2 libs) pre-flips row data client-side; engine-side fix would let ALL DataTexture/typed-array uploads with `flipY=true` behave per spec.
+
+**File(s) (workaround, SHIPPED 2026-07-01, Phase 2.G.1 cut #18):**
+- [brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/libs/rgbe-loader.js](../brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/libs/rgbe-loader.js) (~line 213 — row reverse before DataTexture construction + `tex.flipY = false`)
+- [brewser-apps/apps/experimental/com.natureglass.webgl1threejsdemos/libs/rgbe-loader.js](../brewser-apps/apps/experimental/com.natureglass.webgl1threejsdemos/libs/rgbe-loader.js) (identical patch — same code modulo `__THREE_R184_STAGED__` vs `__THREE_R162_STAGED__`)
+
+**File(s) (engine fix target):** [source/webgl.cc](source/webgl.cc) — `w_tex_image_2d` (line ~1252) and `w_tex_sub_image_2d` (line ~1274).
+
+**Root cause.** Engine's [source/webgl.cc:116](source/webgl.cc#L116) records `st->unpack_flip_y = (val != 0)` in `w_pixel_storei` for `UNPACK_FLIP_Y_WEBGL` (0x9240), but the flag is NEVER read elsewhere. `w_tex_image_2d` / `w_tex_sub_image_2d` pass the ArrayBuffer bytes straight to `glTexImage2D` / `glTexSubImage2D`. Class comment on line 115 explicitly acknowledges the gap: "WebGL-only pixel store emulation state (stored only; 2.E does the work)" — 2.E did NOT do the work.
+
+**Symptom it causes.** Any DataTexture with `flipY=true` (Three.js default) + typed-array data source ends up in GPU memory in file-top-to-bottom order (byte offset 0 = file row 0 = image top). But OpenGL sampling convention treats byte offset 0 = image bottom → sampling with v=1 reads the file bottom row instead of the file top row → image sampled upside-down. Manifests visibly on any content with vertical orientation (skyboxes, portraits, panoramas). Materials-envmaps + webgl-loader-gltf HDR skyboxes were both upside-down before cut #18.
+
+**Engine fix (deferred).** In `w_tex_image_2d` / `w_tex_sub_image_2d`, when `st->unpack_flip_y && pixels != nullptr && width > 0 && height > 1`, compute `bytes_per_pixel(format, type)`, `row_bytes = align_up(width * bpp, st->unpack_alignment)`, allocate temp buffer, memcpy rows in reverse order, pass temp to `glTexImage2D`, free after. Format+type→bpp helper needed:
+- Format channels: RED/ALPHA/LUMINANCE/DEPTH → 1; RG/LUMINANCE_ALPHA/DEPTH_STENCIL → 2; RGB/SRGB → 3; RGBA/SRGB_ALPHA → 4.
+- Type bytes: UBYTE/BYTE → 1; USHORT/SHORT/HALF_FLOAT/HALF_FLOAT_OES → 2; UINT/INT/FLOAT → 4.
+- Packed types (5_6_5, 4_4_4_4, 5_5_5_1) → fixed 2 bpp. 2_10_10_10_REV, 10F_11F_11F_REV, 5_9_9_9_REV, 24_8 → fixed 4 bpp.
+
+**WHY DEFERRED (blast radius).** Multiple currently-working textures may depend on "flag ignored" as compensation:
+1. Textures uploaded via cube-route-shim's OffscreenCanvas→getImageData path (already returns top-down bytes; if flipY comes through as true, we'd double-compensate).
+2. Textures where the demo pre-flipped data (any custom loader that already did the flip and set flipY=false OR left flipY=true assuming no-op).
+3. Any Three.js DataArrayTexture / Data3DTexture / DataTexture path where the WebGL 2 upload code sets `pixelStorei(UNPACK_FLIP_Y_WEBGL, texture.flipY)` unconditionally.
+
+Ship alongside a systematic sweep of DataTexture uploads with `flipY=true` — verify none rely on the compensation — before enabling engine-side.
+
+**DISPOSITION:** `upstream-candidate` (once shipped). Engine correctness matches browser behavior.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.**
+
+*To verify the workaround is still needed* after any V8-engine upstream pull: grep `source/webgl.cc` for `unpack_flip_y`. If the flag is only set (in `w_pixel_storei`) and never read from `w_tex_image_2d` / `w_tex_sub_image_2d`, workaround still needed.
+
+*To upgrade to the engine fix.* When ready to ship engine-side, drop the client-side pre-flip loops in both rgbe-loader.js files (restore `tex.flipY = true`), implement engine-side flip per the recipe above, and sweep the rest of the codebase for latent compensating pre-flips.
+
+---
+
+## #21 — sampler2DShadow → sampler2D runtime shader-rewrite shim (Phase 2.G.1 cut #21) — SHIPPED 2026-07-01
+
+**File(s):**
+- NEW [brewser-runtime-v8/src/scripts/shadow-route-shim.ts](../brewser-runtime-v8/src/scripts/shadow-route-shim.ts) (~230 lines)
+- MODIFIED [brewser-runtime-v8/src/scripts/canvas-runner.ts](../brewser-runtime-v8/src/scripts/canvas-runner.ts) — import + `installShadowRouting(gl)` after `installCubeRouting(gl)` at both `getSharedScreenGL()` and `getSharedScreenGL2()` sites.
+
+**Root cause.** Mesa-Nouveau on Tegra X1 has no working `sampler2DShadow` hardware-compare path. Cut #19 diag rounds 1-3 (nxjs-source-v8/source/webgl.cc temporary instrumentation, reverted after cut #21 landed) proved:
+1. `glTexParameteri(TEXTURE_2D, TEXTURE_COMPARE_MODE, COMPARE_REF_TO_TEXTURE)` lands correctly on the depth texture (err=0x0, `bound_tex` matches the FBO-attached tex).
+2. Compare mode SURVIVES `glTexStorage2D` and `glFramebufferTexture2D` unchanged (`post_mode=0x884E`).
+3. Shadow FBO is `FRAMEBUFFER_COMPLETE` (0x8CD5).
+4. Shadow render pass executes every frame — one `glClear(COLOR|DEPTH|STENCIL)` + one `glDrawElements` (index count matches the shadow-caster geometry) with `dm=1 cd=1.000 err=0x0`.
+
+Yet `sampler2DShadow` returns 0 in the main pass → `directLight.color *= 0` → SpotLight (and any shadow-gated light) invisible. Cut #20 (fallback from `glTexStorage2D` to `glTexImage2D(NULL)` for depth internalformats) also failed. Joins the driver-limit family in [[reference-mesa-nouveau-layered-sampling-unsupported]] alongside sampler3D / sampler2DArray / samplerCube.
+
+**Fix approach.** Wrap `gl.shaderSource` to intercept Three.js's shadow-map shaders:
+1. Scan `\bsampler2DShadow\s+(\w+)` to collect per-shader shadow-sampler identifier set (matches uniform decls AND function-parameter decls in the same pass — Three.js's `getShadow` takes `sampler2DShadow shadowMap` as a param).
+2. Global replace `\bsampler2DShadow\b` → `sampler2D` (safe against `samplerCubeShadow` — different token; also rewrites `precision X sampler2DShadow;` decls without a follow-up identifier).
+3. For each collected identifier, rewrite `texture(IDENT[?], ...)` → `textureShadowCompat(IDENT[?], ...)` (identifier-scoped — does NOT touch texture() calls on regular sampler2D uniforms).
+4. Inject helper: `highp float textureShadowCompat(highp sampler2D _depths, highp vec3 _uvz) { highp float _stored = texture(_depths, _uvz.xy).r; return step(_uvz.z, _stored); }`. Matches Three.js's default `LessEqualCompare` semantics (`shadow.map.depthTexture.compareFunction = LessEqualCompare` → sampler2DShadow returns 1.0 when `ref <= sample_depth`; `step(ref, depth)` returns 1.0 when `ref <= depth`).
+
+Also wraps `gl.texParameteri` to force `TEXTURE_COMPARE_MODE=NONE` on TEXTURE_2D targets — sampling a depth texture as sampler2D with compare mode ON is undefined behavior per ES 3.0 spec; forcing NONE guarantees raw depth-value reads.
+
+**CRITICAL LESSON re-learned from cut #7 (cube-route-shim's cubeUVSample helper).** The helper MUST have explicit `highp` qualifiers on return type, sampler2D param, vec3 param, AND local `_stored`. Mesa-Nouveau's GLSL ES 3.00 compiler is strict — the file-scope `precision highp float;` in Three.js's prelude does NOT propagate to function signatures. First-round attempt without them produced silent shader-compile failures → EVERY material with shadows fell back to nothing rendered → canvas completely black (not just missing spotlight, TOTAL black including non-shadow geometry). Recurrence tell: if a future runtime-shim shader-rewrite adds a helper that returns black-screen behavior on Mesa-Nouveau, check for missing `highp` on the helper decl.
+
+**Symptom it fixes.** webgl-lights-spotlight (v2) — spotlight cone renders correctly on floor, TorusKnot casts proper PCF shadow into the cookie-lit pool. Also fixes any future v2 demo using DirectionalLight/SpotLight with `castShadow=true` + PCF shadow map.
+
+**DEFERRED.** `samplerCubeShadow` (point light shadows). No current v2 demo exercises point light shadows. Parallel rewrite would follow the same shape — collect `samplerCubeShadow IDENT`, rewrite type + calls, inject helper that samples the cube face + does step compare. Requires coordination with cube-route-shim's samplerCube→sampler2D + atlas layer (or its own atlas of some kind). Estimated ~100 additional lines.
+
+**DISPOSITION:** `brewser-specific` (runtime-side). Mesa-Nouveau driver-limit workaround; upstream Three.js would not accept a rewrite that hides sampler2DShadow.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RE-APPLY / VERIFY NOTE.** If a brewser-runtime-v8 upstream pull loses this shim, webgl-lights-spotlight (or any v2 shadow-map demo) regresses to invisible spotlight / ambient-only lighting. Recurrence tell: `[shadow-shim:install]` line missing from `nxjs-debug.log` after context creation. Re-apply by restoring `shadow-route-shim.ts` from git history and re-adding the `installShadowRouting(gl)` calls in canvas-runner.ts after both `installCubeRouting(gl)` sites.
+
+---
+
+## #22 — Switch.VideoDecoder minimal V8 port (Phase 2.G.1 cut #22) — SHIPPED 2026-07-01
+
+**File(s):**
+- NEW [source/video-decoder.h](source/video-decoder.h) (~5 lines — forward decl of `nx_init_video_decoder`)
+- NEW [source/video-decoder.cc](source/video-decoder.cc) (~280 lines — V8 bindings over `nx_media_*`)
+- MODIFIED [source/main.cc](source/main.cc) — `NX_MODULE(video_decoder)` forward decl + `nx_init_video_decoder(iso, init_obj)` call in `build_init_object` right after `nx_init_video`
+- NEW [packages/runtime/src/switch/video-decoder.ts](packages/runtime/src/switch/video-decoder.ts) (~130 lines — trimmed copy of QuickJS's TS wrapper, with pause/seek/setMuted/setVolume/getAudioLevels/getFrequencyData/getWaveform REMOVED since the V8 minimal port doesn't wire them)
+- MODIFIED [packages/runtime/src/switch/index.ts](packages/runtime/src/switch/index.ts) — added `export * from './video-decoder';`
+- MODIFIED [packages/runtime/src/$.ts](packages/runtime/src/$.ts) — added type declarations for the 5 `videoDecoder*` native bindings
+
+**Root cause.** QuickJS-era engine exposed `Switch.VideoDecoder` via a ~2000-line `source/video.c` that owned its own decode threads, packet rings, and audrv voice bookkeeping. V8 fork's `source/video.cc` (348 lines) implements only the `Video` element (for drawImage integration) and skipped the VideoDecoder API entirely — the underlying `nx_media_*` portable pipeline in `source/media-decoder.cc` was ported but not wrapped as VideoDecoder. Demo webgl-materials-video throws `Switch.VideoDecoder unavailable — rebuild nxjs.nro with video support`.
+
+**Scope.** Cut #22 implements the MINIMUM VideoDecoder surface the demo needs, layered as a thin V8 binding over the existing `nx_media_*` API (which is a strict superset of what the QuickJS pipeline provided per-embedder). Implemented: `videoDecoderNew` (synchronous open via `nx_media_open` on main thread — fine for local sdmc files), `videoDecoderPlay` (→ `nx_media_play`), `videoDecoderClose` (→ `nx_media_destroy`), `videoDecoderNextFrame` (→ `nx_media_present` + BGRA→RGBA swizzle-copy into a fresh ArrayBuffer + wrap as `{data, width, height, pts, ended}` object), `videoDecoderInit` (installs prototype getters). Getters wired: `width`, `height`, `duration`, `error`, `ended`, `usedVideo`, `usedAudio`. Stub getters (return sane defaults, no C bindings): `paused` (false), `usedHw` (false — `nx_media` hides hw/sw decision), `muted` (false), `volume` (1.0), `audioTime` (0.0), `audioError` (null).
+
+**BGRA→RGBA swizzle.** `nx_media_present` writes BGRA to the caller's buffer (per [source/media-decoder.h:74-77](source/media-decoder.h#L74) — "caller-owned width*height*4 BGRA buffer"). The demo consumes `frame.data` as a `THREE.DataTexture(bytes, w, h, THREE.RGBAFormat, THREE.UnsignedByteType)` — expects RGBA byte order. Per-frame copy loop swaps `dst[i]=src[i+2]; dst[i+2]=src[i]` for the R↔B swap; G and A stay. Cost: ~500 KB/s at Sintel's ~480×204 @ 24 fps — trivial.
+
+**DEFERRED (not in cut #22, add when a future demo needs them).**
+- `pause()` / `seek()` — `nx_media_pause` / `nx_media_seek` exist in media-decoder.h, just need bindings.
+- `setMuted()` / `setVolume()` / `getAudioLevels()` / `getFrequencyData()` / `getWaveform()` — audio-graph attach + audrv played-sample-count bookkeeping. Significant — the QuickJS impl carries ~600 lines for the visualizer surface (audrv played-sample counter, wave-buffer state, per-band RMS accumulation). Only useful once an audio path lands.
+- `usedHw` proper reading — requires `nx_media_used_hw()` accessor in media-decoder.h (currently doesn't exist; the hw/sw decision is buried in the decode thread state).
+- `muted` / `volume` proper — requires audio-graph attach path first.
+- `audioTime` proper — requires `nx_media_audio_time()` accessor.
+
+**hwAccel option.** Cut #22 accepts `opts.hwAccel` but silently ignores it — `nx_media_open` internally attempts hw first and falls back to sw without exposing which was used. Demo's `usedHw` stub returns false, matching the "software" readback the demo shows. If a future demo needs the actual hw/sw choice, add `nx_media_used_hw()` to media-decoder.h and wire the getter properly.
+
+**Symptom it fixes.** webgl-materials-video (v2) — "Switch.VideoDecoder unavailable" error gone; Sintel trailer plays across the 14×7 cube mosaic; nextFrame() returns fresh frames at the container's frame rate.
+
+**DISPOSITION:** `upstream-candidate`. Switch.VideoDecoder is a public nx.js API surface (was in QuickJS-era 1.0.0-beta.5 releases); the V8 fork should ship it for API parity. The ~280-line V8 binding over the existing portable `nx_media_*` pipeline is a clean upstream addition — no dependencies on brewser-specific code.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.**
+
+*To verify the port is still present* after any V8-engine upstream pull: grep `source/video-decoder.cc` for `nx_init_video_decoder`. If the file is missing, upstream didn't accept our port yet AND lost our fork addition — re-apply.
+
+*Recurrence tell.* Demo throws `Switch.VideoDecoder unavailable — rebuild nxjs.nro with video support` from [webgl-materials-video/assets/main.js:89](../brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/webgl-materials-video/assets/main.js#L89). The `typeof Switch.VideoDecoder !== 'function'` guard proves the class isn't exposed by the runtime.
+
+*Format contract.* `nx_media_present` writes BGRA; if a future demo's Three.js path uses `THREE.BGRAFormat` (unlikely — Three.js doesn't have that), the R↔B swizzle in `nx_video_decoder_next_frame` should be dropped. Otherwise keep the swizzle — most GPU consumers (WebGL RGBA texture uploads, canvas ImageData) expect RGBA.
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches

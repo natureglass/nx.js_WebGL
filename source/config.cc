@@ -247,6 +247,32 @@ static int ini_cb(void *user, const char *section, const char *name,
 				        "(use true|false|on|off|1|0|yes|no)",
 				        value);
 			}
+		} else if (str_ieq(name, "state_probe")) {
+			// Phase 2.G.0 state-contract probe flag. Same boolean spellings.
+			if (str_ieq(value, "true") || str_ieq(value, "on") ||
+			    str_ieq(value, "1") || str_ieq(value, "yes")) {
+				cfg->webgl_state_probe = true;
+			} else if (str_ieq(value, "false") || str_ieq(value, "off") ||
+			           str_ieq(value, "0") || str_ieq(value, "no")) {
+				cfg->webgl_state_probe = false;
+			} else {
+				cfg_log("webgl.state_probe=\"%s\" not honored: invalid "
+				        "(use true|false|on|off|1|0|yes|no)",
+				        value);
+			}
+		} else if (str_ieq(name, "state_probe_active")) {
+			// #16-ACTIVE state-leak probe flag. Same boolean spellings.
+			if (str_ieq(value, "true") || str_ieq(value, "on") ||
+			    str_ieq(value, "1") || str_ieq(value, "yes")) {
+				cfg->webgl_state_probe_active = true;
+			} else if (str_ieq(value, "false") || str_ieq(value, "off") ||
+			           str_ieq(value, "0") || str_ieq(value, "no")) {
+				cfg->webgl_state_probe_active = false;
+			} else {
+				cfg_log("webgl.state_probe_active=\"%s\" not honored: invalid "
+				        "(use true|false|on|off|1|0|yes|no)",
+				        value);
+			}
 		} else {
 			cfg_log("webgl.%s ignored: unknown key", name);
 		}
@@ -374,6 +400,8 @@ void nx_config_defaults(nx_config_t *cfg) {
 	cfg->code_headroom_mb = NX_CODE_HEADROOM_AUTO;
 	cfg->gpu_cache_mib = NX_GPU_CACHE_AUTO;
 	cfg->webgl_test_fbo = false;
+	cfg->webgl_state_probe = false;
+	cfg->webgl_state_probe_active = false;
 	cfg->loaded = false;
 }
 

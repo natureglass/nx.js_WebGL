@@ -555,13 +555,24 @@ export interface Init {
 	 * Initializes EGL + an OpenGL ES 3 context on the screen. Returns the
 	 * native context carrier object, or `undefined` when GL init fails.
 	 */
-	webglContextNew(screen: Screen): WebGLRenderingContext | WebGL2RenderingContext | undefined;
-	// Accepts BOTH WebGLRenderingContext (v1, Phase 2.C) and
-	// WebGL2RenderingContext (v2, Phase 2.G) class constructors. The engine
-	// stashes the prototype carrier + installs the methods on whichever class
-	// was passed.
+	webglContextNew(screen: Screen): WebGLRenderingContext | undefined;
+	// Installs the v1 method table (Phase 2.C) on whichever class is passed
+	// (typically WebGLRenderingContext). The v2 path uses the separate
+	// webgl2InitClass binding (Phase 2.G.0) — see NXJS_PATCHES_NEEDED.md #15
+	// for the table-split rationale.
 	webglInitClass(
-		c: ClassOf<WebGLRenderingContext> | ClassOf<WebGL2RenderingContext>,
+		c: ClassOf<WebGLRenderingContext>,
+		classes: Record<string, unknown>,
+	): void;
+
+	// Phase 2.G.0 — SEPARATE v2 context factory + class init binding pair.
+	// Engine impls share WebGLState with v1 but the install paths are wholly
+	// distinct so v1's hardware-verified JIT install shape stays byte-
+	// identical and v2's empty-but-correctly-shaped install can be hardware-
+	// verified independently. See NXJS_PATCHES_NEEDED.md #14 + #15.
+	webgl2ContextNew(screen: Screen): WebGL2RenderingContext | undefined;
+	webgl2InitClass(
+		c: ClassOf<WebGL2RenderingContext>,
 		classes: Record<string, unknown>,
 	): void;
 
@@ -867,6 +878,22 @@ export interface Init {
 		ctx: AudioContextHandle,
 	): AudioNodeHandle | null;
 	videoClose(video: VideoHandle): void;
+
+	// video-decoder.cc — Switch.VideoDecoder (raw-pixel decode API).
+	// Cut #22 (2026-07-01): thin V8 binding over nx_media_*, distinct from
+	// videoNew/videoLoad above (which power the drawImage-integrated Video
+	// element). See packages/runtime/src/switch/video-decoder.ts.
+	videoDecoderInit(ctor: Function): void;
+	videoDecoderNew(url: string, opts?: unknown): unknown;
+	videoDecoderPlay(dec: unknown): void;
+	videoDecoderClose(dec: unknown): void;
+	videoDecoderNextFrame(dec: unknown): {
+		data: ArrayBuffer | null;
+		width: number;
+		height: number;
+		pts: number;
+		ended: boolean;
+	} | null;
 
 	// (Uint8Array base64/hex methods are provided natively by V8 — no binding.)
 

@@ -1111,7 +1111,16 @@ export interface WebGL2RenderingContext extends Readonly<typeof GL_CONSTANTS> {}
 }
 def(WebGL2RenderingContext);
 
-$.webglInitClass(WebGL2RenderingContext, {
+// Phase 2.G.0 — install via the SEPARATE $.webgl2InitClass binding (not the
+// shared $.webglInitClass). The engine's v2 init installs an empty v2 method
+// table for 2.G.0 — see source/webgl.cc::install_methods_v2 and the JIT-safety
+// rationale block above source/webgl.cc::install_methods. v2 methods land in
+// 2.G.1 as the webgl2-ubo slice's diag-proxy reports them missing. The
+// bulk-defineProperties constants install above (lines 1102-1110) has already
+// populated 387 v2 constants on the prototype, so a v2 instance can still be
+// detected via `gl.constructor.name === 'WebGL2RenderingContext'` and probed
+// for constants, even though no methods are bound.
+$.webgl2InitClass(WebGL2RenderingContext, {
 	WebGLBuffer,
 	WebGLFramebuffer,
 	WebGLProgram,
@@ -1234,11 +1243,26 @@ function sourceToPixels(src: any): {
  * @ignore
  * Internal factory used by `Screen#getContext('webgl2')`. Returns `null`
  * when the GL context could not be created (e.g. EGL/ES3 init failure).
+ *
+ * Phase 2.G.0 — calls the SEPARATE $.webgl2ContextNew engine factory (not
+ * the shared $.webglContextNew). The two paths share engine WebGLState
+ * internally (one process, one bridge, one tenant FBO) but the carrier
+ * objects diverge: v1 has plain {drawingBufferWidth, drawingBufferHeight},
+ * v2 additionally has `__webgl2 = true`. Method install paths are wholly
+ * distinct via the separate $.webgl{,2}InitClass calls — see
+ * source/webgl.cc::install_methods{,_v2}.
+ *
+ * In 2.G.0 the v2 method table is EMPTY: a v2 instance has the 387 v2
+ * constants on its prototype but NO methods bound. Three.js's
+ * `gl.constructor.name === 'WebGL2RenderingContext'` detection works, but
+ * any v2 method call throws `TypeError: X is not a function`. The slice
+ * (webgl2-ubo) is 2.G.1 work; this factory's purpose at 2.G.0 is solely
+ * to verify the JIT install-shape on hardware.
  */
 export function createWebGL2Context(
 	canvas: Screen,
 ): WebGL2RenderingContext | null {
-	const c = $.webglContextNew(canvas);
+	const c = $.webgl2ContextNew(canvas);
 	if (!c) return null;
 	const ctx = proto(c, WebGL2RenderingContext);
 	_.set(ctx, { canvas });

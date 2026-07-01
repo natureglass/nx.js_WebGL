@@ -29,6 +29,7 @@ export * from './ns';
 export * from './profile';
 export * from './savedata';
 export * from './service';
+export * from './video-decoder';
 export { Socket, Server };
 export { WebApplet, type WebAppletOptions } from '../web-applet';
 

@@ -68,6 +68,55 @@ uint64_t s_t_start_ns = 0;
 uint64_t s_frame_count = 0;
 double s_boundary_us_accum = 0.0;
 
+// Phase 2.G.0 state-contract probe gate. Off by default; set true at engine
+// boot via nx_webgl_state_probe_enable(cfg->webgl_state_probe). The probe is
+// read-only.
+bool s_state_probe_on = false;
+
+// #16-ACTIVE state-leak probe gate. Off by default; opt-in via [webgl]
+// state_probe_active = true (see nx_webgl_state_probe_active_enable). Runs
+// ONCE per launch — SET on compose #1, READ_BACK on compose #2, then
+// s_active_probe_done latches and subsequent composes skip. See
+// NXJS_PATCHES_NEEDED.md #16-ACTIVE spec for interpretation of verdicts.
+bool s_state_probe_active_on = false;
+bool s_active_probe_done = false;
+
+// Saved state for the four #16-ACTIVE candidates. Only valid between the
+// compose-#1 SET and compose-#2 READ_BACK.
+struct nx_active_probe_state_t {
+	// (a) UBO slot 3 (Ganesh docs use 0..2; slot 3 is first Three.js contender)
+	GLuint ubo_probe_obj;
+	GLint ubo3_pre;
+	GLint ubo3_set;
+	GLint ubo0_pre; // slot 0 only READ (Ganesh-touched)
+	// (b) Sampler unit 0
+	GLuint samp_probe_obj;
+	GLint samp0_pre;
+	GLint samp0_set;
+	// (c) READ_FRAMEBUFFER (separate from DRAW — passive probe showed if the
+	// two diverge; active tests whether Skia binds both together)
+	GLuint rfb_probe_obj;
+	GLint read_fbo_pre;
+	GLint read_fbo_set;
+	// (d) Transform feedback + rasterizer-discard
+	GLuint tf_probe_obj;
+	GLint tf_pre;
+	GLint tf_set;
+	GLboolean rd_pre;
+	GLboolean rd_set;
+};
+nx_active_probe_state_t s_ap_state = {};
+
+// Frame counter for the compose-path probe sampling. Independent of
+// s_frame_count (which only counts test_fbo frames); this one ticks on
+// every nx_webgl_bridge_compose call regardless of dirty/auto-flush. Sampled
+// at 1, 60, 600 — early baseline + 1s + 10s of steady state.
+uint64_t s_probe_compose_n = 0;
+
+bool probe_sample_this_frame(uint64_t n) {
+	return n == 1 || n == 60 || n == 600;
+}
+
 uint64_t ts_ns() {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -238,6 +287,299 @@ void wrap_compose_image(void) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Phase 2.G.0 — state-contract probe (read-only).
+// ---------------------------------------------------------------------------
+//
+// Purpose: before extending the FROZEN 2.B nx_gl_state_snap_t, determine via
+// hardware probe which of four candidate GL bindings actually leak across
+// our shared-context EGL architecture. The shared-context model (Skia and
+// WebGL share one EGL context) was the root cause across multiple prior
+// bugs — it may make some of the QuickJS-era snap-set assumptions moot
+// (Skia/Ganesh-GL never touching the binding => zero leak risk) or
+// inversely surface new ones.
+//
+// The probe queries each candidate at known hook points and prints to
+// stderr. The user reads the log on hardware; comparing the same-binding
+// value across two consecutive tags reveals whether Skia mutated it between
+// those tags. A binding whose value stays constant across all tags does
+// NOT need to be in nx_gl_state_snap_t. A binding that changes between
+// `init`/`compose-pre`/`compose-post` tags is a candidate for the batched
+// snap extension proposed in Deliverable 2.
+
+// GL enums not necessarily in older GLES3 headers — define numerically to
+// avoid macro dependency on the gl3.h version vendored upstream.
+#ifndef GL_UNIFORM_BUFFER_BINDING
+#define GL_UNIFORM_BUFFER_BINDING                  0x8A28
+#endif
+#ifndef GL_SAMPLER_BINDING
+#define GL_SAMPLER_BINDING                         0x8919
+#endif
+#ifndef GL_READ_FRAMEBUFFER_BINDING
+#define GL_READ_FRAMEBUFFER_BINDING                0x8CAA
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER_BINDING
+#define GL_DRAW_FRAMEBUFFER_BINDING                0x8CA6
+#endif
+#ifndef GL_TRANSFORM_FEEDBACK_BINDING
+#define GL_TRANSFORM_FEEDBACK_BINDING              0x8E25
+#endif
+#ifndef GL_RASTERIZER_DISCARD
+#define GL_RASTERIZER_DISCARD                      0x8C89
+#endif
+
+void nx_webgl_state_probe_enable(bool on) {
+	s_state_probe_on = on;
+	if (on) {
+		fprintf(stderr, "[webgl-bridge:probe] enabled (Phase 2.G.0 state-contract probe; "
+		                "read-only)\n");
+		fflush(stderr);
+	}
+}
+
+bool nx_webgl_state_probe_enabled(void) { return s_state_probe_on; }
+
+void nx_webgl_state_probe_log(const char *tag) {
+	if (!s_state_probe_on) return;
+
+	// Defensive: restore GL_ACTIVE_TEXTURE in case any future probe ever
+	// changes it. The current probe only reads with the unit already at
+	// whatever the caller had selected — we sample SAMPLER_BINDING for
+	// the unit that's currently active (typically unit 0 in Three.js's
+	// per-frame setup), and we sample for unit 0 explicitly by activating
+	// it briefly.
+	GLint saved_active_tex = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active_tex);
+
+	// 1. UBO indexed bindings. Sample slot 0..3 (Three.js v2 typically uses
+	// 2 slots — ViewData + LightingData — so 4 is comfortable headroom).
+	// glGetIntegeri_v is the ES3 indexed-getter; available since GLES 3.0
+	// (shared context bumped to ES3 in Phase 2.A).
+	GLint ubo_base = 0;
+	glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &ubo_base);
+	GLint ubo[4] = {0, 0, 0, 0};
+	for (int i = 0; i < 4; i++) {
+		glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, i, &ubo[i]);
+	}
+
+	// 2. Sampler-unit-0. Activate unit 0 transiently to query its sampler
+	// binding (the only unit Ganesh-GL is documented to touch).
+	glActiveTexture(GL_TEXTURE0);
+	GLint sampler0 = 0;
+	glGetIntegerv(GL_SAMPLER_BINDING, &sampler0);
+
+	// 3. READ vs DRAW framebuffer. DRAW is already in nx_gl_state_snap_t
+	// (field `fbo`); the probe reads BOTH so we can observe whether they
+	// diverge during Skia frames.
+	GLint read_fbo = 0, draw_fbo = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+
+	// 4. Transform feedback binding + rasterizer-discard enable.
+	GLint tf = 0;
+	glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &tf);
+	GLboolean rast_disc = glIsEnabled(GL_RASTERIZER_DISCARD);
+
+	// Restore active tex unit.
+	glActiveTexture((GLenum)saved_active_tex);
+
+	fprintf(stderr,
+	        "[webgl-bridge:probe] tag=%s frame=%llu "
+	        "ubo_base=%d ubo0=%d ubo1=%d ubo2=%d ubo3=%d "
+	        "sampler0=%d read_fbo=%d draw_fbo=%d "
+	        "tf=%d rast_disc=%d\n",
+	        tag ? tag : "(null)",
+	        (unsigned long long)s_probe_compose_n,
+	        ubo_base, ubo[0], ubo[1], ubo[2], ubo[3],
+	        sampler0, read_fbo, draw_fbo,
+	        tf, (int)rast_disc);
+	fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
+// #16-ACTIVE state-leak probe (one-shot per launch)
+// ---------------------------------------------------------------------------
+
+void nx_webgl_state_probe_active_enable(bool on) {
+	s_state_probe_active_on = on;
+	if (on) {
+		fprintf(stderr,
+		        "[webgl-bridge:probe-active] enabled (one-shot #16-ACTIVE — "
+		        "SET on compose #1, READ_BACK on compose #2, then latched)\n");
+		fflush(stderr);
+	}
+}
+
+// Verdict per NXJS_PATCHES_NEEDED.md #16-ACTIVE:
+//   post == set                  → Skia didn't touch     → "moot"
+//   post == pre  && pre != set   → Skia mutated+restored → "NEEDS_SNAP_MUTATE_RESTORE"
+//   post != set && post != pre   → Skia mutated + left   → "NEEDS_SNAP_LEAVE"
+//   post == set && pre == set    → couldn't distinguish (pre matched our set) → "moot-preset-matches"
+static const char *ap_verdict(GLint pre, GLint set, GLint post) {
+	if (post == set) {
+		return (pre == set) ? "moot-preset-matches" : "moot";
+	}
+	if (post == pre) return "NEEDS_SNAP_MUTATE_RESTORE";
+	return "NEEDS_SNAP_LEAVE";
+}
+
+static void nx_active_probe_set(void) {
+	(void)glGetError(); // drain any prior residual
+
+	// ── (a) UBO slot 3 SET + slot 0 pre-snapshot ─────────────────────────
+	glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 3, &s_ap_state.ubo3_pre);
+	glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 0, &s_ap_state.ubo0_pre);
+	glGenBuffers(1, &s_ap_state.ubo_probe_obj);
+	glBindBuffer(GL_UNIFORM_BUFFER, s_ap_state.ubo_probe_obj);
+	glBufferData(GL_UNIFORM_BUFFER, 256, nullptr, GL_DYNAMIC_DRAW);
+	glBindBufferRange(GL_UNIFORM_BUFFER, 3, s_ap_state.ubo_probe_obj, 0, 256);
+	glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 3, &s_ap_state.ubo3_set);
+
+	// ── (b) Sampler unit 0 SET ───────────────────────────────────────────
+	GLint saved_active = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+	glActiveTexture(GL_TEXTURE0);
+	glGetIntegerv(GL_SAMPLER_BINDING, &s_ap_state.samp0_pre);
+	glGenSamplers(1, &s_ap_state.samp_probe_obj);
+	glSamplerParameteri(s_ap_state.samp_probe_obj, GL_TEXTURE_MIN_FILTER,
+	                    GL_NEAREST);
+	glBindSampler(0, s_ap_state.samp_probe_obj);
+	glGetIntegerv(GL_SAMPLER_BINDING, &s_ap_state.samp0_set);
+	glActiveTexture((GLenum)saved_active);
+
+	// ── (c) READ_FRAMEBUFFER SET ─────────────────────────────────────────
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s_ap_state.read_fbo_pre);
+	glGenFramebuffers(1, &s_ap_state.rfb_probe_obj);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, s_ap_state.rfb_probe_obj);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s_ap_state.read_fbo_set);
+
+	// ── (d) Transform feedback + rasterizer-discard SET ──────────────────
+	glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &s_ap_state.tf_pre);
+	s_ap_state.rd_pre = glIsEnabled(GL_RASTERIZER_DISCARD);
+	glGenTransformFeedbacks(1, &s_ap_state.tf_probe_obj);
+	glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, s_ap_state.tf_probe_obj);
+	glEnable(GL_RASTERIZER_DISCARD);
+	glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &s_ap_state.tf_set);
+	s_ap_state.rd_set = glIsEnabled(GL_RASTERIZER_DISCARD);
+
+	GLenum set_err = glGetError();
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] SET complete: "
+	        "ubo3(pre=%d,set=%d) ubo0(pre=%d) samp0(pre=%d,set=%d) "
+	        "read_fbo(pre=%d,set=%d) tf(pre=%d,set=%d) "
+	        "rd(pre=%d,set=%d) err=0x%x\n",
+	        s_ap_state.ubo3_pre, s_ap_state.ubo3_set,
+	        s_ap_state.ubo0_pre,
+	        s_ap_state.samp0_pre, s_ap_state.samp0_set,
+	        s_ap_state.read_fbo_pre, s_ap_state.read_fbo_set,
+	        s_ap_state.tf_pre, s_ap_state.tf_set,
+	        (int)s_ap_state.rd_pre, (int)s_ap_state.rd_set, set_err);
+	fflush(stderr);
+}
+
+static void nx_active_probe_read_back(void) {
+	GLint saved_active = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+	glActiveTexture(GL_TEXTURE0);
+
+	GLint ubo3_post = 0, ubo0_post = 0, samp0_post = 0;
+	GLint read_fbo_post = 0, tf_post = 0;
+	glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 3, &ubo3_post);
+	glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 0, &ubo0_post);
+	glGetIntegerv(GL_SAMPLER_BINDING, &samp0_post);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo_post);
+	glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &tf_post);
+	GLboolean rd_post = glIsEnabled(GL_RASTERIZER_DISCARD);
+
+	// Per-candidate verdict lines
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=ubo_slot3 pre=%d set=%d "
+	        "post=%d verdict=%s\n",
+	        s_ap_state.ubo3_pre, s_ap_state.ubo3_set, ubo3_post,
+	        ap_verdict(s_ap_state.ubo3_pre, s_ap_state.ubo3_set, ubo3_post));
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=ubo_slot0 pre=%d post=%d "
+	        "verdict=%s (passive-mode; pre==post means Ganesh preserved)\n",
+	        s_ap_state.ubo0_pre, ubo0_post,
+	        (ubo0_post == s_ap_state.ubo0_pre ? "moot-passive"
+	                                          : "MUTATED_BY_SKIA"));
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=sampler_unit0 pre=%d "
+	        "set=%d post=%d verdict=%s\n",
+	        s_ap_state.samp0_pre, s_ap_state.samp0_set, samp0_post,
+	        ap_verdict(s_ap_state.samp0_pre, s_ap_state.samp0_set, samp0_post));
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=read_fbo pre=%d set=%d "
+	        "post=%d verdict=%s\n",
+	        s_ap_state.read_fbo_pre, s_ap_state.read_fbo_set, read_fbo_post,
+	        ap_verdict(s_ap_state.read_fbo_pre, s_ap_state.read_fbo_set,
+	                   read_fbo_post));
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=tf pre=%d set=%d post=%d "
+	        "verdict=%s\n",
+	        s_ap_state.tf_pre, s_ap_state.tf_set, tf_post,
+	        ap_verdict(s_ap_state.tf_pre, s_ap_state.tf_set, tf_post));
+	fprintf(stderr,
+	        "[webgl-bridge:probe-active] candidate=rast_disc pre=%d set=%d "
+	        "post=%d verdict=%s\n",
+	        (int)s_ap_state.rd_pre, (int)s_ap_state.rd_set, (int)rd_post,
+	        ap_verdict((GLint)s_ap_state.rd_pre, (GLint)s_ap_state.rd_set,
+	                   (GLint)rd_post));
+
+	// SUMMARY line — feeds #17 snap-extension decisions.
+	bool need_ubo3 = (ubo3_post != s_ap_state.ubo3_set);
+	bool need_ubo0 = (ubo0_post != s_ap_state.ubo0_pre);
+	bool need_samp0 = (samp0_post != s_ap_state.samp0_set);
+	bool need_read_fbo = (read_fbo_post != s_ap_state.read_fbo_set);
+	bool need_tf = (tf_post != s_ap_state.tf_set);
+	bool need_rd = ((int)rd_post != (int)s_ap_state.rd_set);
+	bool any = need_ubo3 || need_ubo0 || need_samp0 || need_read_fbo ||
+	           need_tf || need_rd;
+	fprintf(stderr, "[webgl-bridge:probe-active] SUMMARY needs_snap={");
+	bool first = true;
+#define AP_APPEND(cond, name) \
+	if (cond) { fprintf(stderr, "%s%s", first ? "" : ",", name); first = false; }
+	AP_APPEND(need_ubo3, "ubo_slot3")
+	AP_APPEND(need_ubo0, "ubo_slot0")
+	AP_APPEND(need_samp0, "sampler_unit0")
+	AP_APPEND(need_read_fbo, "read_fbo")
+	AP_APPEND(need_tf, "tf")
+	AP_APPEND(need_rd, "rast_disc")
+#undef AP_APPEND
+	fprintf(stderr, "}%s\n", any ? "" : " (all-moot)");
+	fflush(stderr);
+
+	// ── RESTORE ──────────────────────────────────────────────────────────
+	// Bind back to whatever pre was. pre==0 (unbound) is handled naturally
+	// by the GL binds (buffer=0 unbinds). For UBO we use bindBufferBase
+	// rather than bindBufferRange to avoid the offset+size we didn't save.
+	glBindBufferBase(GL_UNIFORM_BUFFER, 3, (GLuint)s_ap_state.ubo3_pre);
+	glBindSampler(0, (GLuint)s_ap_state.samp0_pre);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s_ap_state.read_fbo_pre);
+	glBindTransformFeedback(GL_TRANSFORM_FEEDBACK,
+	                        (GLuint)s_ap_state.tf_pre);
+	if (s_ap_state.rd_pre)
+		glEnable(GL_RASTERIZER_DISCARD);
+	else
+		glDisable(GL_RASTERIZER_DISCARD);
+	glActiveTexture((GLenum)saved_active);
+
+	// ── CLEANUP ──────────────────────────────────────────────────────────
+	glDeleteBuffers(1, &s_ap_state.ubo_probe_obj);
+	glDeleteSamplers(1, &s_ap_state.samp_probe_obj);
+	glDeleteFramebuffers(1, &s_ap_state.rfb_probe_obj);
+	glDeleteTransformFeedbacks(1, &s_ap_state.tf_probe_obj);
+
+	GLenum cleanup_err = glGetError();
+	if (cleanup_err) {
+		fprintf(stderr,
+		        "[webgl-bridge:probe-active] restore/cleanup err=0x%x "
+		        "(non-fatal; probe done)\n",
+		        cleanup_err);
+		fflush(stderr);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // State save/restore primitive (public — re-used by 2.C+ WebGL bridge).
 // ---------------------------------------------------------------------------
 
@@ -255,19 +597,48 @@ void nx_gl_state_save(nx_gl_state_snap_t *s) {
 	s->scissor      = glIsEnabled(GL_SCISSOR_TEST);
 	s->stencil_test = glIsEnabled(GL_STENCIL_TEST);
 	glGetBooleanv(GL_COLOR_WRITEMASK, s->color_mask);
+	glGetBooleanv(GL_DEPTH_WRITEMASK, &s->depth_mask);   // cut #15
+	glGetIntegerv(GL_STENCIL_WRITEMASK, &s->stencil_mask); // cut #15
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, s->clear_color);
 	glGetIntegerv(GL_BLEND_SRC_RGB, &s->blend_src_rgb);
 	glGetIntegerv(GL_BLEND_DST_RGB, &s->blend_dst_rgb);
 	glGetIntegerv(GL_BLEND_SRC_ALPHA, &s->blend_src_a);
 	glGetIntegerv(GL_BLEND_DST_ALPHA, &s->blend_dst_a);
+	// Patch #17 (from #16-ACTIVE hardware verdict). Sampler binding is per-
+	// texture-unit; we save unit 0 explicitly since that's the only unit
+	// Ganesh is documented to touch and the probe confirmed on hardware.
+	// Save-then-active-flip pattern: capture the caller's active unit
+	// (already saved above into s->active_tex), transiently switch to unit
+	// 0 to read its sampler binding, then leave the active unit as it was
+	// (glGetIntegerv doesn't mutate it, but glActiveTexture does — so we
+	// re-flip back).
+	glActiveTexture(GL_TEXTURE0);
+	glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler_unit0);
+	glActiveTexture((GLenum)s->active_tex);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->read_fbo);
 }
 
 void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
+	// Patch #17: restore read_fbo BEFORE the draw_fbo bind. glBindFramebuffer
+	// with target=GL_FRAMEBUFFER (below) binds BOTH read AND draw to the
+	// draw_fbo value — which is wrong if read_fbo diverged. So bind read
+	// first (via GL_READ_FRAMEBUFFER target, which touches only read), then
+	// the GL_FRAMEBUFFER call binds draw to the correct value AND overwrites
+	// read to draw. If read_fbo != draw_fbo, re-bind read separately AFTER
+	// the FRAMEBUFFER call.
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)s->fbo);
+	if (s->read_fbo != s->fbo) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s->read_fbo);
+	}
 	glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
 	glUseProgram((GLuint)s->program);
 	glBindVertexArray((GLuint)s->vao);
 	glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s->array_buffer);
+	// Patch #17: restore sampler binding on unit 0. Active-flip pattern
+	// mirrored from nx_gl_state_save. Bind BEFORE the final active-tex
+	// restore so the caller's active unit ends up as it was saved.
+	glActiveTexture(GL_TEXTURE0);
+	glBindSampler(0, (GLuint)s->sampler_unit0);
 	glActiveTexture((GLenum)s->active_tex);
 	glBindTexture(GL_TEXTURE_2D, (GLuint)s->tex2d_binding);
 	if (s->blend)        glEnable(GL_BLEND);        else glDisable(GL_BLEND);
@@ -277,6 +648,8 @@ void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
 	if (s->stencil_test) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
 	glColorMask(s->color_mask[0], s->color_mask[1], s->color_mask[2],
 	            s->color_mask[3]);
+	glDepthMask(s->depth_mask);              // cut #15
+	glStencilMask((GLuint)s->stencil_mask);  // cut #15
 	glClearColor(s->clear_color[0], s->clear_color[1], s->clear_color[2],
 	             s->clear_color[3]);
 	glBlendFuncSeparate(s->blend_src_rgb, s->blend_dst_rgb, s->blend_src_a,
@@ -346,17 +719,27 @@ bool nx_webgl_bridge_init(int fbo_w, int fbo_h) {
 	s_t_start_ns = ts_ns();
 	s_frame_count = 0;
 	s_boundary_us_accum = 0.0;
+	s_probe_compose_n = 0;
 	s_initialized = true;
 
 	fprintf(stderr,
 	        "[webgl-bridge] init ok fbo=%dx%d color_tex=%u depth_rb=%u fbo_id=%u\n",
 	        fbo_w, fbo_h, s_color_tex, s_depth_rb, s_fbo);
 	fflush(stderr);
+
+	// Phase 2.G.0 baseline probe — fires once at init end so the log has
+	// the GL state immediately after Skia has initialized + before any
+	// WebGL traffic. Read-only.
+	if (s_state_probe_on) nx_webgl_state_probe_log("init");
+
 	return true;
 }
 
 void nx_webgl_bridge_exit(void) {
 	if (!s_initialized) return;
+	// Phase 2.G.0 exit-time probe — fires once before teardown so the log
+	// captures end-of-session GL state. Read-only.
+	if (s_state_probe_on) nx_webgl_state_probe_log("exit");
 	// Drop the Skia-side SkImage FIRST so the GrDirectContext stops
 	// referencing the tenant color texture, THEN free the GL handles.
 	s_compose_image.reset();
@@ -416,19 +799,50 @@ void nx_webgl_bridge_set_auto_flush(bool v) { s_auto_flush = v; }
 bool nx_webgl_bridge_compose_rect(SkSurface *target,
                                   int src_x, int src_y, int src_w, int src_h,
                                   int dst_x, int dst_y) {
-	if (!s_initialized || !target || !s_compose_image) return false;
+	if (!s_initialized || !target) return false;
 	if (src_w <= 0 || src_h <= 0) return false;
 	SkCanvas *c = target->getCanvas();
 	if (!c) return false;
-	const int skia_sy = s_fbo_h - src_y - src_h;
-	SkRect src = SkRect::MakeXYWH((float)src_x, (float)skia_sy,
-	                              (float)src_w, (float)src_h);
-	SkRect dst = SkRect::MakeXYWH((float)dst_x, (float)dst_y,
-	                              (float)src_w, (float)src_h);
+	// Phase 2.G.1 cut #12 (2026-07-01) — refresh s_compose_image at every
+	// call. The SkImage returned by SkImages::BorrowTextureFrom is treated
+	// as immutable by Ganesh, which caches an internal representation on
+	// first sample. Any subsequent draw with the 6-arg drawImageRect
+	// (which uses kStrict_SrcRectConstraint) samples that cached snapshot
+	// instead of the live GL texture. Auto-flush's 3-arg drawImageRect (no
+	// src rect, no constraint) sampled the same cached view too — which is
+	// why the working v2 demos so far (webgl2-ubo, webgl2-shaders-sky) all
+	// used full-FBO canvases where "first draw" happened AFTER Three.js's
+	// setup ran, capturing a mostly-valid frame; sub-rect demos like
+	// instancing-dynamic captured the initial clear and never advanced.
+	// Rewrapping is cheap (no GL work, just a new SkImage handle over the
+	// same texture id). Also drop kStrict_SrcRectConstraint — kFast is
+	// correct for pixel-aligned rect blits (no interpolation across
+	// non-existent src pixels), and it lets Skia use a live texture-atlas
+	// binding instead of a materialised sub-image.
+	wrap_compose_image();
+	if (!s_compose_image) return false;
+	// Cut #13's paint strategy: 3-arg drawImageRect (whole image at an
+	// offset dst) + clipRect. The 6-arg drawImageRect(src, dst)
+	// overload with explicit src rect triggers a Ganesh caching path
+	// that samples a frozen initial texture snapshot; the 3-arg
+	// implicit-src overload samples the live texture correctly (proven
+	// by the auto-flush path, which uses the same overload).
+	// Y-flip: runtime passes GL coords (matching v1's
+	// nx_webgl_egl_read_bridge_to_canvas_data contract). Skia's
+	// drawImageRect src is in visual/top-down coords on a kBottomLeft
+	// SkImage, so we convert with visual_sy = FBO_h - src_y - src_h.
+	const int visual_sy = s_fbo_h - src_y - src_h;
+	const float draw_dx = (float)dst_x - (float)src_x;
+	const float draw_dy = (float)dst_y - (float)visual_sy;
+	c->save();
+	c->clipRect(SkRect::MakeXYWH((float)dst_x, (float)dst_y,
+	                             (float)src_w, (float)src_h));
 	SkPaint paint;
-	c->drawImageRect(s_compose_image.get(), src, dst,
-	                 SkSamplingOptions(), &paint,
-	                 SkCanvas::kStrict_SrcRectConstraint);
+	c->drawImageRect(s_compose_image.get(),
+	                 SkRect::MakeXYWH(draw_dx, draw_dy,
+	                                  (float)s_fbo_w, (float)s_fbo_h),
+	                 SkSamplingOptions(), &paint);
+	c->restore();
 	return true;
 }
 
@@ -447,9 +861,47 @@ bool nx_webgl_bridge_compose_rect(SkSurface *target,
 // dirty FBO under auto-flush=false stays unflushed (the runtime's readback
 // path consumes it instead).
 void nx_webgl_bridge_compose(SkSurface *target) {
-	if (!s_auto_flush) return;
-	if (!s_initialized || !target || !s_compose_image) return;
-	if (!s_fbo_dirty) return;
+	// Phase 2.G.0 — count every compose-path call (independent of auto_flush
+	// / dirty gates) so the probe sampling tracks the real per-frame
+	// boundary. The compose function IS called once per frame by main.cc's
+	// present hook regardless of dirty/auto_flush gates below.
+	s_probe_compose_n++;
+	if (s_state_probe_on && probe_sample_this_frame(s_probe_compose_n)) {
+		nx_webgl_state_probe_log("compose-pre");
+	}
+
+	// #16-ACTIVE one-shot state-leak probe. Runs before the auto_flush /
+	// dirty / target checks so it fires regardless of whether the compose
+	// will actually do anything this frame. SET on compose #1, READ_BACK on
+	// compose #2 → the between-composes gap is one full Skia scene frame's
+	// worth of GL traffic, exposing bindings Ganesh-GL leaks or restores.
+	if (s_state_probe_active_on && !s_active_probe_done) {
+		if (s_probe_compose_n == 1) {
+			nx_active_probe_set();
+		} else if (s_probe_compose_n == 2) {
+			nx_active_probe_read_back();
+			s_active_probe_done = true;
+		}
+	}
+
+	if (!s_auto_flush) {
+		if (s_state_probe_on && probe_sample_this_frame(s_probe_compose_n)) {
+			nx_webgl_state_probe_log("compose-post-noflush");
+		}
+		return;
+	}
+	if (!s_initialized || !target || !s_compose_image) {
+		if (s_state_probe_on && probe_sample_this_frame(s_probe_compose_n)) {
+			nx_webgl_state_probe_log("compose-post-skip");
+		}
+		return;
+	}
+	if (!s_fbo_dirty) {
+		if (s_state_probe_on && probe_sample_this_frame(s_probe_compose_n)) {
+			nx_webgl_state_probe_log("compose-post-clean");
+		}
+		return;
+	}
 
 	SkCanvas *c = target->getCanvas();
 	if (!c) return;
@@ -462,6 +914,9 @@ void nx_webgl_bridge_compose(SkSurface *target) {
 	                 SkRect::MakeXYWH(dx, dy, (float)s_fbo_w, (float)s_fbo_h),
 	                 SkSamplingOptions(), &paint);
 	s_fbo_dirty = false;
+	if (s_state_probe_on && probe_sample_this_frame(s_probe_compose_n)) {
+		nx_webgl_state_probe_log("compose-post");
+	}
 }
 
 void nx_webgl_bridge_compose_test(SkSurface *target) {
