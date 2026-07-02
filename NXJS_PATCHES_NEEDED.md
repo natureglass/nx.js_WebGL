@@ -39,23 +39,23 @@ proposal verdict.
 
 | # | Where | Disposition | Upstream status | Verify grep target | One-line title |
 |---:|---|---|---|---|---|
-| 1 | engine | upstream-candidate | not-submitted | `image.ts: return globalThis\.fetch\(input, init\)` | image.ts call-time globalThis.fetch deferral |
-| 2 | engine | upstream-candidate | not-submitted | `audio.ts: return globalThis\.fetch\(input, init\)` | audio.ts call-time globalThis.fetch deferral |
-| 3 | engine | upstream-candidate | not-submitted | `video.ts: return globalThis\.fetch\(input, init\)` | video.ts call-time globalThis.fetch deferral |
-| 4 | engine | fork-only (DEFERRED) | n/a | `cursor.cc: file exists` | Screen.setCursorOverlay native binding |
-| 5 | engine | upstream-candidate | not-submitted | `skia_gpu.cc: EGL_CONTEXT_CLIENT_VERSION,\s*3` | skia_gpu ES3 shared context + accessors |
-| 6 | engine | upstream-candidate | not-submitted | `webgl_bridge.h: nx_gl_state_snap_t` | webgl_bridge state save/restore + tenant FBO |
-| 7 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_compose_if_active` | WebGL1 context via screen.getContext('webgl') |
-| 8 | engine | upstream-candidate (FIXED) | not-submitted | `webgl*-rendering-context.ts: NO for-of over GL_CONSTANTS` | V8 JIT crash fix — bulk defineProperties |
+| 1 | engine | upstream-candidate | PR-drafted(PR-A) | `image.ts: return globalThis\.fetch\(input, init\)` | image.ts call-time globalThis.fetch deferral |
+| 2 | engine | upstream-candidate | PR-drafted(PR-A) | `audio.ts: return globalThis\.fetch\(input, init\)` | audio.ts call-time globalThis.fetch deferral |
+| 3 | engine | upstream-candidate | PR-drafted(PR-A) | `video.ts: return globalThis\.fetch\(input, init\)` | video.ts call-time globalThis.fetch deferral |
+| 4 | engine | fork-only (SHIPPED 2026-06-30) | n/a | `cursor.h: nx_cursor_set_static` + `canvas.cc: js_set_cursor_overlay` + `skia_gpu.cc: cursor composite hook` | Screen.setCursorOverlay native binding |
+| 5 | engine | upstream-candidate | PR-drafted(PR-D) | `skia_gpu.cc: EGL_CONTEXT_CLIENT_VERSION,\s*3` | skia_gpu ES3 shared context + accessors |
+| 6 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl_bridge.h: nx_gl_state_snap_t` | webgl_bridge state save/restore + tenant FBO |
+| 7 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: nx_webgl_compose_if_active` | WebGL1 context via screen.getContext('webgl') |
+| 8 | engine | upstream-candidate (FIXED) | PR-drafted(PR-F) | `webgl*-rendering-context.ts: NO for-of over GL_CONSTANTS` | V8 JIT crash fix — bulk defineProperties |
 | 9 | engine | upstream-candidate | not-submitted | `webgl-rendering-context.ts: SRGB8_ALPHA8:` | v1 ES3 sized internalformat constants |
 | 10 | engine | upstream-candidate | not-submitted | `webgl.cc: bucket_e_translate_tex_image` | WebGL1 EXT_sRGB + HalfFloat translate |
 | 11 | engine | fork-only | n/a | `webgl.cc: maybe_replace_pmrem_fs` | PMREM r184 FS replacement |
 | 12 | **runtime** (MOVED) | fork-only | n/a | `cube-route-shim.ts: cubeUVSample` | samplerCube→sampler2D routing layer |
-| 13 | engine | upstream-candidate | not-submitted | `canvas.cc: set_font_size(context, context->state->font_size)` | canvas.cc font-size pin |
-| 14 | engine | upstream-candidate | not-submitted | `webgl.cc: webgl2ContextNew` | WebGL2 context factory |
-| 15 | engine | upstream-candidate | not-submitted | `webgl.cc: install_methods_v2` | v1/v2 FUNCS[] table split |
+| 13 | engine | upstream-candidate | PR-drafted(PR-C) | `canvas.cc: set_font_size(context, context->state->font_size)` | canvas.cc font-size pin |
+| 14 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: webgl2ContextNew` | WebGL2 context factory |
+| 15 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: install_methods_v2` | v1/v2 FUNCS[] table split |
 | 16 | engine | fork-only (diagnostic) | n/a | `webgl_bridge.cc: nx_webgl_state_probe_log` | passive state-contract probe |
-| 17 | engine | fork-only | n/a | `webgl_bridge.h: sampler_unit0` | nx_gl_state_snap_t extension (sampler_unit0 + read_fbo) |
+| 17 | engine | fork-only | PR-drafted(PR-D) | `webgl_bridge.h: sampler_unit0` | nx_gl_state_snap_t extension (sampler_unit0 + read_fbo) |
 | 17-superseded | **archive** (MOVED) | — | — | — | (original template, superseded by shipped #17) |
 | 18 | **runtime** (MOVED) | brewser-specific | n/a | `cube-route-shim.ts: safeBind` | cube-route-shim per-method capability guards |
 | 19 | engine (OPEN) | brewser-specific | n/a | KNOWN-OPEN — Phase 2.G.4 gate | v2 cube-routing applicability |
@@ -65,6 +65,9 @@ proposal verdict.
 | 24 | **runtime** (MOVED) | brewser-specific | n/a | `cube-route-shim.ts: allocateCubeRTAtlas` | Cube-RT-readback rescue |
 | 31 | engine (OPEN) | brewser-specific + upstream-candidate | not-submitted | demo-side: `gpgpu-water/main.js: renderer.resetState()` | Three.js WebGLState cache desync engine fix |
 | 34 | engine (OPEN) | upstream-candidate | not-submitted | runtime workaround: `web-audio-stubs.ts: v8-override-throw-stubs` | Audio createX no-throw stubs |
+| 35 | engine | upstream-candidate (with #6) | PR-drafted(PR-D) | `webgl_bridge.h: depth_mask` + `webgl_bridge.h: stencil_mask` | nx_gl_state_snap_t further extension: depth_mask + stencil_mask (cut #15) |
+| 36 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: nx_gl_state_snap_t user_snap` + `webgl.cc: user_snap.viewport[0]` | WebGL bracket-state-persistence via per-call shadow-tracked user_snap |
+| 37 | engine | upstream-candidate | not-submitted | `webgl.cc: w_tex_storage_3d` | v2 texStorage3D + texSubImage3D bindings (cut #32) |
 
 ## DISPOSITION POLICY
 
@@ -141,7 +144,7 @@ schemes via `globalThis.fetch` (see `installRuntimeFetch` design in
 brewser-runtime-v8/src/resources/runtime-fetch.ts), so the engine's own
 `Image` should honor that. No reason for upstream not to take it.
 
-**UPSTREAM STATUS:** `not-submitted` — flag for a TooTallNate PR.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md). — flag for a TooTallNate PR.
 
 **RE-APPLY / VERIFY NOTE.**
 
@@ -187,7 +190,7 @@ migration dropped both patches.
 **DISPOSITION:** `upstream-candidate`. Same engine-correctness reason
 as #1; ideally bundle both into a single upstream PR.
 
-**UPSTREAM STATUS:** `not-submitted`.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md)..
 
 **RE-APPLY / VERIFY NOTE.** Verify identically to #1 (grep image.ts +
 audio.ts for the local import). Same CALL-TIME gotcha applies. Same
@@ -216,14 +219,14 @@ completeness (the audit grep for `./fetch/fetch` importers caught it).
 **DISPOSITION:** `upstream-candidate`. Bundle into the same upstream
 PR as #1 + #2.
 
-**UPSTREAM STATUS:** `not-submitted`.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md)..
 
 **RE-APPLY / VERIFY NOTE.** Verify identically to #1/#2. Same CALL-TIME
 gotcha. Same fix shape.
 
 ---
 
-## #4 — Screen.setCursorOverlay / setAnimatedCursorOverlay — DEFERRED, NEEDS ENGINE BINDING
+## #4 — Screen.setCursorOverlay / setAnimatedCursorOverlay — SHIPPED 2026-06-30
 
 **File(s):** Native engine — port from QuickJS-era nx.js fork at
 `D:/Workspace/nxjs-source/source/main.c` lines ~180-694 (state +
@@ -283,9 +286,6 @@ rejected:
 
 **UPSTREAM STATUS:** `n/a` (fork-only).
 
-**DEFERRED** to a dedicated round (not in scope for the Step 1 →
-Step 2 transition). When picked up:
-
 **RE-APPLY / PORT NOTE.** The QuickJS-era implementation in
 `nxjs-source/source/main.c` is largely self-contained and JS-ABI-free
 inside `composite_cursor_overlay`; the four JS entry points only need
@@ -298,6 +298,32 @@ present hook (same place the QuickJS fork called it: after
 runtime TS surface in `brewser-runtime-v8/src/graphics/screen.ts`
 already matches the four-method signature; no runtime-side change
 needed once the binding is in place.
+
+### ADDENDUM 2026-07-02 — SHIPPED VERIFIED
+
+**Status upgrade.** SHIPPED via new [source/cursor.cc](source/cursor.cc)
+(312 LOC) + [source/cursor.h](source/cursor.h) (94 LOC), 4 JS
+bindings registered on the Screen prototype in
+[source/canvas.cc:2058-2061](source/canvas.cc), and the compositor
+hook wired into `nx_skia_gpu_present` at
+[source/skia_gpu.cc:252-259](source/skia_gpu.cc). Hardware-verified
+2026-06-30 — cursor visible on real CFW Switch, no trail, demos at
+60 fps.
+
+**Function-name delta from the pre-ship RE-APPLY note.** The QuickJS
+names (`nx_set_cursor_overlay`, etc.) were **not** used verbatim in
+the V8 port. Ship-time names are `nx_cursor_set_static`,
+`nx_cursor_set_animated`, `nx_cursor_set_position`, `nx_cursor_clear`
+— defined in [source/cursor.h](source/cursor.h) at ~lines 53-82 and
+called from `js_set_cursor_overlay` / `js_set_animated_cursor_overlay`
+/ `js_set_cursor_overlay_position` / `js_clear_cursor_overlay` in
+canvas.cc at ~lines 1985-2038. Verify-patches.sh strengthened to
+grep these content-level symbols (see #4 checks in
+`scripts/verify-patches.sh`).
+
+**DISPOSITION unchanged.** Still `fork-only`. See
+[[project-v8-cursor-compositor-shipped]] for the full investigation
+log.
 
 ---
 
@@ -315,7 +341,7 @@ needed once the binding is in place.
 
 **DISPOSITION:** `upstream-candidate`. The shared-context capability is general (any embedder benefits from coexisting Skia + raw GLES rendering on one context). The accessor surface is small + non-brewser-specific. ES3 is a strict superset of ES2 — Ganesh-GL is happy on ES3 (proven across 4,013 frames in the Phase 0 spike + verified by the `[skia] GL version=` log at boot post-2.A). The whole upstream WebGL2 path also assumes ES3 already, so consolidating the EGL/context creation onto skia_gpu and having webgl.cc attach is an upstream win — drops their duplicated EGL init.
 
-**UPSTREAM STATUS:** `not-submitted`. Bundle into a Step-2 PR once 2.D is GREEN (proof point: geometry-cube renders end-to-end through the shared context). Premature to PR before there's a demonstrated working bridge on top.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md).. Bundle into a Step-2 PR once 2.D is GREEN (proof point: geometry-cube renders end-to-end through the shared context). Premature to PR before there's a demonstrated working bridge on top.
 
 **RE-APPLY / VERIFY NOTE.**
 
@@ -412,7 +438,7 @@ upstream PR. The `[webgl] test_fbo` config flag is Phase 2.B
 scaffolding and would be DROPPED from any upstream submission (it's
 the smoke driver, not the primitive).
 
-**UPSTREAM STATUS:** `not-submitted`. Bundle into a Step-2 PR alongside
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md).. Bundle into a Step-2 PR alongside
 #5 once 2.D is GREEN.
 
 **RE-APPLY / VERIFY NOTE.**
@@ -499,7 +525,7 @@ The two fork-specific hooks (`enableGpuBridgePrototype`,
 for canvas-runner.ts compatibility and would be deleted before any
 upstream PR (after canvas-runner drops the check, planned for 2.E).
 
-**UPSTREAM STATUS:** `not-submitted`. Bundle into the same Step-2 PR as
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md).. Bundle into the same Step-2 PR as
 #5 + #6 once 2.D is GREEN. Drop the fork-specific hooks first.
 
 **RE-APPLY / VERIFY NOTE.**
@@ -600,7 +626,7 @@ and idiomatic — millions of programs use `Object.entries` + for-of —
 but at this scale on Tegra's V8 port it crashes the JIT. We've stopped
 triggering it; the underlying V8 codegen bug still exists.
 
-**UPSTREAM STATUS:** `not-submitted`. Candidate-3 (V8/switch-v8 minimal
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-F, branch `upstream-pr/F-jit-safe-defineproperties`. See [upstream-prs/PR-F.md](upstream-prs/PR-F.md).. Candidate-3 (V8/switch-v8 minimal
 repro) remains a worthwhile low-priority follow-up — we've stopped
 triggering the V8 bug, not fixed it. Minimal repro facts: a module-body
 function running `for (const [k, v] of Object.entries(obj))` calling
@@ -974,6 +1000,41 @@ embedded GLSL template; the exact source lives in QuickJS-era
   check it picks up Three.js's emitted values rather than falling back
   to the hardcoded 1536/2048/8 defaults.
 
+### ADDENDUM 2026-07-02 — STILL-UNVERIFIED post-2.G demo push
+
+**Verdict: STILL-UNVERIFIED.** The 2026-07-02 review of the shipped
+2.G demo suite (materials-envmaps, materials-cubemap-dynamic,
+webgl2-multiple-rendertargets, webgl2-ubo, webgl2-texture2darray,
+webgl2demo Sunset Sea, spectraplay visualizer, sensors gyro cube,
+gpgpu-water, webgl-lights-spotlight, webgl-materials-video plus the
+v1 side webgl-materials-cubemap / webgl-loader-gltf / geometry-cube /
+webgl-shadowmap) did not surface a demo that exercises r184
+PMREM cube-convolution.
+
+**Reasoning.**
+- The one PMREM-using demo, `webgl-loader-gltf`, is explicitly
+  pinned to Three.js r162 via `__THREE_R162_STAGED__` (per this
+  entry above and [[reference-pmrem-tegra-compiler-workaround]]),
+  so its PMREM path uses r162's FS which does not contain the
+  `PMREMGGXConvolution` substring.
+- `materials-envmaps` uses `scene.background = equirectTex` via
+  `CubemapFromEquirect` — that path allocates a WebGLCubeRenderTarget
+  and renders the equirect projection into cube faces WITHOUT going
+  through PMREM's GGX-importance-sample step. Cut #24 (cube-RT
+  readback rescue) is what makes this work; PMREM is not involved.
+- `materials-cubemap-dynamic` uses `CubeCamera` per-frame — again
+  no PMREM.
+- All other v2 demos either use LDR paths or have no IBL at all.
+
+The `maybe_replace_pmrem_fs` gate is verified to be dormant on
+this suite (no `[f1:pmrem-fs]` diagnostic firings when re-enabled
+2026-06-29). But **no demo has actually exercised the replacement
+FS's runtime behavior end-to-end on Mesa-Nouveau + r184 PMREM**.
+Status remains APPLIED-BUT-UNVERIFIED. Verification requires a
+demo that uses `scene.environment = pmremGenerator.fromEquirectangular(
+hdrTex).texture` with a Three.js r184 renderer — none currently in
+the suite.
+
 ---
 
 ## #12 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#12)
@@ -1061,7 +1122,7 @@ than sharing the FontFace's instances, but that's a larger refactor
 with allocation-rate + memory implications; the per-text-op
 `set_font_size` re-pin is the minimal, surgical fix.
 
-**UPSTREAM STATUS:** `not-submitted` (2026-06-30). Worth a PR after a
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-C, branch `upstream-pr/C-fonface-charsize-pin`. See [upstream-prs/PR-C.md](upstream-prs/PR-C.md). (2026-06-30). Worth a PR after a
 minimal repro is reduced — likely "two `OffscreenCanvas` instances,
 both set `ctx.font = '14px system-ui'`, one calls save/font('20px')/
 fillText/restore, the other does fillText and gets text at 10 px."
@@ -1183,7 +1244,7 @@ inside a Skia-bridged shared-context architecture benefits from the
 separate v1/v2 factory + init binding split. File a PR after 2.G is
 hardware-verified end-to-end.
 
-**UPSTREAM STATUS:** `not-submitted`.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md)..
 
 **RE-APPLY / VERIFY NOTE.** After upstream pull, `grep` engine
 `source/webgl.cc` for `webgl2ContextNew` and `webgl2InitClass`. If absent,
@@ -1279,7 +1340,7 @@ at all, so the question of split-shape never arose there.
 **DISPOSITION:** `upstream-candidate`. Any embedder splitting v1/v2 into
 separate exposed surfaces benefits. Bundle into the same PR as #14.
 
-**UPSTREAM STATUS:** `not-submitted`.
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md)..
 
 **RE-APPLY / VERIFY NOTE.** After upstream pull, look for
 `install_methods_v2` next to `install_methods` in webgl.cc. If only one
@@ -1770,6 +1831,37 @@ breaks something, the patch hierarchy is:
 attempt to resolve in 2.G.1 (webgl2-ubo slice — no cube usage) or
 2.G.2 (webgl2-multiple-rendertargets — no cube usage).
 
+### ADDENDUM 2026-07-02 — RESOLVED: v2 uses the SAME cube-route-shim as v1
+
+**Verdict: v2 uses the SAME shim as v1 (no fork, no narrowing).**
+Phase 2.G.4 completed with both `materials-envmaps` (v2 equirect →
+cube-RT background) and `materials-cubemap-dynamic` (v2 CubeCamera
+per-frame) rendering correctly on Citron via
+`installCubeRouting(gl)` on the shared v2 GL context. See
+[../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md)
+#12 (extended with the #24 rescue for CubeCamera / WebGLCubeRenderTarget
+FBO writes).
+
+**Evidence.**
+- Both demos exercise `gl.constructor.name === 'WebGL2RenderingContext'`
+  and hit the identical `installCubeRouting(gl)` call site at
+  `canvas-runner.ts::getSharedScreenGL2` (post-#18 safeBind guards).
+- GLSL ES 300 branch in `cube-route-shim.ts::rewriteCubeShader`
+  (see `cube-route-shim.ts:647` region — `texture(sampler, dir)`
+  → `cubeUVSample(sampler, dir)` rewrite) fires correctly on v2
+  shader-source calls; identifier scoping preserved (regular
+  `sampler2D` calls untouched).
+- No `samplerCubeShadow` demo in the current suite exercises the
+  gap noted in the original entry — that remains a DEFERRED
+  future consideration; when a point-light-shadow demo lands,
+  extend the shim per the "parallel rewrite" plan documented in
+  RUNTIME_SHIMS.md #21 (shadow-route-shim).
+
+**Status transition.** OPEN → **RESOLVED — cube-route-shim
+applies unchanged to v2**. Not moved to RUNTIME_SHIMS.md because
+the shim itself already lives there (#12); this ledger entry
+captured the "does v2 need it" question, which is now answered.
+
 ---
 
 ## #20 — UNPACK_FLIP_Y_WEBGL honor for typed-array texImage2D uploads — OPEN, Phase 2.G.4+ engine fix deferred
@@ -1807,6 +1899,28 @@ Ship alongside a systematic sweep of DataTexture uploads with `flipY=true` — v
 *To verify the workaround is still needed* after any V8-engine upstream pull: grep `source/webgl.cc` for `unpack_flip_y`. If the flag is only set (in `w_pixel_storei`) and never read from `w_tex_image_2d` / `w_tex_sub_image_2d`, workaround still needed.
 
 *To upgrade to the engine fix.* When ready to ship engine-side, drop the client-side pre-flip loops in both rgbe-loader.js files (restore `tex.flipY = true`), implement engine-side flip per the recipe above, and sweep the rest of the codebase for latent compensating pre-flips.
+
+### ADDENDUM 2026-07-02 — engine-side fix STILL DEFERRED post-2.G
+
+**Verdict: engine-side fix still DEFERRED; demo-side rgbe-loader.js
+row-reverse workaround still the stopgap.**
+
+Verification: grep of current [source/webgl.cc](source/webgl.cc)
+for `unpack_flip_y` matches only 5 lines — the flag definition at
+line 116 and its `w_pixel_storei` write at line 578. `w_tex_image_2d`
+and `w_tex_sub_image_2d` still do NOT read the flag; the engine
+still ignores the WebGL spec's flipY semantics for typed-array
+uploads.
+
+The blast-radius sweep of DataTexture uploads with `flipY=true`
+(prerequisite named in the entry above) was not conducted during
+the 2.G demo push. Ship-blocked on that sweep; not blocked on any
+active demo work.
+
+Recurrence tell unchanged: any demo whose typed-array texture
+appears vertically flipped in the offscreen output vs the source
+data is either regressed rgbe-loader (workaround gone) or a new
+consumer of the same gap.
 
 ---
 
@@ -1927,6 +2041,88 @@ Symptom re-appeared 2026-07-02 in spectraplay (MP3 Play button "does nothing"). 
 *Recurrence tell.* Any app whose `try { audioContext.createMediaElementSource(el); ... } catch { ... }` block runs → no audio afterwards. Log signature: `[page] "audio graph init failed..." Error: Method not implemented. at createMediaElementSource (nxjs:src/audio/audio-context.ts:...)`. If the polyfill regresses (STUBS_BUILD_TAG guard reintroduced, or polyfill loading order breaks), the log will show `[stubs] "BEFORE: createMediaElementSource=function ... AFTER: createMediaElementSource=function"` with the SAME `=function` on both sides — the polyfill saw the throw-stub and didn't overwrite it.
 
 *Design contract.* The polyfill's fakeNode returns a connect-passthrough; the fakeAnalyser fills its `getByteFrequencyData` / `getByteTimeDomainData` outputs with zeros. Visualization degrades to silence-tracking (all-zero waveform), but audio *playback* is preserved. If a future upstream implementation of `createAnalyser` etc. lands, the polyfill's unconditional override in `definePrototypeMethod` will silently clobber it — remove the polyfill entries for methods upstream now implements, and consider re-introducing the guard scoped to specific method names.
+
+---
+
+## #35 — nx_gl_state_snap_t further extension for depth_mask + stencil_mask (Phase 2.G.1 cut #15) — SHIPPED 2026-07-01
+
+**File(s):** [source/webgl_bridge.h](source/webgl_bridge.h) — struct extended with `GLboolean depth_mask` and `GLint stencil_mask`; [source/webgl_bridge.cc](source/webgl_bridge.cc) — `nx_gl_state_save` reads `GL_DEPTH_WRITEMASK` and `GL_STENCIL_WRITEMASK`; `nx_gl_state_restore` writes them back via `glDepthMask` and `glStencilMask`.
+
+**STATUS: SHIPPED 2026-07-01** via commit `3b5c815`. Contract extension → new entry (not addendum to #17), per the "contract extension = new entry" precedent set by the #17/#17-superseded split.
+
+**Root cause.** The 2.B FROZEN contract omitted `DEPTH_WRITEMASK` and `STENCIL_WRITEMASK` with the reasoning "Ganesh resets these per-draw". That IS true for Skia's own draws, but when Three.js runs BETWEEN Skia frames, Three.js's `WebGLState` cache assumes depth mask starts at TRUE (WebGL default) and short-circuits `gl.depthMask(TRUE)` calls whose cached value matches. If Ganesh left `GL_DEPTH_WRITEMASK` at FALSE (Skia's 2D drawing doesn't want depth writes), Three.js's cache is out of sync with the actual GL state; `gl.clear(DEPTH_BUFFER_BIT)` silently becomes a no-op; the depth buffer stays at its previous frame's values (or uninitialized 0); LESS depth test rejects every cube fragment.
+
+**Symptom.** Draws succeed with no GL error, all state introspection reports clean, no pixels land on the color texture. First surfaced on `webgl2demo Sunset Sea` and `instancing-dynamic` — depth-testing v2 demos that expected the WebGL default `depthMask = TRUE` on frame entry.
+
+**Isolation-test that confirmed the mechanism (cut #14h — since reverted).** Manually calling `glDisable(GL_DEPTH_TEST)` at the top of the demo's animate loop made the same instanced draw produce cube pixels immediately, ruling out geometry/shader/uniform issues and localizing to depth writes.
+
+**Fix (shipped).** Snap the two writemasks in and out of the bridge along with the existing 20-entry contract. `stencil_mask` added alongside `depth_mask` because the same Skia-cache-desync mechanism affects the stencil buffer; not currently exercised by a shipping demo, but the pair is symmetric and the query cost is one extra `glGetIntegerv` per frame.
+
+**Why upstream-vanilla lacks it.** No coexistence bridge; no state contract to extend.
+
+**DISPOSITION:** `upstream-candidate` (with #6). If PR-D (the coexistence primitive) lands, this extension bundles with it because the whole snap contract needs to travel together.
+
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md).. Bundled with PR-D.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl_bridge.h](source/webgl_bridge.h) for `depth_mask` and `stencil_mask` — presence confirms the extension. Recurrence tell: any v2 demo where `gl.clear(DEPTH_BUFFER_BIT)` appears to no-op (depth-tested geometry disappears after the first Skia frame) is this bug returning.
+
+---
+
+## #36 — WebGL bracket-state-persistence via per-call shadow-tracked user_snap (Phase 2.G.1 cut #14) — SHIPPED 2026-07-01, EVOLVED 2026-07-02
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `WebGLState` extended with `nx_gl_state_snap_t user_snap` + `bool user_snap_valid` + `GLuint auto_user_vao`; `enter_bracket` restores from `user_snap` (frame 2+) after cut #15's WebGL-defaults reset; every state-modifying `w_*` method writes its post-call value into the relevant `user_snap.<field>` (per-call shadow tracking). Auto-allocated user VAO ensures WebGL 1 demos that never explicitly bind a VAO still get attribute-state isolation from Skia's default-VAO usage.
+
+**STATUS: SHIPPED 2026-07-01, EVOLVED 2026-07-02.** Multi-round design evolution documented in [[reference-bracket-state-persistence-bug]]:
+- **Round 1** (piecemeal): tracked `user_program` / `user_vao` / `user_tex_2d_tu0` as scalar fields; restored in `enter_bracket`. Fixed webgl2demo Sunset Sea + spectraplay visualizer + sensors gyro cube.
+- **Round 2**: added `viewport` tracking (still scalar fields).
+- **Round 3** (save-at-exit): unified into a `user_snap` copy of `nx_gl_state_snap_t`, captured via `nx_gl_state_save(&user_snap)` at `exit_bracket()`. Broke DT/DM because by exit time Skia had already clobbered them → user_snap captured 0/FALSE.
+- **Round 4 (final)**: per-call shadow tracking — every state-modifying `w_*` method writes its post-call value directly into the relevant `user_snap.<field>` (e.g., `w_use_program` writes `st->user_snap.program = p`; `w_enable` writes `st->user_snap.blend = GL_TRUE` etc.; `w_depth_mask` writes `st->user_snap.depth_mask = m`). `user_snap` now always reflects the demo's INTENT, not whatever GL happened to be in when the bridge next crossed. **Verified via webgl2-multiple-rendertargets brown-stripe fix (2026-07-02 CITRON+HARDWARE)** — drawBuffers + blend + depth persistence all recovered.
+
+**Root cause.** `enter_bracket()` restores Skia's saved snap so the WebGL section starts from Skia's expected GL state. That is WRONG for the DEMO's INTENT: after Skia's frame, the demo's user-visible state (program, VAO, TEXTURE_2D binding, depth mask, blend enable, ...) has been clobbered. The demo's Three.js material system re-emits most state per material per frame, which is why simple demos worked — but raw-WebGL demos (webgl2demo Sunset Sea RAF-driven fullscreen effect, spectraplay visualizer inline canvas, sensors gyro cube) initialize state ONCE at boot and expect the WebGL spec's per-context state persistence.
+
+**Symptom.** Demos that render exactly one frame ever (post-init state got captured), then remain frozen through subsequent RAFs; OR demos that render but with wrong colors / no depth / wrong textures per frame (partial clobber; different subset of state persists depending on which glCall path Three.js took last frame). Sunset Sea locked at 100% frozen scene despite RAF ticking at 60 fps.
+
+**Fix (shipped).** Per-call shadow-tracking on every state-modifying `w_*` method. Complete list at commit tip: `w_viewport`, `w_enable`, `w_disable`, `w_use_program`, `w_bind_vertex_array`, `w_bind_texture` (TU0-only), `w_active_texture`, `w_depth_mask`, `w_stencil_mask`, `w_blend_func` variants, `w_color_mask`, `w_clear_color`, plus a handful of others. `enter_bracket` restores from `user_snap` (frame 2+, gated by `user_snap_valid`). Auto-allocated user VAO isolates the demo's default-VAO attribute state from Skia's.
+
+**Symptom manifestations resolved.**
+- webgl2demo Sunset Sea — no longer frozen (2026-07-01 Citron + hardware).
+- spectraplay visualizer — viewport + blend restored per frame (2026-07-01).
+- sensors gyro cube — depth-test + attribute state restored (2026-07-01).
+- webgl2-multiple-rendertargets brown-stripe — drawBuffers + blend + depth persistence via #36 + #35 combined (2026-07-02 CITRON + HARDWARE verified).
+
+**Why upstream-vanilla lacks it.** No coexistence bridge; the WebGL spec's own state persistence is trivially satisfied when nothing else is drawing on the same context. Skia stealing the context is what breaks the assumption.
+
+**DISPOSITION:** `upstream-candidate`. General correctness for any embedder with a Skia/WebGL coexistence bridge. Bundle with PR-D (the primitive).
+
+**UPSTREAM STATUS:** `PR-drafted(local)` — PR-D, branch `upstream-pr/D-skia-webgl-coexistence`. See [upstream-prs/PR-D.md](upstream-prs/PR-D.md).. Bundled with PR-D.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `user_snap.viewport[0] = x`. If absent, the per-call shadow tracking regressed. Also check `WebGLState` for `nx_gl_state_snap_t user_snap;` + `bool user_snap_valid;` fields. Recurrence tell: a raw-WebGL demo that renders exactly one frame then freezes (or renders but with wrong colors per frame) — that's the bracket state persistence bug returning.
+
+**Cross-references.**
+- [[reference-bracket-state-persistence-bug]] — full investigation log.
+- #35 (depth_mask + stencil_mask snap extension) — companion contract extension; both surfaced together during the webgl2-multiple-rendertargets brown-stripe hunt.
+
+---
+
+## #37 — texStorage3D + texSubImage3D method bindings for v2 (Phase 2.G.1 cut #32) — SHIPPED 2026-07-01
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `w_tex_storage_3d` + `w_tex_sub_image_3d` FN implementations + `install_methods_v2` FUNCS[] entries.
+
+**STATUS: SHIPPED 2026-07-01** via commit `3c26bff` (webgl2 demo fixed).
+
+**Root cause.** Three.js r184's WebGL2 backend unconditionally calls `state.texStorage3D` + `state.texSubImage3D` for `DataArrayTexture` / `Data3DTexture` uploads ([WebGLTextures.js:1174/1190/1198](https://github.com/mrdoob/three.js)). Both wrappers try/catch and silently swallow `"gl.texStorage3D is not a function"` errors, so without these bindings the array-texture storage is never allocated → `sampler2DArray` / `sampler3D` reads return `vec4(0)`.
+
+**Symptom.** webgl2-texture2darray renders black on both Citron and hardware; no error surfaced in the log (silent try/catch in Three.js). Any v2 demo that uploads to a texture array or 3D texture would exhibit the same silent failure.
+
+**Fix (shipped).** Direct passthrough — no format massaging required (GLES3 spec matches WebGL2 spec 1:1 for these entry points). `w_tex_storage_3d(target, levels, internalformat, width, height, depth)` → `glTexStorage3D(...)`. `w_tex_sub_image_3d(target, level, x, y, z, w, h, d, format, type, pixels)` → `glTexSubImage3D(...)`. Both use the shared `enter_bracket()` prelude for state-contract coordination.
+
+**Why upstream-vanilla lacks it.** Upstream V8 nx.js's WebGL2 method table exists but doesn't include these entries in the version we forked from (upstream beta.5's WebGL2 surface predates Three.js r184 usage patterns).
+
+**DISPOSITION:** `upstream-candidate`. Method surface expansion — general benefit for any embedder running Three.js r184+ on a v2 context.
+
+**UPSTREAM STATUS:** `not-submitted`. Bundle with PR-D (WebGL2 method surface) or ship as a small standalone PR alongside PR-A/F/C if PR-D lags.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `w_tex_storage_3d`. Recurrence tell: `webgl2-texture2darray` (or any DataArrayTexture demo) renders black with no error in nxjs-debug.log → this binding regressed.
 
 ---
 

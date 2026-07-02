@@ -34,6 +34,15 @@ enum nx_audio_node_type {
 	// the render thread drains a quantum at a time. The consumed-frame
 	// counter is the A/V sync master clock.
 	NX_AUDIO_NODE_STREAM_SOURCE = 4,
+	NX_AUDIO_NODE_OSCILLATOR = 5,
+};
+
+// OscillatorNode wave types (matches OscillatorType wire values in JS).
+enum nx_audio_oscillator_type {
+	NX_AUDIO_OSCILLATOR_SINE = 0,
+	NX_AUDIO_OSCILLATOR_SQUARE = 1,
+	NX_AUDIO_OSCILLATOR_SAWTOOTH = 2,
+	NX_AUDIO_OSCILLATOR_TRIANGLE = 3,
 };
 
 // AudioParam automation event types (matches the JS side's wire protocol).
@@ -93,7 +102,11 @@ struct nx_audio_node {
 	//   GAIN:          0 = gain
 	//   STEREO_PANNER: 0 = pan
 	//   BUFFER_SOURCE: 0 = playbackRate, 1 = detune
+	//   OSCILLATOR:    0 = frequency, 1 = detune
 	std::vector<nx_audio_param> params;
+
+	// ---- OscillatorNode state ----
+	int oscillator_type = NX_AUDIO_OSCILLATOR_SINE;
 
 	// ---- AudioBufferSourceNode state ----
 	// Channel data points into externally-owned memory (V8 BackingStores);
@@ -182,6 +195,9 @@ void nx_audio_source_start(nx_audio_node *n, double when, double offset,
                            double duration);
 void nx_audio_source_stop(nx_audio_node *n, double when);
 int nx_audio_source_playback_state(nx_audio_node *n);
+
+// ---- oscillator ----
+void nx_audio_oscillator_set_type(nx_audio_node *n, int type);
 
 // ---- stream source (producer side; lock-free, single producer thread) ----
 // Number of frames that can currently be written without overwriting.

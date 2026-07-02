@@ -261,6 +261,76 @@ void process_buffer_source(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	}
 }
 
+// Naive (non-band-limited) oscillator: adequate for UI beeps, chords, and
+// simple tone tests. Higher partials on non-sine waves will alias above
+// Nyquist; a proper band-limited implementation (PolyBLEP or BLIT) is a
+// future upgrade. `n->position` is repurposed as the fractional-cycle phase
+// in [0, 1).
+void process_oscillator(nx_audio_graph *g, nx_audio_node *n, double t0) {
+	zero_bus(n);
+	n->bus_ch = 1;
+	if (!n->started || n->playback_state == NX_AUDIO_SOURCE_FINISHED)
+		return;
+
+	double inv_sr = 1.0 / g->sample_rate;
+	float freq[Q];
+	float detune[Q];
+	param_fill(&n->params[0], t0, inv_sr, freq, Q);
+	param_fill(&n->params[1], t0, inv_sr, detune, Q);
+
+	bool finished = false;
+	for (int i = 0; i < Q; i++) {
+		double t = t0 + i * inv_sr;
+		if (n->stop_time >= 0 && t >= n->stop_time) {
+			finished = true;
+			break;
+		}
+		if (t < n->start_time)
+			continue;
+		if (!n->playing) {
+			n->playing = true;
+			n->position = 0; // phase in [0, 1)
+		}
+		double f = (double)freq[i] * pow(2.0, (double)detune[i] / 1200.0);
+		double p = n->position;
+		float s;
+		switch (n->oscillator_type) {
+		case NX_AUDIO_OSCILLATOR_SQUARE:
+			s = p < 0.5 ? 1.f : -1.f;
+			break;
+		case NX_AUDIO_OSCILLATOR_SAWTOOTH: {
+			double x = p - floor(p + 0.5);
+			s = (float)(2.0 * x);
+			break;
+		}
+		case NX_AUDIO_OSCILLATOR_TRIANGLE: {
+			double q = p - 0.25;
+			q -= floor(q);
+			s = (float)(4.0 * fabs(q - 0.5) - 1.0);
+			break;
+		}
+		case NX_AUDIO_OSCILLATOR_SINE:
+		default:
+			s = (float)sin(p * 6.283185307179586);
+			break;
+		}
+		n->bus[0][i] = s;
+		n->bus[1][i] = s;
+		p += f * inv_sr;
+		// Wrap phase; handle both positive and (rare) negative-frequency
+		// cases without a floor call in the hot path when unnecessary.
+		if (p >= 1.0)
+			p -= floor(p);
+		else if (p < 0.0)
+			p -= floor(p);
+		n->position = p;
+	}
+	if (finished) {
+		n->playback_state = NX_AUDIO_SOURCE_FINISHED;
+		n->playing = false;
+	}
+}
+
 void process_stream_source(nx_audio_graph *g, nx_audio_node *n) {
 	zero_bus(n);
 	n->bus_ch = 2;
@@ -350,6 +420,9 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	case NX_AUDIO_NODE_BUFFER_SOURCE:
 		process_buffer_source(g, n, t0);
 		break;
+	case NX_AUDIO_NODE_OSCILLATOR:
+		process_oscillator(g, n, t0);
+		break;
 	case NX_AUDIO_NODE_STREAM_SOURCE:
 		process_stream_source(g, n);
 		break;
@@ -376,7 +449,8 @@ void render_quantum(nx_audio_graph *g) {
 	// Sources not reachable from the destination still progress through their
 	// schedule (so `ended` fires even for unconnected/indirect sources).
 	for (nx_audio_node *n : g->nodes) {
-		if (n->type == NX_AUDIO_NODE_BUFFER_SOURCE &&
+		if ((n->type == NX_AUDIO_NODE_BUFFER_SOURCE ||
+		     n->type == NX_AUDIO_NODE_OSCILLATOR) &&
 		    n->processed_quantum != g->quantum_id)
 			process_node(g, n, t0);
 	}
@@ -415,6 +489,21 @@ nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type) {
 		n->params.push_back(rate);
 		nx_audio_param detune;
 		detune.value = 0.f;
+		n->params.push_back(detune);
+		break;
+	}
+	case NX_AUDIO_NODE_OSCILLATOR: {
+		nx_audio_param frequency;
+		frequency.value = 440.f;
+		// Per spec: min = -Nyquist, max = +Nyquist.
+		float nyq = (float)(g->sample_rate * 0.5);
+		frequency.min_value = -nyq;
+		frequency.max_value = nyq;
+		n->params.push_back(frequency);
+		nx_audio_param detune;
+		detune.value = 0.f;
+		detune.min_value = -153600.f;
+		detune.max_value = 153600.f;
 		n->params.push_back(detune);
 		break;
 	}
@@ -622,6 +711,11 @@ void nx_audio_source_stop(nx_audio_node *n, double when) {
 int nx_audio_source_playback_state(nx_audio_node *n) {
 	std::lock_guard<std::mutex> lock(n->graph->mutex);
 	return n->playback_state;
+}
+
+void nx_audio_oscillator_set_type(nx_audio_node *n, int type) {
+	std::lock_guard<std::mutex> lock(n->graph->mutex);
+	n->oscillator_type = type;
 }
 
 uint32_t nx_audio_stream_writable(nx_audio_node *n) {

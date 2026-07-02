@@ -223,6 +223,75 @@ void nx_image_close(const FunctionCallbackInfo<Value> &info) {
 		close_image(image);
 }
 
+// Copy `width*height*4` RGBA bytes from `argv[1]` into the image's backing
+// buffer with the RGBA→BGRA-premultiplied swizzle Skia expects. Used by
+// brewser's `<video>` frame delivery to feed decoded FFmpeg RGBA frames into
+// an ImageBitmap that can be drawn via the standard drawImage(img, ...)
+// path — which scales via Skia (unlike `putImageData` on an OffscreenCanvas
+// where a raw data-buffer write can't invalidate the Ganesh texture cache
+// and every frame after the first would paint from the stale upload).
+// The image must have been constructed via `imageNew(w, h)` so it has a
+// backing buffer allocated up-front.
+void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (info.Length() < 2) {
+		nx_throw(iso, "imageWriteRGBA: expected (image, bytes)");
+		return;
+	}
+	nx_image_t *image = nx_get_image(iso, info[0]);
+	if (!image) {
+		nx_throw(iso, "imageWriteRGBA: first arg must be an Image");
+		return;
+	}
+	if (!image->data || image->width == 0 || image->height == 0) {
+		nx_throw(iso,
+		         "imageWriteRGBA: image has no backing buffer — construct via "
+		         "imageNew(width, height)");
+		return;
+	}
+	size_t src_size = 0;
+	uint8_t *src = NX_GetBufferSource(iso, &src_size, info[1]);
+	if (!src) {
+		nx_throw(iso, "imageWriteRGBA: second arg must be ArrayBuffer or "
+		              "TypedArray");
+		return;
+	}
+	size_t expected = (size_t)image->width * (size_t)image->height * 4;
+	if (src_size < expected) {
+		nx_throw(iso, "imageWriteRGBA: buffer smaller than expected");
+		return;
+	}
+	uint8_t *dst = image->data;
+	size_t pixels = (size_t)image->width * (size_t)image->height;
+	for (size_t i = 0; i < pixels; i++) {
+		uint8_t r = src[i * 4 + 0];
+		uint8_t g = src[i * 4 + 1];
+		uint8_t b = src[i * 4 + 2];
+		uint8_t a = src[i * 4 + 3];
+		if (a == 0) {
+			dst[i * 4 + 0] = 0;
+			dst[i * 4 + 1] = 0;
+			dst[i * 4 + 2] = 0;
+			dst[i * 4 + 3] = 0;
+		} else if (a == 255) {
+			dst[i * 4 + 0] = b;
+			dst[i * 4 + 1] = g;
+			dst[i * 4 + 2] = r;
+			dst[i * 4 + 3] = a;
+		} else {
+			dst[i * 4 + 0] = (uint8_t)((b * a) / 255);
+			dst[i * 4 + 1] = (uint8_t)((g * a) / 255);
+			dst[i * 4 + 2] = (uint8_t)((r * a) / 255);
+			dst[i * 4 + 3] = a;
+		}
+	}
+	// Invalidate the memoized SkImage so canvas.cc's drawImage path rebuilds
+	// it (RasterFromPixmapCopy) with the fresh pixels. Without this, Ganesh's
+	// texture cache keys on the SkImage identity and every subsequent draw
+	// re-uses the first frame's texture upload.
+	nx_image_release_cache(image);
+}
+
 void nx_image_get_width(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_image_t *image = nx_get_image(iso, info.This());
@@ -294,4 +363,5 @@ void nx_init_image(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "imageNew", nx_image_new);
 	NX_SET_FUNC(init_obj, "imageDecode", nx_image_decode);
 	NX_SET_FUNC(init_obj, "imageClose", nx_image_close);
+	NX_SET_FUNC(init_obj, "imageWriteRGBA", nx_image_write_rgba);
 }

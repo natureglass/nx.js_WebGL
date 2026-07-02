@@ -503,6 +503,10 @@ export interface Init {
 	imageNew(width?: number, height?: number): Image | ImageBitmap;
 	imageDecode(img: Image | ImageBitmap, data: ArrayBuffer): Promise<void>;
 	imageClose(img: ImageBitmap): void;
+	imageWriteRGBA(
+		img: Image | ImageBitmap,
+		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+	): void;
 
 	// irs.c
 	irsInit(): () => void;
@@ -734,6 +738,7 @@ export interface Init {
 		loopEnd: number,
 	): void;
 	audioSourceState(node: AudioNodeHandle): number;
+	audioOscillatorSetType(node: AudioNodeHandle, type: number): void;
 	audioDecode(buffer: ArrayBuffer): Promise<{
 		channelData: ArrayBuffer[];
 		length: number;

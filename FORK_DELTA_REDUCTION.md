@@ -618,3 +618,315 @@ substitute for upstreaming, because:
 The C++/JS boundary was chosen well; wholesale migration trades
 compiled hot-path code for per-frame JS overhead and doesn't reduce
 the entries that actually cause the most rebase pain.
+
+---
+
+## ADDENDUM 2026-07-02 — per-element injection viability verdict for #1/#2/#3
+
+Follow-up to the "adopt narrowly" recommendation above. This section
+records the read-only investigation of whether the current engine
+runtime surface is sufficient to reimplement the #1/#2/#3 fixes as a
+brewser-runtime `polyfills/engine-augmentation.ts` module, or whether
+UPSTREAM-PR is the only path.
+
+**Investigation method (READ-ONLY, no engine or runtime edits).**
+Read the current runtime TS bodies of `image.ts`, `audio.ts`,
+`video.ts` in `packages/runtime/src/`, plus the `$` binding
+declaration at [packages/runtime/src/$.ts:926-927](packages/runtime/src/$.ts#L926):
+
+```ts
+export const $: Init = (globalThis as any).$;
+delete (globalThis as any).$;
+```
+
+**Critical constraint.** The `$` object is DELETED from `globalThis`
+immediately after the engine runtime bundle captures it. Brewser-
+runtime cannot reach `$.imageDecode`, `$.audioDecode`, `$.videoLoad`,
+`$.entrypoint` from userland. Any reimplementation of the src
+setters that goes through the native decoder bindings is
+NOT-INJECTABLE for that reason alone. The remaining question is
+whether a wrapper-strategy that avoids the private bindings works.
+
+**Trampoline strategy considered.** For each element type, override
+the prototype `src` setter (or `load` method) to:
+1. Late-parse the URL against `document.baseURI` (public in embedder
+   context) or the URL string passed in.
+2. If the scheme is in the engine's built-in accept set
+   (`http/https/blob/data/file/sdmc/romfs/nxjs`), call the ORIGINAL
+   setter unchanged — no wrap, no fetch, no allocation. Preserves
+   the FILE_SCHEMES streaming fast-path (video.ts short-circuits
+   these to a native decoder direct from filesystem, and bypassing
+   that path would force the whole file into memory).
+3. Otherwise (i.e. `brewser://` or any other embedder-registered
+   scheme), fetch the URL via `globalThis.fetch` (which brewser has
+   extended), wrap the resulting ArrayBuffer as a `Blob`, call
+   `URL.createObjectURL(blob)`, and pass the resulting `blob:` URL
+   to the ORIGINAL setter. Since the engine's built-in fetch
+   scheme-registry INCLUDES `blob:`, the engine's native
+   fetch/decode chain then completes exactly as if the URL had been
+   supplied as `blob:` directly.
+4. On the resulting `load` (or `canplaythrough`/`canplay`) event,
+   `URL.revokeObjectURL(blobUrl)` to release the memory.
+
+**Per-element verdict.**
+
+### #1 (image.ts) — **INJECTABLE-BY-REIMPLEMENTATION**
+
+Setter body inaccessible items: `_(this).src = url` (WeakMap-private
+internal state), `$.imageDecode(this, buf)` (private native
+binding). BUT the trampoline strategy above works: the wrapped
+setter delegates to the ORIGINAL setter with a `blob:` URL, so the
+private state and native binding are used through the engine's own
+path. LOC estimate: ~20 LOC in a brewser-runtime module (setter
+wrap + fetch + blob URL + one-shot event listener for revoke).
+
+**Caveats.**
+- Blob-URL allocation costs ~one `URL.createObjectURL` per `src=`
+  assignment; negligible.
+- If an embedder assigns `image.src = 'foo'` then re-assigns to
+  something else before `load` fires, the first blob URL leaks
+  unless the wrap tracks the pending-load state. Solvable with
+  ~5 LOC of `WeakMap<Image, string>` bookkeeping.
+- If the URL string is a data URL that decodes to a scheme-shaped
+  redirect (edge case), the wrap should not re-wrap it. The
+  scheme-detection gate handles this by treating `data:` as
+  built-in.
+
+### #2 (audio.ts) — **INJECTABLE-BY-REIMPLEMENTATION**
+
+Same structure as image.ts: `$.audioDecode` is private but the
+trampoline via blob: URL avoids touching it. `Audio.load()` is a
+public method (line 218) that reads the private `#src` — we can
+override either the `src` setter or `load()`. LOC estimate: ~20
+LOC.
+
+**Caveat.** `Audio` uses private `#src` fields (JavaScript private
+class members, not just convention). We cannot READ them from an
+external override, but we don't need to — we intercept at
+assignment time, so the wrap knows the string being assigned.
+Overriding `set src(val)` on the prototype works because the
+private field is set INSIDE the setter body; if we replace the
+setter, we can call the original setter (bound to the correct
+`this`) to run its private-field write.
+
+### #3 (video.ts) — **INJECTABLE-BY-REIMPLEMENTATION**
+
+`Video.src` setter delegates to a load path that BRANCHES on
+scheme: FILE_SCHEMES (romfs/sdmc/file/nxjs) → `$.videoLoad(handle,
+url, null)` (streaming), else → `fetch → arrayBuffer → $.videoLoad(
+handle, null, buf)` (memory-buffered). To preserve the streaming
+fast-path, the wrap MUST check scheme first and only trampoline
+non-built-in schemes. Same trampoline shape as #1/#2. LOC estimate:
+~25 LOC (has the extra scheme-detection branch to preserve
+streaming for built-in schemes).
+
+**Caveat.** The video streaming path is behavior-preserving only
+if the wrap correctly identifies which schemes are built-in. This
+list is defined at [packages/runtime/src/video.ts:33](packages/runtime/src/video.ts#L33)
+as `FILE_SCHEMES = new Set(['romfs:', 'sdmc:', 'file:', 'nxjs:'])`.
+The augmentation module has to hardcode a compatible list; a
+future engine change to that set would silently regress. This is
+one of the reasons UPSTREAM-PR is still preferred.
+
+### Summary + updated verdict
+
+All three (#1/#2/#3) are **INJECTABLE-BY-REIMPLEMENTATION** via
+the blob-URL trampoline. Total additional LOC estimate: ~100–120
+in one `brewser-runtime-v8/src/polyfills/engine-augmentation.ts`
+(base scaffold + 3 wraps + revoke bookkeeping + marker-based
+idempotency guard learned from #34).
+
+**Preferred path unchanged.** UPSTREAM-PR (PR-A) is still the
+right long-term answer — the trampoline preserves behavior but
+adds a per-src-assignment fetch/blob-alloc/decode cycle where the
+upstreamed fix would be zero-overhead. Ship the augmentation
+module as a stopgap only if PR-A is rejected or its review lags
+beyond an upstream pull cycle.
+
+**No verdict change needed for other entries.** #8/#9/#10/#11/#13/
+#14/#15/#22/#5/#6/#7/#17 remain NOT-INJECTABLE per the risk-flag
+analysis in Phase 2 (INIT-ORDER, HOT-PATH, CONTRACT). #34 already
+has a shipped runtime polyfill, so its INJECTABLE-BY-REIMPLEMENTATION
+status is a matter of record, not a proposal.
+
+---
+
+## ADDENDUM 2026-07-02 — session summary and human next-steps
+
+This session executed the Post-2.G consolidation task
+(state detection + ledger closing pass + PR-D preparation).
+
+### What shipped this session
+
+**Task 0 (state detection + backlog execution).**
+- Confirmed all four items of the prior follow-up backlog were
+  NOT done, then executed them:
+  - **0(c)** Verified `source/cursor.{cc,h}` (406 LOC) + canvas.cc
+    JS bindings + skia_gpu.cc compositor hook all shipped.
+    Upgraded ledger entry #4 heading `DEFERRED, NEEDS ENGINE
+    BINDING` → `SHIPPED 2026-06-30` with a full addendum
+    documenting the function-name delta from the pre-ship
+    RE-APPLY note (`nx_cursor_set_static` etc. instead of the
+    QuickJS-era `nx_set_cursor_overlay`). Strengthened
+    verify-patches.sh #4 check from file-exists to 8 content-level
+    greps.
+  - **0(b)** Appended meta-check to verify-patches.sh: warns
+    (non-fatal) for any ledger entry with no script check and any
+    script check with no ledger entry. Tombstone-aware.
+  - **0(d)** Read-only investigation of injection viability for
+    #1/#2/#3. All three verdict **INJECTABLE-BY-REIMPLEMENTATION**
+    via blob-URL trampoline pattern; ~100–120 LOC total for a
+    brewser-runtime engine-augmentation module. Preferred path
+    (UPSTREAM-PR) unchanged. Full analysis appended to this file
+    (section above).
+  - **0(a)** Drafted PR-A / PR-F / PR-C branches off
+    upstream/main tip (`34d2d03`), one commit each, minimal
+    generic diffs, no brewser mentions. Descriptions at
+    `upstream-prs/PR-A.md` / `PR-F.md` / `PR-C.md`. Ledger
+    UPSTREAM STATUS for #1/#2/#3/#8/#13 upgraded to
+    `PR-drafted(local)`.
+
+**Task 1 (ledger closing pass).**
+- Mined `git log --stat` across nxjs-source-v8 v8-migration +
+  brewser-runtime-v8 + brewser-apps for commits since 2026-06-30.
+- Added dated ADDENDA to existing entries:
+  - **#11** (PMREM r184 FS replacement): STILL-UNVERIFIED post-2.G
+    demo push. No demo in the current 15-demo suite exercises
+    r184 PMREM (webgl-loader-gltf uses r162; materials-envmaps and
+    materials-cubemap-dynamic don't use PMREM). The replacement
+    code is dormant.
+  - **#19** (v2 cube-routing applicability): RESOLVED — v2 uses
+    the SAME shim as v1 unchanged. Evidence: materials-envmaps +
+    materials-cubemap-dynamic both work via `installCubeRouting`
+    on v2 context on Citron.
+  - **#20** (UNPACK_FLIP_Y_WEBGL): engine-side fix STILL DEFERRED
+    post-2.G. Blast-radius sweep not conducted; rgbe-loader.js
+    demo-side workaround remains the stopgap.
+- Added three NEW entries #35, #36, #37 for shipped-but-
+  undocumented changes found in the 3b5c815, 3c26bff, and
+  38234ce commits:
+  - **#35** — `nx_gl_state_snap_t` extension for `depth_mask` +
+    `stencil_mask` (Phase 2.G.1 cut #15, SHIPPED 2026-07-01).
+    Contract extension = new entry per the #17/#17-superseded
+    precedent.
+  - **#36** — WebGL bracket-state-persistence via per-call
+    shadow-tracked `user_snap` (Phase 2.G.1 cut #14, SHIPPED
+    2026-07-01, EVOLVED 2026-07-02). Documents the 4-round
+    design evolution.
+  - **#37** — `texStorage3D` + `texSubImage3D` method bindings for
+    v2 (Phase 2.G.1 cut #32, SHIPPED 2026-07-01).
+- UBO probe verdict from #17: no additional snap-contract
+  extension needed beyond depth_mask/stencil_mask/sampler_unit0/
+  read_fbo (UBO indexed bindings verdict was `moot` per the
+  hardware probe SUMMARY line; documented in-entry).
+- Updated index table with entries #35/#36/#37.
+- Added 6 new verify-patches.sh content-level checks (2 for #35,
+  4 for #36, 2 for #37). **Final verify-patches.sh run: 47
+  checks, 0 MISSING, 0 meta warnings.**
+
+**Task 2 (PR-D preparation).**
+- Created `upstream-pr/D-skia-webgl-coexistence` branch off
+  upstream/main tip in a worktree at `D:/tmp/pr-drafts/PR-D`.
+- Committed the primitive files (12 files, +4447 / -2549) with
+  fork-specific `enableGpuBridgePrototype` +
+  `setBridgeAutoFlush` methods stripped from both engine and TS
+  surfaces. Commit `40fc1e9`.
+- Wrote `upstream-prs/PR-D.md` with honest scoping ("verified
+  across a curated 13-demo Three.js r184 WebGL2 suite on Tegra X1
+  hardware with V8 JIT enabled" — NOT full Three.js or
+  full-WebGL2 conformance), architecture rationale (single
+  shared EGL/ES3 context vs upstream's parallel-EGL model),
+  compilation status per file, and remaining-work items before
+  opening the actual upstream PR.
+- Upgraded UPSTREAM STATUS on #5/#6/#7/#14/#15/#17/#35/#36 to
+  `PR-drafted(PR-D)`.
+
+### What's on the branches (all four PRs, staged)
+
+```
+upstream-pr/A-fetch-deferral            ce83520  +40/-3   (image.ts, audio.ts, video.ts)
+upstream-pr/F-jit-safe-defineproperties f8bf7ff  +17/-3   (webgl2-rendering-context.ts)
+upstream-pr/C-fonface-charsize-pin      d150865  +13/-0   (canvas.cc)
+upstream-pr/D-skia-webgl-coexistence    40fc1e9  +4447/-2549  (12 files, primitive extraction)
+```
+
+All four are LOCAL branches only — no push, no PR opened.
+Worktrees stay at `D:/tmp/pr-drafts/PR-{A,F,C,D}` until the
+human user is ready to review.
+
+### Human next-steps
+
+**Immediate (this week):**
+
+1. **Review PR-A/F/C branches.** All three are small, tight
+   diffs. Suggested review order: PR-A → PR-F → PR-C. Diffs
+   in the worktrees; descriptions in
+   `nxjs-source-v8/upstream-prs/PR-{A,F,C}.md`.
+
+2. **File PR-A/F/C to TooTallNate.** These are the highest-ratio
+   PRs — if merged, retire 5 ledger entries with ~66 lines of
+   engine-TS + native diff. Push each branch to `origin`, open
+   the PR with the body from its markdown file.
+
+3. **Review PR-D branch + description.** Primitive is the
+   architectural upstream — the review takes longer, and the
+   description honestly flags what's still to do (comment
+   sanitation, standalone build verification, `source/main.cc`
+   wiring, feature-flag gating suggestion). Don't push until the
+   "remaining work" list is worked through.
+
+4. **Decide on the augmentation module** (#1/#2/#3 injection).
+   Verdict from Task 0(d): all three are
+   INJECTABLE-BY-REIMPLEMENTATION via blob-URL trampoline in
+   ~100–120 LOC. If PR-A takes long to land upstream, ship the
+   augmentation module in brewser-runtime as a stopgap — it
+   drops three engine-TS files off the modified-upstream list
+   immediately. If PR-A is expected to land quickly, skip the
+   augmentation module; the trampoline overhead isn't free.
+
+**Medium-term:**
+
+5. **Complete PR-D remaining work.** Comment sanitation (find
+   ~10 residual brewser mentions), standalone build check,
+   `source/main.cc` wiring diff, feature-flag gating decision
+   with upstream reviewers. Then file PR-D.
+
+6. **File PR-B (v1 constants + EXT_sRGB/HalfFloat translate).**
+   Blocks on PR-D landing (needs the v1 context surface upstream
+   first).
+
+7. **Prepare PR-E (Switch.VideoDecoder restoration).** API-parity
+   framing; independent of PR-D. Draft same as PR-A/F/C —
+   branch off upstream/main tip, primitive extraction, honest
+   PR description.
+
+**Deferred (needs work before it can land):**
+
+8. **PR-H (#20 UNPACK_FLIP_Y_WEBGL engine fix).** Do the
+   blast-radius sweep of DataTexture uploads first. Only ship
+   engine-side once the sweep confirms no downstream depends on
+   the compensation.
+
+9. **PR-I (#31 WebGLState cache-desync engine seam).** Design
+   review needed — three options proposed in the entry. Sweep
+   ping-pong demos to characterize the true blast radius, then
+   pick the least-invasive option.
+
+### Files to review
+
+- `nxjs-source-v8/upstream-prs/PR-A.md` — Image/Audio/Video
+  fetch deferral (retires #1/#2/#3).
+- `nxjs-source-v8/upstream-prs/PR-F.md` — JIT-safe
+  defineProperties for GL constants (retires #8).
+- `nxjs-source-v8/upstream-prs/PR-C.md` — canvas.cc font-size
+  pin (retires #13).
+- `nxjs-source-v8/upstream-prs/PR-D.md` — Skia/WebGL
+  coexistence primitive (retires #5/#6/#7/#14/#15/#17/#35/#36).
+- `nxjs-source-v8/NXJS_PATCHES_NEEDED.md` — engine ledger with
+  new entries #35/#36/#37 + addenda on #4/#11/#19/#20 + updated
+  index table.
+- `nxjs-source-v8/scripts/verify-patches.sh` — 47 checks + meta-
+  check; clean run.
+- `brewser-runtime-v8/RUNTIME_SHIMS.md` — unchanged (already
+  captured all runtime shims in prior session).
+- `nxjs-source-v8/NXJS_PATCHES_ARCHIVE.md` — unchanged.

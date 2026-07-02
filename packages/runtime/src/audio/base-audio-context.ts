@@ -7,6 +7,7 @@ import { AudioBuffer, createAudioBuffer } from './audio-buffer';
 import { AudioBufferSourceNode } from './audio-buffer-source-node';
 import { AudioDestinationNode } from './audio-destination-node';
 import { GainNode } from './gain-node';
+import { OscillatorNode } from './oscillator-node';
 import { StereoPannerNode } from './stereo-panner-node';
 import { ctxInternal as _, type BaseAudioContextInternal } from './internal';
 import { INTERNAL_SYMBOL } from '../internal';
@@ -237,8 +238,14 @@ export class BaseAudioContext
 	): IIRFilterNode {
 		throw new Error('Method not implemented.');
 	}
+	/**
+	 * Creates an {@link OscillatorNode} for generating a periodic waveform
+	 * (sine / square / sawtooth / triangle).
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/createOscillator
+	 */
 	createOscillator(): OscillatorNode {
-		throw new Error('Method not implemented.');
+		return new OscillatorNode(this);
 	}
 	createPanner(): PannerNode {
 		throw new Error('Method not implemented.');

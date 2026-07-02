@@ -19,6 +19,7 @@ export {
 	listenDatagram,
 } from '../udp';
 export * from './album';
+export * from './bitmap';
 export * from './dns';
 export * from './env';
 export * from './file-system';

@@ -98,10 +98,34 @@ check 3 "video.ts call-time globalThis.fetch" \
     "$NXJS/packages/runtime/src/video.ts" \
     'return globalThis\.fetch\(input, init\)'
 
-# #4 — cursor overlay native binding (DEFERRED per ledger)
-# Ledger says "DEFERRED, NEEDS ENGINE BINDING" — but the cursor
-# files DID land per bucket (a). Presence check:
-check_file_exists 4 "cursor.cc native compositor" "$NXJS/source/cursor.cc"
+# #4 — cursor overlay native binding (SHIPPED 2026-06-30). Content-
+# level greps for the 4 C entry points (see ADDENDUM in ledger for
+# ship-time function names) + JS-side dispatch registrations +
+# skia_gpu present-hook composite call.
+check 4 "cursor.h nx_cursor_set_static prototype" \
+    "$NXJS/source/cursor.h" \
+    'void nx_cursor_set_static'
+check 4 "cursor.h nx_cursor_set_animated prototype" \
+    "$NXJS/source/cursor.h" \
+    'void nx_cursor_set_animated'
+check 4 "cursor.h nx_cursor_set_position prototype" \
+    "$NXJS/source/cursor.h" \
+    'void nx_cursor_set_position'
+check 4 "cursor.h nx_cursor_clear prototype" \
+    "$NXJS/source/cursor.h" \
+    'void nx_cursor_clear'
+check 4 "cursor.cc nx_cursor_set_static body" \
+    "$NXJS/source/cursor.cc" \
+    'void nx_cursor_set_static'
+check 4 "canvas.cc js_set_cursor_overlay JS binding" \
+    "$NXJS/source/canvas.cc" \
+    'js_set_cursor_overlay'
+check 4 "canvas.cc NX_DEF_FUNC setCursorOverlay registration" \
+    "$NXJS/source/canvas.cc" \
+    'setCursorOverlay.*js_set_cursor_overlay'
+check 4 "skia_gpu.cc cursor composite hook in present" \
+    "$NXJS/source/skia_gpu.cc" \
+    'composite_cursor_overlay|nx_cursor.*compose|Cursor compositor'
 
 # #5 — skia_gpu ES3 shared context + accessors
 check 5 "skia_gpu ES3 CLIENT_VERSION=3" \
@@ -219,6 +243,36 @@ check 34 "web-audio-stubs.ts STUBS_BUILD_TAG post-guard-fix" \
     "$RUNTIME/src/polyfills/web-audio-stubs.ts" \
     'v8-override-throw-stubs' --allow-missing
 
+# #35 — snap contract extension: depth_mask + stencil_mask (cut #15)
+check 35 "webgl_bridge.h depth_mask field" \
+    "$NXJS/source/webgl_bridge.h" \
+    '\bdepth_mask\b'
+check 35 "webgl_bridge.h stencil_mask field" \
+    "$NXJS/source/webgl_bridge.h" \
+    '\bstencil_mask\b'
+
+# #36 — bracket-state-persistence via per-call shadow-tracked user_snap
+check 36 "webgl.cc WebGLState user_snap field" \
+    "$NXJS/source/webgl.cc" \
+    'nx_gl_state_snap_t user_snap'
+check 36 "webgl.cc user_snap_valid gate" \
+    "$NXJS/source/webgl.cc" \
+    'user_snap_valid'
+check 36 "webgl.cc per-call shadow write example (viewport)" \
+    "$NXJS/source/webgl.cc" \
+    'user_snap\.viewport\[0\]\s*=\s*x'
+check 36 "webgl.cc auto_user_vao field" \
+    "$NXJS/source/webgl.cc" \
+    'auto_user_vao'
+
+# #37 — v2 texStorage3D + texSubImage3D bindings (cut #32)
+check 37 "webgl.cc w_tex_storage_3d FN" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_tex_storage_3d\)'
+check 37 "webgl.cc w_tex_sub_image_3d FN" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_tex_sub_image_3d\)'
+
 echo
 echo "=== runtime ledger: brewser-runtime-v8/RUNTIME_SHIMS.md (in $RUNTIME) ==="
 
@@ -252,9 +306,87 @@ check 24 "cube-route-shim framebufferTexture2D wrap" \
     'framebufferTexture2D'
 
 echo
+echo "=== meta-check: ledger vs script coverage ==="
+# Non-fatal warnings. Detects:
+#   - ledger entries with no script check (missing coverage)
+#   - script check IDs that don't correspond to any ledger heading
+#     (orphaned check — entry moved/renamed without updating the script)
+# Tombstoned headings ("## #N — MOVED → ...") count as ledger entries
+# for coverage purposes (the moved entry has a check against its new
+# location).
+
+meta_warn=0
+
+# Extract all script check IDs seen during this run. We prefix status
+# lines with "#$id", so re-scan the script for `status "$id"` +
+# `check "$id"` + `check_absent "$id"` + `check_file_exists "$id"` +
+# `echo "  #<id>"` occurrences directly rather than relying on the
+# run's output. Give us the actual coverage of the source file, not
+# the run.
+script="${BASH_SOURCE[0]}"
+runtime_ledger="$RUNTIME/RUNTIME_SHIMS.md"
+engine_ledger="$NXJS/NXJS_PATCHES_NEEDED.md"
+
+# Ledger IDs from BOTH ledgers (engine + runtime). Match the heading
+# form: "## #<id> — ...", but EXCLUDE tombstone lines
+# ("## #N — MOVED → …") — the moved entry is checked at its new
+# location, which shows up in the OTHER ledger's IDs.
+ledger_ids=$(
+    { grep -hP '^## #[\w-]+ — (?!MOVED →)' "$engine_ledger" 2>/dev/null || true;
+      grep -hP '^## #[\w-]+ — (?!MOVED →)' "$runtime_ledger" 2>/dev/null || true; } \
+    | grep -oP '(?<=^## #)[\w-]+(?= —)' \
+    | sort -u
+)
+
+# Script IDs: any argument N in `check N "..."`, `check_absent N "..."`,
+# `check_file_exists N "..."`, `status N "..."`, or comment-style
+# `#  #<N> verified below`.
+script_ids=$(
+    grep -hoP '(?:^\s*(?:check|check_absent|check_file_exists|status)\s+)([\w-]+)\b' "$script" 2>/dev/null \
+    | awk '{print $NF}' \
+    | grep -Ev '^(fail|have_check|missing_check|meta_warn|end|next_headings|end_candidates)$' \
+    | sort -u
+)
+# Also count references in embedded comments like `  #12 verified below`.
+script_ids_all=$( { echo "$script_ids";
+    grep -hoP '(?<=#)[0-9]+(?= verified below)' "$script" 2>/dev/null || true; } | sort -u )
+
+# 1. Ledger entries with no script check.
+for id in $ledger_ids; do
+    # Tombstoned entries are those whose heading text starts with "MOVED →".
+    # Their coverage lives at the moved location and is asserted in the
+    # runtime section; they still count as covered by the "#N verified
+    # below in runtime ledger section." echo lines.
+    if ! grep -qE "^[[:space:]]*(check|check_absent|check_file_exists|status)[[:space:]]+$id\b" "$script"; then
+        if ! grep -qE "verified below.*#$id\b|#$id[[:space:]]+verified below" "$script"; then
+            echo "  WARN: ledger entry #$id has no verify-patches.sh check"
+            meta_warn=$((meta_warn + 1))
+        fi
+    fi
+done
+
+# 2. Script checks referencing an ID that isn't a ledger entry.
+for id in $script_ids_all; do
+    # Non-numeric non-tombstone tokens (parsed noise) — skip.
+    case "$id" in
+        [0-9]*|17-superseded) : ;;
+        *) continue ;;
+    esac
+    if ! echo "$ledger_ids" | grep -qxF "$id"; then
+        echo "  WARN: verify-patches.sh checks #$id but no ledger entry with that id exists"
+        meta_warn=$((meta_warn + 1))
+    fi
+done
+
+if [ "$meta_warn" -eq 0 ]; then
+    echo "  clean — every ledger entry has a check, every check has a ledger entry"
+fi
+
+echo
 echo "=== summary ==="
-echo "checks:  $have_check"
-echo "MISSING: $missing_check"
+echo "checks:       $have_check"
+echo "MISSING:      $missing_check"
+echo "meta warns:   $meta_warn"
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: every applicable patch is PRESENT (open engine asks reported as KNOWN-OPEN)."

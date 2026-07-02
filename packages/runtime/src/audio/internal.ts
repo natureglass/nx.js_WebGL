@@ -64,6 +64,14 @@ export const bufferInternal = createInternal<AudioBuffer, AudioBufferInternal>()
 export const NODE_TYPE_GAIN = 1;
 export const NODE_TYPE_STEREO_PANNER = 2;
 export const NODE_TYPE_BUFFER_SOURCE = 3;
+export const NODE_TYPE_OSCILLATOR = 5;
+
+// OscillatorNode wave types — must match `nx_audio_oscillator_type` in
+// `source/audio-graph.h`. `'custom'` (PeriodicWave) is not yet supported.
+export const OSCILLATOR_TYPE_SINE = 0;
+export const OSCILLATOR_TYPE_SQUARE = 1;
+export const OSCILLATOR_TYPE_SAWTOOTH = 2;
+export const OSCILLATOR_TYPE_TRIANGLE = 3;
 
 // AudioParam automation event types — must match `nx_audio_param_event_type`
 // in `source/audio-graph.h`.

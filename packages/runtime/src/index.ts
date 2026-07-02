@@ -199,6 +199,9 @@ export type * from './audio/audio-scheduled-source-node';
 import './audio/audio-buffer-source-node';
 export type * from './audio/audio-buffer-source-node';
 
+import './audio/oscillator-node';
+export type * from './audio/oscillator-node';
+
 import './audio/gain-node';
 export type * from './audio/gain-node';
 
