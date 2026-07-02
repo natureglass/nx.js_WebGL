@@ -1,5 +1,14 @@
 import { $ } from '../$';
+import { getSharedAudioContext } from '../audio';
+import { ctxInternal, nodeInternal } from '../audio/internal';
+import type { GainNode } from '../audio/gain-node';
 import { proto } from '../utils';
+
+// Per-decoder GainNode owned by the JS wrapper. Kept off the wrapped
+// instance so we don't have to reason about property visibility on the
+// `proto()`-produced object; the WeakMap also drops its reference
+// naturally when the decoder is GC'd.
+const gainByDecoder = new WeakMap<VideoDecoder, GainNode>();
 
 export interface VideoDecoderOptions {
 	/** Try the NVTEGRA hardware decoder first (default: true). Falls
@@ -105,7 +114,40 @@ export class VideoDecoder {
 	declare readonly audioTime: number;
 
 	constructor(url: string, opts?: VideoDecoderOptions) {
-		return proto($.videoDecoderNew(url, opts), VideoDecoder);
+		const inst = proto(
+			$.videoDecoderNew(url, opts),
+			VideoDecoder,
+		) as VideoDecoder;
+		// Cut #22b (2026-07-02): wire the audio stream into the shared
+		// audio graph when the source has an audio track. Restores audio
+		// playback for spectraplay's <audio> flow (routed through the
+		// same videoDecoder path as <video>) and audio-bearing <video>.
+		// Skipped for `noAudio: true` (poster-preview path) and for
+		// sources without a usable audio stream.
+		const wantAudio = !(opts && opts.noAudio) && inst.usedAudio;
+		if (wantAudio) {
+			try {
+				const ctx = getSharedAudioContext();
+				const stream = $.videoDecoderCreateAudioNode(
+					inst,
+					ctxInternal(ctx).handle,
+				);
+				if (stream) {
+					const gain = ctx.createGain();
+					gain.connect(ctx.destination);
+					$.audioNodeConnect(
+						stream,
+						nodeInternal(gain).handle,
+					);
+					gainByDecoder.set(inst, gain);
+				}
+			} catch {
+				// Audio-graph setup failure is non-fatal — video (if any)
+				// still plays silently. The caller sees `audioError` /
+				// `usedAudio=false` via the existing getters.
+			}
+		}
+		return inst;
 	}
 
 	/** Stops the worker thread and releases all FFmpeg + libnx state. */
@@ -118,13 +160,70 @@ export class VideoDecoder {
 		$.videoDecoderPlay(this);
 	}
 
-	// Cut #22 (V8 port, 2026-07-01): pause / seek / setMuted / setVolume /
-	// getAudioLevels / getFrequencyData / getWaveform are NOT wired in the
-	// V8 minimal port — no v2 demo currently exercises them. Add them when a
-	// future demo needs them; the C-side plumbing (nx_media_pause / _seek
-	// exists in media-decoder.h; audio-graph attachment for muted/volume/
-	// visualizer surface is bigger). Attempting to call these methods will
-	// throw at the `$` layer.
+	/** Cut #22b (2026-07-02): freeze decode / audio output. `play()`
+	 * resumes from the same position. */
+	pause(): void {
+		$.videoDecoderPause(this);
+	}
+
+	/** Cut #22b (2026-07-02): seek to `seconds` (clamped to the media
+	 * duration). Audio + video state re-anchor on the next frame. */
+	seek(seconds: number): void {
+		$.videoDecoderSeek(this, Number.isFinite(seconds) ? seconds : 0);
+	}
+
+	/**
+	 * Cut #22b (2026-07-02): sets the playback gain in the [0,1] range.
+	 * Applied through the JS-side GainNode inserted between the stream
+	 * source and the shared context's destination. `muted` overrides to 0
+	 * for the effective output but the stored gain is preserved so
+	 * `setMuted(false)` restores it.
+	 */
+	setVolume(value: number): void {
+		const v = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+		$.videoDecoderSetVolume(this, v);
+		const gain = gainByDecoder.get(this);
+		if (gain) gain.gain.value = this.muted ? 0 : v;
+	}
+
+	/**
+	 * Cut #22b (2026-07-02): zero-gain override on the JS-side GainNode
+	 * (the stored `volume` is preserved).
+	 */
+	setMuted(muted: boolean): void {
+		const m = !!muted;
+		$.videoDecoderSetMuted(this, m);
+		const gain = gainByDecoder.get(this);
+		if (gain) gain.gain.value = m ? 0 : this.volume;
+	}
+
+	/**
+	 * Cut #22b Stage 2 (2026-07-02): fill `out` with the last
+	 * `out.length` mono samples in [-1, 1] from the audio tap. Returns
+	 * `true` when the tap has enough samples (fresh decoder / no audio
+	 * track → `false`).
+	 */
+	getWaveform(out: Float32Array): boolean {
+		return $.videoDecoderGetWaveform(this, out);
+	}
+
+	/**
+	 * Cut #22b Stage 2 (2026-07-02): fill `out` with FFT magnitude,
+	 * bin-averaged across `out.length` bins from ~0..Nyquist, normalized
+	 * to approx [0, 1]. Returns `true` when the tap has enough samples.
+	 */
+	getFrequencyData(out: Float32Array): boolean {
+		return $.videoDecoderGetFrequencyData(this, out);
+	}
+
+	/**
+	 * Cut #22b Stage 2 (2026-07-02): returns `[bass, mid, high]` RMS
+	 * levels in ~[0, 1]. Empty array when audio hasn't accumulated the
+	 * tap window yet.
+	 */
+	getAudioLevels(): number[] {
+		return $.videoDecoderGetAudioLevels(this);
+	}
 
 	/**
 	 * Returns the next decoded frame if one is available + due for

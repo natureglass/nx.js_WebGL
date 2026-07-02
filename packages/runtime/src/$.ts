@@ -886,6 +886,8 @@ export interface Init {
 	videoDecoderInit(ctor: Function): void;
 	videoDecoderNew(url: string, opts?: unknown): unknown;
 	videoDecoderPlay(dec: unknown): void;
+	videoDecoderPause(dec: unknown): void;
+	videoDecoderSeek(dec: unknown, seconds: number): void;
 	videoDecoderClose(dec: unknown): void;
 	videoDecoderNextFrame(dec: unknown): {
 		data: ArrayBuffer | null;
@@ -894,6 +896,20 @@ export interface Init {
 		pts: number;
 		ended: boolean;
 	} | null;
+	// Cut #22b (2026-07-02): audio-graph attach + volume/mute for
+	// Switch.VideoDecoder. Restores playback for audio-bearing sources
+	// (spectraplay MP3 flow + audio-bearing <video> tracks).
+	videoDecoderCreateAudioNode(
+		dec: unknown,
+		ctx: AudioContextHandle,
+	): AudioNodeHandle | null;
+	videoDecoderSetVolume(dec: unknown, value: number): void;
+	videoDecoderSetMuted(dec: unknown, muted: boolean): void;
+	// Cut #22b Stage 2 (2026-07-02): visualizer surface — spectraplay's
+	// `audio.getFrequencyData(specData)` / `audio.getWaveform(waveData)`.
+	videoDecoderGetWaveform(dec: unknown, out: Float32Array): boolean;
+	videoDecoderGetFrequencyData(dec: unknown, out: Float32Array): boolean;
+	videoDecoderGetAudioLevels(dec: unknown): number[];
 
 	// (Uint8Array base64/hex methods are provided natively by V8 — no binding.)
 

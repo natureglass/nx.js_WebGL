@@ -97,6 +97,33 @@ bool nx_media_seeking(nx_media_t *m);
 // Sticky fatal decode error message, or NULL.
 const char *nx_media_error(nx_media_t *m);
 
+// Cut #22b Stage 2 (2026-07-02): audio-visualizer surface.
+//
+// The decode thread taps its resampled audio (downmixed to mono) into a
+// small rolling ring; these three accessors read from the ring from the
+// main thread. They target Switch.VideoDecoder's `getWaveform` /
+// `getFrequencyData` / `getAudioLevels` methods, which brewser-runtime
+// re-exposes on `<audio>` / `<video>` DOM elements (spectraplay's
+// visualizer reads from there).
+//
+// All three return `false` (or 0 for `read_audio_levels`) when the tap
+// hasn't yet accumulated enough samples (fresh decoder / no audio track).
+
+// Fill `out` with the last `out_len` mono samples in [-1, 1]. `out_len`
+// should be <= the internal tap window (2048). Returns true iff data was
+// filled.
+bool nx_media_read_waveform(nx_media_t *m, float *out, uint32_t out_len);
+
+// Compute FFT magnitude over the tap window (Hann-windowed), bin-average
+// into `out_len` bins from 0..~Nyquist, normalize to ~[0, 1]. Returns
+// true iff data was filled.
+bool nx_media_read_spectrum(nx_media_t *m, float *out, uint32_t out_len);
+
+// Fill up to `out_max` per-band RMS values in ~[0, 1] (bass, mid, high).
+// Returns the number of bands written (0..3). Backs `getAudioLevels()`.
+uint32_t nx_media_read_audio_levels(nx_media_t *m, float *out,
+                                    uint32_t out_max);
+
 // Stop the decode thread (joins it) and free everything. The audio node is
 // NOT freed (caller-owned).
 void nx_media_destroy(nx_media_t *m);

@@ -6,6 +6,66 @@ nx.js pull**. Use this file as the re-application checklist at
 upstream-update time. Grows as Step 2 (and beyond) surfaces more
 fork-patches the migration lost.
 
+## For agents doing an upstream-update pull
+
+Every upstream nx.js pull requires reading BOTH ledgers, not just this
+one:
+
+1. **This file** — `NXJS_PATCHES_NEEDED.md` — engine fork delta
+   (native C++ under `source/` + engine-TS under
+   `packages/runtime/src/`). Open engine asks live here even when a
+   runtime/demo workaround has shipped.
+2. **[brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md)** —
+   brewser-runtime shims that wrap the engine's public surface at
+   runtime install time. Upstream-pull sensitivity: an upstream method
+   change or feature landing can invalidate a shim silently. Re-verify
+   at every pull.
+3. **[NXJS_PATCHES_ARCHIVE.md](NXJS_PATCHES_ARCHIVE.md)** — superseded
+   proposals kept for design lineage. Not load-bearing; skim only if
+   researching an entry's history.
+
+Automated check: `scripts/verify-patches.sh` prints PRESENT/MISSING
+per entry across all three ledgers.
+
+Global entry numbering is shared across all three files. **Never
+renumber.** Tombstones like `## #12 — MOVED → …` remain in this file
+to preserve the number-space invariant when future entries are added.
+
+See also [FORK_DELTA_REDUCTION.md](FORK_DELTA_REDUCTION.md) for the
+2026-07-02 fork-delta reduction study and the globalThis-injection
+proposal verdict.
+
+## Index (machine-readable)
+
+| # | Where | Disposition | Upstream status | Verify grep target | One-line title |
+|---:|---|---|---|---|---|
+| 1 | engine | upstream-candidate | not-submitted | `image.ts: return globalThis\.fetch\(input, init\)` | image.ts call-time globalThis.fetch deferral |
+| 2 | engine | upstream-candidate | not-submitted | `audio.ts: return globalThis\.fetch\(input, init\)` | audio.ts call-time globalThis.fetch deferral |
+| 3 | engine | upstream-candidate | not-submitted | `video.ts: return globalThis\.fetch\(input, init\)` | video.ts call-time globalThis.fetch deferral |
+| 4 | engine | fork-only (DEFERRED) | n/a | `cursor.cc: file exists` | Screen.setCursorOverlay native binding |
+| 5 | engine | upstream-candidate | not-submitted | `skia_gpu.cc: EGL_CONTEXT_CLIENT_VERSION,\s*3` | skia_gpu ES3 shared context + accessors |
+| 6 | engine | upstream-candidate | not-submitted | `webgl_bridge.h: nx_gl_state_snap_t` | webgl_bridge state save/restore + tenant FBO |
+| 7 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_compose_if_active` | WebGL1 context via screen.getContext('webgl') |
+| 8 | engine | upstream-candidate (FIXED) | not-submitted | `webgl*-rendering-context.ts: NO for-of over GL_CONSTANTS` | V8 JIT crash fix — bulk defineProperties |
+| 9 | engine | upstream-candidate | not-submitted | `webgl-rendering-context.ts: SRGB8_ALPHA8:` | v1 ES3 sized internalformat constants |
+| 10 | engine | upstream-candidate | not-submitted | `webgl.cc: bucket_e_translate_tex_image` | WebGL1 EXT_sRGB + HalfFloat translate |
+| 11 | engine | fork-only | n/a | `webgl.cc: maybe_replace_pmrem_fs` | PMREM r184 FS replacement |
+| 12 | **runtime** (MOVED) | fork-only | n/a | `cube-route-shim.ts: cubeUVSample` | samplerCube→sampler2D routing layer |
+| 13 | engine | upstream-candidate | not-submitted | `canvas.cc: set_font_size(context, context->state->font_size)` | canvas.cc font-size pin |
+| 14 | engine | upstream-candidate | not-submitted | `webgl.cc: webgl2ContextNew` | WebGL2 context factory |
+| 15 | engine | upstream-candidate | not-submitted | `webgl.cc: install_methods_v2` | v1/v2 FUNCS[] table split |
+| 16 | engine | fork-only (diagnostic) | n/a | `webgl_bridge.cc: nx_webgl_state_probe_log` | passive state-contract probe |
+| 17 | engine | fork-only | n/a | `webgl_bridge.h: sampler_unit0` | nx_gl_state_snap_t extension (sampler_unit0 + read_fbo) |
+| 17-superseded | **archive** (MOVED) | — | — | — | (original template, superseded by shipped #17) |
+| 18 | **runtime** (MOVED) | brewser-specific | n/a | `cube-route-shim.ts: safeBind` | cube-route-shim per-method capability guards |
+| 19 | engine (OPEN) | brewser-specific | n/a | KNOWN-OPEN — Phase 2.G.4 gate | v2 cube-routing applicability |
+| 20 | engine (OPEN) | upstream-candidate | not-submitted | demo-side: `rgbe-loader.js: tex.flipY = false` | UNPACK_FLIP_Y_WEBGL honor for typed-array texImage2D |
+| 21 | **runtime** (MOVED) | brewser-specific | n/a | `shadow-route-shim.ts: textureShadowCompat` | sampler2DShadow→sampler2D rewrite shim |
+| 22 | engine | upstream-candidate | not-submitted | `video-decoder.cc: nx_init_video_decoder` | Switch.VideoDecoder V8 port |
+| 24 | **runtime** (MOVED) | brewser-specific | n/a | `cube-route-shim.ts: allocateCubeRTAtlas` | Cube-RT-readback rescue |
+| 31 | engine (OPEN) | brewser-specific + upstream-candidate | not-submitted | demo-side: `gpgpu-water/main.js: renderer.resetState()` | Three.js WebGLState cache desync engine fix |
+| 34 | engine (OPEN) | upstream-candidate | not-submitted | runtime workaround: `web-audio-stubs.ts: v8-override-throw-stubs` | Audio createX no-throw stubs |
+
 ## DISPOSITION POLICY
 
 Prefer fixes in **brewser-runtime** over engine edits. For general
@@ -916,328 +976,7 @@ embedded GLSL template; the exact source lives in QuickJS-era
 
 ---
 
-## #12 — samplerCube → sampler2D routing layer (Bucket F.2a) — SHIPPED 2026-06-29 (RUNTIME-SIDE; VERIFIED on Citron)
-
-**File(s):** [brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts)
-(NEW, ~310 lines) + 3-line wire-up in
-[brewser-runtime-v8/src/scripts/canvas-runner.ts](../brewser-runtime-v8/src/scripts/canvas-runner.ts)
-(import + two `installCubeRouting(gl)` call sites, in `getSharedScreenGL`
-and `getSharedScreenGL2`, immediately after the existing
-`installBridgeDirtyHooks(gl)`).
-
-**Symptom.** Mesa-Nouveau on Tegra silently returns `vec4(0)` from any
-direct `samplerCube` sampling (see
-[[reference-mesa-nouveau-layered-sampling-unsupported]]). Demos that use
-stock Three.js cube samplers — `MeshLambertMaterial { envMap: cubeTex }`,
-`MeshBasicMaterial` reflective variants, `scene.background = cubeTex` —
-render with the env-mapped heads black and the skybox absent. F.1
-unblocked the PMREM path (Three.js's own 2D-atlas conversion for IBL);
-F.2a unblocks USER cube textures by performing the same atlas conversion
-runtime-side for any cube texture Three.js asks the GL to upload.
-
-**Why runtime, not engine.** The QuickJS-era engine NEVER had a general
-samplerCube routing layer — the cube_uv code in
-[QuickJS webgl_egl.c:8629-8800](D:/Workspace/nxjs-source/source/webgl_egl.c#L8629)
-is the PMREMGGXConvolution FS replacement (already ported as #11), which
-assumes its input is already a `sampler2D` atlas built by Three.js's own
-PMREM. Cube demos like `webgl-materials-cubemap` (Lambert + envMap +
-`scene.background = cubeTex`) bypass PMREM entirely. The pre-V8 fork was
-broken on these demos too — production cubemap demos that worked were
-the ones that explicitly routed through PMREM (per
-[[reference-mesa-nouveau-layered-sampling-unsupported]]: "the working
-cube demos … ALL use sampler2D under the hood"). So F.2a is NEW work
-regardless of layer; runtime placement was chosen because (a) zero
-engine fork delta per the disposition policy, (b) the shared GL context
-has one clean chokepoint (`getSharedScreenGL`), (c) the same
-monkey-patch pattern is already in production via
-`installBridgeDirtyHooks`, (d) Three.js's GLSL is templated and stable
-enough for identifier-tracked substring rewriting.
-
-**The fix (applied).** Three interceptions wrap the shared GL context:
-
-1. **Texture upload reroute.** `gl.texImage2D(TEXTURE_CUBE_MAP_POSITIVE_X +
-   i, ..., image)` is intercepted: per-cube state allocates a
-   companion 2D atlas texture sized `(faceW * 6, faceH)` and uses
-   `gl.texSubImage2D(TEXTURE_2D, 0, i * faceW, 0, ...)` to land each
-   face into its slot. Per-cube state is keyed by the native cube
-   `WebGLTexture` handle via `WeakMap`. `texSubImage2D` against cube
-   face targets is similarly rerouted. `gl.texParameteri(TEXTURE_CUBE_MAP,
-   ...)` is forwarded to the atlas texture (with `WRAP_S`/`WRAP_T` forced
-   to `CLAMP_TO_EDGE` so the strip layout doesn't bleed inter-face).
-   `gl.generateMipmap(TEXTURE_CUBE_MAP)` is silently skipped (atlas mips
-   would bleed at face boundaries).
-
-2. **Bind reroute.** `gl.bindTexture(TEXTURE_CUBE_MAP, tex)` rebinds the
-   atlas as `gl.bindTexture(TEXTURE_2D, atlasTex)` at the current active
-   TU, so the rewritten FS's `sampler2D` reads from the atlas. Active-TU
-   tracking via wrapped `gl.activeTexture`.
-
-3. **Shader rewrite.** `gl.shaderSource(handle, src)` rewrites GLSL:
-   - `uniform [precision]? samplerCube IDENT` → `uniform [precision]? sampler2D IDENT` (identifier captured per shader).
-   - For each captured identifier `IDENT`: `textureCube(IDENT, V)`,
-     `textureCubeLod(IDENT, V, L)`, `textureCubeLodEXT`,
-     `textureCubeGrad`, `textureCubeGradEXT`, and (for GLSL ES 300)
-     `texture(IDENT, V)`, `textureLod(IDENT, V, L)`, `textureProj(IDENT,
-     V)` are rewritten to `cubeUVSample(IDENT, V)`. Identifier-scoped
-     so `sampler2D` calls keep their original `texture`/`textureLod`.
-   - Injects a `cubeUVSample(sampler2D, vec3) → vec4` helper at the top
-     of the shader (after preamble: `#version`, `#extension`, `#define`,
-     `precision`, `//` comments, blank lines). Helper does standard cube-
-     face selection (max-axis test), per-face UV projection, and reads
-     `texture2D(atlas, vec2((face + uv.x) / 6.0, uv.y))`. Uses only
-     `texture2D` (WebGL1-safe; GLSL ES 300 prelude aliases this).
-
-**Layout choice: 6×1 horizontal strip.** Three.js's PMREM cube_uv format
-encodes a packed mip pyramid in a 1536×2048 atlas — appropriate for IBL
-convolution but heavy for an LDR background cube. The strip layout
-avoids per-mip math and accepts 0.5 px of edge bleed at LINEAR filtering
-(CLAMP_TO_EDGE prevents wrap-around). Sufficient for backgrounds /
-reflection envmaps; revisit if cubeUV mipped sampling becomes load-
-bearing for a future demo.
-
-**Identifier scoping rationale.** GLSL ES 300's `texture(s, v)` is
-overloaded by sampler type. A blanket `texture(.*, .*)` rewrite would
-break every `sampler2D` call in the same shader. By capturing the
-specific identifiers declared as `samplerCube` and only rewriting calls
-referencing those identifiers, sampler2D paths stay untouched.
-
-**Why upstream-vanilla lacks it.** Driver-/platform-specific workaround
-for the Mesa-Nouveau layered-sampling limit on Tegra X1. Upstream
-nx.js / V8 / Three.js have no reason to ship a cube→2D atlas reroute.
-
-**DISPOSITION:** `fork-only` (Tegra/Mesa-Nouveau-specific workaround,
-runtime-side instead of engine — same product-specific category as
-#11). Lives in brewser-runtime-v8, not nxjs-source-v8. No engine delta.
-
-**UPSTREAM STATUS:** `n/a` (driver-specific).
-
-**STATUS: SHIPPED + VERIFIED on Citron 2026-06-29.** `webgl-materials-
-cubemap` renders all 3 Walt heads (pure reflection, refraction through
-the center head, yellow-tint mixed reflection on the right) under the
-Royal Castle skybox with clean reflections. No visible artifacts → F.2b
-rescues (SRGB cube downgrade, cube-face FBO aliasing) were SKIPPED per
-the "skip-if-artifact-absent" rule. Build state: brewser.nro =
-66,893,946 B; nxjs.nro = **56,458,217 B IDENTICAL to F.1 close** — zero
-engine delta confirmed throughout F.2a. Hardware-pending: F.2a's
-visible result is Citron-confirmed; consolidated hardware pass at
-Bucket F close. Driver-specific defect (Mesa-Nouveau samplerCube
-returns vec4(0)) is identical on Citron and hardware silicon per
-[[reference-mesa-nouveau-layered-sampling-unsupported]], so a Citron
-PASS for the route + atlas + shader rewrite path is strong evidence
-the fix transfers.
-
-**Implementation arc (7 independent issues had to be solved in
-sequence — initially shipped at 5, the next 2 surfaced when the
-F.2a + F.1 demos were exercised together).** Documenting the cascade
-so a future regression can be attributed to the right layer:
-
-1. **The route at all.** Without the cube-route-shim, `samplerCube`
-   uniforms return `vec4(0)` per the Mesa-Nouveau layered-sampling
-   limit. Three.js's PMREM bypasses this via 2D atlas (F.1); F.2a does
-   the same for USER cube textures.
-
-2. **The shaderSource override actually sticks.** Tracked via
-   `gl.shaderSource !== origShaderSource` self-check at install time
-   (since reverted, but the pattern is the lift). Confirmed via the
-   `[f2a:install]` log line which IS unconditional in shipped code.
-
-3. **Three.js sees the rewritten uniform as samplerCube, not sampler2D.**
-   The shader rewrite replaces `samplerCube envMap` with `sampler2D
-   envMap` so the cube sampling can route through a 2D atlas. BUT Three
-   .js queries `gl.getActiveUniform()` once at program init and caches
-   the resulting type → setter function mapping. If it sees
-   SAMPLER_2D, it wires `setValueT1`/`setTexture2D` — which tries to
-   upload the demo's `CubeTexture` (whose `.image` is a 6-element
-   array, not a single image source) via the 2D path, silently fails,
-   and the cube faces are never uploaded. The actual demo runs to
-   completion (renders at 60fps, `OBJ loaded: yes`, no demo error)
-   while the cube uniform stays bound to Three.js's internal
-   `_emptyCubeTexture` (a 1×1 white placeholder), giving the
-   pre-F.2a-identical "2-of-3 black heads + black skybox" symptom.
-
-   **Fix:** intercept `gl.getActiveUniform()` and fake `SAMPLER_2D
-   (0x8B5E)` back to `SAMPLER_CUBE (0x8B60)` for any uniform name that
-   was originally declared as `samplerCube` (tracked per-program via
-   the WeakMap chain `shader → identifiers → attachShader → program`).
-   With the fake in place, Three.js wires `setValueT6`/`setTextureCube`
-   / `uploadCubeTexture`, which uses `gl.texImage2D(CUBE_FACE_POSITIVE_X
-   + i, ...)` for face uploads — which the cube-route-shim's existing
-   intercepts correctly route to the 2D atlas.
-
-4. **The engine accepts the cube-face image uploads.** nx.js's
-   `w_tex_image_2d` and `w_tex_sub_image_2d` **only support the 9-arg
-   (target, level, internalformat, w, h, border, format, type,
-   pixels) variant with raw pixel bytes** — they do NOT accept the
-   6-arg `texImage2D(target, level, internalformat, format, type,
-   source)` variant with `HTMLImageElement` / `ImageBitmap` /
-   `HTMLCanvasElement` source. The engine reads `info[3]..info[8]`
-   regardless of `info.Length()` and treats undefined slots as
-   numeric-0, producing a malformed glTexImage2D call and
-   `GL_INVALID_ENUM (0x500)`. The cube-route-shim allocates the atlas
-   with the 9-arg null-pixels form (works) but Three.js's per-face
-   uploads pass `cubeImage[i]` as a 6-arg image-source call, which my
-   first shim implementation forwarded as a 7-arg `texSubImage2D
-   (target, level, x, y, format, type, source)` — also rejected by
-   the engine. Diagnosed via per-call `gl.getError()` check (now
-   reverted) showing `err=0x500` for every face upload.
-
-   **Fix:** runtime-side conversion via `OffscreenCanvas` + 2D
-   `getImageData`. The shim's `imageSourceToBytes(src, w, h)` helper
-   creates a (w × h) OffscreenCanvas, draws the image source into it,
-   reads back pixels via `ctx.getImageData(0, 0, w, h).data`
-   (`Uint8ClampedArray` — qualifies as `ArrayBufferView`), then calls
-   the engine's 9-arg `texSubImage2D` with the bytes. `OffscreenCanvas
-   + 2D + drawImage(Image)` and `getImageData` are supported by nx.js
-   v8 (the brewser shell uses them extensively, and engine line
-   1247's `IsNullOrUndefined()` check guards the typed-pixels path).
-
-   **Note (engine-fix candidate, NOT addressed here):** the lack of
-   image-source `texImage2D` / `texSubImage2D` is a general engine
-   gap — any demo doing `gl.texImage2D(TEXTURE_2D, 0, RGBA, RGBA,
-   UByte, img)` directly (not just cube paths) would also silently
-   fail. Currently masked because demos use `DataTexture` (typed-
-   array path, works) or because the silent failure manifests as
-   "black texture" which is the same symptom as many other bugs.
-   Filing a separate engine-side image-source upload patch could be
-   a future round; for F.2a's scope, the runtime-side per-cube
-   conversion suffices.
-
-5. **`renderer.resetState()` per frame + Three.js state cache.** Per
-   the demo's idiom, `renderer.resetState()` resets Three.js's
-   `WebGLState` cache each frame so the bind tracking starts fresh.
-   This means the cube-route-shim's `bindTexture(CUBE_MAP, cubeTex)
-   → bindTexture(TEXTURE_2D, atlas)` re-routing fires per-frame
-   (not just on first use), which is what keeps the atlas bound to
-   the correct active TU through the per-material uniform upload
-   path. If a future demo skips `resetState()`, the atlas could stay
-   bound across frames OR could be unbound by other 2D texture
-   binds — the routing still works because the next setTextureCube
-   re-binds, but per-frame `resetState()` is the cheapest way to
-   keep the state path simple.
-
-6. **Safer bindTexture(CUBE_MAP) — preserve CUBE_MAP state +
-   conditional atlas bind.** The initial shim version did
-   `origBindTexture(TEXTURE_2D, atlas-OR-null)` UNCONDITIONALLY for
-   every CUBE_MAP bind, including binds of textures that didn't have
-   an atlas (Three.js's `_emptyCubeTexture` placeholder, PMREM
-   intermediates, anything pre-first-image-upload). This stomped
-   legitimate 2D texture bindings at the same TU — most visibly
-   `webgl-loader-gltf`'s `MeshStandardMaterial` cubeUV envMap atlas
-   (a sampler2D texture from PMREM) got overwritten with the empty
-   cube's 1×6-white placeholder atlas every frame, regressing F.1's
-   helmet IBL + skybox to matte/black.
-   **Fix:** the shim now ALWAYS forwards CUBE_MAP binds to the
-   actual `TEXTURE_CUBE_MAP` target (so the GL CUBE_MAP state stays
-   correct for any pure-samplerCube shader that wasn't caught by
-   the rewrite), and ONLY touches `TEXTURE_2D[activeTU]` when the
-   bound cube tex has an allocated atlas (`state.atlasAllocated`).
-   ALSO gates the atlas-allocation path itself to source-is-image
-   uploads (typed-array placeholders like Three.js's empty cube go
-   through the engine's native 9-arg path unchanged — no atlas
-   created for them, no bind reroute).
-
-7. **`samplerCube` ↔ `sampler2D envMap` dual-declaration gating
-   (envMap-specifically).** Three.js's shader chunks
-   `envmap_common_pars_fragment` + the BackgroundShader declare BOTH
-   `uniform samplerCube envMap;` (under `#ifdef ENVMAP_TYPE_CUBE`)
-   AND `uniform sampler2D envMap;` (under `#else` / `#elif
-   ENVMAP_TYPE_CUBE_UV`) for the SAME uniform name. The active
-   branch is selected at compile time by the material's `#define
-   ENVMAP_TYPE_CUBE` / `#define ENVMAP_TYPE_CUBE_UV`. The naive
-   "rewrite every `samplerCube IDENT` to `sampler2D IDENT` and fake
-   `getActiveUniform()` to SAMPLER_CUBE for IDENT" approach hijacks
-   Three.js's setTexture2D path for the LIVE cubeUV sampler2D
-   envMap — Three.js then calls `setTextureCube` with a 2D atlas
-   value, `uploadCubeTexture` bails (`texture.image.length !== 6`),
-   the texture is never properly bound, helmet renders matte.
-   **Fix:** before rewriting, scan the source for `sampler2D
-   IDENT` counterparts. Classify each `samplerCube IDENT` as
-   - SOLO (no sampler2D IDENT in source): always rewrite + fake.
-     (BackgroundCubeMaterial's `tCube`; cube-only shaders.)
-   - DUAL (sampler2D IDENT also in source): only rewrite + fake
-     when the source contains `#define ENVMAP_TYPE_CUBE\b(?!_)`
-     (cube branch is the live one). When `#define ENVMAP_TYPE_CUBE_UV`
-     is present, leave the dual ident alone — Three.js takes its
-     native sampler2D-cubeUV upload path. Currently only `envMap`
-     is dual-declared in stock Three.js shader chunks; future-proof
-     handling for other dual idents conservatively skips (better
-     to leave a cube sampler reading vec4(0) than hijack a live
-     sampler2D one). The full webgl-loader-gltf path was restored
-     by this gate without giving up the webgl-materials-cubemap
-     route — both demos now render correctly side-by-side.
-
-**RE-APPLY / VERIFY NOTE.** Grep
-[brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts)
-for `cubeUVSample`. If absent after a brewser-runtime pull / rebase,
-re-port the file + the two `installCubeRouting(gl)` call sites in
-canvas-runner.ts. Verify the install fires by checking `gl[Symbol.for('brewserCubeRouteInstalled')] === true` after `getSharedScreenGL`.
-
-**Recurrence tells:**
-- `webgl-materials-cubemap` regresses to 2-of-3 black heads + no skybox
-  → cube-route-shim regressed; check `import { installCubeRouting }`
-  still present in canvas-runner.ts and the two call sites are intact.
-  The `[f2a:install]` log line (unconditional, one-shot per session) is
-  the first thing to check in nxjs-debug.log — its absence means the
-  shim isn't even being installed.
-- 2-of-3 black heads + skybox black BUT `[f2a:install]` IS present →
-  one of the deeper layers regressed. Set `globalThis.__f2aDiag = true`
-  before the demo runs (e.g., via DevTools or a top-level `<script>`)
-  to get the per-call markers. Then check in order:
-  (a) `[f2a:shader-rewrite]` with `cubeUniforms=envMap` — confirms the
-  GLSL rewrite fires + captures the cube identifier. Absent = the
-  shaderSource override didn't stick, or the source's `samplerCube`
-  pattern doesn't match the regex.
-  (b) `[f2a:uniform-fake-cube]` with `origType=0x8b5e` `fakedTo=0x8b60`
-  — confirms the getActiveUniform fake fires on the rewritten uniform.
-  Absent = the per-shader-to-per-program identifier propagation broke
-  (attachShader hook regressed, or the program-keyed WeakMap miss).
-  (c) `[f2a:atlas-alloc]` with `faceW=512 faceH=512` (or whatever the
-  cube source size is) AFTER the demo's images load — confirms the
-  cube upload reaches the texImage2D hook with the real image size.
-  Absent (or only the `faceW=1 faceH=1 srcCtor=Uint8Array` empty-cube
-  placeholder alloc) = Three.js is wired to setTexture2D (uniform-fake
-  regressed) or `cube tex.needsUpdate` isn't firing in the demo.
-- Any non-cube Three.js demo regresses to black textures or scrambled
-  geometry → an interception is mis-forwarding. Suspect the
-  `texImage2D` / `bindTexture` rewriters; specifically, ensure
-  non-cube targets are passed through to original methods unchanged
-  (the `isCubeFaceTarget(target)` early-bail is the gate).
-- A non-cube `sampler2D` uniform in a shader gets its calls rewritten
-  (e.g., `texture(diffuseMap, vUv)` becomes `cubeUVSample(...)`) →
-  identifier scoping regressed; the `cubeIdents` capture from
-  `uniform samplerCube IDENT` declarations is failing or the per-
-  identifier regex is matching the wrong identifier.
-- Atlas size errors: shader compile fails on `cubeUVSample` (e.g.,
-  redefinition or missing precision) → the helper-injection insertion
-  point landed inside the shader body instead of the preamble. Check
-  the `for (let i = 0; i < lines.length; i++)` loop in
-  `rewriteCubeShader` — should break at the first non-preamble line.
-- Visible inter-face seams on the cube background → strip layout's
-  LINEAR-filter edge bleed at face boundaries. Mitigate by adding
-  per-face padding (1-px texel border replicated from adjacent face
-  edge pixels) in the atlas allocation; F.2b refinement (currently
-  NOT shipped because no visible seams were observed on the
-  webgl-materials-cubemap gate at 512-px-per-face).
-- `webgl-materials-cubemap` works but some OTHER demo with an image-
-  source `texImage2D` regresses → engine still lacks the 6-arg image-
-  source variant. The cube-route-shim's `imageSourceToBytes` only
-  converts CUBE-target uploads (because that's where the shim
-  intercepts). 2D image-source uploads on demo code paths would
-  separately need either an engine-side fix or a broader 2D-path
-  shim — out of scope for F.2a.
-
-**Cross-references:**
-- [[reference-mesa-nouveau-layered-sampling-unsupported]] — the
-  hardware reality F.2a works around.
-- [[reference-pmrem-tegra-compiler-workaround]] — Bug 3 (SRGB cube
-  downgrade) was companion-tracked here pre-V8; if F.2b lands the SRGB
-  cube downgrade rescue, it joins this entry as a sub-bullet.
-- [[reference-mesa-cube-face-aliasing-rescue]] — engine-side cube-face
-  FBO aliasing rescue. F.2a routes USER cube textures around the
-  driver via 2D atlas; rescue is only needed if cube textures are
-  written via FBO (e.g., CubeCamera dynamic cubemap). F.2b may re-port
-  this if `webgl-materials-cubemap-dynamic` becomes a verification
-  target.
+## #12 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#12)
 
 ---
 
@@ -1876,322 +1615,22 @@ tier-up). Hardware verdict:
 
 ---
 
-## #17-superseded — original PROPOSED template (superseded by SHIPPED entry above)
-
-**File(s) (planned):**
-[source/webgl_bridge.h](source/webgl_bridge.h) (`struct nx_gl_state_snap_t`
-+ FROZEN-contract header comment update);
-[source/webgl_bridge.cc](source/webgl_bridge.cc) (`nx_gl_state_save` /
-`nx_gl_state_restore` body extensions).
-
-### Template (apply ONLY the `#ifdef`-gated members the probe verdict elects)
-
-```c
-/* In webgl_bridge.h, REPLACING the existing struct:                       */
-
-/* Phase 2.G.0 — snap extension feature flags. Each defaults OFF; the
- * user-signed-off probe-driven set defines exactly which flip on. The
- * flag set is the LEGAL CUT of the extension; flags not flipped do not
- * grow the struct, do not cost the save/restore roundtrip, and do not
- * change the FROZEN 2.B contract's footprint.
- *
- * Probe-driven flags (set per #16-ACTIVE SUMMARY's needs_snap list):
- *   NX_SNAP_UBO_INDEXED         — UBO indexed bindings 0..N
- *   NX_SNAP_SAMPLER_UNIT0       — sampler-unit-0 binding
- *   NX_SNAP_READ_FBO            — READ_FRAMEBUFFER separate from DRAW
- *   NX_SNAP_TF_BINDING          — transform feedback object binding
- *   NX_SNAP_RASTERIZER_DISCARD  — RASTERIZER_DISCARD enable
- */
-
-/* Slot count for the UBO indexed array. Sized from MAX_UNIFORM_BUFFER_
- * BINDINGS at engine init AT MOST; or hardcoded to the highest probed-
- * leaky slot + 1 (whichever is smaller). Three.js v2 r182 webgl2-ubo
- * uses slots 0+1; pad to 4 for headroom unless probe finds Ganesh
- * touches beyond. */
-#ifndef NX_UBO_SAVE_SLOTS
-#define NX_UBO_SAVE_SLOTS 4
-#endif
-
-struct nx_gl_state_snap_t {
-    /* === Existing 18 fields preserved EXACTLY (do not reorder, do
-     *     not retype, do not rename — the 2.B FROZEN contract). === */
-    GLint fbo;
-    GLint viewport[4];
-    GLint program;
-    GLint vao;
-    GLint array_buffer;
-    GLint active_tex;
-    GLint tex2d_binding;
-    GLboolean blend;
-    GLboolean depth_test;
-    GLboolean cull;
-    GLboolean scissor;
-    GLboolean stencil_test;
-    GLboolean color_mask[4];
-    GLfloat clear_color[4];
-    GLint blend_src_rgb;
-    GLint blend_dst_rgb;
-    GLint blend_src_a;
-    GLint blend_dst_a;
-
-    /* === Phase 2.G.0 batched extension. Each member is gated on its
-     *     probe-driven feature flag. Members whose flag is off cost
-     *     zero (no struct growth, no save/restore GL roundtrip). === */
-
-#ifdef NX_SNAP_UBO_INDEXED
-    GLint ubo_base;                       /* GL_UNIFORM_BUFFER_BINDING */
-    GLint ubo_indexed[NX_UBO_SAVE_SLOTS]; /* glGetIntegeri_v slots 0..N */
-#endif
-
-#ifdef NX_SNAP_SAMPLER_UNIT0
-    GLint sampler_unit0;                  /* GL_SAMPLER_BINDING @ TU 0 */
-#endif
-
-#ifdef NX_SNAP_READ_FBO
-    GLint read_fbo;                       /* GL_READ_FRAMEBUFFER_BINDING */
-#endif
-
-#ifdef NX_SNAP_TF_BINDING
-    GLint tf_binding;                     /* GL_TRANSFORM_FEEDBACK_BINDING */
-#endif
-
-#ifdef NX_SNAP_RASTERIZER_DISCARD
-    GLboolean rasterizer_discard;         /* glIsEnabled(GL_RASTERIZER_DISCARD) */
-#endif
-};
-
-/* In webgl_bridge.cc, nx_gl_state_save body — APPEND to existing reads: */
-
-void nx_gl_state_save(nx_gl_state_snap_t *s) {
-    /* ... existing 18 saves preserved EXACTLY ... */
-
-#ifdef NX_SNAP_UBO_INDEXED
-    glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &s->ubo_base);
-    for (int i = 0; i < NX_UBO_SAVE_SLOTS; i++) {
-        glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, i, &s->ubo_indexed[i]);
-    }
-#endif
-
-#ifdef NX_SNAP_SAMPLER_UNIT0
-    {
-        GLint prev_active;
-        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
-        glActiveTexture(GL_TEXTURE0);
-        glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler_unit0);
-        glActiveTexture((GLenum)prev_active);
-    }
-#endif
-
-#ifdef NX_SNAP_READ_FBO
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->read_fbo);
-#endif
-
-#ifdef NX_SNAP_TF_BINDING
-    glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &s->tf_binding);
-#endif
-
-#ifdef NX_SNAP_RASTERIZER_DISCARD
-    s->rasterizer_discard = glIsEnabled(GL_RASTERIZER_DISCARD);
-#endif
-}
-
-/* In webgl_bridge.cc, nx_gl_state_restore body — APPEND to existing
- * writes BEFORE the existing trailing glBlendFuncSeparate (the order
- * matters: existing fields are restored first, then the extension): */
-
-void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
-    /* ... existing 18 restores preserved EXACTLY ... */
-
-#ifdef NX_SNAP_UBO_INDEXED
-    glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)s->ubo_base);
-    for (int i = 0; i < NX_UBO_SAVE_SLOTS; i++) {
-        /* glBindBufferBase is the right restore call when range/offset
-         * isn't tracked. The probe data tells us whether we ALSO need to
-         * track offset+size: if probe shows a non-0 binding, also
-         * snapshot GL_UNIFORM_BUFFER_START[i] and GL_UNIFORM_BUFFER_SIZE
-         * [i], and restore via glBindBufferRange instead. Final-final
-         * decision deferred to probe output. */
-        glBindBufferBase(GL_UNIFORM_BUFFER, i, (GLuint)s->ubo_indexed[i]);
-    }
-#endif
-
-#ifdef NX_SNAP_SAMPLER_UNIT0
-    {
-        GLint prev_active;
-        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
-        glActiveTexture(GL_TEXTURE0);
-        glBindSampler(0, (GLuint)s->sampler_unit0);
-        glActiveTexture((GLenum)prev_active);
-    }
-#endif
-
-#ifdef NX_SNAP_READ_FBO
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s->read_fbo);
-#endif
-
-#ifdef NX_SNAP_TF_BINDING
-    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, (GLuint)s->tf_binding);
-#endif
-
-#ifdef NX_SNAP_RASTERIZER_DISCARD
-    if (s->rasterizer_discard) glEnable(GL_RASTERIZER_DISCARD);
-    else                       glDisable(GL_RASTERIZER_DISCARD);
-#endif
-}
-```
-
-### Cut-decision rule (parameterized on #16-ACTIVE SUMMARY)
-
-For each candidate verdict in the active probe's SUMMARY line:
-
-| Verdict (#16-ACTIVE) | Action on #17 cut |
-|---|---|
-| `moot` | Do NOT define the corresponding `NX_SNAP_<X>` flag. Field stays out; save/restore unchanged. |
-| `NEEDS_SNAP_LEAVE` (post != set, Skia left it mutated) | DEFINE the flag. Field + save/restore lines fire. |
-| `NEEDS_SNAP_RESTORE` (post == pre != set, Skia restored to its own pre-state) | DEFINE the flag. Same code path; Skia's restore not relied on. |
-| `moot-but-defense-warranted` | DEFINE if the defense cost (one query + one conditional restore per frame) is judged worthwhile vs the risk. Default yes for RASTERIZER_DISCARD. |
-
-### Hardware re-validation checklist (post-extension)
-
-1. Boot brewser-v8 on real CFW Switch with `NX_SNAP_<X>` defines per probe.
-2. v1 demo regression set: `geometry-cube`, `webgl-materials-cubemap`,
-   `webgl-loader-gltf`, `webgl-shadowmap`, the v1 black-texture quartet
-   (post-#10 SRGB fix) — all must render unchanged.
-3. Sustained ≥ 60 s. With `state_probe = true`, the `[webgl-bridge:probe]`
-   lines (#16 passive) should show our snapshotted values correctly
-   restored across frames.
-4. NO new flicker / no Skia corruption / no FBO incomplete.
-
-**Why a single batched extension (not N increments).** Each snap
-extension is hardware-revalidated (the snap is FROZEN; touching it
-risks unmasking a Ganesh state-cache assumption). Batching all
-probe-positive fields into one extension means **one** hardware pass
-re-verifies the contract vs N if added incrementally. Hardware passes
-are the load-bearing cost.
-
-**Symptom it fixes.** Phase 2.G.X demos (webgl2-ubo at 2.G.1,
-webgl2-multiple-rendertargets at 2.G.2, gpgpu-water at 2.G.7) would
-exhibit "Skia renders garbage after WebGL2 draws" symptoms on
-hardware if any of the candidate bindings leak across the WebGL→Skia
-handoff and the snap doesn't cover them. The parameterized template +
-probe-driven cut means we extend by the MINIMUM correct set, not by
-guesswork.
-
-**DISPOSITION:** `upstream-candidate`. Engine-correctness: the
-snap-set should cover all leakable state under shared-context EGL.
-The `#ifdef`-gated shape is for documentation + reversibility; can be
-cleaned up to unconditional members once the cut is final and the
-gates are no longer needed for audit.
-
-**UPSTREAM STATUS:** `not-submitted` (template only).
-
-**RE-APPLY / VERIFY NOTE.** Wait for #16 + #16-ACTIVE probe data +
-user sign-off. Apply the template with the gate set per SUMMARY.
-Hardware-revalidate per the checklist above. Update webgl_bridge.h's
-FROZEN-contract header comment to enumerate the new fields + reasons
-(copy the relevant "INTERPRET" bullet from the #16-ACTIVE per-
-candidate spec into the header doc for each landed field).
+## #17-superseded — MOVED → [NXJS_PATCHES_ARCHIVE.md](NXJS_PATCHES_ARCHIVE.md) (#17-superseded)
 
 ---
 
-## #18 — cube-route-shim per-method capability guards (Phase 2.G.0 — runtime-side, unblocks empty/partial v2 from canvas-runner) — SHIPPED 2026-06-30
-
-**File(s):**
-[brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts)
-(`installCubeRouting` — `safeBind` helper introduced; every wrap
-`target.X = function(...)` site wrapped in `if (origDep1 && origDep2
-&& ...) { ... } else if (diagOn()) { console.debug('[f2a:guard]',
-'skip wrap X') }`).
-
-**Exact change (Phase 2.G.0).** Replace the 14 unconditional
-`gl.X.bind(gl)` calls at the top of `installCubeRouting` with a
-`safeBind(name)` helper that returns `null` when the named method is
-missing on `gl`. Then wrap each of the 12 `target.X = function ...`
-assignments in an `if (origDep1 && origDep2 && ...)` gate listing
-EVERY `origX` ref the wrapper invokes at runtime. When any required
-ref is null, the wrap is silently skipped; the raw `gl.X` (whether
-present or missing) is preserved unchanged.
-
-**Method-dependency map (every wrap → its required-orig set):**
-
-| Wrap | Required origs |
-|---|---|
-| `activeTexture` | `origActiveTexture` |
-| `bindTexture` | `origBindTexture` |
-| `texImage2D` | `origTexImage2D`, `origBindTexture`, `origTexParameteri`, `origTexSubImage2D`, `gl.createTexture` (runtime check) |
-| `texSubImage2D` | `origTexSubImage2D`, `origBindTexture` |
-| `texParameteri` | `origTexParameteri`, `origBindTexture` |
-| `texParameterf` | `origTexParameterf`, `origBindTexture` |
-| `generateMipmap` | `origGenerateMipmap` |
-| `createShader` | `origCreateShader` |
-| `shaderSource` | `origShaderSource` |
-| `attachShader` | `origAttachShader` |
-| `getActiveUniform` | `origGetActiveUniform` |
-| `compileShader` | `origCompileShader`, `origGetShaderParameter`, `origGetShaderInfoLog` (all 3 diag-only) |
-
-**Symptom it fixes.** Before guard: `screen.getContext('webgl2')` on
-a Phase 2.G.0 empty v2 context succeeded engine-side (`[webgl2]
-context_new ok ...` in log), but `canvas-runner.ts::getSharedScreenGL2`
-then called `installCubeRouting(gl)` whose unconditional
-`gl.activeTexture.bind(gl)` at line 132 dereferenced `undefined.bind`
-→ `TypeError` → caught at `getSharedScreenGL2`'s try/catch → returned
-`null` → Three.js's `WebGL.isWebGL2Available()` saw null on its probe
-canvas → reported **"WebGL 2 not supported"**.
-
-After guard: empty v2 → every wrap's deps are null → every wrap is
-silently skipped → `installCubeRouting` returns cleanly →
-`getSharedScreenGL2` returns the empty v2 → Three.js's probe sees a
-valid `WebGL2RenderingContext` → `isWebGL2Available()` passes.
-**Calling any GL method on the empty context throws `TypeError`
-later** — that's correct 2.G.0 behavior (the demo's first GL call
-fails, but the WebGL2 capability gate passes).
-
-After 2.G.1 binds SOME but not all v2 methods (partial population),
-the guard fires per-wrap: wraps whose deps are now bound install
-normally; wraps whose deps are still missing skip silently. Every
-state from empty → full is correct.
-
-**Hooks are method-set DISJOINT, no ordering dependency.**
-`installBridgeDirtyHooks` wraps `drawArrays`/`drawElements`/`clear`
-and is ALREADY per-method-guarded (canvas-runner.ts:795 `if (typeof
-orig !== 'function') return`). `installCubeRouting` wraps the
-texture/shader set. No method is wrapped by both. Install order is
-indifferent.
-
-**Open question deliberately NOT settled here.** cube-route-shim is
-the v1-era Bucket F.2a #12 rescue for the Mesa-Nouveau samplerCube
-driver limit. v2 cube routing applicability is a Phase 2.G.4 re-
-verify — see #19. The guard makes cube-route-shim NON-CRASHING on
-v2; it does NOT decide whether v2 SHOULD have cube routing at all.
-If 2.G.4 determines v2 should not, gate the `installCubeRouting`
-CALL at canvas-runner.ts:361, not the function itself.
-
-**Why upstream-vanilla lacks it.** cube-route-shim is fork-only
-runtime code (#12). The guard is a fork-only refinement of fork-only
-code.
-
-**DISPOSITION:** `brewser-specific`. Runtime-side; fixes a
-brewser-runtime-v8 / nx.js V8 fork integration corner. Stays in the
-runtime fork.
-
-**UPSTREAM STATUS:** `n/a`.
-
-**RE-APPLY / VERIFY NOTE.** After upstream pull (or
-brewser-runtime-v8 refactor), grep `cube-route-shim.ts` for `safeBind`.
-If absent, re-apply the guard pattern: replace the 14 `.bind(gl)`
-calls with `safeBind` and wrap each `target.X = function` in an
-`if (origDeps)` gate. Diagnostic `[f2a:guard]` log lines surface
-every skipped wrap when `__f2aDiag` is on.
-
-**Recurrence tell.** If a future contributor reverts to unconditional
-`.bind(gl)` because the codebase "looks cleaner without the if-blocks",
-v2 instantiation re-breaks on 2.G.0 (empty) AND on any 2.G.X partial
-state where the contributor adds a method to cube-route-shim's
-dependencies without verifying it's bound by 2.G.X's method-table cut.
+## #18 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#18)
 
 ---
 
 ## #31 — Three.js WebGLState cache desyncs across bridge exit_bracket restore — DEMO-SIDE WORKAROUND SHIPPED 2026-07-01, ENGINE-SIDE FIX OPEN
+
+> **Workaround location:** demo-side one-liner in
+> `brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/gpgpu-water/assets/main.js`.
+> Not a numbered runtime shim; not migrated to
+> [RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md).
+> This entry captures the OPEN engine ask (option list below).
+
 
 **File(s) (workaround, SHIPPED 2026-07-01, Phase 2.G.1 cut #31):**
 - [brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/gpgpu-water/assets/main.js](../brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/gpgpu-water/assets/main.js) — one line: `renderer.resetState()` right before `gpuCompute.compute()` in the animate loop.
@@ -2247,45 +1686,7 @@ Before landing the engine-side general fix, sweep every ping-pong or repeated-un
 
 ---
 
-## #24 — Cube-RT-readback rescue (runtime shim; Phase 2.G.1 cut #24) — SHIPPED 2026-07-01, HARDWARE-VERIFY PENDING
-
-**File(s):**
-- MODIFIED [brewser-runtime-v8/src/scripts/cube-route-shim.ts](../brewser-runtime-v8/src/scripts/cube-route-shim.ts) (~150 lines added)
-
-**Root cause.** cube-route-shim (#12) atlases USER cube uploads (`texImage2D(POSITIVE_X+i, ..., image)`) into a 2D strip. WebGLCubeRenderTarget-populated cubes (Three.js's `CubemapFromEquirect` for `scene.background = equirectTex` + `CubeCamera` for `materials-cubemap-dynamic`) bypass that path: face storage is allocated via nullally-source `texImage2D(POSITIVE_X+i, ..., null)`, then the FBO writes to face N via `framebufferTexture2D`. The shim previously skipped null uploads entirely, so no atlas was allocated. Also, Mesa-Nouveau's driver silently aliases FBO writes to face N>0 → face 0 storage anyway ([[reference-mesa-cube-face-aliasing-rescue]]), so even if the shim COULD sample the raw cube, it would sample garbage. Result before this cut: the shim's `bindTexture(CUBE_MAP)` re-bind leaves TEXTURE_2D at whatever was last there (Skia glyph atlas / DOM compose surface), and the rewritten sampler2D envMap samples HTML content as the skybox.
-
-**Fix (runtime, per-context).** In `installCubeRouting`:
-1. Extend `CubeState` with `scratchTex?`, `scratchAllocated?`, `rtInternalformat?`, `rtFormat?`, `rtType?`, `isRenderTarget?`.
-2. Add `fboCubeStates: WeakMap<WebGLFramebuffer, {cubeTex, faceIdx, hasContent}>` + `currentDrawFBO: WebGLFramebuffer | null`.
-3. New helper `allocateCubeRTAtlas(cubeTex, w, h, intl, fmt, type)` — allocates 6×w × h atlas + w × h scratch, both LINEAR/CLAMP_TO_EDGE; sets `isRenderTarget = true`.
-4. New helpers `flushCubeFaceToAtlas(cubeTex, faceIdx)` (bind atlas as TEXTURE_2D + `copyTexSubImage2D` from current FBO at `faceIdx * faceW` offset) and `flushPendingCubeFace(fb)` (idempotent flush of the FBO's pending face).
-5. Existing `texImage2D` null-source path: after forwarding to engine, if `source === null && w >= 8 && h >= 8`, call `allocateCubeRTAtlas`.
-6. NEW wrap: `framebufferTexture2D(FRAMEBUFFER/DRAW_FRAMEBUFFER, ..., POSITIVE_X+i, cubeTex, level)` → if the cube is RT-marked with a scratch, flush any pending face on the same FBO with a different face, then redirect to `framebufferTexture2D(fbTarget, attachment, TEXTURE_2D, cubeState.scratchTex, level)` + record `fboCubeStates[fbo] = {cubeTex, i, hasContent: true}`.
-7. NEW wrap: `bindFramebuffer(target, fb)` — if switching away from `currentDrawFBO` and it has a pending cube face, flush BEFORE switching (`copyTexSubImage2D` reads from the CURRENT framebuffer, so it must still be bound).
-
-**Why this bypasses the Mesa-Nouveau alias bug.** No cube-face writes ever happen. All FBO writes hit `TEXTURE_2D + scratchTex`, which is a normal 2D attachment that the driver handles correctly. The scratch → atlas copy is a `TEXTURE_2D → TEXTURE_2D` `copyTexSubImage2D`, which the QuickJS-era rescue confirmed reaches sampler-visible storage (`glCopyTexSubImage2D` was broken only for cube-face writes).
-
-**Depth attachment.** Three.js allocates a face-size 2D depth renderbuffer for cube RTs and shares it across the 6 face passes. Since scratchTex is also face-size, `FRAMEBUFFER_COMPLETE` after our redirect. No wrap of `framebufferRenderbuffer` needed.
-
-**Sampling path.** Unchanged — existing `bindTexture(TEXTURE_CUBE_MAP, cubeTex)` wrap redirects TEXTURE_2D[activeTU] to the atlas, existing shader rewrite converts samplerCube reads to `cubeUVSample(sampler2D, dir)` on the atlas.
-
-**DISPOSITION:** `brewser-specific` (runtime-side). Zero engine delta.
-
-**UPSTREAM STATUS:** `n/a`.
-
-**Unlocks (after hardware verify).**
-- `scene.background = equirectTex` natural path (materials-envmaps + gpgpu-water) — replaces cut #17 / cut #23 pmremRT.texture workarounds. Slight HDR range preserved on Citron; on Mesa-Nouveau limited to LDR because Three.js's `CubemapFromEquirect` uses RGBA8 internal by default.
-- `materials-cubemap-dynamic` (CubeCamera per-frame cube renders) — first demo that CAN'T be worked around by pmremRT.texture (per-frame content), so this is the load-bearing unlock.
-
-**Not covered (yet).**
-- `framebufferTextureLayer(target, attachment, cubeTex, level, layer)` — WebGL2's alternate cube-face attachment API. Not currently seen in Three.js r184's cube RT path (uses framebufferTexture2D), but any demo that goes through it will bypass our redirect. Add a parallel wrap if a demo trips this.
-- HDR (RGBA16F) cube RTs — `copyTexSubImage2D` should handle the internal format transparently, but not exercised by current v2 demos (Mesa-Nouveau's PMREM path forces LDR downgrade upstream). Verify separately if HDR cube RT demo lands.
-
-**RE-APPLY / VERIFY NOTE.**
-
-*To verify still needed*: revert cut #17 in materials-envmaps to `scene.background = equirectTex`; the demo should render the equirect skybox without HTML/Skia bleed. If HTML shows again, rescue regressed — grep `cube-route-shim.ts` for `allocateCubeRTAtlas`, `flushPendingCubeFace`, `framebufferTexture2D` (should have TWO occurrences: the wrap install + the origBindFramebuffer/origFramebufferTexture2D safeBind block).
-
-*Recurrence tell*: any demo using CubeCamera / WebGLCubeRenderTarget showing solid-color, HTML, or Skia glyph atlas content on any cube surface. First check that the shim's diag markers fire (`__f2aDiag = true` → `[f2a:rt-atlas-alloc]`, `[f2a:rt-redirect]`, `[f2a:rt-flush]` should all appear in nxjs-debug.log; missing = the wrap install skipped due to a safeBind guard fail).
+## #24 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#24)
 
 ---
 
@@ -2409,43 +1810,11 @@ Ship alongside a systematic sweep of DataTexture uploads with `flipY=true` — v
 
 ---
 
-## #21 — sampler2DShadow → sampler2D runtime shader-rewrite shim (Phase 2.G.1 cut #21) — SHIPPED 2026-07-01
-
-**File(s):**
-- NEW [brewser-runtime-v8/src/scripts/shadow-route-shim.ts](../brewser-runtime-v8/src/scripts/shadow-route-shim.ts) (~230 lines)
-- MODIFIED [brewser-runtime-v8/src/scripts/canvas-runner.ts](../brewser-runtime-v8/src/scripts/canvas-runner.ts) — import + `installShadowRouting(gl)` after `installCubeRouting(gl)` at both `getSharedScreenGL()` and `getSharedScreenGL2()` sites.
-
-**Root cause.** Mesa-Nouveau on Tegra X1 has no working `sampler2DShadow` hardware-compare path. Cut #19 diag rounds 1-3 (nxjs-source-v8/source/webgl.cc temporary instrumentation, reverted after cut #21 landed) proved:
-1. `glTexParameteri(TEXTURE_2D, TEXTURE_COMPARE_MODE, COMPARE_REF_TO_TEXTURE)` lands correctly on the depth texture (err=0x0, `bound_tex` matches the FBO-attached tex).
-2. Compare mode SURVIVES `glTexStorage2D` and `glFramebufferTexture2D` unchanged (`post_mode=0x884E`).
-3. Shadow FBO is `FRAMEBUFFER_COMPLETE` (0x8CD5).
-4. Shadow render pass executes every frame — one `glClear(COLOR|DEPTH|STENCIL)` + one `glDrawElements` (index count matches the shadow-caster geometry) with `dm=1 cd=1.000 err=0x0`.
-
-Yet `sampler2DShadow` returns 0 in the main pass → `directLight.color *= 0` → SpotLight (and any shadow-gated light) invisible. Cut #20 (fallback from `glTexStorage2D` to `glTexImage2D(NULL)` for depth internalformats) also failed. Joins the driver-limit family in [[reference-mesa-nouveau-layered-sampling-unsupported]] alongside sampler3D / sampler2DArray / samplerCube.
-
-**Fix approach.** Wrap `gl.shaderSource` to intercept Three.js's shadow-map shaders:
-1. Scan `\bsampler2DShadow\s+(\w+)` to collect per-shader shadow-sampler identifier set (matches uniform decls AND function-parameter decls in the same pass — Three.js's `getShadow` takes `sampler2DShadow shadowMap` as a param).
-2. Global replace `\bsampler2DShadow\b` → `sampler2D` (safe against `samplerCubeShadow` — different token; also rewrites `precision X sampler2DShadow;` decls without a follow-up identifier).
-3. For each collected identifier, rewrite `texture(IDENT[?], ...)` → `textureShadowCompat(IDENT[?], ...)` (identifier-scoped — does NOT touch texture() calls on regular sampler2D uniforms).
-4. Inject helper: `highp float textureShadowCompat(highp sampler2D _depths, highp vec3 _uvz) { highp float _stored = texture(_depths, _uvz.xy).r; return step(_uvz.z, _stored); }`. Matches Three.js's default `LessEqualCompare` semantics (`shadow.map.depthTexture.compareFunction = LessEqualCompare` → sampler2DShadow returns 1.0 when `ref <= sample_depth`; `step(ref, depth)` returns 1.0 when `ref <= depth`).
-
-Also wraps `gl.texParameteri` to force `TEXTURE_COMPARE_MODE=NONE` on TEXTURE_2D targets — sampling a depth texture as sampler2D with compare mode ON is undefined behavior per ES 3.0 spec; forcing NONE guarantees raw depth-value reads.
-
-**CRITICAL LESSON re-learned from cut #7 (cube-route-shim's cubeUVSample helper).** The helper MUST have explicit `highp` qualifiers on return type, sampler2D param, vec3 param, AND local `_stored`. Mesa-Nouveau's GLSL ES 3.00 compiler is strict — the file-scope `precision highp float;` in Three.js's prelude does NOT propagate to function signatures. First-round attempt without them produced silent shader-compile failures → EVERY material with shadows fell back to nothing rendered → canvas completely black (not just missing spotlight, TOTAL black including non-shadow geometry). Recurrence tell: if a future runtime-shim shader-rewrite adds a helper that returns black-screen behavior on Mesa-Nouveau, check for missing `highp` on the helper decl.
-
-**Symptom it fixes.** webgl-lights-spotlight (v2) — spotlight cone renders correctly on floor, TorusKnot casts proper PCF shadow into the cookie-lit pool. Also fixes any future v2 demo using DirectionalLight/SpotLight with `castShadow=true` + PCF shadow map.
-
-**DEFERRED.** `samplerCubeShadow` (point light shadows). No current v2 demo exercises point light shadows. Parallel rewrite would follow the same shape — collect `samplerCubeShadow IDENT`, rewrite type + calls, inject helper that samples the cube face + does step compare. Requires coordination with cube-route-shim's samplerCube→sampler2D + atlas layer (or its own atlas of some kind). Estimated ~100 additional lines.
-
-**DISPOSITION:** `brewser-specific` (runtime-side). Mesa-Nouveau driver-limit workaround; upstream Three.js would not accept a rewrite that hides sampler2DShadow.
-
-**UPSTREAM STATUS:** `n/a`.
-
-**RE-APPLY / VERIFY NOTE.** If a brewser-runtime-v8 upstream pull loses this shim, webgl-lights-spotlight (or any v2 shadow-map demo) regresses to invisible spotlight / ambient-only lighting. Recurrence tell: `[shadow-shim:install]` line missing from `nxjs-debug.log` after context creation. Re-apply by restoring `shadow-route-shim.ts` from git history and re-adding the `installShadowRouting(gl)` calls in canvas-runner.ts after both `installCubeRouting(gl)` sites.
+## #21 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#21)
 
 ---
 
-## #22 — Switch.VideoDecoder minimal V8 port (Phase 2.G.1 cut #22) — SHIPPED 2026-07-01
+## #22 — Switch.VideoDecoder minimal V8 port (Phase 2.G.1 cut #22) — SHIPPED 2026-07-01, EXTENDED WITH CUT #22b (AUDIO SURFACE) 2026-07-02
 
 **File(s):**
 - NEW [source/video-decoder.h](source/video-decoder.h) (~5 lines — forward decl of `nx_init_video_decoder`)
@@ -2483,6 +1852,81 @@ Also wraps `gl.texParameteri` to force `TEXTURE_COMPARE_MODE=NONE` on TEXTURE_2D
 *Recurrence tell.* Demo throws `Switch.VideoDecoder unavailable — rebuild nxjs.nro with video support` from [webgl-materials-video/assets/main.js:89](../brewser-apps/apps/experimental/com.natureglass.webgl2threejsdemos/webgl-materials-video/assets/main.js#L89). The `typeof Switch.VideoDecoder !== 'function'` guard proves the class isn't exposed by the runtime.
 
 *Format contract.* `nx_media_present` writes BGRA; if a future demo's Three.js path uses `THREE.BGRAFormat` (unlikely — Three.js doesn't have that), the R↔B swizzle in `nx_video_decoder_next_frame` should be dropped. Otherwise keep the swizzle — most GPU consumers (WebGL RGBA texture uploads, canvas ImageData) expect RGBA.
+
+**Cut #22b (2026-07-02) — audio surface + transport controls, SHIPPED CITRON VERIFIED.**
+
+Spectraplay MP3 playback surfaced every gap left by cut #22's video-only scope. brewser-runtime's live-dom routes `<audio>` DOM elements through the exact same `videoPlay` / `videoPause` / `videoSeek` / `videoCurrentTime` code path as `<video>`, so a `Switch.VideoDecoder` opened on an MP3 opens+plays but the audio track has nowhere to go — the media's decode thread drops audio packets because `m->audio_node == NULL`. Symptoms: Play button "does nothing" (no sound, no progress-bar advance, no error in the log — decode "starts" successfully, just silent). Same failure mode for `<video>` DOM elements that carry audio.
+
+Cut #22b lands the full HTMLMediaElement-shaped audio surface:
+
+- **Playback wiring**: new `videoDecoderCreateAudioNode(dec, audioCtxHandle)` C binding mirrors `nx_video_create_audio_node` — attaches a STREAM_SOURCE to the media via `nx_media_set_audio_node`, stores the node on `nx_video_decoder_t` (release AFTER `nx_media_destroy` joins the decode thread), returns a JS handle. JS wrapper's constructor auto-attaches when `!opts.noAudio && this.usedAudio`: `getSharedAudioContext()` → stream → GainNode → destination. Skipped for `noAudio: true` (poster-preview path) and sources with no audio track.
+- **Volume/mute**: `videoDecoderSetVolume` / `videoDecoderSetMuted` C bindings store the state on the decoder (feeds the `muted` / `volume` getters — cut #22's stubbed `false`/`1.0` return values are now real). JS wrapper's `setVolume` / `setMuted` also apply through the JS-side GainNode (`gain.gain.value = muted ? 0 : volume`) — stored on a module-level `WeakMap<VideoDecoder, GainNode>` to avoid property-pollution on the `proto()`-wrapped instance.
+- **Transport (`pause`/`seek`)**: cut #22 explicitly deferred these. New `videoDecoderPause` / `videoDecoderSeek` C bindings delegate to `nx_media_pause` / `nx_media_seek` (both already existed in media-decoder.h). JS `pause()` + `seek(seconds)` methods added. `paused` getter tracks the last transition (`d->paused` flag set in play/pause bindings; also reports `true` for ended decoders).
+- **Audio clock (`audioTime`)**: cut #22 stubbed to `0.0`. Now returns `nx_media_current_time(m)` when audio is wired — that clock is already audio-slaved via `clock_now`'s consumed-frame counter (media-decoder.cc:449), so the seek bar tracks the true playback position on audio-only sources.
+- **Visualizer surface (`getWaveform` / `getFrequencyData` / `getAudioLevels`)**: cut #22 didn't wire these; spectraplay reads them at the DOM-element layer (`audio.getFrequencyData(specData)` / `audio.getWaveform(waveData)`) which brewser-runtime's live-video.ts routes to the decoder methods. New audio-tap ring in `nx_media` (TAP_LEN=1024 mono samples, matches QuickJS-era window size, mutex-guarded, written inside `enqueue_audio` right after `swr_convert` with a stereo→mono downmix). Three public reader accessors in media-decoder.h: `nx_media_read_waveform` (chronological slice of the last N samples), `nx_media_read_spectrum` (Hann-windowed radix-2 FFT + linear bin-average + `sqrt(1 + centre/6)` 1/f-flatten so mids and treble bars visibly react — without the flatten only the first 2-3 bass bars ever cleared spectraplay's `Math.min(1, mag * vizFreqGain)` visibility threshold), `nx_media_read_audio_levels` (3-band bass/mid/high RMS). Each reader returns `false` (or 0 for levels) until the tap has accumulated a full window.
+
+**Files (cut #22b delta).**
+- MODIFIED [source/video-decoder.cc](source/video-decoder.cc) — added `audio_node` / `muted` / `volume` / `paused` fields + release-on-close; new bindings `videoDecoderCreateAudioNode` / `SetVolume` / `SetMuted` / `Pause` / `Seek` / `GetWaveform` / `GetFrequencyData` / `GetAudioLevels`; `nx_vd_get_muted` / `_volume` / `_audio_time` / `_paused` getters now read real state.
+- MODIFIED [source/media-decoder.h](source/media-decoder.h) — new public accessors `nx_media_read_waveform` / `_read_spectrum` / `_read_audio_levels`.
+- MODIFIED [source/media-decoder.cc](source/media-decoder.cc) — `TAP_LEN`/`TAP_MASK`/`TAP_LOG2` constants; `tap_mutex` + `tap_ring[1024]` + `tap_write_pos` + `tap_written` fields on `nx_media`; mono-downmix write hook in `enqueue_audio` after `swr_convert`; `fft_tap` iterative radix-2 helper; `snapshot_tap` chronological-order snapshot; the three public readers with FFT + Hann window + 1/f-flatten.
+- MODIFIED [packages/runtime/src/$.ts](packages/runtime/src/$.ts) — type decls for the 8 new bindings.
+- MODIFIED [packages/runtime/src/switch/video-decoder.ts](packages/runtime/src/switch/video-decoder.ts) — constructor auto-attaches audio (`getSharedAudioContext` + `createAudioNode` + `createGain` + `connect`), `WeakMap`-keyed GainNode storage, new methods `pause` / `seek` / `setVolume` / `setMuted` / `getWaveform` / `getFrequencyData` / `getAudioLevels`.
+
+**Verified Citron 2026-07-02.** Spectraplay MP3 tracks from `sdmc:/music/` play audibly, progress bar advances, Pause/Stop pause/resume work, seek by dragging works, mute toggles silence, volume slider changes level, visualizer bars 0..14 (of 16) react to different frequency bands.
+
+**Design contract.** The audio_node lifetime is decoder-owned (released in `free_video_decoder` AFTER `nx_media_destroy` joins the decode thread). The JS-side GainNode is `WeakMap`-referenced — GC drops it when the decoder is unreachable, and the audio graph rerefs it via the connection to `ctx.destination` until then. The audio-tap mutex is held only around the ring write/snapshot (microseconds) — no contention with the decode thread's `nx_audio_stream_write` blocking path.
+
+**Still-deferred (nothing user-visible; add when a demo asks).**
+- `setPlaybackRate` — nx_media doesn't currently support variable-rate playback; would need swresample rate change + clock scaling.
+- Waveform/spectrum play-head sync — my tap is written from the decode thread, so it holds the LATEST decoded audio (may be ~1-2 render buffers ahead of the audrv play head). QuickJS-era's video.c indexed features by played-sample count. For spectraplay's 60Hz visualizer this <50ms latency is invisible; for tightly synced games it might matter.
+- `getVideoPlaybackQuality` etc. — cut #22 covers video demos, adjacent surface.
+
+**Recurrence tell.** If Switch.VideoDecoder's audio surface regresses in a future refactor: `dec.play()` succeeds but no sound + no progress bar advance + no error in the log = `nx_video_decoder_new` isn't calling `videoDecoderCreateAudioNode` (or its C-side is dropping the connection). Log signature: none in the current code path — the failure is silent-by-design (deferred stubs no-op'd). Instrument with a `console.debug` inside `getSharedAudioContext` call in the constructor to prove the auto-attach path fires.
+
+---
+
+## #34 — BaseAudioContext + AudioContext throw-stubs should be no-op nodes (or explicit throws in a documented shape) — OPEN, RUNTIME-SIDE POLYFILL FILLS THE GAP 2026-07-02
+
+> **Workaround location:** the runtime-side polyfill at
+> [brewser-runtime-v8/src/polyfills/web-audio-stubs.ts](../brewser-runtime-v8/src/polyfills/web-audio-stubs.ts)
+> fills the engine gap today; see the upstream-pull-sensitivity
+> header in [RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md)
+> — the #34 polyfill is the pattern example for the
+> guard-by-shape-mis-classifies lesson documented there.
+
+
+**File(s):**
+- [packages/runtime/src/audio/base-audio-context.ts:210-262](packages/runtime/src/audio/base-audio-context.ts#L210) — 12 create* methods (`createAnalyser`, `createBiquadFilter`, `createChannelMerger`, `createChannelSplitter`, `createConstantSource`, `createConvolver`, `createDelay`, `createDynamicsCompressor`, `createIIRFilter`, `createOscillator`, `createPanner`, `createPeriodicWave`, `createScriptProcessor`, `createWaveShaper`) all bodied as `throw new Error('Method not implemented.')`.
+- [packages/runtime/src/audio/audio-context.ts:157-169](packages/runtime/src/audio/audio-context.ts#L157) — 3 more (`createMediaElementSource`, `createMediaStreamDestination`, `createMediaStreamSource`) same pattern.
+
+**Root cause.** These methods aren't just missing — they're actively harmful, because they throw *after* `new AudioContext()` has already succeeded in the surrounding `try` block. In app code the shape is invariably:
+
+```js
+audioContext = audioContext || new AudioContext();   // allocates audrv voice
+sourceNode = audioContext.createMediaElementSource(audio);  // throws
+```
+
+The catch swallows the exception, but the AudioContext is now half-init: constructed, holding an audrv voice + graph + render-thread reference, never closed because the app skipped the "everything worked, keep it" path. Whatever plays audio next through the runtime's shared context contends with a stranded voice that renders silence from an unconnected graph. Symptom: playback is *initiated* successfully (`audio.play()` doesn't throw), the render thread pulls buffers, no error surfaces — user just hears nothing.
+
+Symptom re-appeared 2026-07-02 in spectraplay (MP3 Play button "does nothing"). Same class of bug was previously diagnosed 2026-06-03 in the QuickJS-era mediaplayer + WebAudio-Tone game; the response then was to write a runtime-side polyfill ([brewser-runtime-v8/src/polyfills/web-audio-stubs.ts](../brewser-runtime-v8/src/polyfills/web-audio-stubs.ts)) that overrides the throw-stubs with no-op fake nodes. That polyfill had a latent bug of its own — its `definePrototypeMethod` bailed with `if (typeof proto[name] === 'function') return;` because the throw-stubs ARE functions — so the polyfill silently no-op'd against the throw-stubs it was written to patch. Fixed 2026-07-02 in [brewser-runtime-v8/src/polyfills/web-audio-stubs.ts](../brewser-runtime-v8/src/polyfills/web-audio-stubs.ts) (dropped the guard; STUBS_BUILD_TAG bumped to `v8-override-throw-stubs`).
+
+**Proposed upstream fix.** For methods that produce a *node* the caller connects into the graph (`createMediaElementSource`, `createMediaStreamSource`, `createMediaStreamDestination`, `createConvolver`, `createDelay`, `createBiquadFilter`, `createPanner`, `createStereoPanner`, `createDynamicsCompressor`, `createWaveShaper`, `createScriptProcessor`, `createIIRFilter`, `createChannelMerger`, `createChannelSplitter`), return `this.createGain()` (which is real, spec-shaped, and silent when its gain stays at 1). For methods with distinctive *interfaces* consumers introspect (`createAnalyser.getByteFrequencyData`, `createOscillator.start/stop`, `createConstantSource.offset`, `createPeriodicWave`), either wire real minimal impls or ship the same fake-shapes the runtime-side polyfill uses today.
+
+**Scope.** ~15 method bodies, ~30-line diff net. No native/C++ delta — pure TS. Doesn't need to be perfect; the *specific harm* is throw-after-context-alloc, and any body that returns instead of throws eliminates it.
+
+**Symptom it fixes.** spectraplay MP3 Play button plays audio again on V8 fork. Any app that uses `createMediaElementSource(audio)` for visualization purposes works instead of silently corrupting the audrv state.
+
+**DISPOSITION:** `upstream-candidate`. These are Web Audio surface — either implement or return a benign placeholder; throwing after `new AudioContext()` has succeeded is a spec-hostile shape (`AudioContextOptions` doesn't warn callers that node factories will throw).
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.**
+
+*Verify.* Grep `packages/runtime/src/audio/base-audio-context.ts` for `Method not implemented`. Presence = still upstream-broken; downstream polyfill in brewser-runtime-v8 is load-bearing.
+
+*Recurrence tell.* Any app whose `try { audioContext.createMediaElementSource(el); ... } catch { ... }` block runs → no audio afterwards. Log signature: `[page] "audio graph init failed..." Error: Method not implemented. at createMediaElementSource (nxjs:src/audio/audio-context.ts:...)`. If the polyfill regresses (STUBS_BUILD_TAG guard reintroduced, or polyfill loading order breaks), the log will show `[stubs] "BEFORE: createMediaElementSource=function ... AFTER: createMediaElementSource=function"` with the SAME `=function` on both sides — the polyfill saw the throw-stub and didn't overwrite it.
+
+*Design contract.* The polyfill's fakeNode returns a connect-passthrough; the fakeAnalyser fills its `getByteFrequencyData` / `getByteTimeDomainData` outputs with zeros. Visualization degrades to silence-tracking (all-zero waveform), but audio *playback* is preserved. If a future upstream implementation of `createAnalyser` etc. lands, the polyfill's unconditional override in `definePrototypeMethod` will silently clobber it — remove the polyfill entries for methods upstream now implements, and consider re-introducing the guard scoped to specific method names.
 
 ---
 

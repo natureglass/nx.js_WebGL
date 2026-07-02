@@ -117,28 +117,37 @@ struct WebGLState {
 	bool unpack_premultiply = false;
 	int unpack_alignment = 4;
 	int pack_alignment = 4;
-	// User-intended GL bindings that must persist across bracket close /
-	// reopen cycles per WebGL spec. Skia clobbers these between the
-	// runtime's `exit_bracket()` at compose time and the next frame's
-	// `enter_bracket()` when the demo re-enters WebGL — without tracking
-	// them here, a demo that calls `gl.useProgram(X)` / `gl.bindVertexArray
-	// (Y)` / `gl.bindTexture(GL_TEXTURE_2D, Z)` once at init would silently
-	// end up rendering with Skia's program / VAO / TU0-texture on every
-	// subsequent frame (see the webgl2demo bug where the raymarched-cube
-	// program was bound at init and never rebound — Skia clobbered it and
-	// the demo's subsequent `drawArrays` calls ran with Ganesh's program,
-	// producing a frozen scene). Three.js demos re-emit these bindings per
-	// material per frame so the previous bracket contract accidentally
-	// held there, but the WebGL spec's persistence guarantee was violated
-	// silently. `enter_bracket()` restores these from st BEFORE marking
-	// bracket_open, so all user-visible GL calls see their expected
-	// program / VAO / texture context regardless of what Skia mutated.
-	// Textures on units > 0 are not tracked — no shipping demo requires
-	// more than TU0-persistence, and multi-unit tracking would require an
-	// array indexed by MAX_COMBINED_TEXTURE_IMAGE_UNITS.
-	GLuint user_program = 0;
-	GLuint user_vao = 0;
-	GLuint user_tex_2d_tu0 = 0;
+	// Full user-side GL state snapshot for cross-bracket persistence.
+	// Per the WebGL spec, all GL state a demo sets stays in effect for
+	// subsequent calls until the demo explicitly changes it. Skia clobbers
+	// GL between the runtime's `exit_bracket()` at compose time and the
+	// demo's next `enter_bracket()`; without persistence tracking, a demo
+	// that binds program / VAO / textures / viewport / blend func / etc.
+	// ONCE at init (rather than per-frame) silently ends up rendering
+	// under Skia's state on every subsequent frame. Three.js demos re-emit
+	// state per material and accidentally survived the bug; raw-WebGL
+	// demos like webgl2demo (Sunset Sea) and spectraplay's audio-reactive
+	// visualizer expose it. Design: exit_bracket() saves the demo's live
+	// state INTO `user_snap` BEFORE restoring Skia's snap. enter_bracket()
+	// saves Skia's live state (as before, into `snap`) and then RESTORES
+	// `user_snap` after the cut #15 defaults reset. valid flag gates the
+	// first-ever enter_bracket where no user state has been captured yet
+	// (cut #15's WebGL-defaults reset handles Three.js's initial cache
+	// consistency; user_snap takes over from frame 2 onward).
+	nx_gl_state_snap_t user_snap;
+	bool user_snap_valid = false;
+	// Auto-allocated VAO to hold user's attribute-enable / pointer state
+	// for WebGL 1 demos (which never call bindVertexArray). Without this,
+	// the demo's `enableVertexAttribArray` + `vertexAttribPointer` calls
+	// operate on GL's default VAO (VAO 0), which Ganesh also uses for its
+	// own rendering — Skia clobbers the demo's attribute setup between
+	// frames, and drawArrays reads stale/wrong attribute pointers. Caught
+	// while porting the sensors gyro cube. Allocated once at first
+	// enter_bracket and bound before user's first GL call each frame so
+	// demo's attribute state has a home Ganesh doesn't touch. WebGL 2
+	// demos that call bindVertexArray explicitly override this via the
+	// shadow (user_snap.vao) — their intent wins.
+	GLuint auto_user_vao = 0;
 	// Currently bound DRAW_FRAMEBUFFER as the JS sees it. 0 = "default" =
 	// tenant FBO (the only difference from a browser WebGL where 0 = swap
 	// chain back buffer). When the user binds a non-null framebuffer object,
@@ -333,23 +342,46 @@ void enter_bracket() {
 	glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 	glFrontFace(GL_CCW);
 	glCullFace(GL_BACK);
-	// Restore user-intended persistent bindings (program / VAO / TU0
-	// texture) that would otherwise still hold Skia's last-drawn values.
-	// See the `user_program` / `user_vao` / `user_tex_2d_tu0` field
-	// comments on WebGLState for the design rationale. Zero-check means
-	// a demo that never called useProgram / bindVertexArray / bindTexture
-	// gets whatever Skia left — same as before this fix.
-	if (st->user_program != 0) glUseProgram(st->user_program);
-	if (st->user_vao != 0) glBindVertexArray(st->user_vao);
-	if (st->user_tex_2d_tu0 != 0) {
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, st->user_tex_2d_tu0);
+	// Auto-allocate the persistence VAO if we haven't yet. Bind it so
+	// user's attribute state (enableVertexAttribArray / vertexAttribPointer)
+	// lives in a VAO Ganesh doesn't touch. See auto_user_vao field comment.
+	if (st->auto_user_vao == 0) {
+		glGenVertexArrays(1, &st->auto_user_vao);
+	}
+	glBindVertexArray(st->auto_user_vao);
+	// Establish user_snap baseline on the very first enter (captures
+	// Skia's initial state + cut #15 defaults + auto_user_vao just bound)
+	// OR restore accumulated user state on subsequent enters. See
+	// exit_bracket() comment for why we no longer save user_snap at exit —
+	// Skia's 2D rendering has already clobbered GL state by the time
+	// copyBridgeToScreen fires exit_bracket, so live state is not the
+	// demo's intent. Instead, each state-modifying w_* setter updates the
+	// relevant user_snap field directly, so user_snap always reflects
+	// what the demo INTENDED (per WebGL spec, that's what should persist
+	// across bracket boundaries).
+	if (!st->user_snap_valid) {
+		nx_gl_state_save(&st->user_snap);
+		st->user_snap_valid = true;
+	} else {
+		nx_gl_state_restore(&st->user_snap);
 	}
 	st->bracket_open = true;
 }
 
 void exit_bracket() {
 	if (!st || !st->bracket_open) return;
+	// Do NOT save user_snap here: by the time exit_bracket fires (from
+	// w_copy_bridge_to_canvas after Skia's paintLiveOverlay already ran,
+	// or from nx_webgl_compose_if_active at present), the shared GL
+	// context's live state is Skia-clobbered — it no longer reflects the
+	// demo's intent. Instead, user_snap is updated INCREMENTALLY as each
+	// state-modifying w_* setter fires, so it captures what the demo
+	// actually asked for regardless of what Skia does behind the scenes.
+	// The sensors-cube regression (webgl 1 raw cube, "renders broken")
+	// pinned this: demo called gl.enable(DEPTH_TEST) at init; Skia's 2D
+	// paints disabled DT for compositing; exit_bracket saved DT=0 as
+	// "user state"; every subsequent frame's enter_bracket restored DT=0;
+	// cube drew without depth test → back faces show through front faces.
 	nx_gl_state_restore(&st->snap);
 	GrDirectContext *gr = nx_skia_gpu_gr_context();
 	if (gr) gr->resetContext();
@@ -371,34 +403,90 @@ inline void touch_fbo() {
 #define FN(name) static void name(const FunctionCallbackInfo<Value> &info)
 
 // ----- State / capability -----
+// Shadow-tracking pattern: state-modifying w_* setters update
+// st->user_snap.<field> after glCall so user's INTENT is captured
+// regardless of Skia clobbers between bracket close/reopen. See
+// enter_bracket / exit_bracket comments + [[reference-bracket-state-
+// persistence-bug]] for the design rationale.
 FN(w_viewport) {
 	enter_bracket();
-	glViewport(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
+	const GLint x = a_i32(info, 0), y = a_i32(info, 1);
+	const GLint w = a_i32(info, 2), h = a_i32(info, 3);
+	glViewport(x, y, w, h);
+	if (st) {
+		st->user_snap.viewport[0] = x;
+		st->user_snap.viewport[1] = y;
+		st->user_snap.viewport[2] = w;
+		st->user_snap.viewport[3] = h;
+	}
 }
 FN(w_scissor) {
 	enter_bracket();
 	glScissor(a_i32(info, 0), a_i32(info, 1), a_i32(info, 2), a_i32(info, 3));
 }
-FN(w_enable) { enter_bracket(); glEnable(a_u32(info, 0)); }
-FN(w_disable) { enter_bracket(); glDisable(a_u32(info, 0)); }
+FN(w_enable) {
+	enter_bracket();
+	const GLenum cap = a_u32(info, 0);
+	glEnable(cap);
+	if (st) {
+		switch (cap) {
+			case GL_BLEND:        st->user_snap.blend        = GL_TRUE; break;
+			case GL_DEPTH_TEST:   st->user_snap.depth_test   = GL_TRUE; break;
+			case GL_CULL_FACE:    st->user_snap.cull         = GL_TRUE; break;
+			case GL_SCISSOR_TEST: st->user_snap.scissor      = GL_TRUE; break;
+			case GL_STENCIL_TEST: st->user_snap.stencil_test = GL_TRUE; break;
+		}
+	}
+}
+FN(w_disable) {
+	enter_bracket();
+	const GLenum cap = a_u32(info, 0);
+	glDisable(cap);
+	if (st) {
+		switch (cap) {
+			case GL_BLEND:        st->user_snap.blend        = GL_FALSE; break;
+			case GL_DEPTH_TEST:   st->user_snap.depth_test   = GL_FALSE; break;
+			case GL_CULL_FACE:    st->user_snap.cull         = GL_FALSE; break;
+			case GL_SCISSOR_TEST: st->user_snap.scissor      = GL_FALSE; break;
+			case GL_STENCIL_TEST: st->user_snap.stencil_test = GL_FALSE; break;
+		}
+	}
+}
 FN(w_is_enabled) {
 	enter_bracket();
 	GLboolean b = glIsEnabled(a_u32(info, 0));
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), b == GL_TRUE));
 }
 FN(w_depth_func) { enter_bracket(); glDepthFunc(a_u32(info, 0)); }
-FN(w_depth_mask) { enter_bracket(); glDepthMask(a_bool(info, 0)); }
+FN(w_depth_mask) {
+	enter_bracket();
+	const GLboolean m = a_bool(info, 0);
+	glDepthMask(m);
+	if (st) st->user_snap.depth_mask = m;
+}
 FN(w_depth_range) { enter_bracket(); glDepthRangef(a_f32(info, 0), a_f32(info, 1)); }
 FN(w_cull_face) { enter_bracket(); glCullFace(a_u32(info, 0)); }
 FN(w_front_face) { enter_bracket(); glFrontFace(a_u32(info, 0)); }
 FN(w_blend_func) {
 	enter_bracket();
-	glBlendFunc(a_u32(info, 0), a_u32(info, 1));
+	const GLenum s = a_u32(info, 0), d = a_u32(info, 1);
+	glBlendFunc(s, d);
+	if (st) {
+		st->user_snap.blend_src_rgb = st->user_snap.blend_src_a = s;
+		st->user_snap.blend_dst_rgb = st->user_snap.blend_dst_a = d;
+	}
 }
 FN(w_blend_func_separate) {
 	enter_bracket();
-	glBlendFuncSeparate(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
-	                    a_u32(info, 3));
+	const GLenum sRgb = a_u32(info, 0), dRgb = a_u32(info, 1);
+	const GLenum sA = a_u32(info, 2), dA = a_u32(info, 3);
+	glBlendFuncSeparate(sRgb, dRgb, sA, dA);
+	if (st) {
+		st->user_snap.blend_src_rgb = sRgb;
+		st->user_snap.blend_dst_rgb = dRgb;
+		st->user_snap.blend_src_a   = sA;
+		st->user_snap.blend_dst_a   = dA;
+	}
 }
 FN(w_blend_equation) { enter_bracket(); glBlendEquation(a_u32(info, 0)); }
 FN(w_blend_equation_separate) {
@@ -411,8 +499,15 @@ FN(w_blend_color) {
 }
 FN(w_color_mask) {
 	enter_bracket();
-	glColorMask(a_bool(info, 0), a_bool(info, 1), a_bool(info, 2),
-	            a_bool(info, 3));
+	const GLboolean r = a_bool(info, 0), g = a_bool(info, 1);
+	const GLboolean b = a_bool(info, 2), a = a_bool(info, 3);
+	glColorMask(r, g, b, a);
+	if (st) {
+		st->user_snap.color_mask[0] = r;
+		st->user_snap.color_mask[1] = g;
+		st->user_snap.color_mask[2] = b;
+		st->user_snap.color_mask[3] = a;
+	}
 }
 FN(w_stencil_func) {
 	enter_bracket();
@@ -432,7 +527,12 @@ FN(w_stencil_op_separate) {
 	glStencilOpSeparate(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
 	                    a_u32(info, 3));
 }
-FN(w_stencil_mask) { enter_bracket(); glStencilMask(a_u32(info, 0)); }
+FN(w_stencil_mask) {
+	enter_bracket();
+	const GLuint m = a_u32(info, 0);
+	glStencilMask(m);
+	if (st) st->user_snap.stencil_mask = (GLint)m;
+}
 FN(w_stencil_mask_separate) {
 	enter_bracket();
 	glStencilMaskSeparate(a_u32(info, 0), a_u32(info, 1));
@@ -455,7 +555,15 @@ FN(w_clear) {
 }
 FN(w_clear_color) {
 	enter_bracket();
-	glClearColor(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2), a_f32(info, 3));
+	const GLfloat r = a_f32(info, 0), g = a_f32(info, 1);
+	const GLfloat b = a_f32(info, 2), a = a_f32(info, 3);
+	glClearColor(r, g, b, a);
+	if (st) {
+		st->user_snap.clear_color[0] = r;
+		st->user_snap.clear_color[1] = g;
+		st->user_snap.clear_color[2] = b;
+		st->user_snap.clear_color[3] = a;
+	}
 }
 FN(w_clear_depth) { enter_bracket(); glClearDepthf(a_f32(info, 0)); }
 FN(w_clear_stencil) { enter_bracket(); glClearStencil(a_i32(info, 0)); }
@@ -928,10 +1036,9 @@ FN(w_link_program) { enter_bracket(); glLinkProgram(obj_id(info[0])); }
 FN(w_validate_program) { enter_bracket(); glValidateProgram(obj_id(info[0])); }
 FN(w_use_program) {
 	enter_bracket();
-	GLuint p = obj_id(info[0]);
+	const GLuint p = obj_id(info[0]);
 	glUseProgram(p);
-	// Track user-intended program for bracket-reopen restore.
-	if (st) st->user_program = p;
+	if (st) st->user_snap.program = (GLint)p;
 }
 FN(w_get_program_parameter) {
 	GLuint p = obj_id(info[0]);
@@ -1042,7 +1149,10 @@ FN(w_is_buffer) {
 }
 FN(w_bind_buffer) {
 	enter_bracket();
-	glBindBuffer(a_u32(info, 0), obj_id(info[1]));
+	const GLenum target = a_u32(info, 0);
+	const GLuint buf = obj_id(info[1]);
+	glBindBuffer(target, buf);
+	if (st && target == GL_ARRAY_BUFFER) st->user_snap.array_buffer = (GLint)buf;
 }
 FN(w_buffer_data) {
 	enter_bracket();
@@ -1173,19 +1283,17 @@ FN(w_bind_texture) {
 	const GLenum target = a_u32(info, 0);
 	const GLuint tex = obj_id(info[1]);
 	glBindTexture(target, tex);
-	// Track user's TU0 TEXTURE_2D binding for bracket-reopen restore.
-	// Only TU0 tracked (see WebGLState field comment for why).
-	if (st && target == GL_TEXTURE_2D) {
-		GLint active_tex_unit = GL_TEXTURE0;
-		glGetIntegerv(GL_ACTIVE_TEXTURE, &active_tex_unit);
-		if (active_tex_unit == (GLint)GL_TEXTURE0) {
-			st->user_tex_2d_tu0 = tex;
-		}
+	// Track TU0 TEXTURE_2D binding to match nx_gl_state_snap_t coverage.
+	if (st && target == GL_TEXTURE_2D &&
+		st->user_snap.active_tex == (GLint)GL_TEXTURE0) {
+		st->user_snap.tex2d_binding = (GLint)tex;
 	}
 }
 FN(w_active_texture) {
 	enter_bracket();
-	glActiveTexture(a_u32(info, 0));
+	const GLenum unit = a_u32(info, 0);
+	glActiveTexture(unit);
+	if (st) st->user_snap.active_tex = (GLint)unit;
 }
 FN(w_tex_parameteri) {
 	enter_bracket();
@@ -1411,7 +1519,7 @@ FN(w_bind_vertex_array) {
 	enter_bracket();
 	const GLuint v = obj_id(info[0]);
 	glBindVertexArray(v);
-	if (st) st->user_vao = v;
+	if (st) st->user_snap.vao = (GLint)v;
 }
 
 // UBO core (cut #3b) — minimum surface for Three.js's UBO setup: index
@@ -1617,6 +1725,16 @@ FN(w_bind_framebuffer) {
 	// JS sees null/0 as "default" framebuffer; we redirect to tenant FBO.
 	GLuint actual = (fbo == 0) ? nx_webgl_bridge_fbo_id() : fbo;
 	glBindFramebuffer(target, actual);
+	if (st) {
+		// GL_FRAMEBUFFER binds both draw and read; the other two target
+		// only one endpoint.
+		if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+			st->user_snap.fbo = (GLint)actual;
+		}
+		if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+			st->user_snap.read_fbo = (GLint)actual;
+		}
+	}
 }
 FN(w_framebuffer_texture_2d) {
 	enter_bracket();

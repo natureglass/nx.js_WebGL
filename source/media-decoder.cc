@@ -33,6 +33,19 @@ struct av_log_quiet {
 } av_log_quiet_init;
 
 constexpr int RING_SLOTS = 3;
+// Cut #22b Stage 2: audio-tap window size for the visualizer readers.
+// Must be a power of two (masked with TAP_LEN - 1 in the writer). 1024
+// samples ≈ 21.3 ms at 48 kHz — matches the pre-migration (QuickJS-era)
+// video.c FFT window so per-bin magnitudes land in the same range as
+// spectraplay's `vizFreqGain=30` was originally tuned for.
+constexpr uint32_t TAP_LEN = 1024;
+constexpr uint32_t TAP_MASK = TAP_LEN - 1;
+// Log2(TAP_LEN) — the FFT butterfly loop needs a compile-time bit count.
+constexpr int TAP_LOG2 = 10;
+// Local pi (avoid depending on <math.h>'s M_PI which is a non-portable
+// GNU/BSD extension — devkitPro's newlib does provide it, but keep it
+// robust against toolchain changes).
+constexpr double TAP_PI = 3.14159265358979323846;
 // Present a frame when its PTS is within this much of the clock (one frame of
 // slack at 24 fps is ~41 ms; this is just sub-frame jitter tolerance).
 constexpr double PRESENT_EPSILON = 0.001;
@@ -96,6 +109,15 @@ struct nx_media {
 	// ---- presentation quality counters (main thread only) ----
 	uint64_t presented_frames = 0;
 	uint64_t dropped_frames = 0;
+
+	// ---- audio tap (Cut #22b Stage 2 — visualizer surface) ----
+	// Rolling mono downmix of the resampled audio. Written by the decode
+	// thread inside enqueue_audio; read by the main thread through
+	// nx_media_read_waveform / _read_spectrum / _read_audio_levels.
+	std::mutex tap_mutex;
+	float tap_ring[TAP_LEN] = {};
+	uint32_t tap_write_pos = 0;
+	uint64_t tap_written = 0;
 
 	// ---- control ----
 	std::mutex ctl_mutex;
@@ -256,6 +278,21 @@ bool enqueue_audio(nx_media *m, AVFrame *frame, double pts) {
 		    std::memory_order_relaxed);
 		m->audio_pts_base.store(pts, std::memory_order_relaxed);
 		m->audio_clock_valid.store(true, std::memory_order_release);
+	}
+
+	// Cut #22b Stage 2: tap the resampled audio into the visualizer
+	// ring. Interleaved stereo f32 → mono downmix (L+R)/2. Held under a
+	// short mutex so the reader can snapshot a consistent window.
+	{
+		std::lock_guard<std::mutex> tap_lock(m->tap_mutex);
+		const float *sp = m->audio_scratch.data();
+		uint32_t wp = m->tap_write_pos;
+		for (int i = 0; i < got; i++) {
+			m->tap_ring[wp] = 0.5f * (sp[i * 2] + sp[i * 2 + 1]);
+			wp = (wp + 1) & TAP_MASK;
+		}
+		m->tap_write_pos = wp;
+		m->tap_written += (uint64_t)got;
 	}
 
 	const float *src = m->audio_scratch.data();
@@ -947,6 +984,174 @@ done:
 		avio_context_free(&avio);
 	}
 	return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Cut #22b Stage 2: visualizer readers (waveform / spectrum / audio-levels)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Iterative radix-2 Cooley-Tukey FFT on TAP_LEN complex samples in-place.
+// Not general-purpose — hard-coded to the tap window size so the inner
+// loops can constant-fold. Called at most a few times per second (per
+// spectrum read), so no need for split-radix / SIMD; correctness matters.
+void fft_tap(float *re, float *im) {
+	// Bit-reverse permutation.
+	for (uint32_t i = 0; i < TAP_LEN; i++) {
+		uint32_t j = 0;
+		uint32_t k = i;
+		for (int b = 0; b < TAP_LOG2; b++) {
+			j = (j << 1) | (k & 1u);
+			k >>= 1;
+		}
+		if (j > i) {
+			std::swap(re[i], re[j]);
+			std::swap(im[i], im[j]);
+		}
+	}
+	// Cooley-Tukey butterflies (forward FFT — negative-angle twiddles).
+	for (uint32_t size = 2; size <= TAP_LEN; size <<= 1) {
+		uint32_t half = size >> 1;
+		double angle_step = -2.0 * TAP_PI / (double)size;
+		for (uint32_t start = 0; start < TAP_LEN; start += size) {
+			for (uint32_t k = 0; k < half; k++) {
+				double angle = angle_step * (double)k;
+				float wr = (float)cos(angle);
+				float wi = (float)sin(angle);
+				uint32_t i0 = start + k;
+				uint32_t i1 = i0 + half;
+				float tr = wr * re[i1] - wi * im[i1];
+				float ti = wr * im[i1] + wi * re[i1];
+				re[i1] = re[i0] - tr;
+				im[i1] = im[i0] - ti;
+				re[i0] = re[i0] + tr;
+				im[i0] = im[i0] + ti;
+			}
+		}
+	}
+}
+
+// Snapshot the most-recent TAP_LEN mono samples in chronological order.
+// Returns false if the tap hasn't yet accumulated a full window (e.g.
+// fresh decoder). Caller-owned buffer must hold TAP_LEN floats.
+bool snapshot_tap(nx_media *m, float *out) {
+	std::lock_guard<std::mutex> lock(m->tap_mutex);
+	if (m->tap_written < TAP_LEN) return false;
+	uint32_t wp = m->tap_write_pos; // one past the newest sample
+	for (uint32_t i = 0; i < TAP_LEN; i++) {
+		// Oldest → newest: sample at logical index i is at ring index
+		// (wp + i) mod TAP_LEN — because wp is the next write, i.e.
+		// exactly TAP_LEN samples old going forward.
+		uint32_t idx = (wp + i) & TAP_MASK;
+		out[i] = m->tap_ring[idx];
+	}
+	return true;
+}
+
+} // namespace
+
+bool nx_media_read_waveform(nx_media_t *m, float *out, uint32_t out_len) {
+	if (!m || !out || out_len == 0 || out_len > TAP_LEN) return false;
+	std::lock_guard<std::mutex> lock(m->tap_mutex);
+	if (m->tap_written < out_len) return false;
+	uint32_t wp = m->tap_write_pos;
+	// The newest sample is at (wp - 1) mod TAP_LEN. Copy out_len samples
+	// ending at the newest, in chronological order (oldest first).
+	for (uint32_t i = 0; i < out_len; i++) {
+		uint32_t idx = (wp + TAP_LEN - out_len + i) & TAP_MASK;
+		out[i] = m->tap_ring[idx];
+	}
+	return true;
+}
+
+bool nx_media_read_spectrum(nx_media_t *m, float *out, uint32_t out_len) {
+	if (!m || !out || out_len == 0) return false;
+	float samples[TAP_LEN];
+	if (!snapshot_tap(m, samples)) return false;
+	// Hann window (reduces spectral leakage from the rectangular window
+	// otherwise implied by a hard buffer boundary).
+	for (uint32_t i = 0; i < TAP_LEN; i++) {
+		float w = 0.5f * (1.0f - (float)cos(2.0 * TAP_PI * (double)i /
+		                                    (double)(TAP_LEN - 1)));
+		samples[i] *= w;
+	}
+	float re[TAP_LEN];
+	float im[TAP_LEN] = {};
+	memcpy(re, samples, sizeof(re));
+	fft_tap(re, im);
+	// Useful bins are 0..N/2. Convert to magnitude, normalize by (N/2)
+	// so a unit-amplitude tone reads ~1.0 at its bin. Matches the
+	// QuickJS-era video.c formulation.
+	constexpr uint32_t USABLE = TAP_LEN / 2;
+	float mag[USABLE];
+	const float norm = 2.0f / (float)TAP_LEN;
+	for (uint32_t i = 0; i < USABLE; i++) {
+		mag[i] = sqrtf(re[i] * re[i] + im[i] * im[i]) * norm;
+	}
+	// Linear-scale bin-average USABLE bins into out_len output bins,
+	// then flatten the natural 1/f rolloff of music (bass content
+	// dominates the raw magnitude spectrum, so without compensation only
+	// the first few output bins ever visibly react). The sqrt(1 + bin/K)
+	// weighting boosts the tail without warping the bass response —
+	// tuned so mid-range bins (~1 kHz) roughly double vs the raw
+	// magnitude and treble (~10 kHz) reads ~3× stronger.
+	for (uint32_t i = 0; i < out_len; i++) {
+		uint32_t lo = (uint32_t)((uint64_t)i * USABLE / out_len);
+		uint32_t hi = (uint32_t)((uint64_t)(i + 1) * USABLE / out_len);
+		if (hi <= lo) hi = lo + 1;
+		if (hi > USABLE) hi = USABLE;
+		float sum = 0;
+		for (uint32_t k = lo; k < hi; k++) sum += mag[k];
+		float avg = sum / (float)(hi - lo);
+		// Weight by ~sqrt(centre_bin) — cheap 1/f flatten.
+		float centre = 0.5f * (float)(lo + hi);
+		float weight = sqrtf(1.0f + centre / 6.0f);
+		out[i] = avg * weight;
+	}
+	return true;
+}
+
+uint32_t nx_media_read_audio_levels(nx_media_t *m, float *out,
+                                    uint32_t out_max) {
+	if (!m || !out || out_max == 0) return 0;
+	// Three bands (bass / mid / high). Reuse the spectrum path so the
+	// mapping matches the visualizer's frequency reading.
+	constexpr uint32_t BANDS = 3;
+	const uint32_t n = out_max < BANDS ? out_max : BANDS;
+	// Compute a per-band RMS of the tap window in the frequency domain
+	// (Parseval). Cheaper: just RMS the raw tap samples split into
+	// low-pass / mid / high-pass via a coarse Butterworth-shaped IIR —
+	// but for a visualizer the FFT-band approach is more legible.
+	float samples[TAP_LEN];
+	if (!snapshot_tap(m, samples)) return 0;
+	for (uint32_t i = 0; i < TAP_LEN; i++) {
+		float w = 0.5f * (1.0f - (float)cos(2.0 * TAP_PI * (double)i /
+		                                    (double)(TAP_LEN - 1)));
+		samples[i] *= w;
+	}
+	float re[TAP_LEN];
+	float im[TAP_LEN] = {};
+	memcpy(re, samples, sizeof(re));
+	fft_tap(re, im);
+	constexpr uint32_t USABLE = TAP_LEN / 2;
+	const float norm = 2.0f / (float)TAP_LEN;
+	// Band edges: bass 0..~250 Hz, mid 250 Hz..~4 kHz, high 4 kHz..Nyquist.
+	// At 48 kHz sample rate and TAP_LEN=2048, bin size ≈ 23.44 Hz — so
+	// 10 bins ≈ 235 Hz, 170 bins ≈ 4 kHz.
+	uint32_t edges[BANDS + 1] = {0, 10, 170, USABLE};
+	for (uint32_t b = 0; b < n; b++) {
+		uint32_t lo = edges[b];
+		uint32_t hi = edges[b + 1];
+		float sum = 0;
+		for (uint32_t k = lo; k < hi; k++) {
+			float mag = sqrtf(re[k] * re[k] + im[k] * im[k]) * norm;
+			sum += mag * mag;
+		}
+		float rms = (hi > lo) ? sqrtf(sum / (float)(hi - lo)) : 0.0f;
+		out[b] = rms;
+	}
+	return n;
 }
 
 void nx_media_destroy(nx_media_t *m) {
