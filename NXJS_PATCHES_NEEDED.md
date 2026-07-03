@@ -71,6 +71,7 @@ proposal verdict.
 | 43 | engine | upstream-candidate | not-submitted | `webgl.cc: populate_native_extensions` + `webgl.cc: \[gl-ext-dump\]` | Phase-0: native GL extension enumeration + `_getNativeExtensionsString`/`_getEglVersion` internals + `[gl-ext-dump]` boot log (RUNTIME_SHIMS #44 companion) |
 | 44 | **runtime** (MOVED) | fork-only | n/a | `webgl-ext-shim.ts: installGetBackendInfo` | Phase-0: `gl.getBackendInfo` runtime shim (engine #43 companion) |
 | 45 | engine | upstream-candidate | not-submitted | `webgl2-rendering-context.ts: TS extension stub reached` | Phase-0: webgl2-rendering-context.ts landmine defuse — dead TS stubs throw instead of silent `[]`/null |
+| 46 | engine | upstream-candidate | not-submitted | `webgl_bridge.cc: GL_DEPTH24_STENCIL8` + `webgl_bridge.cc: \[bridge-fbo:` | Phase-0 commit 2: bridge FBO stencil contract — DEPTH24_STENCIL8 renderbuffer + combined attach + STENCIL_BITS=8 wire + [bridge-fbo] completeness assert |
 
 ## DISPOSITION POLICY
 
@@ -2203,6 +2204,67 @@ The trap is install-order dependent. Step (b) of the phase plan is an install-or
 - Grep hit missing → someone reverted to the silent `return []` stub. Restore the throw.
 
 **Sequencing.** Ships in the same cut as #43 + [RUNTIME_SHIMS.md #44](../brewser-runtime-v8/RUNTIME_SHIMS.md#44).
+
+---
+
+## #46 — Bridge FBO stencil contract fix — DEPTH24_STENCIL8 renderbuffer + STENCIL_BITS wire + [bridge-fbo] completeness assert — SHIPPED 2026-07-03 (phase-0 commit 2 — HARDWARE VERIFICATION PENDING)
+
+**File(s):** [source/webgl_bridge.cc](source/webgl_bridge.cc) — `create_fbo()` at [webgl_bridge.cc:145-198](source/webgl_bridge.cc#L145-L198): renderbuffer storage `GL_DEPTH_COMPONENT24` → `GL_DEPTH24_STENCIL8`, attachment `GL_DEPTH_ATTACHMENT` → `GL_DEPTH_STENCIL_ATTACHMENT` (single combined attach — ES3-preferred over the split double-attach pattern), `[bridge-fbo:INCOMPLETE]` / `[bridge-fbo:complete]` distinctive log tags. [source/webgl.cc](source/webgl.cc) — `w_get_parameter()` adds explicit `case GL_STENCIL_BITS:` / `case GL_DEPTH_BITS:` branches. Note the underlying spec-correct behavior would already be right (glGetIntegerv on the currently-bound tenant FBO returns 8/24); the explicit case is for grep-visibility of the wire so a hardware regression is diagnosable.
+
+**Symptom.** Two-way contract violation the phase-0 gap report ([WEBGL_EXTENSION_GAP.md §Broken-introspection C](../brewser-runtime-v8/docs/WEBGL_EXTENSION_GAP.md)) called out:
+- `getContextAttributes.stencil` returns `true` (hardcoded at [webgl.cc:849-867](source/webgl.cc#L849-L867)).
+- `getParameter(STENCIL_BITS)` returns `0` — because the tenant FBO's depth attachment was `GL_DEPTH_COMPONENT24` with no stencil renderbuffer.
+- Downstream: Unity `RectMask2D`, Phaser stencil masks, any content that queries `STENCIL_BITS >= 1` before enabling stencil ops will fall back to non-stencil paths or bail out entirely. Pre-migration was internally consistent (advertise `stencil:false`, `STENCIL_BITS=0`); V8 migration re-introduced the inconsistency.
+
+**Fix.** Combined depth+stencil renderbuffer:
+
+```cpp
+glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                          GL_RENDERBUFFER, s_depth_rb);
+```
+
+Memory delta on Tegra Nouveau is likely zero: `DEPTH_COMPONENT24` is stored as padded `D24X8` in most driver implementations, so `DEPTH24_STENCIL8` claims already-allocated bits. Not framed as a tradeoff.
+
+FBO completeness assert (mandatory) — distinctive tag `[bridge-fbo:INCOMPLETE status=0xXXXX]` on failure, `[bridge-fbo:complete WxH color=RGBA8 depth=24 stencil=8]` on success. Citron IS authoritative for this assert (functional gate, not render correctness — per phase-0 commit 2 rider 3).
+
+**Rider 2 stencil-path audit (read-only findings from commit-2 landing session).**
+
+1. **Bracket contract has a stencil coverage gap (PROPOSED FOLLOW-UP — DO NOT FOLD INTO THIS CUT).** `nx_gl_state_snap_t` at [webgl_bridge.cc:606-639](source/webgl_bridge.cc#L606-L639) captures `GL_STENCIL_TEST` (enable) and `GL_STENCIL_WRITEMASK` (cut #15) but does NOT capture:
+   - `GL_STENCIL_CLEAR_VALUE`
+   - `GL_STENCIL_FUNC` / `GL_STENCIL_REF` / `GL_STENCIL_VALUE_MASK`
+   - `GL_STENCIL_FAIL` / `GL_STENCIL_PASS_DEPTH_FAIL` / `GL_STENCIL_PASS_DEPTH_PASS`
+   - All `_BACK_` separate stencil params
+   
+   Previously benign — stencil-less tenant FBO made stencil-op state fully vestigial. Post-commit-2, if Skia's Ganesh backend mutates stencil test/func/op between the demo's frames (it does; Ganesh uses stencil for path clipping), a demo that sets stencil config ONCE at init will have that config clobbered on frame 2+. Recommend: follow-up ledger entry extending `nx_gl_state_snap_t` in the same cut #15 family (stencil clear value + func tuple + op tuple + BACK variants). Standing "do-not-touch bracket machinery" rule prohibits fixing in this cut.
+   
+2. **gl-teardown.ts reset rows are safe.** [gl-teardown.ts:352-381](../brewser-runtime-v8/src/scripts/gl-teardown.ts#L352-L381) resets all stencil-related state (`stencilMask(0xFFFFFFFF)`, `disable(STENCIL_TEST)`, `stencilFunc(ALWAYS,0,0xFFFFFFFF)`, `stencilOp(KEEP,KEEP,KEEP)`, `clearStencil(0)`) to WebGL spec initial values. Post-commit-2 the `gl.clear(...|STENCIL_BUFFER_BIT)` at [gl-teardown.ts:600](../brewser-runtime-v8/src/scripts/gl-teardown.ts#L600) now actually clears the real 8-bit stencil (previously a no-op) — the clear value is 0 which is correct.
+
+3. **canvas-runner resetScreenGLForScript.** Already audited in [RUNTIME_SHIMS.md #42 follow-up rider 3 table](../brewser-runtime-v8/RUNTIME_SHIMS.md). The only stencil row there is `disable(STENCIL_TEST)` (at line 1213), classified "Clean — toggles reset to spec defaults". Verdict holds post-commit-2.
+
+4. **`gl.clear(STENCIL_BUFFER_BIT)` audit.** Now effective. `w_clear` at [webgl.cc](source/webgl.cc) forwards to native `glClear`; native clear operates against the currently-bound FBO's actual attachments. Value comes from `GL_STENCIL_CLEAR_VALUE` (default 0). Correct.
+
+**Verdict:** "fine, that's the point" for gl-teardown + canvas-runner (rows 2/3/4). NOT fine for the bracket contract (row 1). The bracket gap is a separate, hardware-testable follow-up; it is NOT a commit-2 blocker because most demos re-emit stencil config per material (Three.js pattern), and raw-WebGL demos in the current curated 13-demo suite do not exercise stencil at all.
+
+**Hardware verification pending.** Per phase-0 commit 2 rider 3, the hardware-session gate for this commit is LIMITED to:
+- (a) No regression across the existing curated 13-demo suite (functional, not render correctness).
+- (b) `[bridge-fbo:complete]` fires + `[bridge-fbo:INCOMPLETE]` does NOT fire in the hardware boot log.
+- (c) `com.natureglass.webglreport`: `stencilBits: 8`, `getContextAttributes.stencil: true` (both, on both v1 and v2 contexts).
+
+Authoritative stencil FUNCTIONALITY verification is DEFERRED to the first stencil-exercising content (a Unity `RectMask2D` scene or a trivial stencil-mask test page). The current 13-demo suite does NOT exercise stencil — suite-green does NOT prove stencil works.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js's WebGL surface is null-stubbed; there is no tenant FBO to attach stencil to. The tenant FBO model itself is a fork addition ([NXJS_PATCHES_NEEDED.md #6](#6)); this fix extends #6's contract with the stencil bits that were always advertised but never delivered.
+
+**DISPOSITION:** `upstream-candidate` (with #6). Bundles with the coexistence primitive PR when it lands.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl_bridge.cc](source/webgl_bridge.cc) for `GL_DEPTH24_STENCIL8` and `[bridge-fbo:`. Grep [source/webgl.cc](source/webgl.cc) for `case GL_STENCIL_BITS:`. Recurrence tells:
+- `[bridge-fbo:INCOMPLETE]` in a hardware log → the DEPTH24_STENCIL8 attach was rejected. Likely: the shared EGL config's stencil requirement got dropped ([NXJS_PATCHES_NEEDED.md #5](#5)), or Nouveau on that build refuses combined depth/stencil renderbuffers (would be surprising). Revert this commit as first step, then debug.
+- `getParameter(STENCIL_BITS)` reports 0 while `[bridge-fbo:complete]` fires → the enter_bracket path is not binding the tenant FBO before w_get_parameter runs, OR the switch case was reverted. Check bracket integrity, not the switch.
+- Suite demo renders broken depth-tested geometry post-commit-2 → depth attachment regressed. Log `[bridge-fbo:complete]` should show `depth=24 stencil=8`; if `depth=` is wrong, the combined attach is misbehaving on this driver — revert to split-attach (`DEPTH_ATTACHMENT` + `STENCIL_ATTACHMENT` pointing at the same renderbuffer) as fallback.
+
+**Sequencing.** Ships as commit 2 of the phase-0 pair. Independently revertable via `git revert` of this commit alone; commit 1 (#43/#44/#45 introspection prerequisite) makes no rendering-behavior changes by construction.
 
 ---
 

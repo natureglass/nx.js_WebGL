@@ -152,25 +152,45 @@ bool create_fbo(int w, int h) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+	// Phase-0 commit 2 — combined depth/stencil renderbuffer to honor the
+	// context's advertised `stencil: true` and produce 8 bits at
+	// `getParameter(STENCIL_BITS)`. Nouveau typically stores DEPTH_COMPONENT24
+	// as padded D24X8 anyway, so DEPTH24_STENCIL8 claims already-allocated
+	// bits — no measurable memory delta on Tegra. Unlocks Unity RectMask2D
+	// and Phaser stencil masks post-hardware-verify. Depth path preserved:
+	// depth attachment goes through the SAME renderbuffer via the combined
+	// DEPTH_STENCIL_ATTACHMENT point (single attach, ES3-preferred), so
+	// DEPTH_BITS still reports 24. See NXJS_PATCHES_NEEDED.md #46.
 	glGenRenderbuffers(1, &s_depth_rb);
 	glBindRenderbuffer(GL_RENDERBUFFER, s_depth_rb);
-	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
 
 	glGenFramebuffers(1, &s_fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 	                       s_color_tex, 0);
-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
 	                          GL_RENDERBUFFER, s_depth_rb);
 	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 	// Unbind BEFORE checking status so the failure path leaves Skia's FBO 0
 	// current rather than our incomplete tenant.
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	if (status != GL_FRAMEBUFFER_COMPLETE) {
-		fprintf(stderr, "[webgl-bridge] FBO incomplete: 0x%x\n", status);
+		// Distinctive tag [bridge-fbo:INCOMPLETE] — grep target for
+		// hardware-session gate (a) per phase-0 commit-2 rider 3. Citron
+		// is authoritative for THIS assert (functional).
+		fprintf(stderr,
+		        "[bridge-fbo:INCOMPLETE] status=0x%x — DEPTH24_STENCIL8 attach failed\n",
+		        (unsigned)status);
 		fflush(stderr);
 		return false;
 	}
+	// Positive-path breadcrumb for the same gate; the assert holds when this
+	// fires and [bridge-fbo:INCOMPLETE] does not.
+	fprintf(stderr,
+	        "[bridge-fbo:complete] %dx%d color=RGBA8 depth=24 stencil=8 (combined attach)\n",
+	        w, h);
+	fflush(stderr);
 	return true;
 }
 

@@ -713,6 +713,25 @@ FN(w_get_parameter) {
 		info.GetReturnValue().Set(Int32Array::New(ab, 0, 2));
 		return;
 	}
+	case GL_STENCIL_BITS:
+	case GL_DEPTH_BITS: {
+		// Phase-0 commit 2 — explicit case for grep-visibility of the
+		// STENCIL_BITS/DEPTH_BITS wire. The tenant FBO is currently bound
+		// (enter_bracket() above); glGetIntegerv returns THAT FBO's
+		// attachment bits. Post-DEPTH24_STENCIL8 upgrade in webgl_bridge.cc
+		// create_fbo, STENCIL_BITS = 8 and DEPTH_BITS = 24 on the default
+		// (tenant) framebuffer, matching getContextAttributes's advertised
+		// {depth:true, stencil:true}. Demo-bound custom FBOs report their
+		// own attachment bits — spec-correct without special-casing.
+		// See NXJS_PATCHES_NEEDED.md #46 recurrence tell: a hardware regression
+		// where getParameter(STENCIL_BITS) reads 0 while the FBO log says
+		// [bridge-fbo:complete] stencil=8 = the enter_bracket path decoupled
+		// from create_fbo (broken bracket contract), NOT this switch.
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+		return;
+	}
 	default: {
 		GLint v = 0;
 		glGetIntegerv(pname, &v);

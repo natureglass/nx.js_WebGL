@@ -358,6 +358,29 @@ check_absent 45 "webgl2-rendering-context.ts stub no longer silently returns nul
     "$NXJS/packages/runtime/src/canvas/webgl2-rendering-context.ts" \
     'getExtension\(name:\s*string\)\s*:\s*any\s*\{\s*return\s*null;'
 
+# #46 — Phase-0 commit 2: bridge FBO stencil contract fix.
+check 46 "webgl_bridge.cc renderbuffer uses GL_DEPTH24_STENCIL8" \
+    "$NXJS/source/webgl_bridge.cc" \
+    'glRenderbufferStorage\s*\(\s*GL_RENDERBUFFER\s*,\s*GL_DEPTH24_STENCIL8'
+check 46 "webgl_bridge.cc attaches via GL_DEPTH_STENCIL_ATTACHMENT" \
+    "$NXJS/source/webgl_bridge.cc" \
+    'GL_DEPTH_STENCIL_ATTACHMENT'
+check_absent 46 "webgl_bridge.cc no longer uses depth-only GL_DEPTH_COMPONENT24 storage" \
+    "$NXJS/source/webgl_bridge.cc" \
+    'glRenderbufferStorage\s*\(\s*GL_RENDERBUFFER\s*,\s*GL_DEPTH_COMPONENT24'
+check_absent 46 "webgl_bridge.cc no longer uses depth-only GL_DEPTH_ATTACHMENT" \
+    "$NXJS/source/webgl_bridge.cc" \
+    'glFramebufferRenderbuffer\s*\(\s*GL_FRAMEBUFFER\s*,\s*GL_DEPTH_ATTACHMENT'
+check 46 "webgl_bridge.cc emits [bridge-fbo:complete] positive breadcrumb" \
+    "$NXJS/source/webgl_bridge.cc" \
+    '\[bridge-fbo:complete\]'
+check 46 "webgl_bridge.cc emits [bridge-fbo:INCOMPLETE] failure assert" \
+    "$NXJS/source/webgl_bridge.cc" \
+    '\[bridge-fbo:INCOMPLETE\]'
+check 46 "webgl.cc w_get_parameter has explicit GL_STENCIL_BITS/GL_DEPTH_BITS case" \
+    "$NXJS/source/webgl.cc" \
+    'case GL_STENCIL_BITS:'
+
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="
