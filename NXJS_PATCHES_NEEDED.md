@@ -78,6 +78,7 @@ proposal verdict.
 | 47 | engine | upstream-candidate | not-submitted | `webgl.cc: has_native_ext` + `webgl.cc: is_v2_context` + `webgl.cc: w_compressed_tex_image_2d` | Phase-1 batch 1: driver-probed advertisement + 16 batch-1 extension rows + compressed 2D upload natives + UNMASKED/MAX_ANISO getParameter branches |
 | 48 | engine | upstream-candidate | not-submitted | `webgl.cc: probe_ext_frag_depth` + `webgl.cc: ANGLE_instanced_arrays` + `webgl.cc: WEBGL_debug_shaders` | Phase-1 batch 2A: Unity-P1 v1 function surfaces (ANGLE_instanced_arrays, WEBGL_draw_buffers, EXT_frag_depth probe, OES_VAO list-flip) + WEBGL_lose_context / WEBGL_debug_shaders software minimal impls + WEBGL_compressed_texture_etc (rider 1) |
 | 49 | engine | upstream-candidate | not-submitted | `webgl.cc: v2_rider2` + `webgl.cc: Rider 2 explicit list` | Phase-1 batch 2B: Rider 2 v2 spec-conformance prune — 5 WebGL1-only extensions return null on v2 (OES_standard_derivatives, OES_texture_float, OES_texture_half_float, OES_texture_half_float_linear, WEBGL_depth_texture) — Chrome / Firefox match |
+| 50 | engine | upstream-candidate | not-submitted | `webgl.cc: Phase-1.5-LOW` + `webgl.cc: w_get_buffer_sub_data` + `webgl.cc: OES_fbo_render_mipmap` | Phase-1.5-LOW: 30 core WebGL2 methods (buffer 2, framebuffer thin 6, 3D texture 3, uint uniforms 8, non-square matrix 6, clear buffer 4, draw range 1) + rider OES_fbo_render_mipmap on v1 (batch-2 defect fix). Counter 17→47/88. |
 
 ## DISPOSITION POLICY
 
@@ -2460,6 +2461,59 @@ Chrome, Firefox, and Safari all return null for these on WebGL2 contexts. Brewse
 - Chrome-compat diff test flags any of the 5 names as ADVERTISED on v2 → prune not in effect on that build.
 
 **Sequencing.** Batch-2 Commit B. Independently revertable via `git revert` of this commit alone; Commit A (#48) makes no v2 advertising changes.
+
+---
+
+## #50 — Phase-1.5-LOW: 30 core WebGL2 methods + OES_fbo_render_mipmap rider — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `u32_list()` helper + 30 new `FN(w_*)` implementations grouped in a phase-1.5-LOW block + 30 new FUNCS[] entries in `install_methods_v2` + OES_fbo_render_mipmap advertising row + `w_get_extension` branch.
+
+**Motivation.** The report app's v2 function counter (17/88 pre-tier) is the phase-1 acceptance metric per plan §0.1. This tier lands the 30 methods classified LOW-effort per plan §0.1's family analysis — every glX call is a thin wrapper, no new K_* handle kinds, no lifecycle concerns.
+
+**Methods landed by family (grep-verifiable via `FN\(w_[a-z_0-9]+\)` in webgl.cc):**
+
+- **Buffer (2):** `w_get_buffer_sub_data`, `w_copy_buffer_sub_data`.
+- **Framebuffer thin (6):** `w_framebuffer_texture_layer`, `w_invalidate_framebuffer`, `w_invalidate_sub_framebuffer`, `w_read_buffer`, `w_renderbuffer_storage_multisample`, `w_get_frag_data_location`.
+- **3D texture (3):** `w_copy_tex_sub_image_3d`, `w_compressed_tex_image_3d`, `w_compressed_tex_sub_image_3d`.
+- **UInt uniforms (8):** `w_uniform_1ui`..`4ui`, `w_uniform_1uiv`..`4uiv` (macro-generated).
+- **Non-square matrix uniforms (6):** `w_uniform_matrix_2x3fv`, `3x2fv`, `2x4fv`, `4x2fv`, `3x4fv`, `4x3fv` (macro-generated).
+- **Clear buffer (4):** `w_clear_buffer_iv`, `_uiv`, `_fv`, `_fi`.
+- **Draw range (1):** `w_draw_range_elements`.
+
+Sum: 30 methods = counter +30 = 17 → 47/88 (matches plan §0.1.1 reconciled progression).
+
+**Implementation notes per family:**
+- **`getBufferSubData` via glMapBufferRange.** `glGetBufferSubData` is desktop-GL only (not in Mesa Nouveau's GLES3 header set). The canonical WebGL2 impl pattern uses `glMapBufferRange` with `GL_MAP_READ_BIT` + memcpy + `glUnmapBuffer`.
+- **UInt uniforms via UNI_UIV macro** — mirrors the existing UNI_FV / UNI_IV macros in the Uniform block. Requires the new `u32_list` helper (Uint32Array unwrap parallel to `i32_list`).
+- **Non-square matrix uniforms via UNI_MAT_RxC(R, C) macro** — expands to `glUniformMatrixRxCfv`. Column-major element count is `R * C` per matrix.
+- **Clear buffer family** — `iv` / `uiv` / `fv` variants take a 4-element list; `fi` takes 2 scalars (depth + stencil). All forward to `glClearBufferX`.
+
+**Rider — OES_fbo_render_mipmap on v1 (batch-2 defect fix).** Plan §2.6 v1 row 15 assigned this to batch 2 but batch 1/2 both missed advertising it. Ships in phase-1.5-LOW as an explicitly-labeled rider. Bucket A (`framebufferTexture2D` with `level > 0` is core ES3), no engine plumbing needed — advertising + empty ext object.
+
+**Batch-1 cross-check performed.** Every batch-1/2 advertising row cross-checked against plan §2.6 (v1 30 rows, v2 34 rows). Only defect: OES_fbo_render_mipmap missed. WEBGL_compressed_texture_etc's plan-vs-reality drift (planned batch 1, landed batch 2 rider 1) documented in the batch-2 report; not a defect, just slipped tier.
+
+**Runtime-semantics verification per family (Citron smoke micro-probes recommended).**
+- **Buffer ops** — `copyBufferSubData` from an ARRAY_BUFFER to a COPY_WRITE_BUFFER + `getBufferSubData` from the destination + JS-side memcmp against the source data.
+- **Framebuffer thin** — `framebufferTextureLayer` on a TEXTURE_2D_ARRAY layer + draw + `readPixels` shows the expected color; `readBuffer(COLOR_ATTACHMENT1)` after a MRT draw returns attachment 1's pixels; `invalidateFramebuffer(FRAMEBUFFER, [DEPTH_ATTACHMENT])` followed by clear+draw produces the right depth output.
+- **3D texture** — `compressedTexImage3D` with an ETC2/EAC block layered into a TEXTURE_2D_ARRAY + `copyTexSubImage3D` between layers + sample the destination in a shader.
+- **UInt uniforms** — bind a uint uniform, set via `uniform2uiv([0x12345678, 0xDEADBEEF])`, sample in a shader that writes those values to color, `readPixels` should return the bit pattern.
+- **Non-square matrix** — `uniformMatrix3x2fv` with a known transform, apply in shader, verify output.
+- **Clear buffer** — `clearBufferfv(COLOR, 0, [r,g,b,a])` on FBO with 2 attachments + `readPixels` reads exactly [r,g,b,a] from attachment 0 only.
+- **`drawRangeElements`** — draw a subset of indices; count vs `drawElements` gives identical output.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed.
+
+**DISPOSITION:** `upstream-candidate`. All 30 methods are trivial thin wrappers around ES3 core entry points; upstream could take the entire block without controversy.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-LOW`, `w_get_buffer_sub_data`, `OES_fbo_render_mipmap`. Recurrence tells:
+- Report renders `17 / 88 implemented` post-hardware → the FUNCS[] block regressed. Check `install_methods_v2` for the new entries.
+- Three.js `renderer.copyTextureToTexture3D` or similar demo throws `TypeError` → one of the 3D texture methods regressed.
+- Non-square matrix uniforms return garbage in a shader → the UNI_MAT_RxC macro produced wrong count; check the R*C divisor.
+- `getBufferSubData` returns zeros → `glMapBufferRange` failed silently; check target binding and MAP_READ_BIT support.
+
+**Sequencing.** First phase-1.5 tier per plan §0.1.1's decided order (b1 → b2 → phase-1.5-LOW → LOW-MED → MED → b3 → MED-HIGH). Independently revertable from batches 1/2 and from subsequent tiers.
 
 ---
 

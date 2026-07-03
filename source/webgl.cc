@@ -434,6 +434,37 @@ bool i32_list(Isolate *iso, Local<Value> v, std::vector<int32_t> &tmp,
 	return false;
 }
 
+// Phase-1.5-LOW helper — uint32 array unwrap. Mirror of i32_list but
+// accepts Uint32Array (WebGL2's `uniform*uiv` typed-array shape) plus
+// generic JS arrays. Used by the UNI_UIV macro for the 8 uint uniform
+// vector setters landed in this tier.
+bool u32_list(Isolate *iso, Local<Value> v, std::vector<uint32_t> &tmp,
+              const uint32_t **out, size_t *n) {
+	if (!v.IsEmpty() && v->IsUint32Array()) {
+		Local<Uint32Array> ta = v.As<Uint32Array>();
+		*n = ta->Length();
+		*out = (const uint32_t *)((uint8_t *)ta->Buffer()->Data() +
+		                          ta->ByteOffset());
+		return true;
+	}
+	if (!v.IsEmpty() && v->IsArray()) {
+		Local<Array> arr = v.As<Array>();
+		Local<Context> ctx = cur(iso);
+		uint32_t len = arr->Length();
+		tmp.resize(len);
+		for (uint32_t i = 0; i < len; i++) {
+			Local<Value> el;
+			tmp[i] = 0;
+			if (arr->Get(ctx, i).ToLocal(&el))
+				tmp[i] = el->Uint32Value(ctx).FromMaybe(0);
+		}
+		*out = tmp.data();
+		*n = tmp.size();
+		return true;
+	}
+	return false;
+}
+
 // UTF-8 string from JS, owned by caller (free with delete[]).
 char *take_string(Isolate *iso, Local<Value> v) {
 	if (v.IsEmpty() || !v->IsString()) {
@@ -1280,6 +1311,16 @@ FN(w_get_extension) {
 		info.GetReturnValue().Set(o);
 		return;
 	}
+	// Phase-1.5-LOW rider — OES_fbo_render_mipmap (v1). Advertise-only
+	// per spec: framebufferTexture2D with level > 0 is core ES3, so an
+	// empty ext object is spec-legal + sufficient. Retires the batch-2
+	// report's defect (row 15 of plan §2.6 v1 table was claimed done but
+	// not actually advertised).
+	if (!v2 && has_native_ext("GL_OES_fbo_render_mipmap") &&
+	    strcmp(name, "OES_fbo_render_mipmap") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
 	// Phase-1 batch-2 — EXT_frag_depth (v1). Advertise-only per spec
 	// (enables `#extension GL_EXT_frag_depth : enable` + `gl_FragDepthEXT`
 	// writes in #version 100 shaders). Empty object per Khronos.
@@ -1456,6 +1497,13 @@ FN(w_get_supported_extensions) {
 	// risk documented in plan §1.3 — suite guard on this batch's smoke.
 	if (!v2 && has_native_ext("GL_OES_vertex_array_object"))
 		out.push_back("OES_vertex_array_object");
+	// Phase-1.5-LOW rider — OES_fbo_render_mipmap on v1 (batch-2 report
+	// defect; plan §2.6 row 15 = A, batch 2). Bucket A: `framebufferTexture2D`
+	// with `level > 0` is core ES3, so advertising alone unblocks Three.js's
+	// v1 capability probe. No engine plumbing needed beyond the ext-object
+	// branch below.
+	if (!v2 && has_native_ext("GL_OES_fbo_render_mipmap"))
+		out.push_back("OES_fbo_render_mipmap");
 	// EXT_frag_depth (v1): compile-probe-gated per plan §2.4. Native
 	// token IS in the 134-list, but only advertise if ESSL-100 accepts
 	// the extension directive. Probe result cached; runs at most once.
@@ -2736,6 +2784,274 @@ FN(w_copy_bridge_to_canvas) {
 // calls on a v2 instance throw `TypeError: X is not a function`.
 // ---------------------------------------------------------------------------
 
+// ============================================================================
+// Phase-1.5-LOW — 30 core WebGL2 methods (tier LOW per plan §0.1).
+// All v2-only; installed on install_methods_v2 FUNCS[] only. Grouped by
+// Khronos family for grep-audit + verify-patches.sh check-family
+// alignment.
+// ============================================================================
+
+// ----- Buffer ops (v2 adds) -----
+FN(w_get_buffer_sub_data) {
+	// getBufferSubData(target, srcByteOffset, dstBuffer, dstOffset?, length?)
+	// Implemented via glMapBufferRange + memcpy + glUnmapBuffer since
+	// glGetBufferSubData is desktop-GL only (ES3 doesn't provide it as
+	// a core entry point on all drivers, including Mesa Nouveau's GLES
+	// header set). This is the canonical WebGL2 impl pattern.
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLintptr src_off = (GLintptr)a_i32(info, 1);
+	if (info.Length() < 3) return;
+	size_t view_len = 0;
+	void *dst = view_bytes(info[2], &view_len);
+	if (!dst) return;
+	size_t dst_off = 0;
+	size_t len = view_len;
+	if (info.Length() >= 4 && info[3]->IsNumber())
+		dst_off = (size_t)a_i32(info, 3);
+	if (info.Length() >= 5 && info[4]->IsNumber())
+		len = (size_t)a_i32(info, 4);
+	if (dst_off + len > view_len) len = (view_len > dst_off) ?
+	    (view_len - dst_off) : 0;
+	if (len == 0) return;
+	void *mapped = glMapBufferRange(target, src_off, (GLsizeiptr)len,
+	                                GL_MAP_READ_BIT);
+	if (mapped) {
+		memcpy((uint8_t *)dst + dst_off, mapped, len);
+		glUnmapBuffer(target);
+	}
+}
+FN(w_copy_buffer_sub_data) {
+	// copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size)
+	enter_bracket();
+	const GLenum r_target = a_u32(info, 0);
+	const GLenum w_target = a_u32(info, 1);
+	const GLintptr r_off = (GLintptr)a_i32(info, 2);
+	const GLintptr w_off = (GLintptr)a_i32(info, 3);
+	const GLsizeiptr size = (GLsizeiptr)a_i32(info, 4);
+	glCopyBufferSubData(r_target, w_target, r_off, w_off, size);
+}
+
+// ----- Framebuffer thin (v2 adds) -----
+FN(w_framebuffer_texture_layer) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLenum attachment = a_u32(info, 1);
+	const GLuint tex = obj_id(info[2]);
+	const GLint level = a_i32(info, 3);
+	const GLint layer = a_i32(info, 4);
+	glFramebufferTextureLayer(target, attachment, tex, level, layer);
+}
+FN(w_invalidate_framebuffer) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	std::vector<int32_t> tmp;
+	const int32_t *p = nullptr;
+	size_t n = 0;
+	if (!i32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return;
+	glInvalidateFramebuffer(target, (GLsizei)n, (const GLenum *)p);
+}
+FN(w_invalidate_sub_framebuffer) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	std::vector<int32_t> tmp;
+	const int32_t *p = nullptr;
+	size_t n = 0;
+	if (!i32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return;
+	const GLint x = a_i32(info, 2);
+	const GLint y = a_i32(info, 3);
+	const GLsizei w = a_i32(info, 4);
+	const GLsizei h = a_i32(info, 5);
+	glInvalidateSubFramebuffer(target, (GLsizei)n, (const GLenum *)p,
+	                            x, y, w, h);
+}
+FN(w_read_buffer) {
+	enter_bracket();
+	glReadBuffer(a_u32(info, 0));
+}
+FN(w_renderbuffer_storage_multisample) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLsizei samples = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLsizei w = a_i32(info, 3);
+	const GLsizei h = a_i32(info, 4);
+	glRenderbufferStorageMultisample(target, samples, internalformat, w, h);
+}
+FN(w_get_frag_data_location) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint prog = obj_id(info[0]);
+	char *name = take_string(iso, info[1]);
+	GLint loc = glGetFragDataLocation(prog, name);
+	delete[] name;
+	info.GetReturnValue().Set(Int32::New(iso, loc));
+}
+
+// ----- 3D texture family (v2 adds — 3D-copy + compressed 3D) -----
+FN(w_copy_tex_sub_image_3d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xoff = a_i32(info, 2);
+	const GLint yoff = a_i32(info, 3);
+	const GLint zoff = a_i32(info, 4);
+	const GLint x = a_i32(info, 5);
+	const GLint y = a_i32(info, 6);
+	const GLsizei w = a_i32(info, 7);
+	const GLsizei h = a_i32(info, 8);
+	glCopyTexSubImage3D(target, level, xoff, yoff, zoff, x, y, w, h);
+}
+FN(w_compressed_tex_image_3d) {
+	// compressedTexImage3D(target, level, internalformat, w, h, d, border, data)
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLsizei w = a_i32(info, 3);
+	const GLsizei h = a_i32(info, 4);
+	const GLsizei d = a_i32(info, 5);
+	const GLint border = a_i32(info, 6);
+	size_t len = 0;
+	void *pixels = view_bytes(info[7], &len);
+	if (info[7]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[7].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[7]->IsNullOrUndefined()) { pixels = nullptr; len = 0; }
+	glCompressedTexImage3D(target, level, internalformat, w, h, d, border,
+	                        (GLsizei)len, pixels);
+}
+FN(w_compressed_tex_sub_image_3d) {
+	// compressedTexSubImage3D(target, level, xo, yo, zo, w, h, d, format, data)
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xo = a_i32(info, 2);
+	const GLint yo = a_i32(info, 3);
+	const GLint zo = a_i32(info, 4);
+	const GLsizei w = a_i32(info, 5);
+	const GLsizei h = a_i32(info, 6);
+	const GLsizei d = a_i32(info, 7);
+	const GLenum format = a_u32(info, 8);
+	size_t len = 0;
+	void *pixels = view_bytes(info[9], &len);
+	if (info[9]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[9].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[9]->IsNullOrUndefined()) { pixels = nullptr; len = 0; }
+	glCompressedTexSubImage3D(target, level, xo, yo, zo, w, h, d, format,
+	                           (GLsizei)len, pixels);
+}
+
+// ----- UInt uniforms (v2 adds) -----
+FN(w_uniform_1ui) { enter_bracket(); glUniform1ui(uniform_loc(info[0]), a_u32(info, 1)); }
+FN(w_uniform_2ui) { enter_bracket(); glUniform2ui(uniform_loc(info[0]), a_u32(info, 1), a_u32(info, 2)); }
+FN(w_uniform_3ui) { enter_bracket(); glUniform3ui(uniform_loc(info[0]), a_u32(info, 1), a_u32(info, 2), a_u32(info, 3)); }
+FN(w_uniform_4ui) { enter_bracket(); glUniform4ui(uniform_loc(info[0]), a_u32(info, 1), a_u32(info, 2), a_u32(info, 3), a_u32(info, 4)); }
+
+#define UNI_UIV(N) \
+FN(w_uniform_##N##uiv) { \
+	enter_bracket(); \
+	std::vector<uint32_t> tmp; \
+	const uint32_t *p = nullptr; \
+	size_t n = 0; \
+	if (!u32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return; \
+	glUniform##N##uiv(uniform_loc(info[0]), (GLsizei)(n / N), p); \
+}
+UNI_UIV(1)
+UNI_UIV(2)
+UNI_UIV(3)
+UNI_UIV(4)
+#undef UNI_UIV
+
+// ----- Non-square matrix uniforms (v2 adds) -----
+// glUniformMatrix{R}x{C}fv — R rows, C columns, submitted column-major.
+// Element count per matrix = R * C = 6 (2x3, 3x2) / 8 (2x4, 4x2) / 12 (3x4, 4x3).
+#define UNI_MAT_RxC(R, C) \
+FN(w_uniform_matrix_##R##x##C##fv) { \
+	enter_bracket(); \
+	std::vector<float> tmp; \
+	const float *p = nullptr; \
+	size_t n = 0; \
+	if (!f32_list(info.GetIsolate(), info[2], tmp, &p, &n)) return; \
+	const GLsizei count = (GLsizei)(n / (R * C)); \
+	glUniformMatrix##R##x##C##fv(uniform_loc(info[0]), count, \
+	                              a_bool(info, 1) ? GL_TRUE : GL_FALSE, p); \
+}
+UNI_MAT_RxC(2, 3)
+UNI_MAT_RxC(3, 2)
+UNI_MAT_RxC(2, 4)
+UNI_MAT_RxC(4, 2)
+UNI_MAT_RxC(3, 4)
+UNI_MAT_RxC(4, 3)
+#undef UNI_MAT_RxC
+
+// ----- Clear buffer family (v2 adds) -----
+// clearBufferiv(buffer, drawbuffer, values) — 4 int values (RGBA/depth/stencil
+// per buffer target). Same shape for uiv / fv. The `fi` variant takes 2
+// scalars (depth + stencil) rather than an array.
+FN(w_clear_buffer_iv) {
+	enter_bracket();
+	const GLenum buffer = a_u32(info, 0);
+	const GLint drawbuffer = a_i32(info, 1);
+	std::vector<int32_t> tmp;
+	const int32_t *p = nullptr;
+	size_t n = 0;
+	if (!i32_list(info.GetIsolate(), info[2], tmp, &p, &n)) return;
+	glClearBufferiv(buffer, drawbuffer, p);
+	(void)n;
+}
+FN(w_clear_buffer_uiv) {
+	enter_bracket();
+	const GLenum buffer = a_u32(info, 0);
+	const GLint drawbuffer = a_i32(info, 1);
+	std::vector<uint32_t> tmp;
+	const uint32_t *p = nullptr;
+	size_t n = 0;
+	if (!u32_list(info.GetIsolate(), info[2], tmp, &p, &n)) return;
+	glClearBufferuiv(buffer, drawbuffer, p);
+	(void)n;
+}
+FN(w_clear_buffer_fv) {
+	enter_bracket();
+	const GLenum buffer = a_u32(info, 0);
+	const GLint drawbuffer = a_i32(info, 1);
+	std::vector<float> tmp;
+	const float *p = nullptr;
+	size_t n = 0;
+	if (!f32_list(info.GetIsolate(), info[2], tmp, &p, &n)) return;
+	glClearBufferfv(buffer, drawbuffer, p);
+	(void)n;
+}
+FN(w_clear_buffer_fi) {
+	enter_bracket();
+	const GLenum buffer = a_u32(info, 0);
+	const GLint drawbuffer = a_i32(info, 1);
+	const GLfloat depth = a_f32(info, 2);
+	const GLint stencil = a_i32(info, 3);
+	glClearBufferfi(buffer, drawbuffer, depth, stencil);
+}
+
+// ----- Draw range (v2 adds) -----
+FN(w_draw_range_elements) {
+	enter_bracket();
+	const GLenum mode = a_u32(info, 0);
+	const GLuint start = a_u32(info, 1);
+	const GLuint end = a_u32(info, 2);
+	const GLsizei count = a_i32(info, 3);
+	const GLenum type = a_u32(info, 4);
+	const GLintptr offset = (GLintptr)a_i32(info, 5);
+	glDrawRangeElements(mode, start, end, count, type, (const void *)offset);
+}
+
+// ============================================================================
+// End phase-1.5-LOW block.
+// ============================================================================
+
 static void install_methods(Isolate *iso, Local<Object> proto) {
 	struct Spec { const char *name; FunctionCallback fn; };
 	static const Spec FUNCS[] = {
@@ -3106,6 +3422,49 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    // console.error override, so no surfaced error. See drawBuffers impl
 	    // comment above for the full chain.
 	    {"drawBuffers", w_draw_buffers},
+	    // ============================================================
+	    // Phase-1.5-LOW — 30 core WebGL2 methods (tier LOW per plan §0.1).
+	    // Grouped by Khronos family to align with verify-patches.sh
+	    // check-family layout. Counter jump 17 → 47 / 88 (all in this
+	    // tier are v2-only, so v1 install_methods FUNCS[] is untouched).
+	    // ============================================================
+	    // Buffer ops (2)
+	    {"getBufferSubData", w_get_buffer_sub_data},
+	    {"copyBufferSubData", w_copy_buffer_sub_data},
+	    // Framebuffer thin (6)
+	    {"framebufferTextureLayer", w_framebuffer_texture_layer},
+	    {"invalidateFramebuffer", w_invalidate_framebuffer},
+	    {"invalidateSubFramebuffer", w_invalidate_sub_framebuffer},
+	    {"readBuffer", w_read_buffer},
+	    {"renderbufferStorageMultisample", w_renderbuffer_storage_multisample},
+	    {"getFragDataLocation", w_get_frag_data_location},
+	    // 3D texture family (3)
+	    {"copyTexSubImage3D", w_copy_tex_sub_image_3d},
+	    {"compressedTexImage3D", w_compressed_tex_image_3d},
+	    {"compressedTexSubImage3D", w_compressed_tex_sub_image_3d},
+	    // UInt uniforms (8)
+	    {"uniform1ui", w_uniform_1ui},
+	    {"uniform2ui", w_uniform_2ui},
+	    {"uniform3ui", w_uniform_3ui},
+	    {"uniform4ui", w_uniform_4ui},
+	    {"uniform1uiv", w_uniform_1uiv},
+	    {"uniform2uiv", w_uniform_2uiv},
+	    {"uniform3uiv", w_uniform_3uiv},
+	    {"uniform4uiv", w_uniform_4uiv},
+	    // Non-square matrix uniforms (6)
+	    {"uniformMatrix2x3fv", w_uniform_matrix_2x3fv},
+	    {"uniformMatrix3x2fv", w_uniform_matrix_3x2fv},
+	    {"uniformMatrix2x4fv", w_uniform_matrix_2x4fv},
+	    {"uniformMatrix4x2fv", w_uniform_matrix_4x2fv},
+	    {"uniformMatrix3x4fv", w_uniform_matrix_3x4fv},
+	    {"uniformMatrix4x3fv", w_uniform_matrix_4x3fv},
+	    // Clear buffer family (4)
+	    {"clearBufferiv", w_clear_buffer_iv},
+	    {"clearBufferuiv", w_clear_buffer_uiv},
+	    {"clearBufferfv", w_clear_buffer_fv},
+	    {"clearBufferfi", w_clear_buffer_fi},
+	    // Draw range (1)
+	    {"drawRangeElements", w_draw_range_elements},
 	    // Add sync / queries / etc. here as the diag-proxy reports them.
 	};
 	Local<Context> ctx = iso->GetCurrentContext();

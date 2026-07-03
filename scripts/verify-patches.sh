@@ -575,6 +575,81 @@ check 49 "webgl.cc OES_texture_float_linear KEPT on v2 (still a WebGL2 ext per r
     "$NXJS/source/webgl.cc" \
     'out\.push_back\("OES_texture_float_linear"\)'
 
+# #50 — Phase-1.5-LOW: 30 core WebGL2 methods + OES_fbo_render_mipmap rider.
+# Family-grouped checks so a regression at any tier level shows up as a
+# single family-tagged MISSING line.
+check 50 "webgl.cc u32_list helper for uint typed-array unwrap" \
+    "$NXJS/source/webgl.cc" \
+    'bool u32_list\(Isolate'
+# Buffer ops (2)
+check 50 "webgl.cc [buffer] getBufferSubData FN + FUNCS[]" \
+    "$NXJS/source/webgl.cc" \
+    '"getBufferSubData", w_get_buffer_sub_data'
+check 50 "webgl.cc [buffer] copyBufferSubData FN + FUNCS[]" \
+    "$NXJS/source/webgl.cc" \
+    '"copyBufferSubData", w_copy_buffer_sub_data'
+# Framebuffer thin (6)
+check 50 "webgl.cc [fbo-thin] framebufferTextureLayer" \
+    "$NXJS/source/webgl.cc" \
+    '"framebufferTextureLayer", w_framebuffer_texture_layer'
+check 50 "webgl.cc [fbo-thin] invalidateFramebuffer" \
+    "$NXJS/source/webgl.cc" \
+    '"invalidateFramebuffer", w_invalidate_framebuffer'
+check 50 "webgl.cc [fbo-thin] invalidateSubFramebuffer" \
+    "$NXJS/source/webgl.cc" \
+    '"invalidateSubFramebuffer", w_invalidate_sub_framebuffer'
+check 50 "webgl.cc [fbo-thin] readBuffer" \
+    "$NXJS/source/webgl.cc" \
+    '"readBuffer", w_read_buffer'
+check 50 "webgl.cc [fbo-thin] renderbufferStorageMultisample" \
+    "$NXJS/source/webgl.cc" \
+    '"renderbufferStorageMultisample", w_renderbuffer_storage_multisample'
+check 50 "webgl.cc [fbo-thin] getFragDataLocation" \
+    "$NXJS/source/webgl.cc" \
+    '"getFragDataLocation", w_get_frag_data_location'
+# 3D texture (3)
+check 50 "webgl.cc [tex3d] copyTexSubImage3D" \
+    "$NXJS/source/webgl.cc" \
+    '"copyTexSubImage3D", w_copy_tex_sub_image_3d'
+check 50 "webgl.cc [tex3d] compressedTexImage3D" \
+    "$NXJS/source/webgl.cc" \
+    '"compressedTexImage3D", w_compressed_tex_image_3d'
+check 50 "webgl.cc [tex3d] compressedTexSubImage3D" \
+    "$NXJS/source/webgl.cc" \
+    '"compressedTexSubImage3D", w_compressed_tex_sub_image_3d'
+# UInt uniforms (8)
+check 50 "webgl.cc [uint-uni] uniform1ui" \
+    "$NXJS/source/webgl.cc" \
+    '"uniform1ui", w_uniform_1ui'
+check 50 "webgl.cc [uint-uni] uniform4uiv" \
+    "$NXJS/source/webgl.cc" \
+    '"uniform4uiv", w_uniform_4uiv'
+# Non-square matrix (6)
+check 50 "webgl.cc [nsq-mat] uniformMatrix2x3fv" \
+    "$NXJS/source/webgl.cc" \
+    '"uniformMatrix2x3fv", w_uniform_matrix_2x3fv'
+check 50 "webgl.cc [nsq-mat] uniformMatrix4x3fv" \
+    "$NXJS/source/webgl.cc" \
+    '"uniformMatrix4x3fv", w_uniform_matrix_4x3fv'
+# Clear buffer (4)
+check 50 "webgl.cc [clear-buf] clearBufferiv" \
+    "$NXJS/source/webgl.cc" \
+    '"clearBufferiv", w_clear_buffer_iv'
+check 50 "webgl.cc [clear-buf] clearBufferfi" \
+    "$NXJS/source/webgl.cc" \
+    '"clearBufferfi", w_clear_buffer_fi'
+# Draw range (1)
+check 50 "webgl.cc [draw-range] drawRangeElements" \
+    "$NXJS/source/webgl.cc" \
+    '"drawRangeElements", w_draw_range_elements'
+# Rider — OES_fbo_render_mipmap (batch-2 defect fix)
+check 50 "webgl.cc [rider] OES_fbo_render_mipmap advertised on v1" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("OES_fbo_render_mipmap"\)'
+check 50 "webgl.cc [rider] OES_fbo_render_mipmap w_get_extension branch" \
+    "$NXJS/source/webgl.cc" \
+    '"OES_fbo_render_mipmap"'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
