@@ -77,6 +77,7 @@ proposal verdict.
 | 46 | engine | upstream-candidate | not-submitted | `webgl_bridge.cc: GL_DEPTH24_STENCIL8` + `webgl_bridge.cc: \[bridge-fbo:` | Phase-0 commit 2: bridge FBO stencil contract — DEPTH24_STENCIL8 renderbuffer + combined attach + STENCIL_BITS=8 wire + [bridge-fbo] completeness assert |
 | 47 | engine | upstream-candidate | not-submitted | `webgl.cc: has_native_ext` + `webgl.cc: is_v2_context` + `webgl.cc: w_compressed_tex_image_2d` | Phase-1 batch 1: driver-probed advertisement + 16 batch-1 extension rows + compressed 2D upload natives + UNMASKED/MAX_ANISO getParameter branches |
 | 48 | engine | upstream-candidate | not-submitted | `webgl.cc: probe_ext_frag_depth` + `webgl.cc: ANGLE_instanced_arrays` + `webgl.cc: WEBGL_debug_shaders` | Phase-1 batch 2A: Unity-P1 v1 function surfaces (ANGLE_instanced_arrays, WEBGL_draw_buffers, EXT_frag_depth probe, OES_VAO list-flip) + WEBGL_lose_context / WEBGL_debug_shaders software minimal impls + WEBGL_compressed_texture_etc (rider 1) |
+| 49 | engine | upstream-candidate | not-submitted | `webgl.cc: v2_rider2` + `webgl.cc: Rider 2 explicit list` | Phase-1 batch 2B: Rider 2 v2 spec-conformance prune — 5 WebGL1-only extensions return null on v2 (OES_standard_derivatives, OES_texture_float, OES_texture_half_float, OES_texture_half_float_linear, WEBGL_depth_texture) — Chrome / Firefox match |
 
 ## DISPOSITION POLICY
 
@@ -2422,6 +2423,43 @@ these WebGL extensions would benefit.
 
 **Sequencing.** Ships as batch-2 Commit A. Rider-2 v2 spec-conformance
 prune ships as batch-2 Commit B (#49) — independently revertable.
+
+---
+
+## #49 — Phase-1 batch 2B: Rider 2 v2 spec-conformance prune — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — 5 rows moved from unconditional advertising to `if (!v2)` block in `w_get_supported_extensions` + `v2_rider2` early guard in `w_get_extension` returning null for the same 5 names.
+
+**Root cause.** Khronos WebGL Extension Registry marks these 5 extensions as WebGL1-only; their functionality is promoted to WebGL2 core:
+- `OES_standard_derivatives` — GLSL `fwidth`/`dFdx`/`dFdy` are core ESSL 3.00.
+- `OES_texture_float` — sized RGBA32F etc. are ES3 core sized internalformats.
+- `OES_texture_half_float` — sized RGBA16F etc. are ES3 core sized internalformats.
+- `OES_texture_half_float_linear` — half-float linear filtering is ES3 core.
+- `WEBGL_depth_texture` — DEPTH_COMPONENT16/24/32F sampling is ES3 core.
+
+Chrome, Firefox, and Safari all return null for these on WebGL2 contexts. Brewser now matches.
+
+**Kept on v2 unchanged:**
+- `OES_texture_float_linear` — genuine WebGL2 extension per registry (FLOAT texture linear filtering is not ES3 core).
+- `EXT_texture_filter_anisotropic` — advertised via the driver-gated block per #47; unaffected by this prune.
+
+**Deferred to a follow-up spec-conformance sweep:**
+- `EXT_blend_minmax`, `OES_element_index_uint`, `EXT_sRGB` are ALSO WebGL1-only per registry but Alex's Rider 2 did not list them explicitly. Getting them prune-consistent needs another pass; documented for a future commit so this ledger entry matches the exact prune list approved for batch 2.
+
+**Guard.** Batch-2 Citron smoke must include 2-3 curated 13-suite demos on the v2 path. If any regresses (e.g., Three.js `capabilities.floatTextureType` fallback breaks or a demo blackboxes on `WEBGL_depth_texture` absence), revert THIS commit alone (`git revert HEAD`) and document the retention as deliberate compat.
+
+**Why upstream-vanilla lacks it.** Upstream doesn't advertise extensions at all.
+
+**DISPOSITION:** `upstream-candidate`.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `v2_rider2` and `if (!v2) {` around the WebGL1-only static push. Recurrence tells:
+- v2 `getSupportedExtensions()` returns 5 extra names (25 → 30-ish) → the prune guard regressed. Revert.
+- Three.js demo regresses on v2 with a "half-float extension missing" error → suite-guard tripped; revert (`git revert HEAD~1` after finding the commit hash — the failure is likely on THIS commit, not batch 2A).
+- Chrome-compat diff test flags any of the 5 names as ADVERTISED on v2 → prune not in effect on that build.
+
+**Sequencing.** Batch-2 Commit B. Independently revertable via `git revert` of this commit alone; Commit A (#48) makes no v2 advertising changes.
 
 ---
 

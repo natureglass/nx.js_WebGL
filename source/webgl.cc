@@ -892,6 +892,32 @@ FN(w_get_extension) {
 	// queries; subsequent gl.<method>(EXT_CONST) calls reach native ES3
 	// (which already implements the underlying capability) transparently.
 	// No new engine GL plumbing needed.
+	// Phase-1 batch-2 rider-2 — v2 spec-conformance prune. These
+	// WebGL1-only extensions return null on v2 to match Chrome / Firefox
+	// (Khronos registry marks them WebGL1-only; the underlying capability
+	// is WebGL2 core). Coordinates with the removal from
+	// `w_get_supported_extensions`'s v2 path. OES_texture_float_linear is
+	// KEPT on v2 (still a genuine WebGL2 extension); EXT_texture_filter_
+	// anisotropic is KEPT (advertised via the driver-gated block).
+	// v1-only names (return null on v2) — Alex's Rider 2 explicit list.
+	// Note: EXT_blend_minmax / OES_element_index_uint / EXT_sRGB are
+	// ALSO WebGL1-only per registry but Rider 2 did NOT list them
+	// explicitly; deferred to a follow-up spec-conformance sweep so
+	// this commit matches the exact prune list Alex approved.
+	// `v2` is computed here (early) rather than reusing the `v2` decl
+	// deeper in the function so this guard runs before any WebGL1-only
+	// branch. The batch-1 `const bool v2 = is_v2_context(info)` below
+	// stays in place (its scope is the batch-1 branch block).
+	const bool v2_rider2 = is_v2_context(info);
+	if (v2_rider2 &&
+	    (strcmp(name, "OES_standard_derivatives") == 0 ||
+	     strcmp(name, "OES_texture_float") == 0 ||
+	     strcmp(name, "OES_texture_half_float") == 0 ||
+	     strcmp(name, "OES_texture_half_float_linear") == 0 ||
+	     strcmp(name, "WEBGL_depth_texture") == 0)) {
+		info.GetReturnValue().SetNull();
+		return;
+	}
 	if (strcmp(name, "EXT_blend_minmax") == 0) {
 		make_obj_with({{"MIN_EXT", 0x8007}, {"MAX_EXT", 0x8008}});
 		return;
@@ -1343,13 +1369,30 @@ FN(w_get_supported_extensions) {
 	// corresponding branch in `w_get_extension` — the two are
 	// consistent by construction.
 	std::vector<const char *> out;
-	// Always-on statics (both context kinds, core in ES3).
-	out.push_back("OES_standard_derivatives");
-	out.push_back("OES_texture_float");
+	// Phase-1 batch-2 rider-2 — v2 spec-conformance prune. The Khronos
+	// registry lists OES_standard_derivatives / OES_texture_float /
+	// OES_texture_half_float / OES_texture_half_float_linear /
+	// WEBGL_depth_texture as WebGL1-only (their functionality is
+	// promoted to WebGL2 core). Chrome and Firefox return null for
+	// these on v2 contexts; Brewser now matches. Kept on v2 unchanged:
+	// OES_texture_float_linear (a genuine WebGL2 extension per registry).
+	// EXT_texture_filter_anisotropic (kept unchanged — advertised by
+	// the driver-gated block below, not affected by this prune).
+	// Retention behavior for Three.js: `capabilities.floatTextureType`
+	// falls back to gl.HALF_FLOAT / gl.FLOAT ES3 core paths cleanly
+	// when the pruned extensions are absent; no manual override needed.
+	// Guard: batch-2 Citron smoke must include 2-3 curated 13-suite
+	// demos on the v2 path; revert this commit alone if any regresses.
+	if (!v2) {
+		out.push_back("OES_standard_derivatives");
+		out.push_back("OES_texture_float");
+		out.push_back("OES_texture_half_float");
+		out.push_back("OES_texture_half_float_linear");
+		out.push_back("WEBGL_depth_texture");
+	}
+	// KEPT on both: OES_texture_float_linear (registry keeps this as a
+	// v2 ext; FLOAT texture sampling with linear filtering is not core).
 	out.push_back("OES_texture_float_linear");
-	out.push_back("OES_texture_half_float");
-	out.push_back("OES_texture_half_float_linear");
-	out.push_back("WEBGL_depth_texture");
 	out.push_back("WEBGL_debug_renderer_info");  // batch-1
 	// v1-only statics (v2 has them as core).
 	if (!v2) {

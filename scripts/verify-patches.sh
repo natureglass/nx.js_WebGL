@@ -560,6 +560,21 @@ check 48 "webgl.cc OES_vertex_array_object advertised on v1 (list-flip retires #
     "$NXJS/source/webgl.cc" \
     'out\.push_back\("OES_vertex_array_object"\)'
 
+# #49 — Phase-1 batch 2B: Rider 2 v2 spec-conformance prune. 5 WebGL1-only
+# extensions return null on v2 (matches Chrome / Firefox behavior).
+check 49 "webgl.cc v2_rider2 prune guard in w_get_extension" \
+    "$NXJS/source/webgl.cc" \
+    'const bool v2_rider2 = is_v2_context'
+check 49 "webgl.cc OES_standard_derivatives moved to v1-only advertising" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("OES_standard_derivatives"\)'
+check 49 "webgl.cc WEBGL_depth_texture moved to v1-only advertising" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("WEBGL_depth_texture"\)'
+check 49 "webgl.cc OES_texture_float_linear KEPT on v2 (still a WebGL2 ext per registry)" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("OES_texture_float_linear"\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
