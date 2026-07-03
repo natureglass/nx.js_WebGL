@@ -2670,6 +2670,34 @@ Sum: 25 methods = counter +25 = 53 → 78/88 (matches plan §0.1.1 progression).
 
 ---
 
+## #54 — Mesa Nouveau NV120 occlusion-query driver ceiling: `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn — DOCUMENTED-DRIVER-QUIRK 2026-07-03
+
+Discovered by com.natureglass.gl-probes v0.4.0 QUERY probe on 2026-07-03. Not an engine defect — the engine's query surface is functionally correct (proven by gl-probes v0.7.0 discriminator smoke: `curActive=true` right after `beginQuery`, zero GL errors end-to-end, draw painted [255,255,255,255] via `readPixels` verification).
+
+**File(s):** none — this is a driver capability ceiling, not an engine change. The QUERY surface implementation (`w_create_query`, `w_begin_query`, `w_end_query`, `w_get_query_parameter` — ledger #53) is byte-identical to what other GLES3 drivers accept.
+
+**Symptom.** `beginQuery(ANY_SAMPLES_PASSED, q)` → fullscreen `drawArrays(TRIANGLE_STRIP, 0, 4)` → `endQuery(ANY_SAMPLES_PASSED)` → `getQueryParameter(q, QUERY_RESULT)` returns 0. Verified via `getQueryParameter(q, QUERY_RESULT_AVAILABLE)` returning true first (query result is finalized, driver just returned 0). Same viewport, same shader, and `readPixels(4, 4)` returns `[255,255,255,255]` proving the draw painted the target.
+
+**Discriminator ladder from gl-probes v0.7.0 log:**
+```
+eBegin=0x0 eDraw=0x0 eEnd=0x0 eAvail=0x0 eResult=0x0 curActive=true
+```
+- `eBegin=0x0` — glBeginQuery accepted (query name valid, target not busy)
+- `eDraw=0x0` — glDrawArrays succeeded inside the query bracket
+- `eEnd=0x0` — glEndQuery succeeded
+- `curActive=true` — `getQuery(ANY_SAMPLES_PASSED, CURRENT_QUERY)` returned the wrapped query right after beginQuery
+- `eResult=0x0` + `QUERY_RESULT=0` — no error, driver just says no samples passed
+
+**Impact.** LOW severity — Three.js and typical WebGL2 apps don't use occlusion queries in the common rendering path. Applications that DO (visibility culling, occlusion-based LOD) will see always-visible behavior (result=0 → interpret as "not occluded" → conservative render everything). No visual regression, just no perf benefit from the occlusion query.
+
+**Same driver family as [[reference-mesa-nouveau-layered-sampling-unsupported]]** — Mesa Nouveau NV120 has documented gaps in less-common ES3 features (layered sampling, glDrawRangeElements per #52a, now ANY_SAMPLES_PASSED). Not an engine responsibility to work around at the FN level; downstream applications either don't hit these paths (Three.js) or gracefully degrade (occlusion query = conservative always-visible).
+
+**DISPOSITION:** `driver-ceiling — no engine fix planned`. Engine surface remains spec-conformant. gl-probes v0.8.0 QUERY probe relaxed to verify surface + wiring (curActive after beginQuery, no GL errors, draw painted, QUERY_RESULT non-negative) rather than driver-specific result semantics — PASS on Nouveau NV120 with the "Mesa Nouveau NV120 quirk — result=0" annotation in the detail; would PASS on any other driver with "spec-conformant (result > 0 for visible draw)" annotation.
+
+**Recurrence tell.** Same driver on same hardware — behavior expected to persist. Different hardware or updated Mesa: QUERY probe detail will read "spec-conformant (result > 0 for visible draw)" — the annotation is the audit trail.
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches

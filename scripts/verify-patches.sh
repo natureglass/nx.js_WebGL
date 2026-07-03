@@ -768,6 +768,11 @@ check 53 "webgl.cc [med] block header comment present" \
     "$NXJS/source/webgl.cc" \
     'Phase-1\.5-MED'
 
+# #54 — Mesa Nouveau NV120 ANY_SAMPLES_PASSED driver ceiling. No engine
+# change; guardrail is documentation-only. Ledger entry existence is the
+# only check.
+status 54 "KNOWN-OPEN" "Mesa Nouveau NV120 ANY_SAMPLES_PASSED driver ceiling (documented; no engine fix)"
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
