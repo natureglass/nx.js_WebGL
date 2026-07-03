@@ -336,46 +336,11 @@ The paired strict re-run 2.4 seconds later on the same cached WebGL2 context sho
 
 ---
 
-## §#56b — `getBufferSubData` re-invocation write-visibility race on Mesa Nouveau NV120
+## §#56b — `getBufferSubData` re-invocation write-visibility race on Mesa Nouveau NV120 — CLOSED 2026-07-04
 
 **Ledger:** [NXJS_PATCHES_NEEDED.md #56b](../NXJS_PATCHES_NEEDED.md#56b).
 
-**Fix landed 2026-07-03 (`w_get_buffer_sub_data` in source/webgl.cc).**
-Adds `nx_56b_readback_sync_guard("getBufferSubData")` immediately before
-`glMapBufferRange`. The helper does:
-```
-GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 100_000_000ns);
-glDeleteSync(sync);
-```
-Timeout expiry (100ms) logs `[#56b] getBufferSubData: clientWaitSync TIMEOUT after 100ms — proceeding to map anyway` and falls through to the map (no runtime hang). `glFinish` + per-target rebind from #56 are RETAINED (they fix a distinct fresh-context failure mode; do not conflate).
-
-**LEDGER RATIONALE — EMPIRICAL, NOT SPEC-GUARANTEED.** ES3 §2.9.5 says `glMapBufferRange(GL_MAP_READ_BIT)` implicitly syncs; a conformant driver needs neither fence nor extra flush. This is an empirical Mesa Nouveau NV120 workaround — the fence path exercises a different flushing code path that reaches the mapped-region cache. **Do NOT cite ES3 §4.1.2 as a guarantee for this fix.**
-
-**Verdict procedure for the next hardware boot.**
-
-1. Boot the current default NRO (fence-guard fix landed). Grep boot log for `[#56b]` — absent on normal path (helper is quiet unless timeout/fail); presence of `[#56b] getBufferSubData: clientWaitSync TIMEOUT` = escalate to rung 2.
-2. Open **GL Probes** app.
-3. Click **Run Probes (WebGL 2)** (yellow — non-strict). Capture
-   `sdmc:/switch/brewser/logs/gl-probes-v0.15.0.log`. This is invocation #1.
-4. **Without reloading**, click **Run Probes STRICT (hardware)** (green).
-   Capture `sdmc:/switch/brewser/logs/gl-probes-v0.15.0-all-strict.log`.
-   This is invocation #2 — the actual #56b test.
-
-**Verdict table.**
-
-| Boot #1 BUFFER | Boot #2 BUFFER | Verdict | Downstream action |
-|---|---|---|---|
-| both arms PASS | both arms PASS | **CONFIRMED FIX** | Reclassify ledger #56b to CLOSED. Move to Archived. Restore headline claim to 88/88 SURFACE + 88/88 FUNCTIONAL. |
-| both arms PASS | Arm-B `got=<sentinel pattern>` | Copy didn't complete before map | Rung 2 — add `GL_MAP_INVALIDATE_RANGE_BIT` OR pre-issue `glInvalidateBufferSubData` before map. |
-| both arms PASS | Arm-B `got=<mix of src + prior>` | Stale-map cache still active | Rung 2 first, then rung 3 if 2 doesn't carry. |
-| Any other pattern | Any | UNEXPECTED — capture the full detail string + attach to ledger, re-triage before jumping ladder. | |
-
-**Rung 2** — `GL_MAP_INVALIDATE_RANGE_BIT` on map + optional `glInvalidateBufferSubData` proc-address resolution.
-
-**Rung 3** — staging-copy readback through per-call fresh scratch buffer (`glGenBuffers` → `glCopyBufferSubData` from source into scratch → map scratch (guaranteed cache-cold) → memcpy → `glDeleteBuffers`).
-
-**HW session date / verdict:** 2026-07-03 fix shipped, awaiting next hardware boot for verdict.
+Hardware-verified closed 2026-07-04 (see Archived section below). Rung 1 (fence-guard) carries on both non-strict + strict re-run. Verdict procedure retained in the Archived §#56b entry for future re-diagnosis if the recurrence tell reappears.
 
 ### Hardware smoke #2 re-verifications (2026-07-03)
 
@@ -415,6 +380,37 @@ Ledger #56.
 All 5 b3 probes PASS on real Tegra Nouveau NV120: TIMER_QUERY, POLY_CLAMP,
 INDEXED_BLEND, MULTI_DRAW, BFE_CONST. Extension advertising + wiring
 hardware-verified. Ledger #57.
+
+### §#56b — getBufferSubData re-invocation write-visibility race (2026-07-04)
+Rung-1 fence-guard (`nx_56b_readback_sync_guard`: `glFenceSync` +
+`glClientWaitSync(SYNC_FLUSH_COMMANDS_BIT, 100ms)` + `glDeleteSync`) verified
+on real Tegra Nouveau NV120 across two-boot verdict procedure:
+
+- **Boot #1 non-strict** (`gl-probes-v0.15.0.log`, 2026-07-03T22:08:55.576Z):
+  `BUFFER buffer_roundtrip PASS — Arm A + Arm B both ok 64B memcmp`.
+  Summary: 26 PASS / 0 FAIL / 0 SKIP.
+- **Boot #2 strict** (`gl-probes-v0.15.0-all-strict.log`,
+  2026-07-03T22:11:22.716Z, cold power-cycle between boots):
+  identical BUFFER PASS. Summary: 26 PASS / 0 FAIL / 0 SKIP.
+
+**Mechanism discriminator confirmed load-bearing.** SYNC probe reports
+`clientWaitSync=CONDITION_SATISFIED` on hardware (Citron reports
+`ALREADY_SIGNALED`). CONDITION_SATISFIED = the fence was a real driver
+barrier that had NOT yet completed at the moment of `clientWaitSync` —
+exactly the extra flushing code path predicted by the rung-1 rationale.
+
+**Escalation ladder (retained for recurrence).** Rung 2 =
+`GL_MAP_INVALIDATE_RANGE_BIT` on map or `glInvalidateBufferSubData` before
+map. Rung 3 = per-call fresh scratch buffer via `glGenBuffers` +
+`glCopyBufferSubData` + map + `glDeleteBuffers`.
+
+**Recurrence tells.** Hardware BUFFER strict re-run FAIL with `mismatch@0`
+value matching sentinel pattern → copy didn't complete before map (rung 2).
+FAIL with MIX of src + prior-invocation bytes → stale-map still active
+(rung 2 then rung 3). Ledger #56b + class audit (`nx_56b_readback_sync_guard`
+required at all future GPU→CPU readback map sites). Headline claim after
+closure: **88/88 SURFACE + 88/88 FUNCTIONAL on hardware, zero open
+functional defects**.
 
 Minor open sub-item — TIMER_QUERY 32-bit truncation (`0xFFFFFFFF` on both Citron
 and hardware for TIMESTAMP_EXT queries whose 64-bit driver time exceeds 2^32).

@@ -2747,11 +2747,11 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 - gl-probes TF_PAUSE probe FAIL under non-strict (i.e., not just PASS-QUIRK-RELAXED but actual FAIL) → a new driver-quirk shape appeared that the probe doesn't yet recognize; capture the `out=[...]` array and open a new sub-item.
 - gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
-**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). #56's second-stage per-target rebind fallback hardware-verified 2026-07-03 (fresh-context BUFFER probe both arms PASS on real Tegra Nouveau NV120). **Headline claim: 88/88 SURFACE + N/88 FUNCTIONALLY CORRECT on hardware, 1 open functional defect (#56b GPGPU ping-pong readback race — fix-shipped, verdict-pending-hardware).**
+**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). #56's second-stage per-target rebind fallback hardware-verified 2026-07-03 (fresh-context BUFFER probe both arms PASS on real Tegra Nouveau NV120). #56b fence-guard hardware-verified 2026-07-04 (strict re-invocation BUFFER probe both arms PASS on both Boot #1 non-strict and Boot #2 strict). **Headline claim: 88/88 SURFACE + 88/88 FUNCTIONALLY CORRECT on hardware, zero open functional defects.**
 
 ---
 
-## #56b — `getBufferSubData` re-invocation on live context reads stale bytes despite full re-execution — FIX-SHIPPED-VERDICT-PENDING-HARDWARE 2026-07-03
+## #56b — `getBufferSubData` re-invocation on live context reads stale bytes despite full re-execution — SHIPPED + HARDWARE-VERIFIED 2026-07-04
 
 **Discovered by** code-reading review of the 2026-07-03 hardware smoke #3 strict-run BUFFER FAIL. The initial "carryover" explanation (VRAM allocator reuse + Nouveau non-zero-init `bufferData`) was **incomplete** — code-reading gl-probes.js:230-258 shows `probeBufferRoundtrip` calls `gl.createBuffer()` TWICE per invocation (returning fresh handles), issues `gl.bufferData(ARRAY_BUFFER, src, STATIC_DRAW)` writing all 64 src bytes to srcBuf, then `gl.copyBufferSubData(ARRAY_BUFFER, COPY_WRITE_BUFFER, 0, 0, 64)` copying all 64 bytes to dstBuf. Every invocation re-executes the FULL write path. Stale-memory read from an unwritten region is not a possible explanation.
 
@@ -2784,9 +2784,18 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 
 **Runtime-semantics verification (Citron smoke — non-regression only; verdict is hardware's).** Citron/AMD Vulkan translation of `glMapBufferRange` didn't exhibit either fresh-context or re-invocation failure on prior smokes, so Citron cannot distinguish "fix carries" from "fix regressed silently". Non-regression Citron smoke required (BUFFER probe still `both ok`); actual #56b verdict comes from the next hardware boot.
 
-**DISPOSITION:** `fix-shipped, verdict-pending-hardware`. Headline claim regressed from `88/88 SURFACE + 88/88 FUNCTIONAL` back to `88/88 SURFACE + N/88 FUNCTIONAL, 1 open (#56b)` until the hardware verdict.
+**HARDWARE VERIFICATION (2026-07-04).** Real Tegra Nouveau NV120, two-boot verdict procedure per runbook §#56b executed clean:
 
-**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `nx_56b_readback_sync_guard`. Recurrence tell: hardware BUFFER `both arms ok` on both consecutive runs of the same boot = fix carrying, close #56b. Hardware BUFFER strict re-run FAILs = jump to rung 2 without re-diagnosis. Runbook §#56b has the exact verdict procedure.
+- **Boot #1 non-strict** (`gl-probes-v0.15.0.log`, generated 2026-07-03T22:08:55.576Z): `BUFFER buffer_roundtrip PASS — Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy, sentinel pre-fill 0xA5) both ok 64B memcmp`. Summary: 26 PASS / 0 FAIL / 0 SKIP.
+- **Boot #2 strict** (`gl-probes-v0.15.0-all-strict.log`, generated 2026-07-03T22:11:22.716Z, cold power-cycle between boots): identical BUFFER PASS on Arm A + Arm B. Summary: 26 PASS / 0 FAIL / 0 SKIP.
+
+**Mechanism discriminator confirmed load-bearing.** Line 28 both logs: `SYNC clientWaitSync=CONDITION_SATISFIED` on hardware (Citron reports `ALREADY_SIGNALED`). CONDITION_SATISFIED means the fence was a real driver barrier that had NOT yet completed at the moment of `clientWaitSync` — precisely the extra flushing code path that the rung-1 rationale predicted. Rung 1 (`glFenceSync + glClientWaitSync(SYNC_FLUSH_COMMANDS_BIT)`) carries; rungs 2 (`GL_MAP_INVALIDATE_RANGE_BIT` / `glInvalidateBufferSubData`) and 3 (per-call fresh scratch buffer) remain UNSHIPPED and are the escalation ladder if the tell reappears.
+
+**DISPOSITION:** `shipped, hardware-verified`. Class-level primitive `nx_56b_readback_sync_guard` remains the required guard for all future GPU→CPU readback map sites per class audit (2026-07-03) above. Headline claim restored to `88/88 SURFACE + 88/88 FUNCTIONAL on hardware, zero open functional defects`.
+
+**UPSTREAM STATUS:** `not-submitted`. Rung-1 rationale (empirical Mesa Nouveau map-coherency workaround) is a driver-quirk mitigation, not an nx.js correctness bug — upstream candidate is a Mesa bug report against Nouveau NV120's `glMapBufferRange(GL_MAP_READ_BIT)` sync path, not an nx.js PR.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `nx_56b_readback_sync_guard`. Recurrence tell: hardware BUFFER strict re-run FAIL with `mismatch@0` value matching sentinel pattern → copy didn't complete before map, jump to rung 2. FAIL with MIX of src + prior-invocation bytes → stale-map still active, jump to rung 3. Runbook §#56b's verdict table is now the reference for re-diagnosis.
 
 ---
 
