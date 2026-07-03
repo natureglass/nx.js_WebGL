@@ -2517,6 +2517,43 @@ Sum: 30 methods = counter +30 = 17 → 47/88 (matches plan §0.1.1 reconciled pr
 
 ---
 
+## #51 — Phase-1.5-LOW-MED: 6 v2 methods (integer vertex attribs + getInternalformatParameter) — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — 6 new `FN(w_*)` implementations grouped in a phase-1.5-LOW-MED block after the LOW block + 6 new FUNCS[] entries in `install_methods_v2`.
+
+**Motivation.** The report app's v2 function counter target progression per plan §0.1.1 (47 → 53 → 78 → 88). This tier lands the 6 methods classified LOW-MED per plan §0.1's family analysis. Each is thin-wrapper effort but requires modest plumbing that put them just above LOW: integer vertex attribs have their own glVertexAttribI* family separate from glVertexAttrib*f, and getInternalformatParameter has SAMPLES-list sizing plumbing (probe NUM_SAMPLE_COUNTS first to know the return array size).
+
+**Methods landed by family (grep-verifiable via `FN\(w_[a-z_0-9]+\)` in webgl.cc):**
+
+- **Integer vertex attribs (5):** `w_vertex_attrib_i4i`, `w_vertex_attrib_i4ui`, `w_vertex_attrib_i4iv`, `w_vertex_attrib_i4uiv`, `w_vertex_attrib_i_pointer`.
+- **getInternalformatParameter (1):** `w_get_internalformat_parameter`.
+
+Sum: 6 methods = counter +6 = 47 → 53/88 (matches plan §0.1.1 reconciled progression).
+
+**Implementation notes per family:**
+- **`vertexAttribI4iv` / `I4uiv`** — parse via existing `i32_list` / `u32_list` helpers (both landed in earlier tiers). Guard n<4 → return early (spec: TypeError, but silent no-op is safer than an engine crash on a malformed caller).
+- **`vertexAttribIPointer`** — mirror of `vertexAttribPointer` but WITHOUT the `normalized` boolean parameter. Integer attributes carry ivec/uvec through the pipeline as-is; there's no float conversion, so `normalized` is meaningless. Signature: `(index, size, type, stride, offset)` — 5 args instead of 6.
+- **`getInternalformatParameter`** — returns Int32Array (spec-required typed-array shape). For `NUM_SAMPLE_COUNTS` (0x9380), returns length-1 Int32Array containing the count. For `SAMPLES` (0x80A9) and other array-shaped pnames, first probe NUM_SAMPLE_COUNTS to size the destination, then materialize. Cap at 32 to bound the transient allocation (Mesa Nouveau reports ≤ 8 in practice; 32 is comfortable headroom for hypothetical future drivers).
+
+**Runtime-semantics verification per family (Citron smoke micro-probes via com.natureglass.gl-probes app — landed in a paired brewser-apps commit).**
+- **Integer vertex attribs** — INT_ATTRIB probe: uint vertex attribute value 42 flat-out through varying → RGBA32UI FBO write via `outColor = uvec4(v_val,0,0,0)` → readPixels with UNSIGNED_INT type returns R=42. Exercises `vertexAttribIPointer` + integer-attribute draw round-trip end-to-end.
+- **getInternalformatParameter** — INFORMAT_PARAM probe: `getInternalformatParameter(RENDERBUFFER, RGBA8, SAMPLES)` returns Int32Array with length ≥ 1, all values ≥ 1. Validates the SAMPLES sizing path (NUM_SAMPLE_COUNTS pre-probe → allocate → refill).
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed.
+
+**DISPOSITION:** `upstream-candidate`. All 6 methods are thin wrappers around ES3 core entry points (no ext gates); upstream could take the block without controversy.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-LOW-MED`, `w_vertex_attrib_i_pointer`, `w_get_internalformat_parameter`. Recurrence tells:
+- Report renders `47 / 88 implemented` post-hardware → the phase-1.5-LOW-MED FUNCS[] block regressed. Check `install_methods_v2` for the 6 new entries.
+- gl-probes app's INT_ATTRIB probe FAILs with `attrib readback R=0` → `vertexAttribIPointer` is silently no-op'ing OR the integer-attribute path isn't wired end-to-end (likely a Three.js-style `flat` varying miscompile — but that would be a driver issue not an engine regression). Cross-check with a raw GL_ARRAY_BUFFER + UINT type + `glGetError` after `glVertexAttribIPointer`.
+- gl-probes app's INFORMAT_PARAM probe FAILs with `return value null` → `w_get_internalformat_parameter` regressed to a default `void` return. Check the `Int32Array::New(ab, 0, count)` at the tail of the FN body.
+
+**Sequencing.** Second phase-1.5 tier per plan §0.1.1's decided order. Independently revertable from #50 (phase-1.5-LOW).
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches

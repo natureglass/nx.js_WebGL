@@ -3052,6 +3052,112 @@ FN(w_draw_range_elements) {
 // End phase-1.5-LOW block.
 // ============================================================================
 
+// ============================================================================
+// Phase-1.5-LOW-MED — 6 methods (tier LOW-MED per plan §0.1). All v2-only;
+// installed on install_methods_v2 FUNCS[] only.
+//
+// Integer vertex attribs (5) — mirror of the float `vertexAttrib*f` family
+// but writing to an integer attribute slot (accessed as `in ivec4` /
+// `in uvec4` / `in int` / `in uint` in ESSL 3.00). `vertexAttribIPointer`
+// is the buffer-backed counterpart of `vertexAttribPointer` for integer
+// attributes — it MUST NOT normalize, so there's no `normalized` bool
+// parameter (unlike the float pointer version).
+//
+// getInternalformatParameter(target, internalformat, pname) — WebGL2's
+// exposure of `glGetInternalformativ`. Currently the only pnames the spec
+// defines are SAMPLES (returns Int32Array of driver-supported MSAA counts
+// for the format, high→low) and NUM_SAMPLE_COUNTS (single int). We look
+// up NUM_SAMPLE_COUNTS first to size the SAMPLES buffer since the ES3
+// spec doesn't publish a fixed upper bound.
+// ============================================================================
+
+// ----- Integer vertex attribs (v2 adds) -----
+FN(w_vertex_attrib_i4i) {
+	enter_bracket();
+	glVertexAttribI4i(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
+	                  a_i32(info, 3), a_i32(info, 4));
+}
+FN(w_vertex_attrib_i4ui) {
+	enter_bracket();
+	glVertexAttribI4ui(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
+	                   a_u32(info, 3), a_u32(info, 4));
+}
+FN(w_vertex_attrib_i4iv) {
+	enter_bracket();
+	std::vector<int32_t> tmp;
+	const int32_t *p = nullptr;
+	size_t n = 0;
+	if (!i32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return;
+	// glVertexAttribI4iv reads exactly 4 ints. Under-length input is a
+	// caller bug (WebGL2 spec: TypeError). Guard against under-read but
+	// otherwise forward the first 4; over-length input is trimmed to 4.
+	if (n < 4) return;
+	glVertexAttribI4iv(a_u32(info, 0), p);
+}
+FN(w_vertex_attrib_i4uiv) {
+	enter_bracket();
+	std::vector<uint32_t> tmp;
+	const uint32_t *p = nullptr;
+	size_t n = 0;
+	if (!u32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return;
+	if (n < 4) return;
+	glVertexAttribI4uiv(a_u32(info, 0), p);
+}
+FN(w_vertex_attrib_i_pointer) {
+	// vertexAttribIPointer(index, size, type, stride, offset). Note the
+	// missing `normalized` parameter vs. vertexAttribPointer — integer
+	// attributes cannot normalize by definition (they carry ivec/uvec
+	// through the pipeline; no float conversion).
+	enter_bracket();
+	glVertexAttribIPointer(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
+	                       a_i32(info, 3),
+	                       (const void *)(intptr_t)a_i64(info, 4));
+}
+
+// ----- getInternalformatParameter (v2 adds) -----
+FN(w_get_internalformat_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum target = a_u32(info, 0);
+	const GLenum internalformat = a_u32(info, 1);
+	const GLenum pname = a_u32(info, 2);
+
+	// Fast-path for NUM_SAMPLE_COUNTS: single-value return, still shaped
+	// as an Int32Array of length 1 to match the WebGL2 spec's
+	// "always-returns-a-typed-array" contract.
+	if (pname == 0x9380 /* GL_NUM_SAMPLE_COUNTS */) {
+		GLint n = 0;
+		glGetInternalformativ(target, internalformat, pname, 1, &n);
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, 4);
+		int32_t *out = (int32_t *)ab->Data();
+		out[0] = n;
+		info.GetReturnValue().Set(Int32Array::New(ab, 0, 1));
+		return;
+	}
+
+	// SAMPLES (or any array-shaped pname): probe NUM_SAMPLE_COUNTS to
+	// know the return size, then materialize the actual values. Cap at
+	// 32 to bound the transient allocation on drivers that pretend to
+	// support absurd sample counts (Mesa Nouveau reports ≤ 8 in practice
+	// — 32 is comfortable headroom).
+	GLint count = 0;
+	glGetInternalformativ(target, internalformat, 0x9380 /*NUM_SAMPLE_COUNTS*/,
+	                       1, &count);
+	if (count < 0) count = 0;
+	if (count > 32) count = 32;
+
+	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, count * 4);
+	int32_t *out = (int32_t *)ab->Data();
+	if (count > 0) {
+		glGetInternalformativ(target, internalformat, pname, count, out);
+	}
+	info.GetReturnValue().Set(Int32Array::New(ab, 0, count));
+}
+
+// ============================================================================
+// End phase-1.5-LOW-MED block.
+// ============================================================================
+
 static void install_methods(Isolate *iso, Local<Object> proto) {
 	struct Spec { const char *name; FunctionCallback fn; };
 	static const Spec FUNCS[] = {
@@ -3465,6 +3571,19 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"clearBufferfi", w_clear_buffer_fi},
 	    // Draw range (1)
 	    {"drawRangeElements", w_draw_range_elements},
+	    // ============================================================
+	    // Phase-1.5-LOW-MED — 6 methods (tier LOW-MED per plan §0.1).
+	    // Counter jump 47 → 53 / 88 (all v2-only, so v1 FUNCS[] stays
+	    // untouched — same as phase-1.5-LOW).
+	    // ============================================================
+	    // Integer vertex attribs (5)
+	    {"vertexAttribI4i", w_vertex_attrib_i4i},
+	    {"vertexAttribI4ui", w_vertex_attrib_i4ui},
+	    {"vertexAttribI4iv", w_vertex_attrib_i4iv},
+	    {"vertexAttribI4uiv", w_vertex_attrib_i4uiv},
+	    {"vertexAttribIPointer", w_vertex_attrib_i_pointer},
+	    // getInternalformatParameter (1)
+	    {"getInternalformatParameter", w_get_internalformat_parameter},
 	    // Add sync / queries / etc. here as the diag-proxy reports them.
 	};
 	Local<Context> ctx = iso->GetCurrentContext();

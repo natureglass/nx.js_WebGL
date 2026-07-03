@@ -650,6 +650,34 @@ check 50 "webgl.cc [rider] OES_fbo_render_mipmap w_get_extension branch" \
     "$NXJS/source/webgl.cc" \
     '"OES_fbo_render_mipmap"'
 
+# #51 — Phase-1.5-LOW-MED: 6 core WebGL2 methods (integer vertex attribs +
+# getInternalformatParameter). Counter 47 → 53 / 88.
+# Integer vertex attribs (5)
+check 51 "webgl.cc [int-attrib] vertexAttribI4i" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribI4i", w_vertex_attrib_i4i'
+check 51 "webgl.cc [int-attrib] vertexAttribI4ui" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribI4ui", w_vertex_attrib_i4ui'
+check 51 "webgl.cc [int-attrib] vertexAttribI4iv" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribI4iv", w_vertex_attrib_i4iv'
+check 51 "webgl.cc [int-attrib] vertexAttribI4uiv" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribI4uiv", w_vertex_attrib_i4uiv'
+check 51 "webgl.cc [int-attrib] vertexAttribIPointer" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribIPointer", w_vertex_attrib_i_pointer'
+# getInternalformatParameter (1)
+check 51 "webgl.cc [informat-param] getInternalformatParameter" \
+    "$NXJS/source/webgl.cc" \
+    '"getInternalformatParameter", w_get_internalformat_parameter'
+# Family marker — the LOW-MED block's header comment. Regression tell:
+# absent = someone deleted the block wholesale, not just a single FN.
+check 51 "webgl.cc [low-med] block header comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Phase-1\.5-LOW-MED'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
