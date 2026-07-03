@@ -678,6 +678,24 @@ check 51 "webgl.cc [low-med] block header comment present" \
     "$NXJS/source/webgl.cc" \
     'Phase-1\.5-LOW-MED'
 
+# #52 — Two gl-probes-discovered gaps (OPEN).
+# #52a: drawRangeElements silent no-op on Citron/Mesa Nouveau — gets a
+#       defensive touch_fbo() to match the other draw FNs but the failure
+#       persists. Guardrail checks the defensive fix is present.
+# #52b: WebGL1 core getTexParameter missing from FUNCS[] — deferred fix.
+#       Guardrail marks it as known-open until the FN + FUNCS[] entry lands.
+check 52 "webgl.cc [drawrange] touch_fbo() defensive addition present" \
+    "$NXJS/source/webgl.cc" \
+    'glDrawRangeElements\(mode, start, end, count, type, \(const void \*\)offset\);\n\s*touch_fbo\(\)' \
+    --allow-missing
+# Fallback single-line check (grep -P handles \n in pattern; --allow-missing
+# lets the compound multiline pattern degrade to KNOWN-OPEN rather than fail
+# the whole audit if grep's regex flavor doesn't span lines).
+check 52 "webgl.cc [drawrange] w_draw_range_elements has touch_fbo call" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_draw_range_elements\)'
+status 52 "KNOWN-OPEN" "webgl.cc getTexParameter FUNCS[] gap (v1 core method missing — see ledger #52b)"
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

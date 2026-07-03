@@ -3046,6 +3046,7 @@ FN(w_draw_range_elements) {
 	const GLenum type = a_u32(info, 4);
 	const GLintptr offset = (GLintptr)a_i32(info, 5);
 	glDrawRangeElements(mode, start, end, count, type, (const void *)offset);
+	touch_fbo();
 }
 
 // ============================================================================

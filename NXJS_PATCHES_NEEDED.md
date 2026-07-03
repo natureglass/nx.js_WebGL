@@ -2554,6 +2554,69 @@ Sum: 6 methods = counter +6 = 47 → 53/88 (matches plan §0.1.1 reconciled prog
 
 ---
 
+## #52 — Two gl-probes-discovered gaps: drawRangeElements Citron-side no-op + WebGL1 `getTexParameter` absent from FUNCS[] — OPEN 2026-07-03
+
+Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both are pre-existing surface gaps surfaced by the new probe harness — not regressions from #50 / #51.
+
+### #52a — `drawRangeElements` renders nothing on Citron/Mesa Nouveau
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `w_draw_range_elements` at line 3040, wired in `install_methods_v2` FUNCS[].
+
+**Symptom.** The gl-probes `DRAW_RANGE draw_range_elements_subset_match` probe issues an identical clear+draw pair via `gl.drawElements(TRIANGLES, 3, U16, 0)` (works — reads back `[255,128,64,255]`) then `gl.drawRangeElements(TRIANGLES, 0, 2, 3, U16, 0)` (fails — reads back `[0,0,0,0]`). All `gl.getError` probes report `NO_ERROR (0x0)` end-to-end. The `(0,0)` corner pixel ALSO reads `[0,0,0,0]` — meaning the preceding `gl.clearColor(0,0,0,1)` + `gl.clear(COLOR_BUFFER_BIT)` also did not hit the user FBO (would have painted α=255).
+
+**What we know.**
+- Engine wiring is correct: disassembly of `_ZL21w_draw_range_elementsRK…` shows the FN parses all 6 args and tail-calls `glDrawRangeElements(w0=mode, w1=start, w2=end, w3=count, w4=type, x5=offset)` per AArch64 ABI. Verified 2026-07-03.
+- No runtime shim wraps `drawRangeElements`: canvas-runner's `installBridgeDirtyHooks` wraps `drawArrays`/`drawElements`/`clear`/`drawArraysInstanced`/`drawElementsInstanced` only. cube-route-shim, shadow-route-shim, gl-teardown do not touch draw-family methods.
+- `touch_fbo()` was missing from `w_draw_range_elements`; added 2026-07-03 as a defensive pattern-match with the other draw FNs. Non-load-bearing for user FBOs (`draw_into_default` is false), so did NOT change the failure.
+- The failure is 100% reproducible on Citron/Mesa Nouveau NV120 and DID NOT occur pre-touch_fbo either — the fix candidate doesn't cure it. This eliminates the missing-`touch_fbo` theory.
+- Baseline drawElements + readPixels PASSES on the same VAO / FBO / shader in the same probe run — so state is intact BEFORE the second block. Between the two blocks: only `gl.clearColor` + `gl.clear` + `gl.drawRangeElements` (all wrapped identically to other v2 methods).
+
+**Hypotheses (unranked, needs engine-side fprintf to pin down).**
+1. Mesa Nouveau driver quirk where `glDrawRangeElements` silently no-ops or is aliased to a broken path. Nouveau has historical implementation gaps with less-common ES3 entry points.
+2. Some engine state contract we haven't identified — perhaps the `w_read_pixels` before the second block subtly invalidates the FBO binding for the next draw call, and `drawRangeElements`'s implementation isn't robust to it while `drawElements` is (asymmetric because the wrap-list vs no-wrap distinction).
+3. GC / handle-life issue on the runtime side.
+
+**Impact.** LOW-severity — `drawRangeElements` is an ES3 optimization hint (`start`/`end` args tell the driver the valid vertex index range). Applications can safely fall back to `drawElements` with identical semantics. No Three.js path in the current demo set uses `drawRangeElements`. Blocks only the specific counter test on the phase-1.5-LOW acceptance smoke; the other 29 methods in #50 verified via other probes.
+
+**Next diagnostic step.** Add fprintf inside `w_draw_range_elements` logging the 6 arg values + `st->bound_fbo_js` + a post-glDrawRangeElements `glGetError` result. Rebuild + run gl-probes. If the FN is called with correct args and post-call `glGetError = 0`, root cause is confirmed as driver-side and this becomes a documented driver limit (like [[reference-mesa-nouveau-layered-sampling-unsupported]]). If the FN isn't called or is called with wrong args, root cause is engine / dispatch.
+
+**DISPOSITION:** `open — investigate before phase-1.5-MED` (blocks tier-acceptance smoke). Ok to defer diagnostic engine-side fprintf to a follow-up commit; commit `8ffe876` (phase-1.5-LOW-MED) is unaffected — its own methods PASS.
+
+### #52b — `getTexParameter` (WebGL1 core) never wired into FUNCS[]
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — no `FN(w_get_tex_parameter)` exists; `install_methods` (v1) and `install_methods_v2` (v2) FUNCS[] neither register a `getTexParameter` entry.
+
+**Symptom.** Any call to `gl.getTexParameter(target, pname)` throws `TypeError: gl.getTexParameter is not a function` — even though the method is WebGL1 CORE (mandatory since spec 1.0). Discovered by gl-probes `EXT_ANISO anisotropy_texparameter_roundtrip` probe attempting to verify a `texParameterf(TEXTURE_MAX_ANISOTROPY_EXT, 16.0)` set via a getter readback. Set landed (no GL error); readback impossible.
+
+**Impact.** LOW-severity — Three.js and typical WebGL apps never call `getTexParameter` (they set-and-forget texture parameters). Applications that DO call it (feature-detect probes, debugging tools) get the TypeError and know to fall back. But it's a spec-conformance gap that the report app's future WebGL1 function counter (v1 twin of the 88-list) would surface — currently there's no counter for v1 so the gap is invisible.
+
+**Fix.** Trivial — one-liner FN + FUNCS[] entry (both v1 and v2):
+```c
+FN(w_get_tex_parameter) {
+    enter_bracket();
+    Isolate *iso = info.GetIsolate();
+    const GLenum target = a_u32(info, 0);
+    const GLenum pname = a_u32(info, 1);
+    // TEXTURE_MAX_ANISOTROPY_EXT (0x84FE) returns float; TEXTURE_MAX_LOD /
+    // TEXTURE_MIN_LOD also float. All others are int.
+    if (pname == 0x84FE || pname == GL_TEXTURE_MAX_LOD || pname == GL_TEXTURE_MIN_LOD) {
+        GLfloat f = 0.0f;
+        glGetTexParameterfv(target, pname, &f);
+        info.GetReturnValue().Set(Number::New(iso, f));
+    } else {
+        GLint v = 0;
+        glGetTexParameteriv(target, pname, &v);
+        info.GetReturnValue().Set(Int32::New(iso, v));
+    }
+}
+```
+
+**DISPOSITION:** `upstream-candidate`, deferred to a follow-up commit. Not blocking phase-1.5-MED (unrelated to counter progression). Ledger #52b tracks; next available slot in a phase-1.5-MED or batch-3 commit is fine.
+
+**RE-APPLY / VERIFY NOTE.** For #52a — recurrence tell: gl-probes DRAW_RANGE FAIL with `eDE=0x0 eClear=0x0 eDRE=0x0 eRead=0x0 corner=[0,0,0,0]` = mystery still stands. For #52b — grep `FN(w_get_tex_parameter)` in webgl.cc = should exist after fix; absent means still-a-gap.
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches
