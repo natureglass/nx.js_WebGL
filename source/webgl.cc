@@ -100,6 +100,10 @@ enum ObjKind : uint8_t {
 	// BEFORE K_COUNT (which sizes the protos[] array). New entries are
 	// stamped on v2 contexts by nx_webgl2_init_class's MAP[] extension.
 	K_VERTEX_ARRAY_OBJECT,
+	// Phase-1.5-MED handle kinds (ledger #53).
+	K_QUERY,
+	K_SAMPLER,
+	K_SYNC,
 	K_COUNT,
 };
 
@@ -107,6 +111,11 @@ struct GLObj {
 	uint32_t id;
 	int32_t loc; // uniform location for K_UNIFORM_LOCATION
 	uint8_t kind;
+	// K_SYNC uses a GLsync (opaque pointer), not a GLuint name. Held in
+	// its own field to avoid punning `id`+`loc` bits into a 64-bit
+	// pointer (which introduces sign-extension traps on the loc int32).
+	// For all non-K_SYNC handles this stays zero and is not read.
+	GLsync sync = nullptr;
 };
 
 struct WebGLState {
@@ -3039,13 +3048,33 @@ FN(w_clear_buffer_fi) {
 // ----- Draw range (v2 adds) -----
 FN(w_draw_range_elements) {
 	enter_bracket();
+	// NXJS_PATCHES_NEEDED #52a interim fix — Mesa Nouveau NV120 silently
+	// no-ops glDrawRangeElements. Citron gl-probes v0.3.0 discriminator
+	// (sentinel clear color + isolation-mode + per-step glGetError)
+	// proved the failure reproduces on a fresh WebGL2 context with no
+	// prior probes: baseline glDrawElements PASSES on the same
+	// VAO/FBO/shader, then clearColor(sentinel)+clear+glDrawRangeElements
+	// yields FBO texture untouched (readback [0,0,0,0]) with all
+	// glGetError = 0. Not probe state leakage, not the touch_fbo pattern
+	// mismatch, not an engine wiring issue (disassembly + ABI verified).
+	// ES3 §2.8.3 makes the (start, end) range a driver optimization hint
+	// only — the equivalent draw call is glDrawElements(mode, count,
+	// type, indices). Falling back is spec-legal; Three.js and every
+	// tested Nouveau-target demo tolerates the substitution.
 	const GLenum mode = a_u32(info, 0);
-	const GLuint start = a_u32(info, 1);
-	const GLuint end = a_u32(info, 2);
+	(void)a_u32(info, 1); // start — range hint, unused post-fallback
+	(void)a_u32(info, 2); // end   — range hint, unused post-fallback
 	const GLsizei count = a_i32(info, 3);
 	const GLenum type = a_u32(info, 4);
 	const GLintptr offset = (GLintptr)a_i32(info, 5);
-	glDrawRangeElements(mode, start, end, count, type, (const void *)offset);
+	static bool s_fallback_logged = false;
+	if (!s_fallback_logged) {
+		fprintf(stderr, "[#52a] drawRangeElements -> drawElements fallback "
+		                "(range hint dropped; see NXJS_PATCHES_NEEDED #52a)\n");
+		fflush(stderr);
+		s_fallback_logged = true;
+	}
+	glDrawElements(mode, count, type, (const void *)offset);
 	touch_fbo();
 }
 
@@ -3159,6 +3188,338 @@ FN(w_get_internalformat_parameter) {
 // End phase-1.5-LOW-MED block.
 // ============================================================================
 
+// ============================================================================
+// #52b — WebGL1 core getTexParameter (both v1 + v2 FUNCS[]).
+// Discovered by gl-probes v0.1.0 EXT_ANISO. TEXTURE_MAX_ANISOTROPY_EXT
+// (0x84FE), TEXTURE_MAX_LOD (0x813B), TEXTURE_MIN_LOD (0x813A) are float-
+// valued; everything else int-valued.
+// ============================================================================
+FN(w_get_tex_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum target = a_u32(info, 0);
+	const GLenum pname = a_u32(info, 1);
+	if (pname == 0x84FE || pname == GL_TEXTURE_MAX_LOD ||
+	    pname == GL_TEXTURE_MIN_LOD) {
+		GLfloat f = 0.0f;
+		glGetTexParameterfv(target, pname, &f);
+		info.GetReturnValue().Set(Number::New(iso, f));
+	} else {
+		GLint v = 0;
+		glGetTexParameteriv(target, pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+	}
+}
+
+// ============================================================================
+// Phase-1.5-MED — 25 core WebGL2 methods (ledger #53).
+// Four families: sampler (7), sync (6), query (7), UBO introspection (5).
+// 3 new K_* handle kinds: K_QUERY, K_SAMPLER, K_SYNC (declared in the
+// ObjKind enum + registered in nx_webgl2_init_class MAP[]). All v2-only;
+// installed on install_methods_v2 FUNCS[] only. Runtime teardown tracking
+// for the new handle kinds already lands via brewser-runtime-v8's
+// gl-teardown.ts (samplers/queries/syncs/transformFeedbacks pre-wired).
+// Counter jump 53 → 78/88.
+// ============================================================================
+
+// ----- Sampler family (7) -----
+FN(w_create_sampler) {
+	GLuint s = 0;
+	glGenSamplers(1, &s);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_SAMPLER, s));
+}
+FN(w_delete_sampler) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteSamplers(1, &id);
+}
+FN(w_is_sampler) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsSampler(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_sampler) {
+	enter_bracket();
+	glBindSampler(a_u32(info, 0), obj_id(info[1]));
+}
+FN(w_sampler_parameter_i) {
+	enter_bracket();
+	glSamplerParameteri(obj_id(info[0]), a_u32(info, 1), a_i32(info, 2));
+}
+FN(w_sampler_parameter_f) {
+	enter_bracket();
+	glSamplerParameterf(obj_id(info[0]), a_u32(info, 1), a_f32(info, 2));
+}
+FN(w_get_sampler_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint s = obj_id(info[0]);
+	const GLenum pname = a_u32(info, 1);
+	if (pname == GL_TEXTURE_MAX_LOD || pname == GL_TEXTURE_MIN_LOD) {
+		GLfloat f = 0.0f;
+		glGetSamplerParameterfv(s, pname, &f);
+		info.GetReturnValue().Set(Number::New(iso, f));
+	} else {
+		GLint v = 0;
+		glGetSamplerParameteriv(s, pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+	}
+}
+
+// ----- Sync family (6) -----
+FN(w_fence_sync) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum condition = a_u32(info, 0);
+	const GLbitfield flags = a_u32(info, 1);
+	GLsync s = glFenceSync(condition, flags);
+	if (!s) { info.GetReturnValue().SetNull(); return; }
+	Local<Object> obj = new_gl_obj(iso, K_SYNC, 0);
+	GLObj *o = nx::Unwrap<GLObj>(obj);
+	if (o) o->sync = s;
+	info.GetReturnValue().Set(obj);
+}
+FN(w_is_sync) {
+	GLObj *o = get_gl_obj(info[0]);
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    (o && o->kind == K_SYNC && o->sync) ? (glIsSync(o->sync) == GL_TRUE) : false));
+}
+FN(w_delete_sync) {
+	GLObj *o = get_gl_obj(info[0]);
+	if (o && o->kind == K_SYNC && o->sync) {
+		glDeleteSync(o->sync);
+		o->sync = nullptr;
+	}
+}
+FN(w_client_wait_sync) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	GLObj *o = get_gl_obj(info[0]);
+	if (!o || o->kind != K_SYNC || !o->sync) {
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, GL_WAIT_FAILED));
+		return;
+	}
+	const GLbitfield flags = a_u32(info, 1);
+	// timeout is a GLuint64. JS Number can express it directly (up to
+	// 2^53 — WebGL2 typically uses small values like 0 or a few ms in ns).
+	const GLuint64 timeout = (GLuint64)a_f64(info, 2);
+	GLenum r = glClientWaitSync(o->sync, flags, timeout);
+	info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, r));
+}
+FN(w_wait_sync) {
+	enter_bracket();
+	GLObj *o = get_gl_obj(info[0]);
+	if (!o || o->kind != K_SYNC || !o->sync) return;
+	const GLbitfield flags = a_u32(info, 1);
+	// waitSync's timeout is required to be GL_TIMEOUT_IGNORED per WebGL2
+	// spec, but we forward whatever the caller passed for parity with
+	// desktop drivers. GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFF.
+	const GLuint64 timeout = (GLuint64)a_f64(info, 2);
+	glWaitSync(o->sync, flags, timeout);
+}
+FN(w_get_sync_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	GLObj *o = get_gl_obj(info[0]);
+	if (!o || o->kind != K_SYNC || !o->sync) { info.GetReturnValue().SetNull(); return; }
+	const GLenum pname = a_u32(info, 1);
+	GLint v = 0;
+	GLsizei written = 0;
+	glGetSynciv(o->sync, pname, 1, &written, &v);
+	info.GetReturnValue().Set(Int32::New(iso, v));
+}
+
+// ----- Query family (7) -----
+// Note: batch-3's EXT_disjoint_timer_query builds ON this — the query
+// ext object exposes suffixed methods that alias these core natives +
+// adds queryCounterEXT + timer-EXT constants. This is the batch-3 dedup
+// base per plan §0.1.1.
+FN(w_create_query) {
+	GLuint q = 0;
+	glGenQueries(1, &q);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_QUERY, q));
+}
+FN(w_delete_query) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteQueries(1, &id);
+}
+FN(w_is_query) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsQuery(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_begin_query) {
+	enter_bracket();
+	glBeginQuery(a_u32(info, 0), obj_id(info[1]));
+}
+FN(w_end_query) {
+	enter_bracket();
+	glEndQuery(a_u32(info, 0));
+}
+FN(w_get_query) {
+	// getQuery(target, pname) — pname is CURRENT_QUERY. Returns the
+	// currently-active query for the target, or null if none active.
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum target = a_u32(info, 0);
+	const GLenum pname = a_u32(info, 1);
+	GLint v = 0;
+	glGetQueryiv(target, pname, &v);
+	if (v == 0) { info.GetReturnValue().SetNull(); return; }
+	info.GetReturnValue().Set(new_gl_obj(iso, K_QUERY, (GLuint)v));
+}
+FN(w_get_query_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint q = obj_id(info[0]);
+	const GLenum pname = a_u32(info, 1);
+	// QUERY_RESULT_AVAILABLE returns bool; QUERY_RESULT returns int (spec:
+	// GLuint64 but WebGL2 exposes as regular number).
+	GLuint v = 0;
+	glGetQueryObjectuiv(q, pname, &v);
+	if (pname == GL_QUERY_RESULT_AVAILABLE) {
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
+	} else {
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, v));
+	}
+}
+
+// ----- UBO introspection (5) -----
+FN(w_get_indexed_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum target = a_u32(info, 0);
+	const GLuint index = a_u32(info, 1);
+	// TRANSFORM_FEEDBACK_BUFFER_BINDING / UNIFORM_BUFFER_BINDING return
+	// a buffer object; the SIZE / START pnames return int64 but WebGL2
+	// exposes as regular number.
+	if (target == GL_UNIFORM_BUFFER_BINDING ||
+	    target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING) {
+		GLint v = 0;
+		glGetIntegeri_v(target, index, &v);
+		if (v == 0) { info.GetReturnValue().SetNull(); return; }
+		info.GetReturnValue().Set(new_gl_obj(iso, K_BUFFER, (GLuint)v));
+		return;
+	}
+	// SIZE / START / etc. return integer values.
+	GLint64 v = 0;
+	glGetInteger64i_v(target, index, &v);
+	info.GetReturnValue().Set(Number::New(iso, (double)v));
+}
+FN(w_get_uniform_indices) {
+	// getUniformIndices(program, names[]) — returns Uint32Array of
+	// indices, one per input name.
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	if (info.Length() < 2 || !info[1]->IsArray()) return;
+	Local<Array> names = info[1].As<Array>();
+	const uint32_t n = names->Length();
+	if (n == 0) {
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, 0);
+		info.GetReturnValue().Set(Uint32Array::New(ab, 0, 0));
+		return;
+	}
+	Local<Context> ctx = cur(iso);
+	std::vector<char *> owned(n, nullptr);
+	std::vector<const char *> ptrs(n, nullptr);
+	for (uint32_t i = 0; i < n; i++) {
+		Local<Value> nm;
+		if (!names->Get(ctx, i).ToLocal(&nm)) continue;
+		owned[i] = take_string(iso, nm);
+		ptrs[i] = owned[i] ? owned[i] : "";
+	}
+	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
+	glGetUniformIndices(program, (GLsizei)n, ptrs.data(),
+	                     (GLuint *)ab->Data());
+	for (uint32_t i = 0; i < n; i++) if (owned[i]) delete[] owned[i];
+	info.GetReturnValue().Set(Uint32Array::New(ab, 0, n));
+}
+FN(w_get_active_uniforms) {
+	// getActiveUniforms(program, uniformIndices, pname) — returns array
+	// of results, one per input index. Result type depends on pname:
+	// TYPE / SIZE / OFFSET / etc. return Int32Array; IS_ROW_MAJOR
+	// returns bool array.
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	std::vector<uint32_t> tmp;
+	const uint32_t *indices = nullptr;
+	size_t n = 0;
+	if (!u32_list(iso, info[1], tmp, &indices, &n)) return;
+	const GLenum pname = a_u32(info, 2);
+	if (n == 0) {
+		info.GetReturnValue().Set(Array::New(iso, 0));
+		return;
+	}
+	std::vector<GLint> out(n);
+	glGetActiveUniformsiv(program, (GLsizei)n, indices, pname, out.data());
+	Local<Context> ctx = cur(iso);
+	Local<Array> arr = Array::New(iso, (int)n);
+	const bool is_bool = (pname == GL_UNIFORM_IS_ROW_MAJOR);
+	for (size_t i = 0; i < n; i++) {
+		Local<Value> v = is_bool
+		    ? (Local<Value>)Boolean::New(iso, out[i] != 0)
+		    : (Local<Value>)Int32::New(iso, out[i]);
+		arr->Set(ctx, (uint32_t)i, v).Check();
+	}
+	info.GetReturnValue().Set(arr);
+}
+FN(w_get_active_uniform_block_parameter) {
+	// getActiveUniformBlockParameter(program, blockIndex, pname) —
+	// pname determines return shape:
+	//   UNIFORM_BLOCK_BINDING / _DATA_SIZE / _ACTIVE_UNIFORMS → int
+	//   UNIFORM_BLOCK_REFERENCED_BY_VERTEX/_FRAGMENT_SHADER → bool
+	//   UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES → Uint32Array of length
+	//     ACTIVE_UNIFORMS
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	const GLuint blockIndex = a_u32(info, 1);
+	const GLenum pname = a_u32(info, 2);
+	if (pname == GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER ||
+	    pname == GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER) {
+		GLint v = 0;
+		glGetActiveUniformBlockiv(program, blockIndex, pname, &v);
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
+		return;
+	}
+	if (pname == GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES) {
+		GLint count = 0;
+		glGetActiveUniformBlockiv(program, blockIndex,
+		    GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &count);
+		if (count < 0) count = 0;
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, count * 4);
+		if (count > 0) {
+			glGetActiveUniformBlockiv(program, blockIndex, pname,
+			    (GLint *)ab->Data());
+		}
+		info.GetReturnValue().Set(Uint32Array::New(ab, 0, count));
+		return;
+	}
+	// Scalar int pnames.
+	GLint v = 0;
+	glGetActiveUniformBlockiv(program, blockIndex, pname, &v);
+	info.GetReturnValue().Set(Int32::New(iso, v));
+}
+FN(w_get_active_uniform_block_name) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	const GLuint blockIndex = a_u32(info, 1);
+	GLint len = 0;
+	glGetActiveUniformBlockiv(program, blockIndex,
+	    GL_UNIFORM_BLOCK_NAME_LENGTH, &len);
+	std::vector<char> buf(len > 0 ? len : 1);
+	GLsizei written = 0;
+	if (len > 0) glGetActiveUniformBlockName(program, blockIndex, len,
+	                                          &written, buf.data());
+	info.GetReturnValue().Set(
+	    String::NewFromUtf8(iso, buf.data(), NewStringType::kNormal,
+	                         written).ToLocalChecked());
+}
+
+// ============================================================================
+// End phase-1.5-MED block.
+// ============================================================================
+
 static void install_methods(Isolate *iso, Local<Object> proto) {
 	struct Spec { const char *name; FunctionCallback fn; };
 	static const Spec FUNCS[] = {
@@ -3197,6 +3558,7 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"pixelStorei", w_pixel_storei},
 	    {"getError", w_get_error},
 	    {"getParameter", w_get_parameter},
+	    {"getTexParameter", w_get_tex_parameter},
 	    {"getExtension", w_get_extension},
 	    {"getSupportedExtensions", w_get_supported_extensions},
 	    // Phase-0 gap fill — internal natives for the runtime's
@@ -3374,6 +3736,7 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"pixelStorei", w_pixel_storei},
 	    {"getError", w_get_error},
 	    {"getParameter", w_get_parameter},
+	    {"getTexParameter", w_get_tex_parameter},
 	    {"getExtension", w_get_extension},
 	    {"getSupportedExtensions", w_get_supported_extensions},
 	    // Phase-0 gap fill — internal natives for the runtime's
@@ -3585,7 +3948,43 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"vertexAttribIPointer", w_vertex_attrib_i_pointer},
 	    // getInternalformatParameter (1)
 	    {"getInternalformatParameter", w_get_internalformat_parameter},
-	    // Add sync / queries / etc. here as the diag-proxy reports them.
+	    // ============================================================
+	    // Phase-1.5-MED — 25 methods (ledger #53). Counter jump 53 → 78/88.
+	    // Sampler (7) + sync (6) + query (7) + UBO introspection (5).
+	    // ============================================================
+	    // Sampler (7)
+	    {"createSampler", w_create_sampler},
+	    {"deleteSampler", w_delete_sampler},
+	    {"isSampler", w_is_sampler},
+	    {"bindSampler", w_bind_sampler},
+	    {"samplerParameteri", w_sampler_parameter_i},
+	    {"samplerParameterf", w_sampler_parameter_f},
+	    {"getSamplerParameter", w_get_sampler_parameter},
+	    // Sync (6)
+	    {"fenceSync", w_fence_sync},
+	    {"isSync", w_is_sync},
+	    {"deleteSync", w_delete_sync},
+	    {"clientWaitSync", w_client_wait_sync},
+	    {"waitSync", w_wait_sync},
+	    {"getSyncParameter", w_get_sync_parameter},
+	    // Query (7) — batch-3 dedup base per plan §0.1.1
+	    {"createQuery", w_create_query},
+	    {"deleteQuery", w_delete_query},
+	    {"isQuery", w_is_query},
+	    {"beginQuery", w_begin_query},
+	    {"endQuery", w_end_query},
+	    {"getQuery", w_get_query},
+	    {"getQueryParameter", w_get_query_parameter},
+	    // UBO introspection (5)
+	    {"getIndexedParameter", w_get_indexed_parameter},
+	    {"getUniformIndices", w_get_uniform_indices},
+	    {"getActiveUniforms", w_get_active_uniforms},
+	    {"getActiveUniformBlockParameter", w_get_active_uniform_block_parameter},
+	    {"getActiveUniformBlockName", w_get_active_uniform_block_name},
+	    // #52b — WebGL1 core getTexParameter (also folded into v1
+	    // install_methods below).
+	    {"getTexParameter", w_get_tex_parameter},
+	    // Add MED-HIGH transform-feedback here as the diag-proxy reports them.
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
@@ -3675,6 +4074,10 @@ void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 	    {"WebGLShaderPrecisionFormat", K_SHADER_PRECISION_FORMAT},
 	    // v2-only handle kinds (cut #3+):
 	    {"WebGLVertexArrayObject", K_VERTEX_ARRAY_OBJECT},
+	    // Phase-1.5-MED handle kinds (ledger #53):
+	    {"WebGLQuery", K_QUERY},
+	    {"WebGLSampler", K_SAMPLER},
+	    {"WebGLSync", K_SYNC},
 	};
 	for (const auto &kv : MAP) {
 		Local<Value> jc;

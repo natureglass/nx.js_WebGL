@@ -684,17 +684,89 @@ check 51 "webgl.cc [low-med] block header comment present" \
 #       persists. Guardrail checks the defensive fix is present.
 # #52b: WebGL1 core getTexParameter missing from FUNCS[] — deferred fix.
 #       Guardrail marks it as known-open until the FN + FUNCS[] entry lands.
-check 52 "webgl.cc [drawrange] touch_fbo() defensive addition present" \
+# #52a — drawRangeElements → drawElements fallback (interim fix SHIPPED 2026-07-03).
+# Body substitution + one-time boot log guardrail.
+check 52 "webgl.cc [52a] w_draw_range_elements calls glDrawElements (fallback)" \
     "$NXJS/source/webgl.cc" \
-    'glDrawRangeElements\(mode, start, end, count, type, \(const void \*\)offset\);\n\s*touch_fbo\(\)' \
-    --allow-missing
-# Fallback single-line check (grep -P handles \n in pattern; --allow-missing
-# lets the compound multiline pattern degrade to KNOWN-OPEN rather than fail
-# the whole audit if grep's regex flavor doesn't span lines).
-check 52 "webgl.cc [drawrange] w_draw_range_elements has touch_fbo call" \
+    'glDrawElements\(mode, count, type, \(const void \*\)offset\);'
+check 52 "webgl.cc [52a] fallback boot log present" \
     "$NXJS/source/webgl.cc" \
-    'FN\(w_draw_range_elements\)'
-status 52 "KNOWN-OPEN" "webgl.cc getTexParameter FUNCS[] gap (v1 core method missing — see ledger #52b)"
+    '\[#52a\] drawRangeElements -> drawElements fallback'
+check_absent 52 "webgl.cc [52a] no direct glDrawRangeElements call in body (proves fallback still active)" \
+    "$NXJS/source/webgl.cc" \
+    'glDrawRangeElements\('
+# #52b — getTexParameter FN + FUNCS[] entries (SHIPPED 2026-07-03).
+check 52 "webgl.cc [52b] w_get_tex_parameter FN present" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_tex_parameter\)'
+check 52 "webgl.cc [52b] getTexParameter registered (v1 or v2 FUNCS[])" \
+    "$NXJS/source/webgl.cc" \
+    '"getTexParameter", w_get_tex_parameter'
+
+# #53 — Phase-1.5-MED: 25 methods across 4 families + 3 new K_* handle kinds.
+# Handle-kind guardrails.
+check 53 "webgl.cc [med-handle] K_QUERY enum member" \
+    "$NXJS/source/webgl.cc" \
+    'K_QUERY,'
+check 53 "webgl.cc [med-handle] K_SAMPLER enum member" \
+    "$NXJS/source/webgl.cc" \
+    'K_SAMPLER,'
+check 53 "webgl.cc [med-handle] K_SYNC enum member" \
+    "$NXJS/source/webgl.cc" \
+    'K_SYNC,'
+check 53 "webgl.cc [med-handle] GLObj gained GLsync sync field" \
+    "$NXJS/source/webgl.cc" \
+    'GLsync sync = nullptr'
+check 53 "webgl.cc [med-handle] WebGLQuery class registered in nx_webgl2_init_class MAP" \
+    "$NXJS/source/webgl.cc" \
+    '"WebGLQuery", K_QUERY'
+check 53 "webgl.cc [med-handle] WebGLSampler class registered" \
+    "$NXJS/source/webgl.cc" \
+    '"WebGLSampler", K_SAMPLER'
+check 53 "webgl.cc [med-handle] WebGLSync class registered" \
+    "$NXJS/source/webgl.cc" \
+    '"WebGLSync", K_SYNC'
+# Sampler family (7)
+check 53 "webgl.cc [med-sampler] createSampler" \
+    "$NXJS/source/webgl.cc" \
+    '"createSampler", w_create_sampler'
+check 53 "webgl.cc [med-sampler] getSamplerParameter" \
+    "$NXJS/source/webgl.cc" \
+    '"getSamplerParameter", w_get_sampler_parameter'
+# Sync family (6)
+check 53 "webgl.cc [med-sync] fenceSync" \
+    "$NXJS/source/webgl.cc" \
+    '"fenceSync", w_fence_sync'
+check 53 "webgl.cc [med-sync] clientWaitSync" \
+    "$NXJS/source/webgl.cc" \
+    '"clientWaitSync", w_client_wait_sync'
+check 53 "webgl.cc [med-sync] getSyncParameter" \
+    "$NXJS/source/webgl.cc" \
+    '"getSyncParameter", w_get_sync_parameter'
+# Query family (7)
+check 53 "webgl.cc [med-query] createQuery" \
+    "$NXJS/source/webgl.cc" \
+    '"createQuery", w_create_query'
+check 53 "webgl.cc [med-query] beginQuery" \
+    "$NXJS/source/webgl.cc" \
+    '"beginQuery", w_begin_query'
+check 53 "webgl.cc [med-query] getQueryParameter" \
+    "$NXJS/source/webgl.cc" \
+    '"getQueryParameter", w_get_query_parameter'
+# UBO introspection (5)
+check 53 "webgl.cc [med-ubo] getUniformIndices" \
+    "$NXJS/source/webgl.cc" \
+    '"getUniformIndices", w_get_uniform_indices'
+check 53 "webgl.cc [med-ubo] getActiveUniforms" \
+    "$NXJS/source/webgl.cc" \
+    '"getActiveUniforms", w_get_active_uniforms'
+check 53 "webgl.cc [med-ubo] getActiveUniformBlockName" \
+    "$NXJS/source/webgl.cc" \
+    '"getActiveUniformBlockName", w_get_active_uniform_block_name'
+# Family marker — regression tell for block-wholesale delete.
+check 53 "webgl.cc [med] block header comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Phase-1\.5-MED'
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="

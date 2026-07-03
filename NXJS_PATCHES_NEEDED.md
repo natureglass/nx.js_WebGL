@@ -2554,7 +2554,7 @@ Sum: 6 methods = counter +6 = 47 → 53/88 (matches plan §0.1.1 reconciled prog
 
 ---
 
-## #52 — Two gl-probes-discovered gaps: drawRangeElements Citron-side no-op + WebGL1 `getTexParameter` absent from FUNCS[] — OPEN 2026-07-03
+## #52 — Two gl-probes-discovered gaps: drawRangeElements Citron-side no-op (SHIPPED interim fix 2026-07-03) + WebGL1 `getTexParameter` absent from FUNCS[] (SHIPPED 2026-07-03)
 
 Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both are pre-existing surface gaps surfaced by the new probe harness — not regressions from #50 / #51.
 
@@ -2580,7 +2580,11 @@ Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both
 
 **Next diagnostic step.** Add fprintf inside `w_draw_range_elements` logging the 6 arg values + `st->bound_fbo_js` + a post-glDrawRangeElements `glGetError` result. Rebuild + run gl-probes. If the FN is called with correct args and post-call `glGetError = 0`, root cause is confirmed as driver-side and this becomes a documented driver limit (like [[reference-mesa-nouveau-layered-sampling-unsupported]]). If the FN isn't called or is called with wrong args, root cause is engine / dispatch.
 
-**DISPOSITION:** `open — investigate before phase-1.5-MED` (blocks tier-acceptance smoke). Ok to defer diagnostic engine-side fprintf to a follow-up commit; commit `8ffe876` (phase-1.5-LOW-MED) is unaffected — its own methods PASS.
+**DISCRIMINATOR OUTCOME 2026-07-03.** gl-probes v0.3.0 sentinel + isolation-mode smokes both FAIL identically (`sentinel=no cornerSentinel=no allZero=yes cornerZero=yes eDE=0x0 eClear=0x0 eDRE=0x0 eRead=0x0 baseline=[255,128,64,255] ranged=[0,0,0,0]`). Isolation run (DRAW_RANGE as first-and-only probe on fresh WebGL2 context) reproduces the failure identically → NOT probe-side state leakage from other probes. The FBO texture is genuinely untouched by both the second `gl.clear` AND `gl.drawRangeElements` despite both calls returning `GL_NO_ERROR`. `glClear` on Mesa Nouveau evidently follows the same silent-no-op path as `glDrawRangeElements` when the driver enters some post-`glReadPixels` state we haven't characterized.
+
+**INTERIM FIX SHIPPED 2026-07-03.** `w_draw_range_elements` (source/webgl.cc) now calls `glDrawElements(mode, count, type, indices)` instead of `glDrawRangeElements`. Spec-legal per ES3 §2.8.3 (the `start`/`end` args are a driver optimization hint only — the equivalent draw is `glDrawElements` with the same mode/count/type/indices). One-time boot log `[#52a] drawRangeElements -> drawElements fallback (range hint dropped; see NXJS_PATCHES_NEEDED #52a)` documents that the workaround is active. `start` and `end` arg slots still parse for arg-count parity (via `(void)a_u32(info, 1)/2`) so removing the fallback in a future engine cycle is a one-line change. gl-probes DRAW_RANGE probe expected to PASS post-fix on the next Citron smoke.
+
+**DISPOSITION:** `interim-shipped; engine-native re-enable is an upstream / driver-followup`. Removing the fallback requires either a Mesa Nouveau driver update that fixes `glDrawRangeElements` (out of our control) OR isolating the exact state that trips the driver into no-op mode. Not blocking phase-1.5-MED.
 
 ### #52b — `getTexParameter` (WebGL1 core) never wired into FUNCS[]
 
@@ -2611,9 +2615,58 @@ FN(w_get_tex_parameter) {
 }
 ```
 
-**DISPOSITION:** `upstream-candidate`, deferred to a follow-up commit. Not blocking phase-1.5-MED (unrelated to counter progression). Ledger #52b tracks; next available slot in a phase-1.5-MED or batch-3 commit is fine.
+**SHIPPED 2026-07-03** in the phase-1.5-MED commit (folded per Alex's plan). `FN(w_get_tex_parameter)` added between the LOW-MED and MED blocks. Registered in both v1 (`install_methods` FUNCS[]) and v2 (`install_methods_v2` FUNCS[]) as `"getTexParameter"`. `EXT_ANISO` probe un-SKIP'd in gl-probes v0.4.0 — now performs the full anisotropy roundtrip (set → get via `getTexParameter`) and must PASS in the phase-1.5-MED tier-acceptance smoke.
 
-**RE-APPLY / VERIFY NOTE.** For #52a — recurrence tell: gl-probes DRAW_RANGE FAIL with `eDE=0x0 eClear=0x0 eDRE=0x0 eRead=0x0 corner=[0,0,0,0]` = mystery still stands. For #52b — grep `FN(w_get_tex_parameter)` in webgl.cc = should exist after fix; absent means still-a-gap.
+**DISPOSITION:** `upstream-candidate, shipped`.
+
+**RE-APPLY / VERIFY NOTE.**
+- **#52a** — recurrence tell: absence of `[#52a] drawRangeElements -> drawElements fallback` boot log on first WebGL2 draw call = someone reverted the fallback. gl-probes DRAW_RANGE FAIL post-boot = fallback regressed OR the underlying Mesa Nouveau issue reappeared in a different form.
+- **#52b** — grep `FN(w_get_tex_parameter)` in webgl.cc = should exist; grep `"getTexParameter", w_get_tex_parameter` in both v1 + v2 FUNCS[] = should be registered. gl-probes EXT_ANISO FAIL = regressed.
+
+---
+
+## #53 — Phase-1.5-MED: 25 v2 methods (sampler + sync + query + UBO introspection) + 3 new handle kinds — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — 25 new `FN(w_*)` implementations grouped in a phase-1.5-MED block after the LOW-MED block + 25 new FUNCS[] entries in `install_methods_v2` + 3 new K_* enum values (K_QUERY, K_SAMPLER, K_SYNC) + `GLsync sync` field on `GLObj` (K_SYNC uses a driver-opaque pointer, not a GLuint name) + 3 new handle-class registrations in `nx_webgl2_init_class` MAP[] (`WebGLQuery`, `WebGLSampler`, `WebGLSync`).
+
+**Motivation.** Third phase-1.5 tier per plan §0.1.1's decided order (b1 → b2 → LOW → LOW-MED → **MED** → b3 → MED-HIGH). Counter target 53 → 78/88 (+25). Includes the batch-3 dedup base (core query family: `createQuery`..`getQueryParameter`) — batch 3's `EXT_disjoint_timer_query` add is now the timer-EXT delta over this plumbing, not the full 7-method query family.
+
+**Methods landed by family (grep-verifiable via `FN\(w_[a-z_0-9]+\)` in webgl.cc):**
+
+- **Sampler (7):** `w_create_sampler`, `w_delete_sampler`, `w_is_sampler`, `w_bind_sampler`, `w_sampler_parameter_i`, `w_sampler_parameter_f`, `w_get_sampler_parameter`.
+- **Sync (6):** `w_fence_sync`, `w_is_sync`, `w_delete_sync`, `w_client_wait_sync`, `w_wait_sync`, `w_get_sync_parameter`.
+- **Query (7):** `w_create_query`, `w_delete_query`, `w_is_query`, `w_begin_query`, `w_end_query`, `w_get_query`, `w_get_query_parameter`.
+- **UBO introspection (5):** `w_get_indexed_parameter`, `w_get_uniform_indices`, `w_get_active_uniforms`, `w_get_active_uniform_block_parameter`, `w_get_active_uniform_block_name`.
+
+Sum: 25 methods = counter +25 = 53 → 78/88 (matches plan §0.1.1 progression). +1 non-count'd — `w_get_tex_parameter` (per #52b) is folded into the same commit and lands in both v1 + v2 FUNCS[].
+
+**Implementation notes per family:**
+- **Sampler** — `create/delete/is` follow the existing `w_create_vertex_array` pattern via new K_SAMPLER handle kind. `bindSampler(unit, sampler)` binds to a texture unit, not a target. `samplerParameteri/f` mirror `texParameteri/f`; `getSamplerParameter` returns float for TEXTURE_MAX_LOD / TEXTURE_MIN_LOD, int for everything else.
+- **Sync** — `GLsync` is a driver-opaque pointer, not a GLuint name. Held in a new `GLObj::sync` field to avoid punning `id`+`loc` bits into a 64-bit pointer (sign-extension traps on the `loc` int32). `fenceSync` returns a new object wrapping the sync; `deleteSync` nulls it; `isSync` checks the wrapped kind + `glIsSync`. `clientWaitSync`'s timeout is a `GLuint64` — JS Number precision covers the WebGL2 typical range (0..few ms in ns).
+- **Query** — K_QUERY handle. `getQuery(target, pname)` returns a K_QUERY-wrapped `CURRENT_QUERY` result or null. `getQueryParameter` returns bool for `QUERY_RESULT_AVAILABLE`, uint for `QUERY_RESULT` (uses `glGetQueryObjectuiv` — driver upcasts to GLuint64 spec-wise but WebGL2 exposes as regular Number).
+- **UBO introspection** — `getIndexedParameter(UNIFORM_BUFFER_BINDING, idx)` returns a WebGLBuffer via `new_gl_obj(K_BUFFER, name)`; `_START`/`_SIZE` targets return int64 via `Number::New`. `getUniformIndices` takes an array of strings, returns Uint32Array of length input.length. `getActiveUniforms(program, indices, pname)` returns a JS Array whose element type depends on pname (bool for `IS_ROW_MAJOR`, int for others). `getActiveUniformBlockParameter(program, blockIndex, pname)` returns bool for `REFERENCED_BY_*_SHADER`, Uint32Array for `ACTIVE_UNIFORM_INDICES` (pre-sized via `ACTIVE_UNIFORMS`), int for scalar pnames. `getActiveUniformBlockName` returns a UTF-8 string via `String::NewFromUtf8`.
+
+**New K_ handle kinds — runtime teardown pre-wired.** [brewser-runtime-v8/src/scripts/gl-teardown.ts](../brewser-runtime-v8/src/scripts/gl-teardown.ts) already tracks `samplers`, `queries`, `syncs`, and `transformFeedbacks` at lines 304-313 (create/delete wraps) + 524-527 (deletion sweep at teardown). No runtime changes needed for MED — the teardown side was pre-wired defensively when VAO tracking landed. This is the "additive-only" precondition Alex's plan calls out (new kinds may register with gl-teardown.ts; existing reset rows may not be modified) and it's already met without any new runtime commit.
+
+**Runtime-semantics verification per family (Citron smoke via com.natureglass.gl-probes v0.4.0 — landed in a paired brewser-apps commit).**
+- **Sampler** — create/bind + `samplerParameteri(MIN_FILTER, NEAREST)` + `getSamplerParameter` roundtrip check.
+- **Sync** — `fenceSync(SYNC_GPU_COMMANDS_COMPLETE, 0)` + `flush` + `clientWaitSync` returns `ALREADY_SIGNALED` or `CONDITION_SATISFIED` within a small timeout; `getSyncParameter(SYNC_STATUS)` returns `SIGNALED`.
+- **Query** — `beginQuery(ANY_SAMPLES_PASSED)` + draw + `endQuery` + poll `QUERY_RESULT_AVAILABLE` + `QUERY_RESULT > 0` for a visible draw.
+- **UBO introspection** — build a known UBO layout in shader source, `getUniformBlockIndex` → `getActiveUniformBlockParameter(DATA_SIZE, ACTIVE_UNIFORMS)` → `getUniformIndices` → `getActiveUniforms(OFFSET/TYPE)` match std140 expectations.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed.
+
+**DISPOSITION:** `upstream-candidate`. All 25 methods are thin wrappers around ES3 core entry points; upstream could take the block, K_* additions to the enum, and the `GLObj::sync` field extension in one PR without controversy.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-MED`, `w_fence_sync`, `w_create_query`, `w_get_active_uniform_block_name`. Recurrence tells:
+- Report renders `53 / 88 implemented` post-hardware → the MED FUNCS[] block regressed. Check `install_methods_v2` for the 25 new entries.
+- gl-probes SYNC probe FAILs with `clientWaitSync=WAIT_FAILED` → K_SYNC handle regressed to a bare GLuint (the `GLObj::sync` pointer isn't being read back correctly).
+- gl-probes QUERY probe FAILs with `QUERY_RESULT=0` for a visible draw → `w_get_query_parameter`'s `glGetQueryObjectuiv` regressed OR the driver isn't seeing the `beginQuery`/`endQuery` wrapping (which would mean the enter_bracket / exit_bracket cadence dropped the query state).
+- gl-probes UBO_INTRO probe FAILs with unexpected `DATA_SIZE` → shader compile regressed OR the `getActiveUniformBlockiv` pname dispatch got a case wrong.
+
+**Sequencing.** Third phase-1.5 tier per plan §0.1.1's decided order. Independently revertable from #51 (LOW-MED) and #50 (LOW), and from #52a (which is a `w_draw_range_elements` body change, orthogonal to the MED-family FUNCS[] additions).
 
 ---
 
