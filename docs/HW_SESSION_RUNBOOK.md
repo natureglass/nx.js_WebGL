@@ -70,15 +70,14 @@ proves it isn't probe state leakage. Interim `glDrawElements` fallback shipped
    two-block pattern set `?strict=1` (which restores the pre-refactor
    comparison logic in v1.0.0+ if we add it, or manually inspect the log).
 
-**HW verdict** (fill in on hardware session):
-- `[  ]` PASS with fallback disabled → Citron-only issue. Reword #52a to
-  "Citron-emulator quirk"; fallback becomes defensive-only.
-- `[  ]` FAIL with fallback disabled → Real Mesa Nouveau NV120 driver bug.
-  Fallback remains load-bearing. Reword #52a to "driver-ceiling".
-- `[  ]` UNEXPECTED (some other diagnostic) → attach the hardware log to the
+**HW verdict** (2026-07-03 hardware session):
+- `[X]` PASS with fallback disabled → Citron-only issue. Reword #52a to
+  "Citron-emulator quirk"; fallback becomes defensive-only. ← **CONFIRMED**
+- `[ ]` FAIL with fallback disabled → Real Mesa Nouveau NV120 driver bug.
+- `[ ]` UNEXPECTED (some other diagnostic) → attach the hardware log to the
   ledger entry and re-triage.
 
-**HW session date / hardware model / verdict:** _pending_
+**HW session date / hardware model / verdict:** 2026-07-03 — Tegra X1 Nouveau NV120 CFW hbmenu — **CITRON-ONLY QUIRK**. Boot A (default NRO, fallback ON) and Boot B (`NX_52A_DISABLE_FALLBACK=1`, fallback OFF) both painted the DRAW_RANGE probe's expected pixel `[255,127,64,255]`; the strict-mode probe FAIL on both boots is a ±1 pixel-rounding tolerance issue (hardware `round-half-down` vs Citron `round-half-up`), not a `glDrawRangeElements` defect. Logs: `gl-probes-v0.11.0-all-strict-BOOT-A.log`, `gl-probes-v0.11.0-drawrange-iso-BOOT-B.log`, `gl-probes-v0.11.0-all-strict-BOOT-B.log`. Ledger #52a updated + `NX_52A_DISABLE_FALLBACK` build gate retained for future re-verification.
 
 ---
 
@@ -112,22 +111,15 @@ Same **Citron-observed / hardware-pending** class as §#52a and §#54.
 4. Click **Run Probes (WebGL 2)**. Capture
    `sdmc:/switch/brewser/logs/gl-probes-v<VER>.log`.
 
-**HW verdict** (fill in on hardware session):
-- `[  ]` TF_PAUSE PASS strict — probe detail reads
+**HW verdict** (2026-07-03 hardware session):
+- `[X]` TF_PAUSE PASS strict — probe detail reads
   `pause skipped id=200, captured id=100 + id=300 in order` →
   Citron-only issue. Reword this runbook entry + ledger #55 to
-  "Citron-emulator quirk".
-- `[  ]` TF_PAUSE FAIL strict with same quirk signature
-  (`pause+resume acted as end+begin`) → Real Mesa Nouveau NV120 driver
-  ceiling. Reclassify to `driver-ceiling — no engine fix planned` and
-  add to `[[reference-mesa-nouveau-layered-sampling-unsupported]]`-family
-  reference memory. Note: this only affects apps that use TF
-  pause/resume specifically — TF_CAPTURE / TF_ERR still work fine.
-- `[  ]` TF_PAUSE FAIL strict with DIFFERENT signature (e.g., all-sentinel,
-  or "pauseTransformFeedback silently no-oped — all 3 vertices captured") →
-  Different driver bug — attach hardware log and open a new sub-item.
+  "Citron-emulator quirk". ← **CONFIRMED**
+- `[ ]` TF_PAUSE FAIL strict with same quirk signature.
+- `[ ]` TF_PAUSE FAIL strict with DIFFERENT signature.
 
-**HW session date / hardware model / verdict:** _pending_
+**HW session date / hardware model / verdict:** 2026-07-03 — Tegra X1 Nouveau NV120 CFW hbmenu — **CITRON-ONLY QUIRK**. Strict TF_PAUSE probe on real hardware `PASS detail=pause skipped id=200, captured id=100 + id=300 in order | ePauseCtx=0x0 ePause=0x0 eResume=0x0 eEnd=0x0`. Driver honors pause/resume semantics correctly. Log: `gl-probes-v0.11.0-all-strict-BOOT-A.log`.
 
 ---
 
@@ -152,18 +144,13 @@ wiring proven correct; either driver ceiling or Citron GPU-translation gap.
 5. Click **Run Probes (WebGL 2)**. Capture
    `sdmc:/switch/brewser/logs/gl-probes-v<VER>.log`.
 
-**HW verdict** (fill in on hardware session):
-- `[  ]` QUERY PASS strict — probe detail reads
-  `spec-conformant (result > 0 for visible draw)` → Citron-only issue. Revert
+**HW verdict** (2026-07-03 hardware session):
+- `[X]` QUERY PASS strict — Citron-only issue. Revert
   the probe relaxation and restore strict `QUERY_RESULT > 0` as the default
-  in gl-probes.js. Reword #54 to "Citron-emulator quirk".
-- `[  ]` QUERY FAIL strict — probe detail reads
-  `Mesa Nouveau NV120 quirk — result=0 despite pixels drawn (#54)` →
-  Real driver ceiling. Reword #54 to "driver-ceiling — no engine fix planned"
-  and add to `[[reference-mesa-nouveau-layered-sampling-unsupported]]` family
-  in workspace memory.
+  in gl-probes.js. Reword #54 to "Citron-emulator quirk". ← **CONFIRMED**
+- `[ ]` QUERY FAIL strict → Real driver ceiling.
 
-**HW session date / hardware model / verdict:** _pending_
+**HW session date / hardware model / verdict:** 2026-07-03 — Tegra X1 Nouveau NV120 CFW hbmenu — **CITRON-ONLY QUIRK**. Strict QUERY probe on real hardware `PASS detail=surface + wiring ok, QUERY_RESULT=1 — spec-conformant (result > 0 for visible draw) | eBegin=0x0 eDraw=0x0 eEnd=0x0 eAvail=0x0 eResult=0x0 curActive=true`. `ANY_SAMPLES_PASSED` works correctly on real hardware; the Citron `QUERY_RESULT=0` was a Citron GPU-translation gap. Log: `gl-probes-v0.11.0-all-strict-BOOT-A.log`.
 
 ---
 
@@ -275,6 +262,36 @@ updated per its disposition rule, either:
 
 Prefer moving over deleting for the first 6 months post-verification —
 regressions happen and the runbook history is useful triage material.
+
+---
+
+## §#56 — `getBufferSubData` via `glMapBufferRange` returns zeros on Mesa Nouveau NV120 hardware — NEW 2026-07-03
+
+**Ledger:** [NXJS_PATCHES_NEEDED.md #56](../NXJS_PATCHES_NEEDED.md#56).
+
+**Hardware observation.** gl-probes v0.11.0 BUFFER probe on real Tegra
+Nouveau NV120 fails with `mismatch@0 src=3 got=0` — every byte in the
+readback is zero. Reproduces on both Boot A (default NRO) and Boot B
+(fallback-disabled NRO), so not tied to any #52a build gate.
+
+**Citron behavior.** BUFFER probe passes cleanly with `copy+getSubData
+64B memcmp ok`. Citron's AMD Vulkan translation of `glMapBufferRange`
+evidently accepts `GL_COPY_WRITE_BUFFER` target; Nouveau NV120 may not.
+
+**Diagnostic candidates for the next engine session.**
+
+1. Split map path by target — for COPY_WRITE_BUFFER / COPY_READ_BUFFER,
+   temporarily rebind to ARRAY_BUFFER, map, unmap, restore original.
+2. Add `glFinish()` before `glMapBufferRange` to force pipeline drain.
+3. Log `glGetError()` after `glMapBufferRange` to see if it's returning
+   NULL with an error code (likely INVALID_OPERATION on unmappable
+   target for Nouveau).
+4. Add a `#ifdef HARDWARE_BUFFER_MAP_QUIRK` compile gate with a
+   fallback path (transient scratch ARRAY_BUFFER + copy + read).
+
+**HW session date / verdict:** 2026-07-03 hardware smoke — **NEW OPEN
+ITEM**. Reproduces on Tegra X1 Nouveau NV120 CFW hbmenu. Log:
+`gl-probes-v0.11.0-all-strict-BOOT-A.log` line 13.
 
 ---
 

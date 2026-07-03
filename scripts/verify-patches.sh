@@ -822,6 +822,12 @@ check 55 "webgl.cc [tf] resumeTransformFeedback" \
 check 55 "webgl.cc [mh] block header comment present" \
     "$NXJS/source/webgl.cc" \
     'Phase-1\.5-MED-HIGH'
+
+# #56 — Hardware-observed getBufferSubData zeros. No engine change YET;
+# ledger entry existence + HW_SESSION_RUNBOOK.md §#56 section are what
+# get audited here. If/when the engine fix lands, add specific check for
+# the split-map-by-target path or the glFinish guard.
+status 56 "KNOWN-OPEN" "getBufferSubData hardware zeros — Mesa Nouveau NV120 (see HW_SESSION_RUNBOOK.md §#56)"
 # #52a fallback gate — new build define check.
 check 52 "webgl.cc [52a] fallback gate: NX_52A_DISABLE_FALLBACK ifndef guard present" \
     "$NXJS/source/webgl.cc" \

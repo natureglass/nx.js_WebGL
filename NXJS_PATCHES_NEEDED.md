@@ -2554,7 +2554,7 @@ Sum: 6 methods = counter +6 = 47 → 53/88 (matches plan §0.1.1 reconciled prog
 
 ---
 
-## #52 — Two gl-probes-discovered gaps: drawRangeElements Citron-side no-op (SHIPPED interim fix 2026-07-03) + WebGL1 `getTexParameter` absent from FUNCS[] (SHIPPED 2026-07-03)
+## #52 — Two gl-probes-discovered gaps: drawRangeElements Citron-only quirk (fallback shipped as defensive-only 2026-07-03) + WebGL1 `getTexParameter` absent from FUNCS[] (SHIPPED 2026-07-03)
 
 Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both are pre-existing surface gaps surfaced by the new probe harness — not regressions from #50 / #51.
 
@@ -2588,9 +2588,9 @@ Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both
 
 **Fallback gate for hardware probe.** `w_draw_range_elements` has a `#ifndef NX_52A_DISABLE_FALLBACK` guard around the substitution. Building with `-DNX_52A_DISABLE_FALLBACK=1` (added to `nxjs-source-v8/Makefile` CFLAGS or via `make CFLAGS_APPEND=-DNX_52A_DISABLE_FALLBACK=1`) restores the direct `glDrawRangeElements` call. Boot log distinguishes the two modes: `[#52a] drawRangeElements DIRECT (fallback DISABLED via NX_52A_DISABLE_FALLBACK build)` vs the default fallback banner.
 
-**DISPOSITION:** `citron-observed, interim-shipped, hardware-pending`. Hardware verdict determines whether:
-- **Hardware PASSES with fallback disabled** → Citron-only regression. Fallback becomes defensive-only, kept in place to protect against Citron re-emerging. Reword this ledger to a "Citron-emulator quirk" classification.
-- **Hardware also FAILS with fallback disabled** → Real Mesa Nouveau NV120 driver bug. Fallback remains load-bearing. Reword to a "driver-ceiling" classification and upstream a Mesa bug report if the fault triggers under the isolation smoke on real Tegra.
+**HARDWARE VERDICT 2026-07-03 — CITRON-ONLY QUIRK.** Real Tegra Nouveau NV120 with fallback-disabled build (`NX_52A_DISABLE_FALLBACK=1`, boot log confirmed `[#52a] drawRangeElements DIRECT (fallback DISABLED via NX_52A_DISABLE_FALLBACK build)`) renders the DRAW_RANGE probe's expected pixel color end-to-end via direct `glDrawRangeElements`. Boot A (default fallback ON) and Boot B (fallback OFF) both produce the exact same pixel readback `[255,127,64,255]`; the strict-mode probe FAIL on both boots is a ±1 pixel-rounding tolerance issue (hardware `round-half-down`, 0.5 → 127; Citron `round-half-up`, 0.5 → 128), NOT a `glDrawRangeElements` defect. See docs/HW_SESSION_RUNBOOK.md §#52a for the filled-in verdict rows.
+
+**DISPOSITION:** `Citron-only quirk (verified 2026-07-03 hardware smoke); fallback remains shipped as defensive-only`. The interim `glDrawElements` fallback is kept in place to protect against Citron re-emerging (Citron sits on top of AMD Vulkan and its glDrawRangeElements → Vulkan translation gap could recur in future Citron versions). No engine-native re-enable planned; `NX_52A_DISABLE_FALLBACK=1` build gate stays in webgl.cc for future hardware-vs-emulator discriminator smokes.
 
 ### #52b — `getTexParameter` (WebGL1 core) never wired into FUNCS[]
 
@@ -2676,7 +2676,7 @@ Sum: 25 methods = counter +25 = 53 → 78/88 (matches plan §0.1.1 progression).
 
 ---
 
-## #54 — Occlusion-query `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn — CITRON-OBSERVED, HARDWARE-PENDING 2026-07-03
+## #54 — Occlusion-query `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn — CITRON-ONLY QUIRK (verified 2026-07-03 hardware smoke)
 
 Discovered by com.natureglass.gl-probes v0.4.0 QUERY probe on Citron 2026-07-03. Engine's query surface (ledger #53 — `w_create_query`, `w_begin_query`, `w_end_query`, `w_get_query_parameter`) is functionally correct on the wiring side.
 
@@ -2694,21 +2694,11 @@ eBegin=0x0 eDraw=0x0 eEnd=0x0 eAvail=0x0 eResult=0x0 curActive=true
 - `curActive=true` — `getQuery(ANY_SAMPLES_PASSED, CURRENT_QUERY)` returned the wrapped query right after beginQuery, proving the query was active during the begin block
 - `eResult=0x0` + `QUERY_RESULT=0` — no error, counter just returned 0
 
-**STATUS: CITRON-OBSERVED / HARDWARE-PENDING.** Per the standing rule, Citron is a functional-iteration authority, NOT a driver-truth authority. The observed behavior could be Mesa Nouveau NV120's real driver ceiling OR Citron's GPU-translation layer failing to plumb the occlusion counter through. Hardware probe (see docs/HW_SESSION_RUNBOOK.md §#54) will resolve.
+**HARDWARE VERDICT 2026-07-03 — CITRON-ONLY QUIRK.** Real Tegra Nouveau NV120 QUERY probe run in strict mode: `PASS detail=surface + wiring ok, QUERY_RESULT=1 — spec-conformant (result > 0 for visible draw) | eBegin=0x0 eDraw=0x0 eEnd=0x0 eAvail=0x0 eResult=0x0 curActive=true`. `ANY_SAMPLES_PASSED` works correctly on real hardware; the Citron `QUERY_RESULT=0` was a Citron GPU-translation gap, not a Mesa Nouveau driver ceiling.
 
-**Interim probe accommodation.** gl-probes v0.8.0 QUERY probe verifies surface + wiring (curActive after beginQuery, no GL errors, draw painted, QUERY_RESULT non-negative) rather than driver-specific result semantics. Pass detail annotates the observed semantic:
-- `spec-conformant (result > 0 for visible draw)` — real hardware or non-Nouveau driver
-- `Mesa Nouveau NV120 quirk — result=0 despite pixels drawn (#54)` — current Citron observation
+**DISPOSITION:** `Citron-only quirk (verified 2026-07-03 hardware smoke)`. gl-probes v0.12.0+ reverts the QUERY probe relaxation — strict `QUERY_RESULT > 0` is now the default (paired brewser-apps commit). On Citron, the probe will FAIL with the Citron-quirk annotation — acceptable because it's a documented Citron-emulator behavior, not an engine or driver defect. On any real GLES3 driver, the probe PASSes.
 
-The relaxation exists so tier acceptance can proceed on Citron; strict-mode probing is available via query param `?strict=1` on the app URL (see gl-probes.js `strictQuery` flag). Hardware smoke MUST use strict mode.
-
-**Impact if the hardware verdict is real driver ceiling.** LOW severity — Three.js and typical WebGL2 apps don't use occlusion queries in the common rendering path. Applications that DO (visibility culling, occlusion-based LOD) see always-visible behavior (result=0 → interpret as "not occluded" → conservative render everything). No visual regression, just no perf benefit.
-
-**DISPOSITION:** `citron-observed, probe-relaxed, hardware-pending`. Hardware verdict determines:
-- **Hardware PASSES strict** → Citron-only issue. Revert the probe relaxation and restore strict `QUERY_RESULT > 0` as the default in gl-probes.js.
-- **Hardware FAILS strict** → Real Mesa Nouveau NV120 driver ceiling. Reclassify to `driver-ceiling — no engine fix planned` and add to `[[reference-mesa-nouveau-layered-sampling-unsupported]]`-family reference memory.
-
-**Recurrence tell.** QUERY probe detail annotation is the audit trail — the day it flips to `spec-conformant` on the same hardware = a Mesa update fixed it.
+**Recurrence tell.** QUERY probe FAIL on hardware = Mesa driver regressed OR the engine's `w_get_query_parameter` / `w_begin_query` wiring regressed. QUERY probe PASS on Citron would be surprising — verify the Citron version hasn't changed its GPU translation.
 
 ---
 
@@ -2749,7 +2739,7 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 
 **UPSTREAM STATUS:** `not-submitted`.
 
-**Citron-observed / hardware-pending sub-item — TF pause/resume.** gl-probes v0.9.0 TF_PAUSE probe observed a driver behavior where `resumeTransformFeedback` resets the buffer write pointer (id=300 overwrote slot 0 that id=100 had captured); pattern is consistent with pause+resume being treated as end+begin. TF_CAPTURE and TF_ERR both PASS strict — the driver-quirk is specific to pause/resume semantics, not the wider TF surface. Verdict pending real-Tegra smoke per docs/HW_SESSION_RUNBOOK.md §#55-pause. gl-probes v0.10.0 TF_PAUSE tags this shape as PASS-QUIRK-RELAXED with the annotation `pause+resume acted as end+begin — id=300 overwrote slot 0, only 1 slot ever captured` (three quirk shapes recognized: this shape, all-sentinel silent-noop, and pause-silently-noop; STRICT mode requires the spec-conformant shape).
+**Citron-only quirk sub-item — TF pause/resume (verified 2026-07-03 hardware smoke).** gl-probes v0.9.0 TF_PAUSE probe observed on Citron that `resumeTransformFeedback` resets the buffer write pointer (id=300 overwrote slot 0 that id=100 had captured). Hardware smoke 2026-07-03 confirmed CITRON-ONLY: real Tegra Nouveau NV120 strict TF_PAUSE `PASS detail=pause skipped id=200, captured id=100 + id=300 in order` — the driver honors pause/resume semantics correctly. gl-probes v0.12.0+ reverts the TF_PAUSE relaxation — strict spec-conformance is now the default. On Citron the probe will FAIL with the Citron-quirk annotation (documented Citron-emulator behavior, not an engine or driver defect).
 
 **RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-MED-HIGH`, `w_begin_transform_feedback`, `K_TRANSFORM_FEEDBACK`, `"WebGLTransformFeedback"`. Recurrence tells:
 - Report renders `78 / 88 implemented` post-hardware → the MED-HIGH FUNCS[] block regressed. Check `install_methods_v2` for the 10 new entries.
@@ -2758,6 +2748,34 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 - gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
 **Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88.
+
+---
+
+## #56 — `getBufferSubData` via `glMapBufferRange(GL_MAP_READ_BIT)` returns zeros on Mesa Nouveau NV120 hardware — HARDWARE-OBSERVED, OPEN 2026-07-03
+
+Discovered by com.natureglass.gl-probes v0.11.0 BUFFER probe on real Tegra Nouveau NV120 (2026-07-03 hardware smoke, both Boot A default NRO and Boot B fallback-disabled NRO). Not reproducible on Citron — passed 21/21 on the Citron final smoke.
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `w_get_buffer_sub_data` at approximately line 2811-2828 (phase-1.5-LOW block, ledger #50).
+
+**Hardware symptom.** gl-probes BUFFER probe fails with `mismatch@0 src=3 got=0` — every byte in the readback is zero, none match the src pattern that was `bufferData`'d into a source ARRAY_BUFFER + `copyBufferSubData`'d into a destination COPY_WRITE_BUFFER. Boot A and Boot B identical → not related to #52a fallback gate.
+
+**Citron symptom.** None — probe passes cleanly with `copy+getSubData 64B memcmp ok`.
+
+**Root-cause hypothesis (unverified).** `w_get_buffer_sub_data` uses `glMapBufferRange(target, offset, length, GL_MAP_READ_BIT)` per phase-1.5-LOW ledger #50 implementation note (glGetBufferSubData is desktop-GL only; not in Mesa Nouveau's GLES3 header set). Mesa Nouveau NV120's `glMapBufferRange` may return NULL for `GL_COPY_WRITE_BUFFER` target — the driver's mapping implementation historically supports only `GL_ARRAY_BUFFER` and `GL_PIXEL_UNPACK_BUFFER` on some Nouveau chip revisions. Alternative: `copyBufferSubData` may not have completed by the time the read fires (missing implicit flush).
+
+**Impact.** MEDIUM severity — Three.js uses `getBufferSubData` in the ping-pong readback path of the `WebGLRenderer.readRenderTargetPixels` fallback and in some geometry-processing utilities. Any demo that reads back GPU-computed vertex data (GPGPU visualizer, particle systems with position feedback) would silently see zeros.
+
+**Diagnostic candidates (for the next engine-native cycle).**
+1. Split the map path by target: for COPY_WRITE_BUFFER and COPY_READ_BUFFER, temporarily rebind to ARRAY_BUFFER (spec: `bindBuffer` is per-target, no data change), map, unmap, restore original binding.
+2. Add `glFinish()` before `glMapBufferRange` — force GPU pipeline drain so `copyBufferSubData` has definitely committed.
+3. Verify `glGetError()` after `glMapBufferRange` — if it errors, log the code (INVALID_OPERATION expected if target is unmappable on this driver).
+4. Consider an `#ifdef HARDWARE_BUFFER_MAP_QUIRK` compile gate with a fallback path (transient scratch ARRAY_BUFFER + glBufferSubData + retry).
+
+**DISPOSITION:** `hardware-observed, open — investigate before running any demo that exercises getBufferSubData on real Tegra`. Not blocking phase-1.5 tier acceptance (webglreport 88/88 confirmed on hardware; the FUNCTION SURFACE is wired) but blocking real-content correctness for a specific readback path.
+
+**RE-APPLY / VERIFY NOTE.** Recurrence tell: gl-probes BUFFER `mismatch@0 src=3 got=0` = symptom active. gl-probes BUFFER `copy+getSubData 64B memcmp ok` on hardware = fix landed or driver updated.
+
+Not paired with a probe change — the BUFFER probe already correctly detects the mismatch. Add engine-side diagnostic + fix in a follow-up commit.
 
 ---
 
