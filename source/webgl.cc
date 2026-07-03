@@ -3123,16 +3123,52 @@ FN(w_get_buffer_sub_data) {
 	// JS perspective (the returned bytes must be up-to-date).
 	glFinish();
 
+	// #56 candidate (a1) — per-target rebind fallback for map. 2026-07-03
+	// second hardware smoke on Mesa Nouveau NV120 confirmed: Arm A
+	// (ARRAY_BUFFER direct readback) PASSes with candidates (a)+(b), but
+	// Arm B (COPY_WRITE_BUFFER via copy) still FAILs — the map returns
+	// non-NULL but points at unrelated memory (Boot A read got=0, Boot B
+	// read got=42; both spurious). Target-specific defect. Workaround:
+	// for COPY_WRITE_BUFFER / COPY_READ_BUFFER / PIXEL_PACK_BUFFER, look
+	// up the buffer name bound to that target, temporarily rebind to
+	// ARRAY_BUFFER (per-target binding — no data movement, driver
+	// side-effect-free), map from ARRAY_BUFFER (verified to work by
+	// Arm A), unmap, restore original ARRAY_BUFFER binding.
+	GLenum map_target = target;
+	GLint saved_array_binding = 0;
+	bool did_rebind = false;
+	if (target == GL_COPY_WRITE_BUFFER || target == GL_COPY_READ_BUFFER ||
+	    target == GL_PIXEL_PACK_BUFFER) {
+		GLenum binding_pname = 0;
+		if (target == GL_COPY_WRITE_BUFFER) binding_pname = GL_COPY_WRITE_BUFFER_BINDING;
+		else if (target == GL_COPY_READ_BUFFER) binding_pname = GL_COPY_READ_BUFFER_BINDING;
+		else if (target == GL_PIXEL_PACK_BUFFER) binding_pname = GL_PIXEL_PACK_BUFFER_BINDING;
+		GLint target_binding = 0;
+		glGetIntegerv(binding_pname, &target_binding);
+		if (target_binding != 0) {
+			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_array_binding);
+			glBindBuffer(GL_ARRAY_BUFFER, (GLuint)target_binding);
+			map_target = GL_ARRAY_BUFFER;
+			did_rebind = true;
+#ifdef NX_56_DEBUG
+			fprintf(stderr, "[#56] per-target rebind: target=0x%x bind=%d "
+			                "saved_array=%d\n", target, target_binding,
+			        saved_array_binding);
+			fflush(stderr);
+#endif
+		}
+	}
+
 #ifdef NX_56_DEBUG
 	while (glGetError() != GL_NO_ERROR);
 #endif
-	void *mapped = glMapBufferRange(target, src_off, (GLsizeiptr)len,
+	void *mapped = glMapBufferRange(map_target, src_off, (GLsizeiptr)len,
 	                                GL_MAP_READ_BIT);
 #ifdef NX_56_DEBUG
 	GLenum e_map = glGetError();
-	fprintf(stderr, "[#56] glMapBufferRange target=0x%x off=%td len=%zu "
+	fprintf(stderr, "[#56] glMapBufferRange target=0x%x (mapped as 0x%x) off=%td len=%zu "
 	                "-> mapped=%p err=0x%x\n",
-	        target, (ptrdiff_t)src_off, len, mapped, e_map);
+	        target, map_target, (ptrdiff_t)src_off, len, mapped, e_map);
 	if (mapped) {
 		const uint8_t *b = (const uint8_t *)mapped;
 		size_t log_len = len < 16 ? len : 16;
@@ -3145,8 +3181,18 @@ FN(w_get_buffer_sub_data) {
 
 	if (mapped) {
 		memcpy(dst_bytes, mapped, len);
-		glUnmapBuffer(target);
+		glUnmapBuffer(map_target);
+		if (did_rebind) {
+			glBindBuffer(GL_ARRAY_BUFFER, (GLuint)saved_array_binding);
+		}
 		return;
+	}
+
+	// Restore original ARRAY_BUFFER binding before falling through to the
+	// proc-address fallback (which uses the caller's target directly and
+	// doesn't need the rebind).
+	if (did_rebind) {
+		glBindBuffer(GL_ARRAY_BUFFER, (GLuint)saved_array_binding);
 	}
 
 	// #56 candidate (a) fallback — glMapBufferRange returned NULL (Mesa

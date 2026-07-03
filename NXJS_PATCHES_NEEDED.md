@@ -2751,7 +2751,7 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 
 ---
 
-## #56 — `getBufferSubData` via `glMapBufferRange(GL_MAP_READ_BIT)` returns zeros on Mesa Nouveau NV120 hardware — HARDWARE-OBSERVED, DIAGNOSIS-SHIPPED-FIX-PENDING-HARDWARE 2026-07-03
+## #56 — `getBufferSubData` on COPY_WRITE_BUFFER returns wrong data on Mesa Nouveau NV120 hardware — TARGET-SPECIFIC-QUIRK, SECOND-STAGE FIX SHIPPED 2026-07-03 (VERDICT-PENDING-NEXT-HARDWARE)
 
 Discovered by com.natureglass.gl-probes v0.11.0 BUFFER probe on real Tegra Nouveau NV120 (2026-07-03 hardware smoke, both Boot A default NRO and Boot B fallback-disabled NRO). Not reproducible on Citron — passed 21/21 on the Citron final smoke.
 
@@ -2787,9 +2787,28 @@ Alex's diagnostic ladder from the post-hardware directive, resolved by code-read
 
 **DISPOSITION:** `diagnosis-shipped-fix-pending-hardware-verify`. Not blocking phase-1.5 tier acceptance headline (88/88 SURFACE installed + hardware-verified callable). Blocks the 87/88 → 88/88 FUNCTIONAL correctness jump; hardware smoke next boot resolves.
 
-**RE-APPLY / VERIFY NOTE.** Recurrence tell: hardware gl-probes BUFFER `BOTH ARMS FAIL — universal map/readback defect` = fix regressed OR driver behavior further degraded. Hardware BUFFER `Arm A PASS, Arm B FAIL` = target-specific quirk still open — implement candidate (a1) per-target-rebind fallback. Hardware BUFFER `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok` = fix confirmed carrying, reclassify to CLOSED. Boot log grep for `[#56] glGetBufferSubData proc-address resolved: 0x[1-9a-f]` = fallback available (non-null); `0x0` = only the sync candidate is protecting us.
+**RE-APPLY / VERIFY NOTE.** Recurrence tell: hardware gl-probes BUFFER `BOTH ARMS FAIL — universal map/readback defect` = fix regressed OR driver behavior further degraded. Hardware BUFFER `Arm A PASS, Arm B FAIL` = target-specific quirk still open. Hardware BUFFER `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok` = fix confirmed carrying, reclassify to CLOSED. Boot log grep for `[#56] glGetBufferSubData proc-address resolved: 0x[1-9a-f]` = fallback available (non-null); `0x0` = only the sync candidate is protecting us.
 
 Runbook §#56 has the exact verdict procedure for the next hardware boot.
+
+---
+
+### #56 second-stage fix — per-target rebind (SHIPPED 2026-07-03, hardware-verdict pending)
+
+**2026-07-03 hardware smoke (second session) verdict.** gl-probes v0.14.0 BUFFER probe on real Tegra Nouveau NV120:
+
+- Boot A (default NRO, non-strict): `Arm A (ARRAY_BUFFER direct) PASS, Arm B (COPY_WRITE_BUFFER via copy) FAIL — target- or copy-specific defect (#56 candidate) | Arm-B mismatch@0 src=3 got=0`
+- Boot B (default NRO, strict): identical shape, `got=42` (spurious value — memory from a prior probe's allocation containing id=42 from TF_ERR)
+
+**Diagnosis.** The candidate (a)+(b) fix from Commit 1 (`1c42457`) partially works — the `glFinish()` sync helps `glMapBufferRange` on ARRAY_BUFFER return correct data (Arm A PASS). But `glMapBufferRange(GL_COPY_WRITE_BUFFER)` on Mesa Nouveau NV120 returns non-NULL (so the fallback path never fires) yet points at unrelated memory. The `glGetBufferSubData` proc-address fallback path (candidate a) is unreachable because it's gated on `if (mapped == NULL)`. Target-specific driver defect confirmed.
+
+**Second-stage fix landed (candidate a1).** For `GL_COPY_WRITE_BUFFER`, `GL_COPY_READ_BUFFER`, `GL_PIXEL_PACK_BUFFER`: look up the buffer name currently bound to that target via `glGetIntegerv(GL_<TARGET>_BINDING)`; temporarily rebind that buffer to `GL_ARRAY_BUFFER` (per-target binding — no data movement, driver side-effect-free); map from `GL_ARRAY_BUFFER` (verified to work by Arm A); memcpy; unmap; restore original `GL_ARRAY_BUFFER` binding. Preserves original target binding on the caller's namespace.
+
+**Expected next hardware verdict.** BUFFER probe both arms PASS: `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. If confirmed, reclassify #56 to CLOSED and move to Archived section of docs/HW_SESSION_RUNBOOK.md.
+
+**If FAIL persists.** Rebuild with `-DNX_56_DEBUG=1` — the new per-call log line `[#56] per-target rebind: target=0x8F37 bind=<name> saved_array=<name>` will confirm the rebind ran; if it did AND readback is still wrong, then even `glMapBufferRange(GL_ARRAY_BUFFER)` on a buffer allocated via a different target has the same defect, and we escalate to the proc-address `glGetBufferSubData` fallback path (which the second-stage fix rearranges to be reachable after the rebind attempt).
+
+**Corrected `NX_56_DEBUG` fallback reachability.** Commit 1's shape gated `resolve_pfn_get_buffer_sub_data()` on `if (mapped == NULL)` — but the map returned non-NULL with wrong data, so the fallback was unreachable. Commit 3 (second stage) shifts the gate: if the rebind path ran, the map is now against ARRAY_BUFFER (verified working) — the map-returns-non-NULL-with-wrong-data path shouldn't fire. If it somehow does, we still fall through to the proc-address fallback which reads via the original target.
 
 ---
 

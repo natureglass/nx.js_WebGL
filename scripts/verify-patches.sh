@@ -838,6 +838,12 @@ check 56 "webgl.cc [#56] proc-address resolution boot log" \
 check 56 "webgl.cc [#56] NX_56_DEBUG per-call diagnostic guard" \
     "$NXJS/source/webgl.cc" \
     '#ifdef NX_56_DEBUG'
+check 56 "webgl.cc [#56] second-stage: per-target rebind fallback" \
+    "$NXJS/source/webgl.cc" \
+    'per-target rebind fallback for map'
+check 56 "webgl.cc [#56] rebind branch: COPY_WRITE_BUFFER handling" \
+    "$NXJS/source/webgl.cc" \
+    'target == GL_COPY_WRITE_BUFFER \|\| target == GL_COPY_READ_BUFFER'
 
 # #57 — Batch 3 final extension batch. All driver-gated advertising +
 # w_get_extension branches + FUNCS[] wiring.

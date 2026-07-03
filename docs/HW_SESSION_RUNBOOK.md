@@ -320,11 +320,22 @@ from COPY_WRITE_BUFFER.
 | `BOTH ARMS FAIL — universal map/readback defect` | NO EFFECT — mitigations didn't carry | Rebuild with `-DNX_56_DEBUG=1` and re-smoke; the per-call diagnostic will reveal whether glMapBufferRange returns NULL AND the fallback proc-address was NULL (candidate 4 escalation: transient scratch buffer path via bufferData + bufferSubData). |
 | `Arm B PASS, Arm A FAIL — inverted-severity map defect` | UNEXPECTED | Attach hardware log + rebuild NX_56_DEBUG. Very strange — investigate before proceeding. |
 
-**HW session date / verdict:** 2026-07-03 hardware smoke — **DIAGNOSIS
-SHIPPED**, awaiting next hardware boot for fix-verify. Reproduces on
-Tegra X1 Nouveau NV120 CFW hbmenu. Original log:
-`gl-probes-v0.11.0-all-strict-BOOT-A.log` line 13. Fix boot log
-prediction: `[#56] glGetBufferSubData proc-address resolved: 0x<non-zero>`.
+**HW session date / verdict:** 2026-07-03 hardware smoke #2 — **PARTIAL — target-specific quirk on COPY_WRITE_BUFFER**. Verdict row 2 from the runbook table above. Logs: `hw-gl-probes-v0.14.0.log` and `hw-gl-probes-v0.14.0-all-strict.log` line 13. Non-strict `got=0`, strict `got=42` — the map returns non-NULL but wrong data.
+
+**Second-stage fix SHIPPED 2026-07-03 (per-target rebind).** For `GL_COPY_WRITE_BUFFER` / `GL_COPY_READ_BUFFER` / `GL_PIXEL_PACK_BUFFER`, `w_get_buffer_sub_data` now rebinds the target's buffer to `GL_ARRAY_BUFFER` (verified working per Arm A PASS), maps from there, unmaps, restores original ARRAY_BUFFER binding. Boot log line predicted with `-DNX_56_DEBUG=1`: `[#56] per-target rebind: target=0x8F37 bind=<name> saved_array=<name>`.
+
+**Next hardware boot prediction.** BUFFER probe both arms PASS: `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. If confirmed, reclassify #56 to CLOSED and archive.
+
+### Hardware smoke #2 re-verifications (2026-07-03)
+
+Gl-probes v0.14.0 STRICT run on the same session confirmed:
+- **§#52a** — DRAW_RANGE PASS (drawrange-iso mode, default NRO fallback active). Hardware verdict from smoke #1 stands: CITRON-ONLY QUIRK.
+- **§#54** — QUERY PASS strict `QUERY_RESULT=1 spec-conformant`. CITRON-ONLY QUIRK re-verified.
+- **§#55-pause** — TF_PAUSE PASS strict `pause skipped id=200, captured id=100 + id=300 in order`. CITRON-ONLY QUIRK re-verified.
+
+All 5 new **b3 probes** (ledger #57) PASS strict on hardware: TIMER_QUERY, POLY_CLAMP, INDEXED_BLEND, MULTI_DRAW, BFE_CONST. Batch 3 hardware-verified.
+
+**Minor #57 sub-item — TIMER_QUERY 32-bit truncation.** Hardware TIMER_QUERY probe reports `t0=4294967295 t1=4294967295 (delta=0 ns)` with `disjoint=0`. Both Citron and hardware return `0xFFFFFFFF` from `glGetQueryObjectuiv(QUERY_RESULT_EXT)` — the engine currently uses the 32-bit variant, saturating for TIMESTAMP_EXT queries whose 64-bit result exceeds 2^32. Surface + wiring verified. Future improvement: switch to `glGetQueryObjectui64vEXT` for TIMER queries via proc-address resolution; JS-side represents up to 2^53 as a Number. Non-blocking; deferred until a demo needs nanosecond delta values.
 
 ---
 
