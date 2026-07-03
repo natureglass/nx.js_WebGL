@@ -823,11 +823,21 @@ check 55 "webgl.cc [mh] block header comment present" \
     "$NXJS/source/webgl.cc" \
     'Phase-1\.5-MED-HIGH'
 
-# #56 — Hardware-observed getBufferSubData zeros. No engine change YET;
-# ledger entry existence + HW_SESSION_RUNBOOK.md §#56 section are what
-# get audited here. If/when the engine fix lands, add specific check for
-# the split-map-by-target path or the glFinish guard.
-status 56 "KNOWN-OPEN" "getBufferSubData hardware zeros — Mesa Nouveau NV120 (see HW_SESSION_RUNBOOK.md §#56)"
+# #56 — Fix landed 2026-07-03 (glFinish sync + glGetBufferSubData proc-
+# address fallback in w_get_buffer_sub_data). Guardrails ensure both
+# mitigations stay in place until hardware verifies which one carries.
+check 56 "webgl.cc [#56] glFinish() sync candidate before glMapBufferRange" \
+    "$NXJS/source/webgl.cc" \
+    'candidate \(b\) — sync barrier before map'
+check 56 "webgl.cc [#56] glGetBufferSubData proc-address fallback resolver" \
+    "$NXJS/source/webgl.cc" \
+    'resolve_pfn_get_buffer_sub_data'
+check 56 "webgl.cc [#56] proc-address resolution boot log" \
+    "$NXJS/source/webgl.cc" \
+    '\[#56\] glGetBufferSubData proc-address resolved'
+check 56 "webgl.cc [#56] NX_56_DEBUG per-call diagnostic guard" \
+    "$NXJS/source/webgl.cc" \
+    '#ifdef NX_56_DEBUG'
 # #52a fallback gate — new build define check.
 check 52 "webgl.cc [52a] fallback gate: NX_52A_DISABLE_FALLBACK ifndef guard present" \
     "$NXJS/source/webgl.cc" \

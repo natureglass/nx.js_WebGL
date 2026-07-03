@@ -2747,11 +2747,11 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 - gl-probes TF_PAUSE probe FAIL under non-strict (i.e., not just PASS-QUIRK-RELAXED but actual FAIL) → a new driver-quirk shape appeared that the probe doesn't yet recognize; capture the `out=[...]` array and open a new sub-item.
 - gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
-**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88.
+**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). Note that #56 is a hardware-only functional defect in one of those 88 (`getBufferSubData`), so the FUNCTIONAL correctness count is 87/88 pending #56's fix land + hardware verification. Headline claim: **88/88 surface, 87/88 functionally correct on hardware, 1 open functional defect (#56)**.
 
 ---
 
-## #56 — `getBufferSubData` via `glMapBufferRange(GL_MAP_READ_BIT)` returns zeros on Mesa Nouveau NV120 hardware — HARDWARE-OBSERVED, OPEN 2026-07-03
+## #56 — `getBufferSubData` via `glMapBufferRange(GL_MAP_READ_BIT)` returns zeros on Mesa Nouveau NV120 hardware — HARDWARE-OBSERVED, DIAGNOSIS-SHIPPED-FIX-PENDING-HARDWARE 2026-07-03
 
 Discovered by com.natureglass.gl-probes v0.11.0 BUFFER probe on real Tegra Nouveau NV120 (2026-07-03 hardware smoke, both Boot A default NRO and Boot B fallback-disabled NRO). Not reproducible on Citron — passed 21/21 on the Citron final smoke.
 
@@ -2761,21 +2761,35 @@ Discovered by com.natureglass.gl-probes v0.11.0 BUFFER probe on real Tegra Nouve
 
 **Citron symptom.** None — probe passes cleanly with `copy+getSubData 64B memcmp ok`.
 
-**Root-cause hypothesis (unverified).** `w_get_buffer_sub_data` uses `glMapBufferRange(target, offset, length, GL_MAP_READ_BIT)` per phase-1.5-LOW ledger #50 implementation note (glGetBufferSubData is desktop-GL only; not in Mesa Nouveau's GLES3 header set). Mesa Nouveau NV120's `glMapBufferRange` may return NULL for `GL_COPY_WRITE_BUFFER` target — the driver's mapping implementation historically supports only `GL_ARRAY_BUFFER` and `GL_PIXEL_UNPACK_BUFFER` on some Nouveau chip revisions. Alternative: `copyBufferSubData` may not have completed by the time the read fires (missing implicit flush).
+**Root-cause candidates worked through (2026-07-03 diagnosis-first pass).**
 
-**Impact.** MEDIUM severity — Three.js uses `getBufferSubData` in the ping-pong readback path of the `WebGLRenderer.readRenderTargetPixels` fallback and in some geometry-processing utilities. Any demo that reads back GPU-computed vertex data (GPGPU visualizer, particle systems with position feedback) would silently see zeros.
+Alex's diagnostic ladder from the post-hardware directive, resolved by code-reading + reference-checking:
 
-**Diagnostic candidates (for the next engine-native cycle).**
-1. Split the map path by target: for COPY_WRITE_BUFFER and COPY_READ_BUFFER, temporarily rebind to ARRAY_BUFFER (spec: `bindBuffer` is per-target, no data change), map, unmap, restore original binding.
-2. Add `glFinish()` before `glMapBufferRange` — force GPU pipeline drain so `copyBufferSubData` has definitely committed.
-3. Verify `glGetError()` after `glMapBufferRange` — if it errors, log the code (INVALID_OPERATION expected if target is unmappable on this driver).
-4. Consider an `#ifdef HARDWARE_BUFFER_MAP_QUIRK` compile gate with a fallback path (transient scratch ARRAY_BUFFER + glBufferSubData + retry).
+(a) **Target-binding mismatch in `w_get_buffer_sub_data`** — RULED OUT by inspection. The JS-supplied `target` is passed verbatim to `glMapBufferRange` and later `glUnmapBuffer`. The QuickJS-era pre-migration reference (`nxjs-source/source/webgl_egl.c:9925 nx_webgl_egl_get_buffer_sub_data`) uses the same target passthrough shape, but calls a RUNTIME-RESOLVED `glGetBufferSubData` via a function pointer set at bridge init — that's the load-bearing difference: the reference used `glGetBufferSubData` (not `glMapBufferRange`), and it worked on the same hardware.
 
-**DISPOSITION:** `hardware-observed, open — investigate before running any demo that exercises getBufferSubData on real Tegra`. Not blocking phase-1.5 tier acceptance (webglreport 88/88 confirmed on hardware; the FUNCTION SURFACE is wired) but blocking real-content correctness for a specific readback path.
+(b) **Missing synchronization (implicit sync bug)** — LIKELY per hardware smoke pattern. ES3 spec §2.9.5 says `glMapBufferRange(GL_MAP_READ_BIT)` implicitly synchronizes against pending writes to the buffer, but Nouveau drivers historically underimplement this for the copyBufferSubData → mapRead pattern. `glFinish()` before the map forces the GPU pipeline to drain.
 
-**RE-APPLY / VERIFY NOTE.** Recurrence tell: gl-probes BUFFER `mismatch@0 src=3 got=0` = symptom active. gl-probes BUFFER `copy+getSubData 64B memcmp ok` on hardware = fix landed or driver updated.
+(c) **Map/unmap pairing or memcpy source error** — RULED OUT by inspection. The code path is straightforward `mapped = glMapBufferRange(target, ...)`; `if (mapped) { memcpy(...); glUnmapBuffer(target); }`. The `if (mapped)` gate cleanly guards against NULL returns; symptom is that mapped IS NULL (which is why the Uint8Array stays at its zero-initialized state).
 
-Not paired with a probe change — the BUFFER probe already correctly detects the mismatch. Add engine-side diagnostic + fix in a follow-up commit.
+**FIX SHIPPED (Commit 1, 2026-07-03) — belt-and-suspenders per Alex's directive.** Both mitigations land together so the next hardware boot pins down which one carries:
+
+1. Candidate (b): `glFinish()` before `glMapBufferRange` — spec-required-anyway sync; perf note documented (readback is inherently sync from the JS perspective).
+2. Candidate (a) fallback: runtime-resolve `glGetBufferSubData` via `eglGetProcAddress` on first `w_get_buffer_sub_data` call. If `glMapBufferRange` returns NULL, use `glGetBufferSubData` — matches the QuickJS-era reference that worked on the same hardware. One-shot boot log `[#56] glGetBufferSubData proc-address resolved: <ptr>` confirms whether the fallback is available at all.
+3. `NX_56_DEBUG` build flag with per-call fprintf instrumentation: mapped pointer, first 16 bytes, glGetError codes before and after map + after fallback. Standard build stays quiet; hardware diagnostic build gets full observability.
+
+**BUFFER probe upgraded to two arms (paired gl-probes v0.13.0 commit).** Arm A reads from ARRAY_BUFFER directly (no copy — isolates the base readback path on a universally-supported target). Arm B is the original copy + read from COPY_WRITE_BUFFER. Discriminator table:
+- Both PASS → fix landed successfully.
+- Arm A PASS, Arm B FAIL → target-specific quirk on COPY_WRITE_BUFFER; add per-target rebind fallback in a follow-up commit.
+- Both FAIL → universal map/readback defect; escalate to third candidate (transient scratch buffer + explicit copy).
+- Arm B PASS, Arm A FAIL → inverted-severity map defect; strange, escalate.
+
+**Impact.** MEDIUM severity if the fix doesn't carry — Three.js's `WebGLRenderer.readRenderTargetPixels` fallback + GPGPU demos + any particle-system geometry-processing utility that reads back GPU-computed vertex data would silently see zeros. Fix land on hardware unblocks those paths.
+
+**DISPOSITION:** `diagnosis-shipped-fix-pending-hardware-verify`. Not blocking phase-1.5 tier acceptance headline (88/88 SURFACE installed + hardware-verified callable). Blocks the 87/88 → 88/88 FUNCTIONAL correctness jump; hardware smoke next boot resolves.
+
+**RE-APPLY / VERIFY NOTE.** Recurrence tell: hardware gl-probes BUFFER `BOTH ARMS FAIL — universal map/readback defect` = fix regressed OR driver behavior further degraded. Hardware BUFFER `Arm A PASS, Arm B FAIL` = target-specific quirk still open — implement candidate (a1) per-target-rebind fallback. Hardware BUFFER `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok` = fix confirmed carrying, reclassify to CLOSED. Boot log grep for `[#56] glGetBufferSubData proc-address resolved: 0x[1-9a-f]` = fallback available (non-null); `0x0` = only the sync candidate is protecting us.
+
+Runbook §#56 has the exact verdict procedure for the next hardware boot.
 
 ---
 

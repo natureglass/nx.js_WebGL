@@ -265,7 +265,7 @@ regressions happen and the runbook history is useful triage material.
 
 ---
 
-## §#56 — `getBufferSubData` via `glMapBufferRange` returns zeros on Mesa Nouveau NV120 hardware — NEW 2026-07-03
+## §#56 — `getBufferSubData` via `glMapBufferRange` returns zeros on Mesa Nouveau NV120 hardware — DIAGNOSIS-SHIPPED-FIX-PENDING-HARDWARE-VERIFY 2026-07-03
 
 **Ledger:** [NXJS_PATCHES_NEEDED.md #56](../NXJS_PATCHES_NEEDED.md#56).
 
@@ -276,22 +276,55 @@ readback is zero. Reproduces on both Boot A (default NRO) and Boot B
 
 **Citron behavior.** BUFFER probe passes cleanly with `copy+getSubData
 64B memcmp ok`. Citron's AMD Vulkan translation of `glMapBufferRange`
-evidently accepts `GL_COPY_WRITE_BUFFER` target; Nouveau NV120 may not.
+accepts `GL_COPY_WRITE_BUFFER` target; Nouveau NV120 evidently doesn't
+sync or doesn't support it for map.
 
-**Diagnostic candidates for the next engine session.**
+**Fix landed 2026-07-03 (`w_get_buffer_sub_data` in source/webgl.cc).**
+Belt-and-suspenders — ships both mitigation candidates so the next
+hardware boot pins down which one carries:
 
-1. Split map path by target — for COPY_WRITE_BUFFER / COPY_READ_BUFFER,
-   temporarily rebind to ARRAY_BUFFER, map, unmap, restore original.
-2. Add `glFinish()` before `glMapBufferRange` to force pipeline drain.
-3. Log `glGetError()` after `glMapBufferRange` to see if it's returning
-   NULL with an error code (likely INVALID_OPERATION on unmappable
-   target for Nouveau).
-4. Add a `#ifdef HARDWARE_BUFFER_MAP_QUIRK` compile gate with a
-   fallback path (transient scratch ARRAY_BUFFER + copy + read).
+1. Candidate (b) — `glFinish()` before `glMapBufferRange`. Cheap
+   pipeline drain; spec says MAP_READ_BIT implicitly syncs but Nouveau
+   drivers historically under-implement this.
+2. Candidate (a) — proc-address fallback. If `glMapBufferRange` returns
+   NULL, resolve `glGetBufferSubData` via `eglGetProcAddress` and use
+   it directly. Matches the QuickJS-era reference impl
+   (`nxjs-source/source/webgl_egl.c:9925`) that worked on same hardware.
+3. `NX_56_DEBUG` build flag — per-call fprintf of the mapped pointer,
+   first 16 bytes, glGetError codes before/after map + after fallback.
 
-**HW session date / verdict:** 2026-07-03 hardware smoke — **NEW OPEN
-ITEM**. Reproduces on Tegra X1 Nouveau NV120 CFW hbmenu. Log:
-`gl-probes-v0.11.0-all-strict-BOOT-A.log` line 13.
+**BUFFER probe gained a second arm (gl-probes v0.13.0).** Arm A reads
+from ARRAY_BUFFER directly (no copy — isolates base readback path on
+a universally-supported target). Arm B is the original copy + read
+from COPY_WRITE_BUFFER.
+
+**Verdict procedure for the next hardware boot.**
+
+1. Boot default NRO (no NX_56_DEBUG). Boot log will contain the
+   one-shot banner:
+   ```
+   [#56] glGetBufferSubData proc-address resolved: 0x<addr>
+   ```
+   Non-zero = proc-address fallback is available. Zero-address = only
+   the glFinish sync mitigation is in play (candidate b alone).
+2. Open **GL Probes** app → click **Run Probes STRICT (hardware)**.
+3. Grab `sdmc:/switch/brewser/logs/gl-probes-v0.13.0-all-strict.log`.
+4. Grep for BUFFER line — parse the detail.
+
+**Verdict table.**
+
+| BUFFER detail | Verdict | Downstream action |
+|---|---|---|
+| `Arm A ... + Arm B ... both ok` | CONFIRMED FIX | Reclassify ledger #56 to CLOSED. Move to Archived section below. Remove `glFinish()` if perf-critical demos care (perf note: probably fine). |
+| `Arm A ... PASS, Arm B ... FAIL — target- or copy-specific defect` | PARTIAL — sync helped ARRAY_BUFFER, target-specific quirk remains on COPY_WRITE_BUFFER | Implement a per-target rebind fallback (rebind to ARRAY_BUFFER, map, unmap, restore) in a follow-up commit. Log the specific failing target in NX_56_DEBUG. |
+| `BOTH ARMS FAIL — universal map/readback defect` | NO EFFECT — mitigations didn't carry | Rebuild with `-DNX_56_DEBUG=1` and re-smoke; the per-call diagnostic will reveal whether glMapBufferRange returns NULL AND the fallback proc-address was NULL (candidate 4 escalation: transient scratch buffer path via bufferData + bufferSubData). |
+| `Arm B PASS, Arm A FAIL — inverted-severity map defect` | UNEXPECTED | Attach hardware log + rebuild NX_56_DEBUG. Very strange — investigate before proceeding. |
+
+**HW session date / verdict:** 2026-07-03 hardware smoke — **DIAGNOSIS
+SHIPPED**, awaiting next hardware boot for fix-verify. Reproduces on
+Tegra X1 Nouveau NV120 CFW hbmenu. Original log:
+`gl-probes-v0.11.0-all-strict-BOOT-A.log` line 13. Fix boot log
+prediction: `[#56] glGetBufferSubData proc-address resolved: 0x<non-zero>`.
 
 ---
 

@@ -2802,13 +2802,60 @@ FN(w_copy_bridge_to_canvas) {
 // alignment.
 // ============================================================================
 
+// #56 fix path — runtime-resolved `glGetBufferSubData`. The GLES3 header
+// set on devkitPro doesn't declare glGetBufferSubData (it's a desktop-GL
+// entry point), but Mesa's Nouveau NV120 driver exports the symbol at
+// runtime — the QuickJS-era pre-migration nx_webgl_egl_get_buffer_sub_data
+// (nxjs-source/source/webgl_egl.c:9925) used it via a runtime-resolved
+// function pointer and worked on the same hardware. Cached at first
+// getBufferSubData call. Diagnostic banner logs on resolution (once per
+// boot).
+typedef void (GL_APIENTRY *pfn_glGetBufferSubData_t)(GLenum target,
+                                                     GLintptr offset,
+                                                     GLsizeiptr size,
+                                                     void *data);
+static pfn_glGetBufferSubData_t s_pfn_get_buffer_sub_data = nullptr;
+static bool s_pfn_get_buffer_sub_data_resolved = false;
+static void resolve_pfn_get_buffer_sub_data() {
+	if (s_pfn_get_buffer_sub_data_resolved) return;
+	s_pfn_get_buffer_sub_data_resolved = true;
+	s_pfn_get_buffer_sub_data = (pfn_glGetBufferSubData_t)
+	    eglGetProcAddress("glGetBufferSubData");
+	fprintf(stderr, "[#56] glGetBufferSubData proc-address resolved: %p "
+	                "(non-null = hardware fallback available; QuickJS-era "
+	                "reference used this successfully on Mesa Nouveau NV120)\n",
+	        (void *)(uintptr_t)s_pfn_get_buffer_sub_data);
+	fflush(stderr);
+}
+
 // ----- Buffer ops (v2 adds) -----
 FN(w_get_buffer_sub_data) {
 	// getBufferSubData(target, srcByteOffset, dstBuffer, dstOffset?, length?)
-	// Implemented via glMapBufferRange + memcpy + glUnmapBuffer since
-	// glGetBufferSubData is desktop-GL only (ES3 doesn't provide it as
-	// a core entry point on all drivers, including Mesa Nouveau's GLES
-	// header set). This is the canonical WebGL2 impl pattern.
+	//
+	// #56 diagnosis-and-fix (2026-07-03 hardware smoke revealed Mesa
+	// Nouveau NV120 silently returns zeros through the glMapBufferRange
+	// path for GL_COPY_WRITE_BUFFER — Citron/AMD Vulkan translation of
+	// the same path works). Ship BOTH candidate mitigations in a single
+	// commit + NX_56_DEBUG instrumentation so the next hardware boot
+	// pins down which one carried the fix:
+	//
+	//   (b) glFinish() before glMapBufferRange — force GPU pipeline
+	//       drain. Spec says MAP_READ_BIT implicitly syncs, but Nouveau
+	//       drivers historically underimplement this for the copy-and-
+	//       read pattern. Perf note: this stalls the GPU on every
+	//       getBufferSubData; readback is inherently sync, so the extra
+	//       latency is acceptable for a spec-conformance path.
+	//
+	//   (a) glGetBufferSubData proc-address fallback — if
+	//       glMapBufferRange returns NULL, resolve glGetBufferSubData
+	//       via eglGetProcAddress and use it directly. Matches the
+	//       QuickJS-era reference implementation that worked on the
+	//       same hardware.
+	//
+	// Build with -DNX_56_DEBUG for boot-log instrumentation on each
+	// getBufferSubData call (mapped ptr, first 16 bytes, glGetError
+	// results before/after map). Standard build stays quiet after the
+	// one-shot proc-address resolution banner.
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
 	const GLintptr src_off = (GLintptr)a_i32(info, 1);
@@ -2825,11 +2872,64 @@ FN(w_get_buffer_sub_data) {
 	if (dst_off + len > view_len) len = (view_len > dst_off) ?
 	    (view_len - dst_off) : 0;
 	if (len == 0) return;
+	uint8_t *dst_bytes = (uint8_t *)dst + dst_off;
+
+	// #56 candidate (b) — sync barrier before map. Cheap on frame-cost
+	// terms; getBufferSubData is inherently a sync operation from the
+	// JS perspective (the returned bytes must be up-to-date).
+	glFinish();
+
+#ifdef NX_56_DEBUG
+	while (glGetError() != GL_NO_ERROR);
+#endif
 	void *mapped = glMapBufferRange(target, src_off, (GLsizeiptr)len,
 	                                GL_MAP_READ_BIT);
+#ifdef NX_56_DEBUG
+	GLenum e_map = glGetError();
+	fprintf(stderr, "[#56] glMapBufferRange target=0x%x off=%td len=%zu "
+	                "-> mapped=%p err=0x%x\n",
+	        target, (ptrdiff_t)src_off, len, mapped, e_map);
 	if (mapped) {
-		memcpy((uint8_t *)dst + dst_off, mapped, len);
+		const uint8_t *b = (const uint8_t *)mapped;
+		size_t log_len = len < 16 ? len : 16;
+		fprintf(stderr, "[#56]   mapped first %zu bytes:", log_len);
+		for (size_t i = 0; i < log_len; i++) fprintf(stderr, " %02x", b[i]);
+		fprintf(stderr, "\n");
+	}
+	fflush(stderr);
+#endif
+
+	if (mapped) {
+		memcpy(dst_bytes, mapped, len);
 		glUnmapBuffer(target);
+		return;
+	}
+
+	// #56 candidate (a) fallback — glMapBufferRange returned NULL (Mesa
+	// Nouveau NV120 may not implement mapping for GL_COPY_WRITE_BUFFER
+	// or other v2-only targets). Try glGetBufferSubData via proc-address.
+	resolve_pfn_get_buffer_sub_data();
+	if (s_pfn_get_buffer_sub_data) {
+		s_pfn_get_buffer_sub_data(target, src_off, (GLsizeiptr)len, dst_bytes);
+#ifdef NX_56_DEBUG
+		GLenum e_read = glGetError();
+		fprintf(stderr, "[#56] fallback glGetBufferSubData target=0x%x off=%td "
+		                "len=%zu called, err=0x%x\n",
+		        target, (ptrdiff_t)src_off, len, e_read);
+		const uint8_t *b = (const uint8_t *)dst_bytes;
+		size_t log_len = len < 16 ? len : 16;
+		fprintf(stderr, "[#56]   readback first %zu bytes:", log_len);
+		for (size_t i = 0; i < log_len; i++) fprintf(stderr, " %02x", b[i]);
+		fprintf(stderr, "\n");
+		fflush(stderr);
+#endif
+	} else {
+#ifdef NX_56_DEBUG
+		fprintf(stderr, "[#56] BOTH PATHS FAILED: glMapBufferRange returned "
+		                "NULL AND glGetBufferSubData proc-address unresolved. "
+		                "dst stays zero-initialized.\n");
+		fflush(stderr);
+#endif
 	}
 }
 FN(w_copy_buffer_sub_data) {
