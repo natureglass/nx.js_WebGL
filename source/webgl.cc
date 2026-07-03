@@ -3046,6 +3046,53 @@ FN(w_copy_bridge_to_canvas) {
 // alignment.
 // ============================================================================
 
+// #56b sync-guard helper — force GPU-command completion + buffer-store
+// coherency for a subsequent MAP_READ. Used before glMapBufferRange in
+// every GPU→CPU readback path that goes through a mapped buffer store.
+//
+// LEDGER RATIONALE (empirical, NOT spec-guaranteed):
+// A spec-conformant GLES3 driver needs neither glFenceSync nor extra
+// coherency work beyond what glFinish already provides — glMapBufferRange
+// with GL_MAP_READ_BIT implicitly synchronizes per ES3 §2.9.5. This
+// helper is an EMPIRICAL workaround for a Mesa Nouveau NV120
+// map-coherency bug documented in NXJS_PATCHES_NEEDED #56b (hardware
+// smoke #3, strict re-run on cached WebGL2 context: fresh-context first
+// readback works with glFinish alone; subsequent readbacks on the same
+// live context read stale bytes). The fence path apparently exercises
+// a different driver flushing code path that reaches the mapped-region
+// cache; glFinish alone happens to skip that flush on re-invocation.
+//
+// Non-conformant reliance on the fence-flush combo is documented per
+// #56b's escalation ladder: if this stops carrying on future hardware,
+// rung 2 adds MAP_INVALIDATE_RANGE_BIT cache-bust pre-map; rung 3 is a
+// staging-copy through a per-call fresh buffer.
+//
+// Timeout 100ms — long enough to swallow any real GPU stall on a small
+// buffer readback, short enough to keep the JS event loop responsive if
+// something has gone catastrophically wrong (log + proceed, don't hang).
+static void nx_56b_readback_sync_guard(const char *site_tag) {
+	GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	if (!sync) {
+		fprintf(stderr, "[#56b] %s: glFenceSync returned NULL "
+		                "— proceeding without fence guard\n", site_tag);
+		fflush(stderr);
+		return;
+	}
+	const GLuint64 timeout_ns = 100000000ULL; // 100ms
+	GLenum r = glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, timeout_ns);
+	if (r == GL_TIMEOUT_EXPIRED) {
+		fprintf(stderr, "[#56b] %s: clientWaitSync TIMEOUT after 100ms "
+		                "— proceeding to map anyway (see escalation ladder in "
+		                "NXJS_PATCHES_NEEDED #56b)\n", site_tag);
+		fflush(stderr);
+	} else if (r == GL_WAIT_FAILED) {
+		fprintf(stderr, "[#56b] %s: clientWaitSync WAIT_FAILED "
+		                "— proceeding to map anyway\n", site_tag);
+		fflush(stderr);
+	}
+	glDeleteSync(sync);
+}
+
 // #56 fix path — runtime-resolved `glGetBufferSubData`. The GLES3 header
 // set on devkitPro doesn't declare glGetBufferSubData (it's a desktop-GL
 // entry point), but Mesa's Nouveau NV120 driver exports the symbol at
@@ -3120,8 +3167,20 @@ FN(w_get_buffer_sub_data) {
 
 	// #56 candidate (b) — sync barrier before map. Cheap on frame-cost
 	// terms; getBufferSubData is inherently a sync operation from the
-	// JS perspective (the returned bytes must be up-to-date).
+	// JS perspective (the returned bytes must be up-to-date). RETAINED
+	// alongside the #56b fence-guard below: glFinish handles the
+	// fresh-context first-readback path (verified 2026-07-03 smoke #3).
 	glFinish();
+
+	// #56b sync-guard — force buffer-store coherency for the subsequent
+	// map. Handles the write-visibility race on re-invocation that
+	// hardware smoke #3 strict-run exposed (verified 2026-07-03: cached
+	// WebGL2 context, second BUFFER probe invocation reads stale bytes
+	// from mapped region despite full re-execution of bufferData +
+	// copyBufferSubData + glFinish). Empirical Nouveau workaround per
+	// NXJS_PATCHES_NEEDED #56b — the fence path exercises a different
+	// driver flushing code path.
+	nx_56b_readback_sync_guard("getBufferSubData");
 
 	// #56 candidate (a1) — per-target rebind fallback for map. 2026-07-03
 	// second hardware smoke on Mesa Nouveau NV120 confirmed: Arm A

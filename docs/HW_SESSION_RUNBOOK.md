@@ -326,13 +326,56 @@ from COPY_WRITE_BUFFER.
 
 **Next hardware boot prediction.** BUFFER probe both arms PASS: `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. If confirmed, reclassify #56 to CLOSED and archive.
 
-### 2026-07-03 hardware smoke #3 (third session) — SECOND-STAGE FIX HARDWARE-VERIFIED
+### 2026-07-03 hardware smoke #3 (third session) — SECOND-STAGE FIX HARDWARE-VERIFIED (fresh-context path)
 
 BUFFER PASS on fresh WebGL2 context: `PASS detail=Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. **26 PASS / 0 FAIL / 0 SKIP (of 26)**. Log: `gl-probes-v0.14.0.log` (non-strict, generated 21:37:53Z).
 
-The paired strict re-run 2.4 seconds later on the same cached WebGL2 context showed Arm B `got=42` — state-carryover artifact from prior TF_ERR probe's a_id=42 upload, driver's `bufferData` doesn't zero-init reused VRAM. Documented probe-design observation, NOT an engine defect. Log: `gl-probes-v0.14.0-all-strict.log`.
+The paired strict re-run 2.4 seconds later on the same cached WebGL2 context showed Arm B `got=42`. Original "state carryover" explanation was **RETRACTED** post code-review — the probe re-executes the full `createBuffer` + `bufferData(src)` + `copyBufferSubData` + `getBufferSubData` sequence per invocation (verified via code-reading gl-probes.js:230-258). Real defect shape is a **write-visibility race** on Mesa Nouveau NV120: the second `getBufferSubData` invocation reads STALE mapped-region bytes despite full re-execution + `glFinish`. Opened as **#56b** — see §#56b below.
 
-**§#56 CLOSED — see Archived section below.**
+**§#56 (fresh-context) CLOSED — see Archived section below.**
+
+---
+
+## §#56b — `getBufferSubData` re-invocation write-visibility race on Mesa Nouveau NV120
+
+**Ledger:** [NXJS_PATCHES_NEEDED.md #56b](../NXJS_PATCHES_NEEDED.md#56b).
+
+**Fix landed 2026-07-03 (`w_get_buffer_sub_data` in source/webgl.cc).**
+Adds `nx_56b_readback_sync_guard("getBufferSubData")` immediately before
+`glMapBufferRange`. The helper does:
+```
+GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 100_000_000ns);
+glDeleteSync(sync);
+```
+Timeout expiry (100ms) logs `[#56b] getBufferSubData: clientWaitSync TIMEOUT after 100ms — proceeding to map anyway` and falls through to the map (no runtime hang). `glFinish` + per-target rebind from #56 are RETAINED (they fix a distinct fresh-context failure mode; do not conflate).
+
+**LEDGER RATIONALE — EMPIRICAL, NOT SPEC-GUARANTEED.** ES3 §2.9.5 says `glMapBufferRange(GL_MAP_READ_BIT)` implicitly syncs; a conformant driver needs neither fence nor extra flush. This is an empirical Mesa Nouveau NV120 workaround — the fence path exercises a different flushing code path that reaches the mapped-region cache. **Do NOT cite ES3 §4.1.2 as a guarantee for this fix.**
+
+**Verdict procedure for the next hardware boot.**
+
+1. Boot the current default NRO (fence-guard fix landed). Grep boot log for `[#56b]` — absent on normal path (helper is quiet unless timeout/fail); presence of `[#56b] getBufferSubData: clientWaitSync TIMEOUT` = escalate to rung 2.
+2. Open **GL Probes** app.
+3. Click **Run Probes (WebGL 2)** (yellow — non-strict). Capture
+   `sdmc:/switch/brewser/logs/gl-probes-v0.15.0.log`. This is invocation #1.
+4. **Without reloading**, click **Run Probes STRICT (hardware)** (green).
+   Capture `sdmc:/switch/brewser/logs/gl-probes-v0.15.0-all-strict.log`.
+   This is invocation #2 — the actual #56b test.
+
+**Verdict table.**
+
+| Boot #1 BUFFER | Boot #2 BUFFER | Verdict | Downstream action |
+|---|---|---|---|
+| both arms PASS | both arms PASS | **CONFIRMED FIX** | Reclassify ledger #56b to CLOSED. Move to Archived. Restore headline claim to 88/88 SURFACE + 88/88 FUNCTIONAL. |
+| both arms PASS | Arm-B `got=<sentinel pattern>` | Copy didn't complete before map | Rung 2 — add `GL_MAP_INVALIDATE_RANGE_BIT` OR pre-issue `glInvalidateBufferSubData` before map. |
+| both arms PASS | Arm-B `got=<mix of src + prior>` | Stale-map cache still active | Rung 2 first, then rung 3 if 2 doesn't carry. |
+| Any other pattern | Any | UNEXPECTED — capture the full detail string + attach to ledger, re-triage before jumping ladder. | |
+
+**Rung 2** — `GL_MAP_INVALIDATE_RANGE_BIT` on map + optional `glInvalidateBufferSubData` proc-address resolution.
+
+**Rung 3** — staging-copy readback through per-call fresh scratch buffer (`glGenBuffers` → `glCopyBufferSubData` from source into scratch → map scratch (guaranteed cache-cold) → memcpy → `glDeleteBuffers`).
+
+**HW session date / verdict:** 2026-07-03 fix shipped, awaiting next hardware boot for verdict.
 
 ### Hardware smoke #2 re-verifications (2026-07-03)
 
@@ -363,8 +406,10 @@ Nouveau NV120. Ledger #55.
 
 ### §#56 — getBufferSubData COPY_WRITE_BUFFER target-specific defect (2026-07-03)
 Per-target rebind fallback (second-stage fix) verified on real Tegra Nouveau
-NV120 fresh-context path: `Arm A + Arm B both ok 64B memcmp`. State-carryover
-observation on re-invocation documented; harness fix deferred. Ledger #56.
+NV120 fresh-context path: `Arm A + Arm B both ok 64B memcmp`. Re-invocation
+strict-run BUFFER FAIL initially attributed to state-carryover was **retracted
+post code-review** and reopened as §#56b (re-invocation write-visibility race).
+Ledger #56.
 
 ### §#57 — Batch 3 extension surface (2026-07-03)
 All 5 b3 probes PASS on real Tegra Nouveau NV120: TIMER_QUERY, POLY_CLAMP,

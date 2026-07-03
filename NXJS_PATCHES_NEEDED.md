@@ -2747,7 +2747,46 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 - gl-probes TF_PAUSE probe FAIL under non-strict (i.e., not just PASS-QUIRK-RELAXED but actual FAIL) → a new driver-quirk shape appeared that the probe doesn't yet recognize; capture the `out=[...]` array and open a new sub-item.
 - gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
-**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). #56's second-stage per-target rebind fallback hardware-verified 2026-07-03 (fresh-context BUFFER probe both arms PASS on real Tegra Nouveau NV120). **Headline claim: 88/88 surface + 88/88 functionally correct on hardware, zero open functional defects.**
+**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). #56's second-stage per-target rebind fallback hardware-verified 2026-07-03 (fresh-context BUFFER probe both arms PASS on real Tegra Nouveau NV120). **Headline claim: 88/88 SURFACE + N/88 FUNCTIONALLY CORRECT on hardware, 1 open functional defect (#56b GPGPU ping-pong readback race — fix-shipped, verdict-pending-hardware).**
+
+---
+
+## #56b — `getBufferSubData` re-invocation on live context reads stale bytes despite full re-execution — FIX-SHIPPED-VERDICT-PENDING-HARDWARE 2026-07-03
+
+**Discovered by** code-reading review of the 2026-07-03 hardware smoke #3 strict-run BUFFER FAIL. The initial "carryover" explanation (VRAM allocator reuse + Nouveau non-zero-init `bufferData`) was **incomplete** — code-reading gl-probes.js:230-258 shows `probeBufferRoundtrip` calls `gl.createBuffer()` TWICE per invocation (returning fresh handles), issues `gl.bufferData(ARRAY_BUFFER, src, STATIC_DRAW)` writing all 64 src bytes to srcBuf, then `gl.copyBufferSubData(ARRAY_BUFFER, COPY_WRITE_BUFFER, 0, 0, 64)` copying all 64 bytes to dstBuf. Every invocation re-executes the FULL write path. Stale-memory read from an unwritten region is not a possible explanation.
+
+**Actual defect shape.** Real write-visibility race on Mesa Nouveau NV120: the second `getBufferSubData` invocation on a live `WebGL2` context (returned by `canvas.getContext('webgl2')`, which caches the instance per spec) reads STALE mapped-region bytes despite the just-completed `copyBufferSubData` + `glFinish()`. First-invocation cold-cache map works; re-invocation on a warm cache misses the store. Bug matters for real content: **Three.js's GPGPU ping-pong path re-reads the SAME buffer across frames** — exactly this shape.
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `nx_56b_readback_sync_guard(const char *site_tag)` static helper (single-caller today but shared-helper shape retained so future GPU→CPU readback map sites use the same primitive without copy-paste). Called from `w_get_buffer_sub_data` immediately after the retained `glFinish()` from #56.
+
+**FIX RATIONALE — EMPIRICAL, NOT SPEC-GUARANTEED.** A spec-conformant GLES3 driver needs neither `glFenceSync` nor additional coherency work beyond what `glFinish` already provides — ES3 §2.9.5 says `glMapBufferRange(GL_MAP_READ_BIT)` implicitly synchronizes against pending writes to the buffer. **Do NOT cite ES3 §4.1.2 as a spec guarantee for this fix**; the guarantee only makes sense against a driver bug. This is an empirical workaround for a Mesa Nouveau NV120 map-coherency defect: the `FenceSync + clientWaitSync(SYNC_FLUSH_COMMANDS_BIT)` sequence apparently exercises a DIFFERENT driver flushing code path that reaches the mapped-region cache, while `glFinish` alone happens to skip that flush on re-invocation. The fix is a workaround; the underlying Mesa Nouveau path should be filed upstream.
+
+**Escalation ladder (jump rungs on next hardware FAIL — no re-diagnosis).**
+
+- **Rung 1 (SHIPPED)** — `glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)` + `glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 100_000_000ns)` + `glDeleteSync(sync)` immediately before `glMapBufferRange`. Timeout → log `[#56b] getBufferSubData: clientWaitSync TIMEOUT after 100ms — proceeding to map anyway` and fall through (don't hang the runtime).
+- **Rung 2** — add `GL_MAP_INVALIDATE_RANGE_BIT` to the map flags on the fresh-context path OR pre-issue a `glInvalidateBufferSubData` (via proc-address) on the target buffer's range before the map, forcing the driver to discard any cached mapped-region contents.
+- **Rung 3** — staging-copy readback through a PER-CALL FRESH buffer: create a new scratch `GL_COPY_READ_BUFFER` per readback, `glCopyBufferSubData` from the source buffer into scratch, map scratch (fresh allocation, no cache-carryover surface), copy out, delete scratch. Trades one extra allocation per readback for guaranteed cache-cold map.
+
+**Recurrence tell.** Hardware gl-probes BUFFER strict re-run after non-strict non-strict shows Arm B `mismatch@0` with a value that MATCHES sentinel pattern → copy didn't complete before map (jump to rung 2 or 3). Shows MIX of src + prior-invocation data → stale-map still active (rung 2 first, then 3). Shows `both arms ok` on BOTH runs of the same boot → rung 1 fix carrying, close #56b.
+
+**Class audit (2026-07-03).** Grepped `source/webgl.cc` for every `glMapBufferRange` with `GL_MAP_READ_BIT` and adjacent GPU→CPU readback map paths:
+
+| Call site | Class member? | Disposition |
+|---|---|---|
+| `w_get_buffer_sub_data` line 3165 | Yes — GPU→CPU buffer-store MAP_READ | **FIXED — calls `nx_56b_readback_sync_guard("getBufferSubData")` before map** |
+| `glReadPixels` line 2920 | No — reads directly from bound READ_FRAMEBUFFER into a CPU pointer; not a buffer store map. Spec-required blocking sync per ES3 §4.3.2 | EXEMPT |
+| `glGetQueryObjectuiv` line 3790 | No — driver-computed query result; separate `QUERY_RESULT_AVAILABLE` sync path | EXEMPT |
+| `PIXEL_PACK_BUFFER` refs lines 3132-3145 | Covered — all inside the per-target rebind branch of the single fix target; no independent PBO map site exists in the current codebase | COVERED |
+
+**#56b closes as a CLASS, not a call site.** Any future GPU→CPU readback via mapped buffer store MUST call `nx_56b_readback_sync_guard(site_tag)` before `glMapBufferRange` — the helper is the class-level primitive.
+
+**Interaction with #56.** `#56` (fresh-context path: `glFinish` + `glGetBufferSubData` proc-address fallback + per-target rebind) STAYS SHIPPED. Do not conflate — those three mitigations handle the fresh-context first-readback failure mode that was verified working on hardware smoke #3 non-strict run. The #56b fence-guard addresses a DISTINCT failure mode (re-invocation write-visibility race) exposed by the same smoke's strict run. Both mitigation blocks coexist in `w_get_buffer_sub_data`.
+
+**Runtime-semantics verification (Citron smoke — non-regression only; verdict is hardware's).** Citron/AMD Vulkan translation of `glMapBufferRange` didn't exhibit either fresh-context or re-invocation failure on prior smokes, so Citron cannot distinguish "fix carries" from "fix regressed silently". Non-regression Citron smoke required (BUFFER probe still `both ok`); actual #56b verdict comes from the next hardware boot.
+
+**DISPOSITION:** `fix-shipped, verdict-pending-hardware`. Headline claim regressed from `88/88 SURFACE + 88/88 FUNCTIONAL` back to `88/88 SURFACE + N/88 FUNCTIONAL, 1 open (#56b)` until the hardware verdict.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `nx_56b_readback_sync_guard`. Recurrence tell: hardware BUFFER `both arms ok` on both consecutive runs of the same boot = fix carrying, close #56b. Hardware BUFFER strict re-run FAILs = jump to rung 2 without re-diagnosis. Runbook §#56b has the exact verdict procedure.
 
 ---
 
@@ -2814,7 +2853,7 @@ Runbook §#56 has the exact verdict procedure for the next hardware boot.
 
 gl-probes v0.14.0 BUFFER probe on real Tegra Nouveau NV120 CFW hbmenu with the per-target rebind engine build:
 - Non-strict run (fresh WebGL2 context, first probe cycle): `BUFFER PASS detail=Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. **26 PASS / 0 FAIL / 0 SKIP (of 26)**. Log: `gl-probes-v0.14.0.log`.
-- Strict re-run (SAME context, 2.4s later): `BUFFER FAIL detail=Arm A PASS, Arm B FAIL got=42`. State-carryover artifact from the just-completed non-strict cycle — `canvas.getContext('webgl2')` returns the cached instance, the driver's VRAM allocator reuses recently-freed buffer memory (id=42 came from the prior TF_ERR probe's `a_id` upload), and Nouveau's `bufferData` doesn't zero-initialize the fresh allocation region. Log: `gl-probes-v0.14.0-all-strict.log`. Documented as a probe-design observation, NOT an engine regression.
+- Strict re-run (SAME context, 2.4s later): `BUFFER FAIL detail=Arm A PASS, Arm B FAIL got=42`. Initial explanation "state carryover / VRAM allocator reuse without zero-init" was RETRACTED post code-review — the probe re-executes the full `createBuffer + bufferData(src) + copyBufferSubData` sequence per invocation (verified by reading gl-probes.js:230-258). Real defect: re-invocation write-visibility race on Mesa Nouveau NV120 (stale mapped-region bytes despite full re-execution + glFinish). Reopened as **#56b** — separate ledger entry above. Log: `gl-probes-v0.14.0-all-strict.log`.
 
 **Fix confirmed carrying on the primary use case** — fresh context, single probe run, both arms PASS end-to-end. Three.js's `WebGLRenderer.readRenderTargetPixels` fallback + GPGPU readback paths that trigger `getBufferSubData` on a per-frame-fresh path (which is the typical shape) work correctly on real Tegra hardware post-fix.
 

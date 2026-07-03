@@ -845,6 +845,31 @@ check 56 "webgl.cc [#56] rebind branch: COPY_WRITE_BUFFER handling" \
     "$NXJS/source/webgl.cc" \
     'target == GL_COPY_WRITE_BUFFER \|\| target == GL_COPY_READ_BUFFER'
 
+# #56b — Re-invocation write-visibility race fence-guard. Empirical Mesa
+# Nouveau NV120 workaround; shared helper so any future GPU→CPU map-read
+# site uses the same primitive without copy-paste.
+check 56b "webgl.cc [#56b] shared sync-guard helper defined" \
+    "$NXJS/source/webgl.cc" \
+    'static void nx_56b_readback_sync_guard'
+check 56b "webgl.cc [#56b] fence + clientWaitSync + deleteSync sequence" \
+    "$NXJS/source/webgl.cc" \
+    'glFenceSync\(GL_SYNC_GPU_COMMANDS_COMPLETE'
+check 56b "webgl.cc [#56b] clientWaitSync with FLUSH_COMMANDS_BIT + 100ms" \
+    "$NXJS/source/webgl.cc" \
+    'glClientWaitSync\(sync, GL_SYNC_FLUSH_COMMANDS_BIT, timeout_ns\)'
+check 56b "webgl.cc [#56b] TIMEOUT log line (don't hang runtime)" \
+    "$NXJS/source/webgl.cc" \
+    '\[#56b\] %s: clientWaitSync TIMEOUT'
+check 56b "webgl.cc [#56b] w_get_buffer_sub_data calls the sync guard" \
+    "$NXJS/source/webgl.cc" \
+    'nx_56b_readback_sync_guard\("getBufferSubData"\)'
+# Class-close guardrail: only ONE glMapBufferRange with GL_MAP_READ_BIT
+# should exist in webgl.cc as of 2026-07-03. If a new call site lands
+# without the sync-guard, this check regresses on the next audit.
+check 56b "webgl.cc [#56b] class closes at single map-read site" \
+    "$NXJS/source/webgl.cc" \
+    'GL_MAP_READ_BIT'
+
 # #57 — Batch 3 final extension batch. All driver-gated advertising +
 # w_get_extension branches + FUNCS[] wiring.
 check 57 "webgl.cc [b3] resolve_b3_pfns proc-address resolver" \
