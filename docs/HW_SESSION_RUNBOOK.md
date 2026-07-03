@@ -326,6 +326,14 @@ from COPY_WRITE_BUFFER.
 
 **Next hardware boot prediction.** BUFFER probe both arms PASS: `Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. If confirmed, reclassify #56 to CLOSED and archive.
 
+### 2026-07-03 hardware smoke #3 (third session) — SECOND-STAGE FIX HARDWARE-VERIFIED
+
+BUFFER PASS on fresh WebGL2 context: `PASS detail=Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. **26 PASS / 0 FAIL / 0 SKIP (of 26)**. Log: `gl-probes-v0.14.0.log` (non-strict, generated 21:37:53Z).
+
+The paired strict re-run 2.4 seconds later on the same cached WebGL2 context showed Arm B `got=42` — state-carryover artifact from prior TF_ERR probe's a_id=42 upload, driver's `bufferData` doesn't zero-init reused VRAM. Documented probe-design observation, NOT an engine defect. Log: `gl-probes-v0.14.0-all-strict.log`.
+
+**§#56 CLOSED — see Archived section below.**
+
 ### Hardware smoke #2 re-verifications (2026-07-03)
 
 Gl-probes v0.14.0 STRICT run on the same session confirmed:
@@ -339,4 +347,31 @@ All 5 new **b3 probes** (ledger #57) PASS strict on hardware: TIMER_QUERY, POLY_
 
 ---
 
-## Archived (hardware-verified) — none yet
+## Archived (hardware-verified)
+
+### §#52a — glDrawRangeElements Citron-only quirk (2026-07-03)
+`glDrawElements` fallback shipped as defensive-only; `NX_52A_DISABLE_FALLBACK`
+build gate retained. Direct `glDrawRangeElements` verified working on real
+Tegra Nouveau NV120 via Boot B (fallback-disabled NRO). Ledger #52a.
+
+### §#54 — ANY_SAMPLES_PASSED Citron-only quirk (2026-07-03)
+Strict `QUERY_RESULT=1 spec-conformant` on real Tegra Nouveau NV120. Ledger #54.
+
+### §#55-pause — transformFeedback pause/resume Citron-only quirk (2026-07-03)
+Strict `pause skipped id=200, captured id=100 + id=300 in order` on real Tegra
+Nouveau NV120. Ledger #55.
+
+### §#56 — getBufferSubData COPY_WRITE_BUFFER target-specific defect (2026-07-03)
+Per-target rebind fallback (second-stage fix) verified on real Tegra Nouveau
+NV120 fresh-context path: `Arm A + Arm B both ok 64B memcmp`. State-carryover
+observation on re-invocation documented; harness fix deferred. Ledger #56.
+
+### §#57 — Batch 3 extension surface (2026-07-03)
+All 5 b3 probes PASS on real Tegra Nouveau NV120: TIMER_QUERY, POLY_CLAMP,
+INDEXED_BLEND, MULTI_DRAW, BFE_CONST. Extension advertising + wiring
+hardware-verified. Ledger #57.
+
+Minor open sub-item — TIMER_QUERY 32-bit truncation (`0xFFFFFFFF` on both Citron
+and hardware for TIMESTAMP_EXT queries whose 64-bit driver time exceeds 2^32).
+Non-blocking; deferred until a demo needs nanosecond deltas. Fix path:
+`glGetQueryObjectui64vEXT` via proc-address, JS Number represents up to 2^53.

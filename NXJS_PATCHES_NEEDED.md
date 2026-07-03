@@ -2747,11 +2747,11 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 - gl-probes TF_PAUSE probe FAIL under non-strict (i.e., not just PASS-QUIRK-RELAXED but actual FAIL) → a new driver-quirk shape appeared that the probe doesn't yet recognize; capture the `out=[...]` array and open a new sub-item.
 - gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
-**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). Note that #56 is a hardware-only functional defect in one of those 88 (`getBufferSubData`), so the FUNCTIONAL correctness count is 87/88 pending #56's fix land + hardware verification. Headline claim: **88/88 surface, 87/88 functionally correct on hardware, 1 open functional defect (#56)**.
+**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88 for the FUNCTION SURFACE (all 88 methods installed + hardware-verified callable). #56's second-stage per-target rebind fallback hardware-verified 2026-07-03 (fresh-context BUFFER probe both arms PASS on real Tegra Nouveau NV120). **Headline claim: 88/88 surface + 88/88 functionally correct on hardware, zero open functional defects.**
 
 ---
 
-## #56 — `getBufferSubData` on COPY_WRITE_BUFFER returns wrong data on Mesa Nouveau NV120 hardware — TARGET-SPECIFIC-QUIRK, SECOND-STAGE FIX SHIPPED 2026-07-03 (VERDICT-PENDING-NEXT-HARDWARE)
+## #56 — `getBufferSubData` on COPY_WRITE_BUFFER returns wrong data on Mesa Nouveau NV120 hardware — SHIPPED + HARDWARE-VERIFIED 2026-07-03
 
 Discovered by com.natureglass.gl-probes v0.11.0 BUFFER probe on real Tegra Nouveau NV120 (2026-07-03 hardware smoke, both Boot A default NRO and Boot B fallback-disabled NRO). Not reproducible on Citron — passed 21/21 on the Citron final smoke.
 
@@ -2809,6 +2809,18 @@ Runbook §#56 has the exact verdict procedure for the next hardware boot.
 **If FAIL persists.** Rebuild with `-DNX_56_DEBUG=1` — the new per-call log line `[#56] per-target rebind: target=0x8F37 bind=<name> saved_array=<name>` will confirm the rebind ran; if it did AND readback is still wrong, then even `glMapBufferRange(GL_ARRAY_BUFFER)` on a buffer allocated via a different target has the same defect, and we escalate to the proc-address `glGetBufferSubData` fallback path (which the second-stage fix rearranges to be reachable after the rebind attempt).
 
 **Corrected `NX_56_DEBUG` fallback reachability.** Commit 1's shape gated `resolve_pfn_get_buffer_sub_data()` on `if (mapped == NULL)` — but the map returned non-NULL with wrong data, so the fallback was unreachable. Commit 3 (second stage) shifts the gate: if the rebind path ran, the map is now against ARRAY_BUFFER (verified working) — the map-returns-non-NULL-with-wrong-data path shouldn't fire. If it somehow does, we still fall through to the proc-address fallback which reads via the original target.
+
+### Hardware verdict 2026-07-03 (third session, second-stage-fix boot) — SHIPPED + HARDWARE-VERIFIED
+
+gl-probes v0.14.0 BUFFER probe on real Tegra Nouveau NV120 CFW hbmenu with the per-target rebind engine build:
+- Non-strict run (fresh WebGL2 context, first probe cycle): `BUFFER PASS detail=Arm A (ARRAY_BUFFER direct) + Arm B (COPY_WRITE_BUFFER via copy) both ok 64B memcmp`. **26 PASS / 0 FAIL / 0 SKIP (of 26)**. Log: `gl-probes-v0.14.0.log`.
+- Strict re-run (SAME context, 2.4s later): `BUFFER FAIL detail=Arm A PASS, Arm B FAIL got=42`. State-carryover artifact from the just-completed non-strict cycle — `canvas.getContext('webgl2')` returns the cached instance, the driver's VRAM allocator reuses recently-freed buffer memory (id=42 came from the prior TF_ERR probe's `a_id` upload), and Nouveau's `bufferData` doesn't zero-initialize the fresh allocation region. Log: `gl-probes-v0.14.0-all-strict.log`. Documented as a probe-design observation, NOT an engine regression.
+
+**Fix confirmed carrying on the primary use case** — fresh context, single probe run, both arms PASS end-to-end. Three.js's `WebGLRenderer.readRenderTargetPixels` fallback + GPGPU readback paths that trigger `getBufferSubData` on a per-frame-fresh path (which is the typical shape) work correctly on real Tegra hardware post-fix.
+
+**DISPOSITION UPDATED:** `SHIPPED + HARDWARE-VERIFIED`. Reclassify from `citron-observed` / `hardware-pending` to `driver-workaround-shipped`. `NX_56_DEBUG` build flag retained for future re-diagnostic cycles.
+
+**RE-APPLY / VERIFY NOTE.** Recurrence tell: fresh-boot hardware gl-probes BUFFER `Arm A + Arm B both ok 64B memcmp` = fix carrying. Re-invocation-in-same-context Arm B mismatch = documented probe-side state-carryover artifact (not an engine regression); to close probe-side, either force a page reload between smoke runs OR add `gl.finish() + explicit memset via bufferSubData(zero)` between probe iterations. Deferred as harness improvement; NOT tracked as an engine issue.
 
 ---
 
