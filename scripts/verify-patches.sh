@@ -692,9 +692,13 @@ check 52 "webgl.cc [52a] w_draw_range_elements calls glDrawElements (fallback)" 
 check 52 "webgl.cc [52a] fallback boot log present" \
     "$NXJS/source/webgl.cc" \
     '\[#52a\] drawRangeElements -> drawElements fallback'
-check_absent 52 "webgl.cc [52a] no direct glDrawRangeElements call in body (proves fallback still active)" \
+# Direct glDrawRangeElements call is now legitimately present inside the
+# `#if NX_52A_DISABLE_FALLBACK` branch (hardware probe recipe). Do NOT
+# check_absent for it — instead assert both the default (fallback) branch
+# and the ifdef branch coexist so the gate stays intact.
+check 52 "webgl.cc [52a] fallback-disabled DIRECT boot log present (gate branch)" \
     "$NXJS/source/webgl.cc" \
-    'glDrawRangeElements\('
+    '\[#52a\] drawRangeElements DIRECT \(fallback DISABLED'
 # #52b — getTexParameter FN + FUNCS[] entries (SHIPPED 2026-07-03).
 check 52 "webgl.cc [52b] w_get_tex_parameter FN present" \
     "$NXJS/source/webgl.cc" \
@@ -768,10 +772,60 @@ check 53 "webgl.cc [med] block header comment present" \
     "$NXJS/source/webgl.cc" \
     'Phase-1\.5-MED'
 
-# #54 — Mesa Nouveau NV120 ANY_SAMPLES_PASSED driver ceiling. No engine
-# change; guardrail is documentation-only. Ledger entry existence is the
-# only check.
-status 54 "KNOWN-OPEN" "Mesa Nouveau NV120 ANY_SAMPLES_PASSED driver ceiling (documented; no engine fix)"
+# #54 — Citron-observed ANY_SAMPLES_PASSED / hardware-pending. No engine
+# change; guardrail is documentation-only. Ledger entry existence + the
+# HW_SESSION_RUNBOOK.md section are what get audited here.
+status 54 "KNOWN-OPEN" "ANY_SAMPLES_PASSED Citron-observed / hardware-pending (see docs/HW_SESSION_RUNBOOK.md §#54)"
+check_file_exists 54 "docs/HW_SESSION_RUNBOOK.md exists" \
+    "$NXJS/docs/HW_SESSION_RUNBOOK.md"
+
+# #55 — Phase-1.5-MED-HIGH: 10 transform-feedback methods + K_TRANSFORM_FEEDBACK
+# handle + WebGLTransformFeedback class registration. Counter 78 → 88/88.
+check 55 "webgl.cc [mh-handle] K_TRANSFORM_FEEDBACK enum member" \
+    "$NXJS/source/webgl.cc" \
+    'K_TRANSFORM_FEEDBACK,'
+check 55 "webgl.cc [mh-handle] WebGLTransformFeedback class registered" \
+    "$NXJS/source/webgl.cc" \
+    '"WebGLTransformFeedback", K_TRANSFORM_FEEDBACK'
+# 10 methods.
+check 55 "webgl.cc [tf] createTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"createTransformFeedback", w_create_transform_feedback'
+check 55 "webgl.cc [tf] deleteTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"deleteTransformFeedback", w_delete_transform_feedback'
+check 55 "webgl.cc [tf] isTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"isTransformFeedback", w_is_transform_feedback'
+check 55 "webgl.cc [tf] bindTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"bindTransformFeedback", w_bind_transform_feedback'
+check 55 "webgl.cc [tf] beginTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"beginTransformFeedback", w_begin_transform_feedback'
+check 55 "webgl.cc [tf] endTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"endTransformFeedback", w_end_transform_feedback'
+check 55 "webgl.cc [tf] transformFeedbackVaryings" \
+    "$NXJS/source/webgl.cc" \
+    '"transformFeedbackVaryings", w_transform_feedback_varyings'
+check 55 "webgl.cc [tf] getTransformFeedbackVarying" \
+    "$NXJS/source/webgl.cc" \
+    '"getTransformFeedbackVarying", w_get_transform_feedback_varying'
+check 55 "webgl.cc [tf] pauseTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"pauseTransformFeedback", w_pause_transform_feedback'
+check 55 "webgl.cc [tf] resumeTransformFeedback" \
+    "$NXJS/source/webgl.cc" \
+    '"resumeTransformFeedback", w_resume_transform_feedback'
+# Family marker.
+check 55 "webgl.cc [mh] block header comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Phase-1\.5-MED-HIGH'
+# #52a fallback gate — new build define check.
+check 52 "webgl.cc [52a] fallback gate: NX_52A_DISABLE_FALLBACK ifndef guard present" \
+    "$NXJS/source/webgl.cc" \
+    '#ifndef NX_52A_DISABLE_FALLBACK'
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="

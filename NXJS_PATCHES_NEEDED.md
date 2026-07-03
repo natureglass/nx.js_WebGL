@@ -2580,11 +2580,17 @@ Discovered via com.natureglass.gl-probes v0.2.0 Citron smoke on 2026-07-03. Both
 
 **Next diagnostic step.** Add fprintf inside `w_draw_range_elements` logging the 6 arg values + `st->bound_fbo_js` + a post-glDrawRangeElements `glGetError` result. Rebuild + run gl-probes. If the FN is called with correct args and post-call `glGetError = 0`, root cause is confirmed as driver-side and this becomes a documented driver limit (like [[reference-mesa-nouveau-layered-sampling-unsupported]]). If the FN isn't called or is called with wrong args, root cause is engine / dispatch.
 
-**DISCRIMINATOR OUTCOME 2026-07-03.** gl-probes v0.3.0 sentinel + isolation-mode smokes both FAIL identically (`sentinel=no cornerSentinel=no allZero=yes cornerZero=yes eDE=0x0 eClear=0x0 eDRE=0x0 eRead=0x0 baseline=[255,128,64,255] ranged=[0,0,0,0]`). Isolation run (DRAW_RANGE as first-and-only probe on fresh WebGL2 context) reproduces the failure identically → NOT probe-side state leakage from other probes. The FBO texture is genuinely untouched by both the second `gl.clear` AND `gl.drawRangeElements` despite both calls returning `GL_NO_ERROR`. `glClear` on Mesa Nouveau evidently follows the same silent-no-op path as `glDrawRangeElements` when the driver enters some post-`glReadPixels` state we haven't characterized.
+**CITRON DISCRIMINATOR OUTCOME 2026-07-03.** gl-probes v0.3.0 sentinel + isolation-mode smokes on Citron both FAIL identically (`sentinel=no cornerSentinel=no allZero=yes cornerZero=yes eDE=0x0 eClear=0x0 eDRE=0x0 eRead=0x0 baseline=[255,128,64,255] ranged=[0,0,0,0]`). Isolation run (DRAW_RANGE as first-and-only probe on fresh WebGL2 context) reproduces the failure identically → NOT probe-side state leakage from other probes. The FBO texture is genuinely untouched by both the second `gl.clear` AND `gl.drawRangeElements` despite both calls returning `GL_NO_ERROR`.
 
-**INTERIM FIX SHIPPED 2026-07-03.** `w_draw_range_elements` (source/webgl.cc) now calls `glDrawElements(mode, count, type, indices)` instead of `glDrawRangeElements`. Spec-legal per ES3 §2.8.3 (the `start`/`end` args are a driver optimization hint only — the equivalent draw is `glDrawElements` with the same mode/count/type/indices). One-time boot log `[#52a] drawRangeElements -> drawElements fallback (range hint dropped; see NXJS_PATCHES_NEEDED #52a)` documents that the workaround is active. `start` and `end` arg slots still parse for arg-count parity (via `(void)a_u32(info, 1)/2`) so removing the fallback in a future engine cycle is a one-line change. gl-probes DRAW_RANGE probe expected to PASS post-fix on the next Citron smoke.
+**STATUS: CITRON-OBSERVED-NOOP / HARDWARE-PENDING.** Per the standing rule, Citron is a functional-iteration authority, NOT a driver-truth authority — Citron sits on top of AMD Vulkan on Windows, not a real Tegra Nouveau stack. The Citron-observed silent no-op could be Mesa Nouveau NV120 driver behavior OR a Citron GPU translation/emulation issue. Hardware probe (see docs/HW_SESSION_RUNBOOK.md §#52a) will resolve.
 
-**DISPOSITION:** `interim-shipped; engine-native re-enable is an upstream / driver-followup`. Removing the fallback requires either a Mesa Nouveau driver update that fixes `glDrawRangeElements` (out of our control) OR isolating the exact state that trips the driver into no-op mode. Not blocking phase-1.5-MED.
+**INTERIM FIX SHIPPED 2026-07-03.** `w_draw_range_elements` (source/webgl.cc) calls `glDrawElements(mode, count, type, indices)` instead of `glDrawRangeElements`. Spec-legal per ES3 §2.8.3 (the `start`/`end` args are a driver optimization hint only — the equivalent draw is `glDrawElements` with the same mode/count/type/indices). One-time boot log `[#52a] drawRangeElements -> drawElements fallback (range hint dropped; see NXJS_PATCHES_NEEDED #52a)` documents that the workaround is active. Fallback stays shipped regardless of the eventual hardware verdict (belt-and-suspenders); hardware outcome only decides whether it becomes defensive-only or remains load-bearing.
+
+**Fallback gate for hardware probe.** `w_draw_range_elements` has a `#ifndef NX_52A_DISABLE_FALLBACK` guard around the substitution. Building with `-DNX_52A_DISABLE_FALLBACK=1` (added to `nxjs-source-v8/Makefile` CFLAGS or via `make CFLAGS_APPEND=-DNX_52A_DISABLE_FALLBACK=1`) restores the direct `glDrawRangeElements` call. Boot log distinguishes the two modes: `[#52a] drawRangeElements DIRECT (fallback DISABLED via NX_52A_DISABLE_FALLBACK build)` vs the default fallback banner.
+
+**DISPOSITION:** `citron-observed, interim-shipped, hardware-pending`. Hardware verdict determines whether:
+- **Hardware PASSES with fallback disabled** → Citron-only regression. Fallback becomes defensive-only, kept in place to protect against Citron re-emerging. Reword this ledger to a "Citron-emulator quirk" classification.
+- **Hardware also FAILS with fallback disabled** → Real Mesa Nouveau NV120 driver bug. Fallback remains load-bearing. Reword to a "driver-ceiling" classification and upstream a Mesa bug report if the fault triggers under the isolation smoke on real Tegra.
 
 ### #52b — `getTexParameter` (WebGL1 core) never wired into FUNCS[]
 
@@ -2670,31 +2676,86 @@ Sum: 25 methods = counter +25 = 53 → 78/88 (matches plan §0.1.1 progression).
 
 ---
 
-## #54 — Mesa Nouveau NV120 occlusion-query driver ceiling: `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn — DOCUMENTED-DRIVER-QUIRK 2026-07-03
+## #54 — Occlusion-query `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn — CITRON-OBSERVED, HARDWARE-PENDING 2026-07-03
 
-Discovered by com.natureglass.gl-probes v0.4.0 QUERY probe on 2026-07-03. Not an engine defect — the engine's query surface is functionally correct (proven by gl-probes v0.7.0 discriminator smoke: `curActive=true` right after `beginQuery`, zero GL errors end-to-end, draw painted [255,255,255,255] via `readPixels` verification).
+Discovered by com.natureglass.gl-probes v0.4.0 QUERY probe on Citron 2026-07-03. Engine's query surface (ledger #53 — `w_create_query`, `w_begin_query`, `w_end_query`, `w_get_query_parameter`) is functionally correct on the wiring side.
 
-**File(s):** none — this is a driver capability ceiling, not an engine change. The QUERY surface implementation (`w_create_query`, `w_begin_query`, `w_end_query`, `w_get_query_parameter` — ledger #53) is byte-identical to what other GLES3 drivers accept.
+**File(s):** none — this ledger tracks an observed behavior, not an engine change.
 
-**Symptom.** `beginQuery(ANY_SAMPLES_PASSED, q)` → fullscreen `drawArrays(TRIANGLE_STRIP, 0, 4)` → `endQuery(ANY_SAMPLES_PASSED)` → `getQueryParameter(q, QUERY_RESULT)` returns 0. Verified via `getQueryParameter(q, QUERY_RESULT_AVAILABLE)` returning true first (query result is finalized, driver just returned 0). Same viewport, same shader, and `readPixels(4, 4)` returns `[255,255,255,255]` proving the draw painted the target.
+**Citron symptom.** `beginQuery(ANY_SAMPLES_PASSED, q)` → fullscreen `drawArrays(TRIANGLE_STRIP, 0, 4)` → `endQuery(ANY_SAMPLES_PASSED)` → `getQueryParameter(q, QUERY_RESULT)` returns 0. Verified via `getQueryParameter(q, QUERY_RESULT_AVAILABLE)` returning true first (query result finalized). `readPixels(4, 4)` returns `[255,255,255,255]` proving the draw painted the target.
 
-**Discriminator ladder from gl-probes v0.7.0 log:**
+**Citron discriminator ladder from gl-probes v0.7.0 log:**
 ```
 eBegin=0x0 eDraw=0x0 eEnd=0x0 eAvail=0x0 eResult=0x0 curActive=true
 ```
 - `eBegin=0x0` — glBeginQuery accepted (query name valid, target not busy)
 - `eDraw=0x0` — glDrawArrays succeeded inside the query bracket
 - `eEnd=0x0` — glEndQuery succeeded
-- `curActive=true` — `getQuery(ANY_SAMPLES_PASSED, CURRENT_QUERY)` returned the wrapped query right after beginQuery
-- `eResult=0x0` + `QUERY_RESULT=0` — no error, driver just says no samples passed
+- `curActive=true` — `getQuery(ANY_SAMPLES_PASSED, CURRENT_QUERY)` returned the wrapped query right after beginQuery, proving the query was active during the begin block
+- `eResult=0x0` + `QUERY_RESULT=0` — no error, counter just returned 0
 
-**Impact.** LOW severity — Three.js and typical WebGL2 apps don't use occlusion queries in the common rendering path. Applications that DO (visibility culling, occlusion-based LOD) will see always-visible behavior (result=0 → interpret as "not occluded" → conservative render everything). No visual regression, just no perf benefit from the occlusion query.
+**STATUS: CITRON-OBSERVED / HARDWARE-PENDING.** Per the standing rule, Citron is a functional-iteration authority, NOT a driver-truth authority. The observed behavior could be Mesa Nouveau NV120's real driver ceiling OR Citron's GPU-translation layer failing to plumb the occlusion counter through. Hardware probe (see docs/HW_SESSION_RUNBOOK.md §#54) will resolve.
 
-**Same driver family as [[reference-mesa-nouveau-layered-sampling-unsupported]]** — Mesa Nouveau NV120 has documented gaps in less-common ES3 features (layered sampling, glDrawRangeElements per #52a, now ANY_SAMPLES_PASSED). Not an engine responsibility to work around at the FN level; downstream applications either don't hit these paths (Three.js) or gracefully degrade (occlusion query = conservative always-visible).
+**Interim probe accommodation.** gl-probes v0.8.0 QUERY probe verifies surface + wiring (curActive after beginQuery, no GL errors, draw painted, QUERY_RESULT non-negative) rather than driver-specific result semantics. Pass detail annotates the observed semantic:
+- `spec-conformant (result > 0 for visible draw)` — real hardware or non-Nouveau driver
+- `Mesa Nouveau NV120 quirk — result=0 despite pixels drawn (#54)` — current Citron observation
 
-**DISPOSITION:** `driver-ceiling — no engine fix planned`. Engine surface remains spec-conformant. gl-probes v0.8.0 QUERY probe relaxed to verify surface + wiring (curActive after beginQuery, no GL errors, draw painted, QUERY_RESULT non-negative) rather than driver-specific result semantics — PASS on Nouveau NV120 with the "Mesa Nouveau NV120 quirk — result=0" annotation in the detail; would PASS on any other driver with "spec-conformant (result > 0 for visible draw)" annotation.
+The relaxation exists so tier acceptance can proceed on Citron; strict-mode probing is available via query param `?strict=1` on the app URL (see gl-probes.js `strictQuery` flag). Hardware smoke MUST use strict mode.
 
-**Recurrence tell.** Same driver on same hardware — behavior expected to persist. Different hardware or updated Mesa: QUERY probe detail will read "spec-conformant (result > 0 for visible draw)" — the annotation is the audit trail.
+**Impact if the hardware verdict is real driver ceiling.** LOW severity — Three.js and typical WebGL2 apps don't use occlusion queries in the common rendering path. Applications that DO (visibility culling, occlusion-based LOD) see always-visible behavior (result=0 → interpret as "not occluded" → conservative render everything). No visual regression, just no perf benefit.
+
+**DISPOSITION:** `citron-observed, probe-relaxed, hardware-pending`. Hardware verdict determines:
+- **Hardware PASSES strict** → Citron-only issue. Revert the probe relaxation and restore strict `QUERY_RESULT > 0` as the default in gl-probes.js.
+- **Hardware FAILS strict** → Real Mesa Nouveau NV120 driver ceiling. Reclassify to `driver-ceiling — no engine fix planned` and add to `[[reference-mesa-nouveau-layered-sampling-unsupported]]`-family reference memory.
+
+**Recurrence tell.** QUERY probe detail annotation is the audit trail — the day it flips to `spec-conformant` on the same hardware = a Mesa update fixed it.
+
+---
+
+## #55 — Phase-1.5-MED-HIGH: 10 v2 transform-feedback methods + K_TRANSFORM_FEEDBACK handle — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — 10 new `FN(w_*)` implementations grouped in a phase-1.5-MED-HIGH block after the MED block + 10 new FUNCS[] entries in `install_methods_v2` + 1 new K_* enum value (K_TRANSFORM_FEEDBACK) + 1 new handle-class registration in `nx_webgl2_init_class` MAP[] (`WebGLTransformFeedback`).
+
+**Motivation.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order (b1 → b2 → LOW → LOW-MED → MED → b3 → **MED-HIGH**). Counter target 78 → 88/88 — closes the WebGL2 spec function counter. Beyond this tier, the report's `WebGL 2 Functions (N / 88)` metric no longer moves; batch 3 adds extension-suffixed methods only.
+
+**Methods landed (10 total):** all in a single family — transform feedback.
+
+- `w_create_transform_feedback` — `glGenTransformFeedbacks(1, &id)` → new K_TRANSFORM_FEEDBACK handle
+- `w_delete_transform_feedback` — `glDeleteTransformFeedbacks(1, &id)`
+- `w_is_transform_feedback` — `glIsTransformFeedback(id) == GL_TRUE`
+- `w_bind_transform_feedback` — `glBindTransformFeedback(target, id)`
+- `w_begin_transform_feedback` — `glBeginTransformFeedback(primitiveMode)`
+- `w_end_transform_feedback` — `glEndTransformFeedback()`
+- `w_transform_feedback_varyings` — `glTransformFeedbackVaryings(program, count, names[], bufferMode)`. Takes a JS Array of strings; effect stored on the program object, **applied at next `linkProgram`** — callers MUST relink for the binding to take effect. Standard WebGL2 pattern.
+- `w_get_transform_feedback_varying` — `glGetTransformFeedbackVarying` → K_ACTIVE_INFO handle (same JS shape as `getActiveAttrib` / `getActiveUniform`, `{name, size, type}`). Returns null if the varying at that index is undefined.
+- `w_pause_transform_feedback` — `glPauseTransformFeedback()`
+- `w_resume_transform_feedback` — `glResumeTransformFeedback()`
+
+Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
+
+**RASTERIZER_DISCARD (0x8C89) handling.** `gl.enable(RASTERIZER_DISCARD)` / `gl.disable(RASTERIZER_DISCARD)` route through the existing `w_enable` / `w_disable`, which forward the raw cap to `glEnable`/`glDisable` without a whitelist — only the BLEND/DEPTH_TEST/CULL/SCISSOR/STENCIL caps get shadow-tracked into `st->user_snap` for cross-bracket persistence. RASTERIZER_DISCARD is typically enabled inside the user's `beginTransformFeedback` … `endTransformFeedback` bracket (single frame; no bracket cycle in the middle for a well-behaved synchronous demo), so lack of shadow tracking is spec-conformant. A future extension of `nx_gl_state_snap_t` could add RASTERIZER_DISCARD for long-running demos that leave discard on across frames — deferred until observed as a real need.
+
+**New K_TRANSFORM_FEEDBACK handle kind — runtime teardown pre-wired.** [brewser-runtime-v8/src/scripts/gl-teardown.ts](../brewser-runtime-v8/src/scripts/gl-teardown.ts) already tracks `transformFeedbacks` at lines 154, 171, 312-313, 527 (defensive addition when VAO tracking landed — same pre-wired story as the K_QUERY/K_SAMPLER/K_SYNC additions in #53). No runtime commit needed for MED-HIGH — the additive-only precondition is already met.
+
+**Runtime-semantics verification (mandated micro-probes per plan §0.1.2 addendum — non-negotiable).** Via com.natureglass.gl-probes v0.9.0's TF probe family (paired brewser-apps commit):
+
+- **Capture arm** — SEPARATE_ATTRIBS mode. Vertex shader outputs a `flat out vec4 v_capture` from a per-vertex input; transformFeedbackVaryings binds `v_capture`; program is (re-)linked after the binding; a small buffer is bound via `bindBufferBase(TRANSFORM_FEEDBACK_BUFFER, 0, buf)`; a 3-vertex `drawArrays(POINTS, 0, 3)` runs inside a begin/end TF bracket with `RASTERIZER_DISCARD` enabled; `getBufferSubData` reads back 3×`vec4` = 48 bytes; JS-side memcmp against the expected transformed values.
+- **Pause/resume arm** — begin TF → draw 1 vertex → pause → draw 1 vertex (should NOT be captured) → resume → draw 1 vertex → end. `getBufferSubData` should show 2 captured vertices (not 3), verifying pause/resume actually gated the capture.
+- **Begin-during-active arm** — begin TF → without ending, try `beginTransformFeedback` again → should set `INVALID_OPERATION` (0x502) per ES3 §2.14.1. gl-probes verifies with `glGetError` — must be INVALID_OPERATION, not a crash.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed.
+
+**DISPOSITION:** `upstream-candidate`. All 10 methods are thin wrappers around ES3 core entry points; K_TRANSFORM_FEEDBACK enum + handle registration follow the same pattern as #53's three MED handle kinds; upstream could take the block, K_TRANSFORM_FEEDBACK addition, and the paired probe additions in one PR without controversy.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-MED-HIGH`, `w_begin_transform_feedback`, `K_TRANSFORM_FEEDBACK`, `"WebGLTransformFeedback"`. Recurrence tells:
+- Report renders `78 / 88 implemented` post-hardware → the MED-HIGH FUNCS[] block regressed. Check `install_methods_v2` for the 10 new entries.
+- gl-probes TF_CAPTURE probe FAILs with buffer readback zeros → `transformFeedbackVaryings` did not take effect (missing relink post-binding) OR `beginTransformFeedback`/`endTransformFeedback` are silently no-op'ing.
+- gl-probes TF_PAUSE_RESUME probe FAILs with 3 captured vertices instead of 2 → pause is silently a no-op on the driver (see docs/HW_SESSION_RUNBOOK.md for hardware verdict process).
+- gl-probes TF_BEGIN_ACTIVE probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
+
+**Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88.
 
 ---
 

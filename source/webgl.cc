@@ -104,6 +104,8 @@ enum ObjKind : uint8_t {
 	K_QUERY,
 	K_SAMPLER,
 	K_SYNC,
+	// Phase-1.5-MED-HIGH handle kind (ledger #55).
+	K_TRANSFORM_FEEDBACK,
 	K_COUNT,
 };
 
@@ -3046,35 +3048,57 @@ FN(w_clear_buffer_fi) {
 }
 
 // ----- Draw range (v2 adds) -----
+//
+// #52a fallback gate: define NX_52A_DISABLE_FALLBACK at build time to
+// call glDrawRangeElements directly (needed for the HW_SESSION_RUNBOOK
+// hardware probe that records whether real Tegra Nouveau also silent-
+// no-ops or if the behavior is Citron-only). Default (undefined) keeps
+// the spec-legal glDrawElements substitution shipping.
+#ifndef NX_52A_DISABLE_FALLBACK
+#define NX_52A_DISABLE_FALLBACK 0
+#endif
 FN(w_draw_range_elements) {
 	enter_bracket();
-	// NXJS_PATCHES_NEEDED #52a interim fix — Mesa Nouveau NV120 silently
-	// no-ops glDrawRangeElements. Citron gl-probes v0.3.0 discriminator
-	// (sentinel clear color + isolation-mode + per-step glGetError)
-	// proved the failure reproduces on a fresh WebGL2 context with no
-	// prior probes: baseline glDrawElements PASSES on the same
-	// VAO/FBO/shader, then clearColor(sentinel)+clear+glDrawRangeElements
-	// yields FBO texture untouched (readback [0,0,0,0]) with all
-	// glGetError = 0. Not probe state leakage, not the touch_fbo pattern
-	// mismatch, not an engine wiring issue (disassembly + ABI verified).
-	// ES3 §2.8.3 makes the (start, end) range a driver optimization hint
-	// only — the equivalent draw call is glDrawElements(mode, count,
-	// type, indices). Falling back is spec-legal; Three.js and every
-	// tested Nouveau-target demo tolerates the substitution.
+	// NXJS_PATCHES_NEEDED #52a — Citron-observed silent no-op:
+	// gl-probes v0.3.0 discriminator (sentinel clear color + isolation-
+	// mode + per-step glGetError) showed the failure reproduces on a
+	// fresh WebGL2 context with no prior probes: baseline glDrawElements
+	// PASSES on the same VAO/FBO/shader, then clearColor(sentinel)+
+	// clear+glDrawRangeElements yields FBO texture untouched (readback
+	// [0,0,0,0]) with all glGetError = 0. Whether this is a Mesa
+	// Nouveau driver behavior or a Citron GPU translation issue is
+	// HARDWARE-PENDING per the standing "Citron is functional iteration,
+	// not driver truth" rule — the hardware probe recipe is in
+	// docs/HW_SESSION_RUNBOOK.md §#52a.
+	// ES3 §2.8.3 makes the (start, end) range a driver optimization
+	// hint only — glDrawElements(mode, count, type, indices) is the
+	// spec-legal equivalent. Fallback stays shipped regardless of
+	// hardware outcome (belt-and-suspenders); hardware verdict decides
+	// whether it becomes defensive-only or remains load-bearing.
 	const GLenum mode = a_u32(info, 0);
-	(void)a_u32(info, 1); // start — range hint, unused post-fallback
-	(void)a_u32(info, 2); // end   — range hint, unused post-fallback
+	const GLuint start = a_u32(info, 1); // used only if fallback disabled
+	const GLuint end   = a_u32(info, 2);
 	const GLsizei count = a_i32(info, 3);
 	const GLenum type = a_u32(info, 4);
 	const GLintptr offset = (GLintptr)a_i32(info, 5);
-	static bool s_fallback_logged = false;
-	if (!s_fallback_logged) {
+	static bool s_boot_logged = false;
+	if (!s_boot_logged) {
+#if NX_52A_DISABLE_FALLBACK
+		fprintf(stderr, "[#52a] drawRangeElements DIRECT (fallback DISABLED "
+		                "via NX_52A_DISABLE_FALLBACK build) — hardware probe mode\n");
+#else
 		fprintf(stderr, "[#52a] drawRangeElements -> drawElements fallback "
 		                "(range hint dropped; see NXJS_PATCHES_NEEDED #52a)\n");
+#endif
 		fflush(stderr);
-		s_fallback_logged = true;
+		s_boot_logged = true;
 	}
+#if NX_52A_DISABLE_FALLBACK
+	glDrawRangeElements(mode, start, end, count, type, (const void *)offset);
+#else
+	(void)start; (void)end;
 	glDrawElements(mode, count, type, (const void *)offset);
+#endif
 	touch_fbo();
 }
 
@@ -3518,6 +3542,125 @@ FN(w_get_active_uniform_block_name) {
 
 // ============================================================================
 // End phase-1.5-MED block.
+// ============================================================================
+
+// ============================================================================
+// Phase-1.5-MED-HIGH — 10 transform-feedback methods (ledger #55).
+// Closes the WebGL2 spec function counter: 78 → 88/88.
+// One new handle kind: K_TRANSFORM_FEEDBACK. Runtime teardown side already
+// tracks transformFeedbacks in gl-teardown.ts (pre-wired defensive
+// addition when VAO tracking landed — same as the K_QUERY/K_SAMPLER/
+// K_SYNC additions in #53). No runtime commit needed.
+//
+// Spec notes:
+// - transformFeedbackVaryings binds do NOT take effect until the program
+//   is (re-)linked. Callers MUST call linkProgram AFTER
+//   transformFeedbackVaryings; otherwise the varyings-capture list is
+//   silently the previous link's contents (or empty for a never-linked
+//   program). Standard WebGL2 pattern.
+// - getTransformFeedbackVarying returns a WebGLActiveInfo (name/size/type) —
+//   reuses the existing K_ACTIVE_INFO handle kind + JS class.
+// - RASTERIZER_DISCARD (0x8C89) is a passthrough enable/disable cap. The
+//   existing w_enable / w_disable forward the raw cap to glEnable/glDisable
+//   without a whitelist (only shadow-track the BLEND/DEPTH_TEST/CULL/
+//   SCISSOR/STENCIL caps for user_snap restore); RASTERIZER_DISCARD lives
+//   only for the duration of the user's begin/end bracket in typical use,
+//   so lack of shadow tracking is spec-conformant. A future extension of
+//   nx_gl_state_snap_t could add RASTERIZER_DISCARD for long-running
+//   demos that leave discard on across frames.
+// ============================================================================
+
+FN(w_create_transform_feedback) {
+	GLuint t = 0;
+	glGenTransformFeedbacks(1, &t);
+	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(),
+	                                      K_TRANSFORM_FEEDBACK, t));
+}
+FN(w_delete_transform_feedback) {
+	GLuint id = obj_id(info[0]);
+	if (id) glDeleteTransformFeedbacks(1, &id);
+}
+FN(w_is_transform_feedback) {
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    glIsTransformFeedback(obj_id(info[0])) == GL_TRUE));
+}
+FN(w_bind_transform_feedback) {
+	enter_bracket();
+	glBindTransformFeedback(a_u32(info, 0), obj_id(info[1]));
+}
+FN(w_begin_transform_feedback) {
+	enter_bracket();
+	glBeginTransformFeedback(a_u32(info, 0));
+}
+FN(w_end_transform_feedback) {
+	enter_bracket();
+	glEndTransformFeedback();
+}
+FN(w_transform_feedback_varyings) {
+	// transformFeedbackVaryings(program, varyings, bufferMode). `varyings`
+	// is a JS Array of strings. Effect is stored on the program object;
+	// applied at the next glLinkProgram — callers MUST relink for the
+	// binding to take effect.
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	if (info.Length() < 2 || !info[1]->IsArray()) return;
+	Local<Array> names = info[1].As<Array>();
+	const uint32_t n = names->Length();
+	const GLenum bufferMode = a_u32(info, 2);
+	if (n == 0) {
+		glTransformFeedbackVaryings(program, 0, nullptr, bufferMode);
+		return;
+	}
+	Local<Context> ctx = cur(iso);
+	std::vector<char *> owned(n, nullptr);
+	std::vector<const char *> ptrs(n, nullptr);
+	for (uint32_t i = 0; i < n; i++) {
+		Local<Value> nm;
+		if (!names->Get(ctx, i).ToLocal(&nm)) continue;
+		owned[i] = take_string(iso, nm);
+		ptrs[i] = owned[i] ? owned[i] : "";
+	}
+	glTransformFeedbackVaryings(program, (GLsizei)n, ptrs.data(), bufferMode);
+	for (uint32_t i = 0; i < n; i++) if (owned[i]) delete[] owned[i];
+}
+FN(w_get_transform_feedback_varying) {
+	// getTransformFeedbackVarying(program, index) → WebGLActiveInfo|null.
+	// Reuses the K_ACTIVE_INFO handle + JS class (same shape as
+	// getActiveAttrib / getActiveUniform).
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint program = obj_id(info[0]);
+	const GLuint index = a_u32(info, 1);
+	char name[256];
+	GLsizei nlen = 0;
+	GLint size = 0;
+	GLenum type = 0;
+	glGetTransformFeedbackVarying(program, index, sizeof(name),
+	                               &nlen, &size, &type, name);
+	if (nlen == 0) { info.GetReturnValue().SetNull(); return; }
+	Local<Object> obj = new_gl_obj(iso, K_ACTIVE_INFO, 0);
+	Local<Context> c = cur(iso);
+	obj->Set(c, String::NewFromUtf8(iso, "name").ToLocalChecked(),
+	         String::NewFromUtf8(iso, name, NewStringType::kNormal,
+	                              nlen).ToLocalChecked()).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "size").ToLocalChecked(),
+	         Int32::New(iso, size)).Check();
+	obj->Set(c, String::NewFromUtf8(iso, "type").ToLocalChecked(),
+	         Uint32::NewFromUnsigned(iso, type)).Check();
+	info.GetReturnValue().Set(obj);
+}
+FN(w_pause_transform_feedback) {
+	enter_bracket();
+	glPauseTransformFeedback();
+}
+FN(w_resume_transform_feedback) {
+	enter_bracket();
+	glResumeTransformFeedback();
+}
+
+// ============================================================================
+// End phase-1.5-MED-HIGH block.
 // ============================================================================
 
 static void install_methods(Isolate *iso, Local<Object> proto) {
@@ -3984,7 +4127,20 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    // #52b — WebGL1 core getTexParameter (also folded into v1
 	    // install_methods below).
 	    {"getTexParameter", w_get_tex_parameter},
-	    // Add MED-HIGH transform-feedback here as the diag-proxy reports them.
+	    // ============================================================
+	    // Phase-1.5-MED-HIGH — 10 transform-feedback methods (ledger #55).
+	    // Counter jump 78 → 88/88 (closes the WebGL2 spec counter).
+	    // ============================================================
+	    {"createTransformFeedback", w_create_transform_feedback},
+	    {"deleteTransformFeedback", w_delete_transform_feedback},
+	    {"isTransformFeedback", w_is_transform_feedback},
+	    {"bindTransformFeedback", w_bind_transform_feedback},
+	    {"beginTransformFeedback", w_begin_transform_feedback},
+	    {"endTransformFeedback", w_end_transform_feedback},
+	    {"transformFeedbackVaryings", w_transform_feedback_varyings},
+	    {"getTransformFeedbackVarying", w_get_transform_feedback_varying},
+	    {"pauseTransformFeedback", w_pause_transform_feedback},
+	    {"resumeTransformFeedback", w_resume_transform_feedback},
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
@@ -4078,6 +4234,8 @@ void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 	    {"WebGLQuery", K_QUERY},
 	    {"WebGLSampler", K_SAMPLER},
 	    {"WebGLSync", K_SYNC},
+	    // Phase-1.5-MED-HIGH handle kind (ledger #55):
+	    {"WebGLTransformFeedback", K_TRANSFORM_FEEDBACK},
 	};
 	for (const auto &kv : MAP) {
 		Local<Value> jc;
