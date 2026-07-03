@@ -807,19 +807,36 @@ export class WebGL2RenderingContext {
 	}
 
 	/**
-	 * WebGL extensions are not currently implemented; returns an empty array.
-	 * The WebGL2 core API (which includes most WebGL1 extension
-	 * functionality) is fully available.
+	 * Phase-0 landmine defuse — these two methods are shadowed at runtime
+	 * by the native install path (`$.webgl2InitClass` → `install_methods_v2`
+	 * in [source/webgl.cc], which registers `w_get_supported_extensions`
+	 * and `w_get_extension` on the same prototype AFTER the class body runs).
+	 * Post-patch #8 the native install lands via `Object.defineProperties`,
+	 * which overwrites these class-body methods — so they are DEAD CODE
+	 * today, invisible in the return values the hardware log shows on
+	 * both v1 + v2 contexts (SAME 9 advertised extensions).
+	 *
+	 * The trap is install-order dependent: step (b) of the phase plan is
+	 * an install-order refactor, and a silent `return []` here would
+	 * masquerade as "no extensions" — indistinguishable from a driver
+	 * regression at diagnostic time. Making resurrection LOUD converts a
+	 * silent zero into an unmissable throw. See phase-0 ledger entry +
+	 * [WEBGL_EXTENSION_GAP.md §Broken-introspection D](../../../../../brewser-runtime-v8/docs/WEBGL_EXTENSION_GAP.md).
 	 */
 	getSupportedExtensions(): string[] {
-		return [];
+		throw new Error(
+			'nx.js TS extension stub reached — native install order broken ' +
+			'(getSupportedExtensions). Fix install_methods_v2 registration ' +
+			'in webgl.cc so the native overrides this class-body method.',
+		);
 	}
 
-	/**
-	 * WebGL extensions are not currently implemented; returns `null`.
-	 */
 	getExtension(name: string): any {
-		return null;
+		throw new Error(
+			'nx.js TS extension stub reached — native install order broken ' +
+			'(getExtension name=' + String(name) + '). Fix install_methods_v2 ' +
+			'registration in webgl.cc so the native overrides this class-body method.',
+		);
 	}
 
 }

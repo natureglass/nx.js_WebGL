@@ -68,6 +68,9 @@ proposal verdict.
 | 35 | engine | upstream-candidate (with #6) | PR-drafted(PR-D) | `webgl_bridge.h: depth_mask` + `webgl_bridge.h: stencil_mask` | nx_gl_state_snap_t further extension: depth_mask + stencil_mask (cut #15) |
 | 36 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: nx_gl_state_snap_t user_snap` + `webgl.cc: user_snap.viewport[0]` | WebGL bracket-state-persistence via per-call shadow-tracked user_snap |
 | 37 | engine | upstream-candidate | not-submitted | `webgl.cc: w_tex_storage_3d` | v2 texStorage3D + texSubImage3D bindings (cut #32) |
+| 43 | engine | upstream-candidate | not-submitted | `webgl.cc: populate_native_extensions` + `webgl.cc: \[gl-ext-dump\]` | Phase-0: native GL extension enumeration + `_getNativeExtensionsString`/`_getEglVersion` internals + `[gl-ext-dump]` boot log (RUNTIME_SHIMS #44 companion) |
+| 44 | **runtime** (MOVED) | fork-only | n/a | `webgl-ext-shim.ts: installGetBackendInfo` | Phase-0: `gl.getBackendInfo` runtime shim (engine #43 companion) |
+| 45 | engine | upstream-candidate | not-submitted | `webgl2-rendering-context.ts: TS extension stub reached` | Phase-0: webgl2-rendering-context.ts landmine defuse — dead TS stubs throw instead of silent `[]`/null |
 
 ## DISPOSITION POLICY
 
@@ -2123,6 +2126,83 @@ Symptom re-appeared 2026-07-02 in spectraplay (MP3 Play button "does nothing"). 
 **UPSTREAM STATUS:** `not-submitted`. Bundle with PR-D (WebGL2 method surface) or ship as a small standalone PR alongside PR-A/F/C if PR-D lags.
 
 **RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `w_tex_storage_3d`. Recurrence tell: `webgl2-texture2darray` (or any DataArrayTexture demo) renders black with no error in nxjs-debug.log → this binding regressed.
+
+---
+
+## #43 — Native GL extension enumeration + `_getNativeExtensionsString` / `_getEglVersion` + `[gl-ext-dump]` boot log — SHIPPED 2026-07-03 (phase-0 introspection prerequisite)
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — module-level cache (`s_native_ext_list`, `s_native_exts_joined`, `s_native_exts_populated`) + `populate_native_extensions()` helper + `w_get_native_extensions_string` + `w_get_egl_version` FNs + FUNCS[] entries in both `install_methods` and `install_methods_v2` + eager `populate_native_extensions()` call at the tail of `make_context_carrier()`.
+
+**Root cause.** The QuickJS-era engine populated a native-extension `has_*` flag set at backend init and exposed the raw joined string via `gl.getBackendInfo().glExtensions` ([nxjs-source/source/webgl_egl.c:8433-8509](../nxjs-source/source/webgl_egl.c#L8433-L8509)). The V8 migration dropped it — no call site in the current tree invokes `glGetString(GL_EXTENSIONS)` or `glGetStringi(GL_EXTENSIONS, i)` + `GL_NUM_EXTENSIONS`. Downstream: `com.natureglass.webglreport` at [webglreport.js:158-175](../brewser-apps/apps/experimental/com.natureglass.webglreport/webglreport.js#L158-L175) reports "gl.getBackendInfo not available" and "Native GLES Extensions # count: 0", and 17 bucket-B extension rows in the phase-0 gap analysis stay `Driver: ?` because there's no driver-truth accessor. See [WEBGL_EXTENSION_GAP.md §Broken-introspection A](../brewser-runtime-v8/docs/WEBGL_EXTENSION_GAP.md).
+
+**Fix.** ES3 enumeration path:
+
+```cpp
+GLint n = 0;
+glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+for (GLint i = 0; i < n; i++) {
+    const GLubyte *e = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+    if (e) s_native_ext_list.emplace_back((const char *)e);
+}
+std::sort(...);
+```
+
+The legacy `glGetString(GL_EXTENSIONS)` is DEPRECATED on 3.x contexts and Mesa returns NULL for it there — do not fall back to it. Cache is populated once at the tail of `make_context_carrier()` (Skia's ES3 EGL context is current at that point, by construction — the same guard `nx_skia_gpu_egl_context()` check is above the populate call). One-shot boot log:
+
+```
+[gl-ext-dump] count=<N>
+[gl-ext-dump] <ext-1>
+[gl-ext-dump] <ext-2>
+...
+```
+
+The `[gl-ext-dump]` tag is the grep target for the next hardware session's capture of Mesa-Nouveau / Tegra X1 driver truth. Two internal natives are exposed on the WebGL context proto (both v1 and v2 install paths) so the brewser-runtime `getBackendInfo` shim ([RUNTIME_SHIMS.md #44](../brewser-runtime-v8/RUNTIME_SHIMS.md#44)) can call them without needing engine `$` access:
+
+- `gl._getNativeExtensionsString()` returns the joined sorted string.
+- `gl._getEglVersion()` returns the "major.minor" parsed from `eglQueryString(EGL_VERSION)` — trailing vendor blob stripped so the shim's split-on-dot is single-token.
+
+Leading underscore signals "shim consumers only, not a WebGL spec surface" — Three.js and demo code should never call these.
+
+**No advertisement change.** This phase does NOT touch `SUPPORTED[]` at [webgl.cc:782](source/webgl.cc#L782). Bucket-A/B extension advertising is phase 1, gated on the hardware dump this phase enables.
+
+**Why upstream-vanilla lacks it.** The pre-migration fork's `nx_webgl_egl_get_backend_info` was a Brewser-diagnostic surface, not upstream nx.js. `_getNativeExtensionsString`/`_getEglVersion` and the `[gl-ext-dump]` log are minimally-scoped equivalents that upstream would plausibly accept as a `.diagnostics` sub-object on the context — flag for a TooTallNate PR after the schema stabilizes.
+
+**DISPOSITION:** `upstream-candidate` (with slight refactor to a `.diagnostics` sub-object for taste).
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `populate_native_extensions` and `[gl-ext-dump]`. Recurrence tells:
+- No `[gl-ext-dump]` in the hardware log at boot → `make_context_carrier` regressed and no context is being created, OR the eager populate call was removed.
+- `com.natureglass.webglreport` prints "count: 0" for Native GLES Extensions on hardware → the internal native regressed to returning an empty string, OR the runtime-side shim ([RUNTIME_SHIMS.md #44](../brewser-runtime-v8/RUNTIME_SHIMS.md#44)) got detached.
+- Bucket-B advertising work (phase 1) reports every driver-probe as false → `_getNativeExtensionsString` regressed and the phase-1 `has_*` helpers are reading an empty cache.
+
+**Sequencing.** Ships in the same cut as [RUNTIME_SHIMS.md #44](../brewser-runtime-v8/RUNTIME_SHIMS.md#44) — engine + runtime together; the runtime `getBackendInfo` shim without the engine natives returns empty strings for `glExtensions`, defeating the purpose.
+
+---
+
+## #45 — webgl2-rendering-context.ts landmine defuse — dead TS extension stubs throw instead of silent `[]`/null — SHIPPED 2026-07-03 (phase-0 introspection prerequisite)
+
+**File(s):** [packages/runtime/src/canvas/webgl2-rendering-context.ts](packages/runtime/src/canvas/webgl2-rendering-context.ts) lines 809-823 — `getSupportedExtensions()` and `getExtension(name)` class-body methods.
+
+**Root cause.** The class-body methods return `[]` / `null` unconditionally. At runtime they are SHADOWED by the native install path (`$.webgl2InitClass` → `install_methods_v2` in [source/webgl.cc:2180+](source/webgl.cc#L2180)), which registers `w_get_supported_extensions` / `w_get_extension` on the same prototype AFTER the class body runs. Post-patch #8 the native install lands via `Object.defineProperties`, which overwrites these class-body methods — so they are DEAD CODE today (the hardware log shows both v1 and v2 contexts returning the same 9 advertised extensions, corroborating that the native wins).
+
+The trap is install-order dependent. Step (b) of the phase plan is an install-order refactor; a silent `return []` here after any refactor of the install ordering would masquerade as "no extensions" — indistinguishable from a driver regression at diagnostic time, and specifically indistinguishable from the pre-#43 empty-list bug.
+
+**Fix.** Replace both method bodies with `throw new Error('nx.js TS extension stub reached — native install order broken ...')` carrying the offending method name. Making resurrection LOUD converts a silent zero into an unmissable throw with a distinctive grep string.
+
+**Why not delete the methods entirely.** The class-body method declarations are what give TypeScript the "these are on WebGL2RenderingContext" typing at compile time (the merged interface below only declares the ~220 native methods). Deleting the bodies would drop the type-level guarantees. Making them throw preserves the type surface while making runtime resurrection audible.
+
+**Why upstream-vanilla lacks it.** Upstream ships the `return []` / `return null` stub bodies as-is (they predate our phase-0 hardening).
+
+**DISPOSITION:** `upstream-candidate`. Trivial change; upstream should take it (or delete the methods outright, but the throw is the safer default for embedders that observe the same install-order sensitivity).
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/webgl2-rendering-context.ts](packages/runtime/src/canvas/webgl2-rendering-context.ts) for `TS extension stub reached`. Recurrence tells:
+- The literal error string appearing in a hardware log or a demo's console-error handler → the native install order regressed and the phase-0 landmine tripped. Fix the install order in webgl.cc's `install_methods_v2` registration, do NOT quiet the throw.
+- Grep hit missing → someone reverted to the silent `return []` stub. Restore the throw.
+
+**Sequencing.** Ships in the same cut as #43 + [RUNTIME_SHIMS.md #44](../brewser-runtime-v8/RUNTIME_SHIMS.md#44).
 
 ---
 

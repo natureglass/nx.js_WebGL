@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -166,6 +167,61 @@ struct WebGLState {
 };
 
 WebGLState *st = nullptr;
+
+// Native GL extension cache. Populated once at first WebGL context
+// creation via glGetStringi(GL_EXTENSIONS, i) over GL_NUM_EXTENSIONS —
+// the ES3 path; the legacy glGetString(GL_EXTENSIONS) is deprecated
+// for 3.x contexts and Mesa returns NULL for it there. Populate emits
+// a one-shot [gl-ext-dump] boot log the next hardware session greps
+// to resolve all bucket-B extension rows (s3tc, s3tc_srgb, astc,
+// anisotropic, EXT_frag_depth, WEBGL_draw_buffers, EXT_shader_texture_lod,
+// disjoint_timer_query, etc.) against the actual Mesa-Nouveau / Tegra
+// X1 driver capability set. Introspection surface only — no
+// advertisement changes to SUPPORTED[] at [webgl.cc:782] this phase;
+// that is gated on the hardware dump per the phase-0 plan.
+static std::vector<std::string> s_native_ext_list;
+static std::string s_native_exts_joined;
+static bool s_native_exts_populated = false;
+
+static void populate_native_extensions() {
+	if (s_native_exts_populated) return;
+	s_native_exts_populated = true;
+	// GL error hygiene (rider B) — drain any pre-existing error before the
+	// enumeration so any residual we observe below is attributable to our
+	// own calls, and drain at the end so downstream engine code (notably
+	// the commit-2 [bridge-fbo] completeness assert) never sees a stale
+	// error left by us.
+	while (glGetError() != GL_NO_ERROR) { /* drain */ }
+	GLint n = 0;
+	glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+	if (n < 0) n = 0;
+	s_native_ext_list.reserve((size_t)n);
+	for (GLint i = 0; i < n; i++) {
+		const GLubyte *e = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+		if (e) s_native_ext_list.emplace_back((const char *)e);
+	}
+	GLenum err = glGetError();
+	if (err != GL_NO_ERROR) {
+		fprintf(stderr,
+		        "[gl-ext-dump:err] enumeration left GL error 0x%x — draining\n",
+		        (unsigned)err);
+		while (glGetError() != GL_NO_ERROR) { /* drain */ }
+	}
+	std::sort(s_native_ext_list.begin(), s_native_ext_list.end());
+	size_t total = 0;
+	for (const auto &e : s_native_ext_list) total += e.size() + 1;
+	s_native_exts_joined.reserve(total);
+	for (size_t i = 0; i < s_native_ext_list.size(); i++) {
+		if (i) s_native_exts_joined.push_back(' ');
+		s_native_exts_joined += s_native_ext_list[i];
+	}
+	// [gl-ext-dump] one-shot — grep target for hardware capture.
+	fprintf(stderr, "[gl-ext-dump] count=%d\n", (int)s_native_ext_list.size());
+	for (const auto &e : s_native_ext_list) {
+		fprintf(stderr, "[gl-ext-dump] %s\n", e.c_str());
+	}
+	fflush(stderr);
+}
 
 void free_gl_obj(GLObj *o) { delete o; }
 
@@ -759,6 +815,49 @@ FN(w_get_supported_extensions) {
 	}
 	info.GetReturnValue().Set(arr);
 }
+// Phase-0 gap fill — restore native GL extension visibility the QuickJS-
+// era engine exposed via `gl.getBackendInfo().glExtensions` and which the
+// V8 migration dropped. Internal-only native (leading underscore names
+// signal "shim consumers only, not spec surface"). Returns the joined
+// space-separated native GL extension string (sorted alphabetically) so
+// the brewser-runtime getBackendInfo shim can pass it through unchanged
+// to com.natureglass.webglreport, which splits it back into tokens at
+// [webglreport.js:199]. See WEBGL_EXTENSION_GAP.md §Broken-introspection A
+// and phase-0 ledger entry.
+FN(w_get_native_extensions_string) {
+	populate_native_extensions();
+	Isolate *iso = info.GetIsolate();
+	info.GetReturnValue().Set(
+	    String::NewFromUtf8(iso, s_native_exts_joined.c_str(),
+	                        NewStringType::kNormal,
+	                        (int)s_native_exts_joined.size())
+	        .ToLocalChecked());
+}
+
+// Phase-0 gap fill — EGL version string for the getBackendInfo shim's
+// `eglMajor`/`eglMinor` fields (matches pre-migration schema at
+// [nxjs-source/source/webgl_egl.c:8433-8509]). Uses eglQueryString
+// (idempotent, no re-init) on the display Skia already brought up.
+// Returned form: "major.minor" (e.g. "1.5"); trailing vendor blob per
+// EGL spec is stripped so the shim's parse is a single split-on-dot.
+// Empty string means the display isn't up yet (never happens at
+// getContext time; guard is defensive).
+FN(w_get_egl_version) {
+	Isolate *iso = info.GetIsolate();
+	EGLDisplay dpy = nx_skia_gpu_egl_display();
+	const char *raw = dpy ? eglQueryString(dpy, EGL_VERSION) : nullptr;
+	std::string out;
+	if (raw) {
+		const char *end = raw;
+		while (*end && *end != ' ' && *end != '\t') end++;
+		out.assign(raw, (size_t)(end - raw));
+	}
+	info.GetReturnValue().Set(
+	    String::NewFromUtf8(iso, out.c_str(), NewStringType::kNormal,
+	                        (int)out.size())
+	        .ToLocalChecked());
+}
+
 FN(w_is_context_lost) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), false));
 }
@@ -1960,6 +2059,12 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"getParameter", w_get_parameter},
 	    {"getExtension", w_get_extension},
 	    {"getSupportedExtensions", w_get_supported_extensions},
+	    // Phase-0 gap fill — internal natives for the runtime's
+	    // getBackendInfo shim. Leading underscore signals "shim
+	    // consumers only, not a WebGL spec surface". See
+	    // populate_native_extensions() rationale + phase-0 ledger entry.
+	    {"_getNativeExtensionsString", w_get_native_extensions_string},
+	    {"_getEglVersion", w_get_egl_version},
 	    {"isContextLost", w_is_context_lost},
 	    {"getContextAttributes", w_get_context_attributes},
 	    {"getShaderPrecisionFormat", w_get_shader_precision_format},
@@ -2112,6 +2217,12 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"getParameter", w_get_parameter},
 	    {"getExtension", w_get_extension},
 	    {"getSupportedExtensions", w_get_supported_extensions},
+	    // Phase-0 gap fill — internal natives for the runtime's
+	    // getBackendInfo shim. Leading underscore signals "shim
+	    // consumers only, not a WebGL spec surface". See
+	    // populate_native_extensions() rationale + phase-0 ledger entry.
+	    {"_getNativeExtensionsString", w_get_native_extensions_string},
+	    {"_getEglVersion", w_get_egl_version},
 	    {"isContextLost", w_is_context_lost},
 	    {"getContextAttributes", w_get_context_attributes},
 	    {"getShaderPrecisionFormat", w_get_shader_precision_format},
@@ -2418,6 +2529,14 @@ static Local<Object> make_context_carrier(Isolate *iso,
 		}
 	}
 	nx_webgl_bridge_set_webgl_owned(true);
+
+	// Phase-0 — populate the native GL extension cache and emit the
+	// [gl-ext-dump] one-shot boot log. Bridge init above guarantees the
+	// shared ES3 EGL context is current; glGetIntegerv(GL_NUM_EXTENSIONS)
+	// + glGetStringi(GL_EXTENSIONS, i) is legal at this point. First
+	// context creation fires the dump; subsequent creations are cheap
+	// no-ops via the `s_native_exts_populated` guard.
+	populate_native_extensions();
 
 	// Mint the context carrier object. The TS factory sets its prototype to
 	// WebGL{2}RenderingContext, so install_methods{,_v2} having populated the

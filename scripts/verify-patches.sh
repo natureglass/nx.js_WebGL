@@ -304,6 +304,60 @@ check 24 "cube-route-shim allocateCubeRTAtlas rescue" \
 check 24 "cube-route-shim framebufferTexture2D wrap" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     'framebufferTexture2D'
+# #43 — Phase-0: native GL extension enumeration + [gl-ext-dump] boot log.
+check 43 "webgl.cc populate_native_extensions helper" \
+    "$NXJS/source/webgl.cc" \
+    'populate_native_extensions'
+check 43 "webgl.cc emits [gl-ext-dump] boot log" \
+    "$NXJS/source/webgl.cc" \
+    '\[gl-ext-dump\]'
+check 43 "webgl.cc _getNativeExtensionsString native binding" \
+    "$NXJS/source/webgl.cc" \
+    '_getNativeExtensionsString.*w_get_native_extensions_string'
+check 43 "webgl.cc _getEglVersion native binding" \
+    "$NXJS/source/webgl.cc" \
+    '_getEglVersion.*w_get_egl_version'
+check 43 "webgl.cc glGetStringi(GL_EXTENSIONS) enumeration path" \
+    "$NXJS/source/webgl.cc" \
+    'glGetStringi\s*\(\s*GL_EXTENSIONS'
+check 43 "webgl.cc eager populate call in make_context_carrier" \
+    "$NXJS/source/webgl.cc" \
+    'populate_native_extensions\(\);'
+
+# #44 — Phase-0: gl.getBackendInfo runtime shim.
+check 44 "webgl-ext-shim.ts installGetBackendInfo export" \
+    "$RUNTIME/src/scripts/webgl-ext-shim.ts" \
+    'export function installGetBackendInfo'
+check 44 "webgl-ext-shim.ts marker-guard uses Symbol.for" \
+    "$RUNTIME/src/scripts/webgl-ext-shim.ts" \
+    "Symbol\\.for\\('brewserGetBackendInfoInstalled'\\)"
+check 44 "webgl-shim.ts wires installGetBackendInfo on native branch" \
+    "$RUNTIME/src/shims/webgl-shim.ts" \
+    'installGetBackendInfo\(nativeContext'
+check 44 "webgl-shim.ts wires installGetBackendInfo on future branch" \
+    "$RUNTIME/src/shims/webgl-shim.ts" \
+    'installGetBackendInfo\(futureContext'
+check 44 "webgl-ext-shim.ts schema field: glExtensions" \
+    "$RUNTIME/src/scripts/webgl-ext-shim.ts" \
+    'glExtensions'
+check 44 "webgl-ext-shim.ts schema field: eglMajor" \
+    "$RUNTIME/src/scripts/webgl-ext-shim.ts" \
+    'eglMajor'
+check 44 "webgl-ext-shim.ts schema field: bridgeRequestedWidth" \
+    "$RUNTIME/src/scripts/webgl-ext-shim.ts" \
+    'bridgeRequestedWidth'
+
+# #45 — Phase-0: webgl2-rendering-context.ts landmine defuse.
+check 45 "webgl2-rendering-context.ts TS stub throws distinctive error" \
+    "$NXJS/packages/runtime/src/canvas/webgl2-rendering-context.ts" \
+    'TS extension stub reached'
+check_absent 45 "webgl2-rendering-context.ts stub no longer silently returns []" \
+    "$NXJS/packages/runtime/src/canvas/webgl2-rendering-context.ts" \
+    'getSupportedExtensions\(\)\s*:\s*string\[\]\s*\{\s*return\s*\[\];'
+check_absent 45 "webgl2-rendering-context.ts stub no longer silently returns null" \
+    "$NXJS/packages/runtime/src/canvas/webgl2-rendering-context.ts" \
+    'getExtension\(name:\s*string\)\s*:\s*any\s*\{\s*return\s*null;'
+
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="
