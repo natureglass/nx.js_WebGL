@@ -82,6 +82,55 @@ proves it isn't probe state leakage. Interim `glDrawElements` fallback shipped
 
 ---
 
+## §#55-pause — `pauseTransformFeedback` + `resumeTransformFeedback` reset the buffer write pointer instead of continuing
+
+**Ledger:** [NXJS_PATCHES_NEEDED.md #55](../NXJS_PATCHES_NEEDED.md#55).
+
+**Citron observation.** `gl-probes-v0.9.0.log` on Citron 2026-07-03: TF_CAPTURE
+probe PASS (3-vertex SEPARATE_ATTRIBS capture works end-to-end with correct
+[11,12,13,14, 21,22,23,24, 31,32,33,34] readback for ids [10,20,30]). TF_ERR
+probe PASS (nested `beginTransformFeedback` → INVALID_OPERATION as expected).
+TF_PAUSE FAIL: begin → draw id=100 → pause → draw id=200 → resume → draw
+id=300 → end. Expected slot 0 = id=100's `[101,102,103,104]`; observed slot 0
+= `[301,302,303,304]` (id=300's values). Pattern is consistent with
+"pause+resume treated as end+begin" — the buffer write pointer resets on
+`resumeTransformFeedback`, and id=300's capture overwrites id=100's slot.
+
+**Discriminator** (from probe detail): `ePauseCtx=0x0 ePause=0x0 eResume=0x0 eEnd=0x0`
+— no GL errors anywhere. All four TF entry points accepted their arguments.
+
+Same **Citron-observed / hardware-pending** class as §#52a and §#54.
+
+**Hardware probe recipe.**
+
+1. Deploy gl-probes v0.10.0+ files verbatim (no engine rebuild needed — the
+   underlying TF surface is engine-native and doesn't gate on any build
+   flag).
+2. Boot Switch + brewser → **GL Probes**.
+3. Navigate to `brewser://apps/experimental/com.natureglass.gl-probes/index.html?strict=1`
+   to disable the pass-quirk relaxation.
+4. Click **Run Probes (WebGL 2)**. Capture
+   `sdmc:/switch/brewser/logs/gl-probes-v<VER>.log`.
+
+**HW verdict** (fill in on hardware session):
+- `[  ]` TF_PAUSE PASS strict — probe detail reads
+  `pause skipped id=200, captured id=100 + id=300 in order` →
+  Citron-only issue. Reword this runbook entry + ledger #55 to
+  "Citron-emulator quirk".
+- `[  ]` TF_PAUSE FAIL strict with same quirk signature
+  (`pause+resume acted as end+begin`) → Real Mesa Nouveau NV120 driver
+  ceiling. Reclassify to `driver-ceiling — no engine fix planned` and
+  add to `[[reference-mesa-nouveau-layered-sampling-unsupported]]`-family
+  reference memory. Note: this only affects apps that use TF
+  pause/resume specifically — TF_CAPTURE / TF_ERR still work fine.
+- `[  ]` TF_PAUSE FAIL strict with DIFFERENT signature (e.g., all-sentinel,
+  or "pauseTransformFeedback silently no-oped — all 3 vertices captured") →
+  Different driver bug — attach hardware log and open a new sub-item.
+
+**HW session date / hardware model / verdict:** _pending_
+
+---
+
 ## §#54 — Occlusion query `ANY_SAMPLES_PASSED` returns 0 despite pixels drawn
 
 **Ledger:** [NXJS_PATCHES_NEEDED.md #54](../NXJS_PATCHES_NEEDED.md#54).

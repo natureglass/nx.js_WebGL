@@ -2749,11 +2749,13 @@ Sum: 10 methods = counter +10 = 78 → **88/88 (spec-complete)**.
 
 **UPSTREAM STATUS:** `not-submitted`.
 
+**Citron-observed / hardware-pending sub-item — TF pause/resume.** gl-probes v0.9.0 TF_PAUSE probe observed a driver behavior where `resumeTransformFeedback` resets the buffer write pointer (id=300 overwrote slot 0 that id=100 had captured); pattern is consistent with pause+resume being treated as end+begin. TF_CAPTURE and TF_ERR both PASS strict — the driver-quirk is specific to pause/resume semantics, not the wider TF surface. Verdict pending real-Tegra smoke per docs/HW_SESSION_RUNBOOK.md §#55-pause. gl-probes v0.10.0 TF_PAUSE tags this shape as PASS-QUIRK-RELAXED with the annotation `pause+resume acted as end+begin — id=300 overwrote slot 0, only 1 slot ever captured` (three quirk shapes recognized: this shape, all-sentinel silent-noop, and pause-silently-noop; STRICT mode requires the spec-conformant shape).
+
 **RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Phase-1.5-MED-HIGH`, `w_begin_transform_feedback`, `K_TRANSFORM_FEEDBACK`, `"WebGLTransformFeedback"`. Recurrence tells:
 - Report renders `78 / 88 implemented` post-hardware → the MED-HIGH FUNCS[] block regressed. Check `install_methods_v2` for the 10 new entries.
 - gl-probes TF_CAPTURE probe FAILs with buffer readback zeros → `transformFeedbackVaryings` did not take effect (missing relink post-binding) OR `beginTransformFeedback`/`endTransformFeedback` are silently no-op'ing.
-- gl-probes TF_PAUSE_RESUME probe FAILs with 3 captured vertices instead of 2 → pause is silently a no-op on the driver (see docs/HW_SESSION_RUNBOOK.md for hardware verdict process).
-- gl-probes TF_BEGIN_ACTIVE probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
+- gl-probes TF_PAUSE probe FAIL under non-strict (i.e., not just PASS-QUIRK-RELAXED but actual FAIL) → a new driver-quirk shape appeared that the probe doesn't yet recognize; capture the `out=[...]` array and open a new sub-item.
+- gl-probes TF_ERR probe FAILs with GL_NO_ERROR instead of INVALID_OPERATION → the driver isn't rejecting nested begin — quietly wrong; open a ledger followup.
 
 **Sequencing.** Fourth and final phase-1.5 tier per plan §0.1.1's decided order. Closes the phase-1.5 counter progression at 88/88.
 
