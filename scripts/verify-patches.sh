@@ -521,6 +521,45 @@ check 47 "webgl.cc compressedTexSubImage2D wired in FUNCS[] (both v1+v2)" \
     "$NXJS/source/webgl.cc" \
     '"compressedTexSubImage2D", w_compressed_tex_sub_image_2d'
 
+# #48 — Phase-1 batch 2A: Unity-P1 v1 function surfaces + software shims +
+# rider-1 ETC2/EAC.
+check 48 "webgl.cc probe_ext_frag_depth helper" \
+    "$NXJS/source/webgl.cc" \
+    'static bool probe_ext_frag_depth'
+check 48 "webgl.cc emits [frag-depth-probe] result" \
+    "$NXJS/source/webgl.cc" \
+    '\[frag-depth-probe\]'
+check 48 "webgl.cc w_get_extension has ANGLE_instanced_arrays branch (v1)" \
+    "$NXJS/source/webgl.cc" \
+    '"ANGLE_instanced_arrays"'
+check 48 "webgl.cc w_get_extension has WEBGL_draw_buffers branch (v1)" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_draw_buffers"'
+check 48 "webgl.cc w_get_extension has EXT_frag_depth branch (v1, probe-gated)" \
+    "$NXJS/source/webgl.cc" \
+    '"EXT_frag_depth"'
+check 48 "webgl.cc w_get_extension has WEBGL_lose_context branch" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_lose_context"'
+check 48 "webgl.cc w_get_extension has WEBGL_debug_shaders branch" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_debug_shaders"'
+check 48 "webgl.cc w_get_extension has WEBGL_compressed_texture_etc branch (rider 1)" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_compressed_texture_etc"'
+check 48 "webgl.cc v1 install_methods gains drawArraysInstanced" \
+    "$NXJS/source/webgl.cc" \
+    '"drawArraysInstanced", w_draw_arrays_instanced'
+check 48 "webgl.cc v1 install_methods gains vertexAttribDivisor" \
+    "$NXJS/source/webgl.cc" \
+    '"vertexAttribDivisor", w_vertex_attrib_divisor'
+check 48 "webgl.cc v1 install_methods gains drawBuffers" \
+    "$NXJS/source/webgl.cc" \
+    '"drawBuffers", w_draw_buffers'
+check 48 "webgl.cc OES_vertex_array_object advertised on v1 (list-flip retires #42 asymmetry)" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("OES_vertex_array_object"\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

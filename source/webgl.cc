@@ -236,6 +236,54 @@ static bool has_native_ext(const char *token) {
 	                          s_native_ext_list.end(), std::string(token));
 }
 
+// Phase-1 batch-2 helper — driver-accept probe for ESSL-100 shader
+// `#extension GL_EXT_frag_depth : enable` + `gl_FragDepthEXT` writes.
+// Even though `GL_EXT_frag_depth` is in the 134-list on Nouveau, the
+// WebGL1 shader form (#version 100 with gl_FragDepthEXT) needs a compile
+// probe — a driver that ships the native ES3 extension token might not
+// accept the promotion-path GLSL directive. Result cached process-wide;
+// probe runs at most once. Emits `[frag-depth-probe] ACCEPT` or
+// `[frag-depth-probe] REJECT log=...` to stderr for the batch report.
+// Establishes the pattern for batch-3's WEBGL_blend_func_extended
+// ESSL-100 probe.
+static bool s_frag_depth_probed = false;
+static bool s_frag_depth_ok = false;
+static bool probe_ext_frag_depth() {
+	if (s_frag_depth_probed) return s_frag_depth_ok;
+	s_frag_depth_probed = true;
+	const char *src =
+	    "#version 100\n"
+	    "#extension GL_EXT_frag_depth : enable\n"
+	    "precision mediump float;\n"
+	    "void main() {\n"
+	    "    gl_FragColor = vec4(1.0);\n"
+	    "    gl_FragDepthEXT = 0.5;\n"
+	    "}\n";
+	GLuint sh = glCreateShader(GL_FRAGMENT_SHADER);
+	if (!sh) {
+		fprintf(stderr, "[frag-depth-probe] REJECT reason=create-shader-failed\n");
+		fflush(stderr);
+		return false;
+	}
+	glShaderSource(sh, 1, &src, nullptr);
+	glCompileShader(sh);
+	GLint ok = 0;
+	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+	if (ok) {
+		fprintf(stderr, "[frag-depth-probe] ACCEPT\n");
+	} else {
+		char log[512] = {0};
+		GLsizei n = 0;
+		glGetShaderInfoLog(sh, sizeof(log) - 1, &n, log);
+		fprintf(stderr, "[frag-depth-probe] REJECT log=%.*s\n",
+		        (int)(n > 0 ? n : 0), log);
+	}
+	fflush(stderr);
+	glDeleteShader(sh);
+	s_frag_depth_ok = (ok != 0);
+	return s_frag_depth_ok;
+}
+
 // Phase-1 batch-1 helper — v1 vs v2 context detection from the receiver
 // object. `make_context_carrier` at [webgl.cc: is_v2 ? Set(__webgl2)]
 // stamps `__webgl2 = true` on v2 carriers. All context-shared FNs
@@ -813,6 +861,16 @@ FN(w_create_vertex_array);
 FN(w_bind_vertex_array);
 FN(w_delete_vertex_array);
 FN(w_is_vertex_array);
+// Phase-1 batch-2 forward decls — the ANGLE_instanced_arrays and
+// WEBGL_draw_buffers ext objects vend suffixed method names that alias
+// these v2-core natives; the actual FN bodies are defined later in the
+// file. Also `w_is_context_lost` used by the WEBGL_lose_context branch.
+// Same pattern as the VAO forward decls above.
+FN(w_draw_arrays_instanced);
+FN(w_draw_elements_instanced);
+FN(w_vertex_attrib_divisor);
+FN(w_draw_buffers);
+FN(w_is_context_lost);
 
 FN(w_get_extension) {
 	Isolate *iso = info.GetIsolate();
@@ -1121,6 +1179,150 @@ FN(w_get_extension) {
 		info.GetReturnValue().Set(Object::New(iso));
 		return;
 	}
+	// Phase-1 batch-2 rider-1 — WEBGL_compressed_texture_etc (ETC2/EAC).
+	// 10 sized internalformats accepted by ES3 core through the
+	// `compressedTexImage2D` native wired in batch 1.
+	if (strcmp(name, "WEBGL_compressed_texture_etc") == 0) {
+		make_obj_with({
+		    {"COMPRESSED_R11_EAC", 0x9270},
+		    {"COMPRESSED_SIGNED_R11_EAC", 0x9271},
+		    {"COMPRESSED_RG11_EAC", 0x9272},
+		    {"COMPRESSED_SIGNED_RG11_EAC", 0x9273},
+		    {"COMPRESSED_RGB8_ETC2", 0x9274},
+		    {"COMPRESSED_SRGB8_ETC2", 0x9275},
+		    {"COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2", 0x9276},
+		    {"COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2", 0x9277},
+		    {"COMPRESSED_RGBA8_ETC2_EAC", 0x9278},
+		    {"COMPRESSED_SRGB8_ALPHA8_ETC2_EAC", 0x9279}});
+		return;
+	}
+	// Phase-1 batch-2 — ANGLE_instanced_arrays (v1). Alias the ES3 core
+	// natives already installed on v1's FUNCS[] (batch-2 registers
+	// `drawArraysInstanced` / `drawElementsInstanced` / `vertexAttribDivisor`
+	// on v1's install_methods table). The `-ANGLE`-suffixed extension
+	// methods point at the SAME native handlers; JS-side round-trips
+	// through the wrapped surface reach the same GL entry.
+	if (!v2 && has_native_ext("GL_EXT_draw_instanced") &&
+	    strcmp(name, "ANGLE_instanced_arrays") == 0) {
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso,
+		           "VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE").ToLocalChecked(),
+		       Uint32::NewFromUnsigned(iso, 0x88FE)).Check();
+		o->Set(c, String::NewFromUtf8(iso, "drawArraysInstancedANGLE")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_draw_arrays_instanced)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "drawElementsInstancedANGLE")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_draw_elements_instanced)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "vertexAttribDivisorANGLE")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_vertex_attrib_divisor)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// Phase-1 batch-2 — WEBGL_draw_buffers (v1). Aliases the v2 core
+	// `drawBuffers` native (registered on v1's install_methods in this
+	// batch). Constants + `drawBuffersWEBGL` method.
+	if (!v2 && has_native_ext("GL_EXT_draw_buffers") &&
+	    strcmp(name, "WEBGL_draw_buffers") == 0) {
+		Local<Object> o = Object::New(iso);
+		auto set_u = [&](const char *k, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, k).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		set_u("MAX_COLOR_ATTACHMENTS_WEBGL", 0x8CDF);
+		set_u("MAX_DRAW_BUFFERS_WEBGL", 0x8824);
+		// COLOR_ATTACHMENT{0..15}_WEBGL (0x8CE0..0x8CEF)
+		for (int i = 0; i < 16; i++) {
+			char k[40];
+			snprintf(k, sizeof(k), "COLOR_ATTACHMENT%d_WEBGL", i);
+			set_u(k, 0x8CE0 + i);
+		}
+		// DRAW_BUFFER{0..15}_WEBGL (0x8825..0x8834)
+		for (int i = 0; i < 16; i++) {
+			char k[40];
+			snprintf(k, sizeof(k), "DRAW_BUFFER%d_WEBGL", i);
+			set_u(k, 0x8825 + i);
+		}
+		o->Set(c, String::NewFromUtf8(iso, "drawBuffersWEBGL")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_draw_buffers)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// Phase-1 batch-2 — EXT_frag_depth (v1). Advertise-only per spec
+	// (enables `#extension GL_EXT_frag_depth : enable` + `gl_FragDepthEXT`
+	// writes in #version 100 shaders). Empty object per Khronos.
+	// Compile-probe-gated at advertising time above.
+	if (!v2 && has_native_ext("GL_EXT_frag_depth") &&
+	    probe_ext_frag_depth() &&
+	    strcmp(name, "EXT_frag_depth") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// Phase-1 batch-2 — WEBGL_lose_context (both). Software-only,
+	// minimal impl: `loseContext` / `restoreContext` are no-ops; the
+	// caller can still call them without hitting undefined-method
+	// TypeErrors. `isContextLost` piggybacks on the existing
+	// `w_is_context_lost` (returns false since brewser never actually
+	// loses the context under the shared-EGL bracket contract).
+	// Event dispatch (webglcontextlost/restored on the canvas element)
+	// is out of scope; if a future demo needs it, a runtime shim can
+	// wrap this ext object and intercept the methods.
+	if (strcmp(name, "WEBGL_lose_context") == 0) {
+		auto noop_cb = [](const FunctionCallbackInfo<Value> &) {};
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso, "loseContext").ToLocalChecked(),
+		       FunctionTemplate::New(iso, noop_cb)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "restoreContext").ToLocalChecked(),
+		       FunctionTemplate::New(iso, noop_cb)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "isContextLost").ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_is_context_lost)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// Phase-1 batch-2 — WEBGL_debug_shaders (both). Software-only.
+	// `getTranslatedShaderSource(shader)` returns the source string
+	// verbatim as submitted via `shaderSource(shader, source)`. This
+	// stack does no WebGL→ES3 shader translation (unlike ANGLE); the
+	// "translated" and "submitted" source are the same. Matches Mesa's
+	// GL_ARB_debug_shaders convention.
+	if (strcmp(name, "WEBGL_debug_shaders") == 0) {
+		auto get_translated_cb = [](const FunctionCallbackInfo<Value> &pinfo) {
+			Isolate *iso2 = pinfo.GetIsolate();
+			enter_bracket();
+			if (pinfo.Length() < 1) return;
+			GLObj *o = get_gl_obj(pinfo[0]);
+			if (!o || o->kind != K_SHADER) return;
+			GLint len = 0;
+			glGetShaderiv(o->id, GL_SHADER_SOURCE_LENGTH, &len);
+			if (len <= 0) {
+				pinfo.GetReturnValue().Set(
+				    String::NewFromUtf8(iso2, "").ToLocalChecked());
+				return;
+			}
+			std::vector<char> buf((size_t)len);
+			GLsizei got = 0;
+			glGetShaderSource(o->id, len, &got, buf.data());
+			pinfo.GetReturnValue().Set(
+			    String::NewFromUtf8(iso2, buf.data(), NewStringType::kNormal,
+			                        (int)got).ToLocalChecked());
+		};
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso, "getTranslatedShaderSource")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, get_translated_cb)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
 	// Everything else: not advertised yet. Return null (the spec value for
 	// "extension not supported"). 2.E will widen this list as the slice
 	// demos hit it.
@@ -1190,6 +1392,43 @@ FN(w_get_supported_extensions) {
 		out.push_back("EXT_render_snorm");
 	if (v2)
 		out.push_back("WEBGL_stencil_texturing");  // ES3.1 core
+	// Phase-1 batch-2 rider-1 — WEBGL_compressed_texture_etc (ETC2/EAC).
+	// Bucket A: core ES3 compressed formats (no driver-token gate; ES3
+	// spec guarantees). Batch 1 skipped this by OVERSIGHT — the plan's
+	// §4.1 add-list correctly included it, but the batch-1
+	// implementation only wired ETC1 (via GL_OES_compressed_ETC1_RGB8_
+	// texture). Batch 2 closes the omission.
+	out.push_back("WEBGL_compressed_texture_etc");
+	// Phase-1 batch-2 — Unity-P1 v1 function surfaces.
+	if (!v2 && has_native_ext("GL_EXT_draw_instanced"))
+		out.push_back("ANGLE_instanced_arrays");
+	if (!v2 && has_native_ext("GL_EXT_draw_buffers"))
+		out.push_back("WEBGL_draw_buffers");
+	// #42 list-flip: OES_vertex_array_object was intentionally list-hidden
+	// pre-batch-2 (see [NXJS_PATCHES_NEEDED.md #42] rationale). Batch 2
+	// retires the asymmetry: advertise on v1 so `getSupportedExtensions`
+	// and `getExtension` agree. The runtime pre-arm route still calls
+	// `getExtension('OES_vertex_array_object')` by name; that path is
+	// unaffected (the vended object is the same). Three.js path-change
+	// risk documented in plan §1.3 — suite guard on this batch's smoke.
+	if (!v2 && has_native_ext("GL_OES_vertex_array_object"))
+		out.push_back("OES_vertex_array_object");
+	// EXT_frag_depth (v1): compile-probe-gated per plan §2.4. Native
+	// token IS in the 134-list, but only advertise if ESSL-100 accepts
+	// the extension directive. Probe result cached; runs at most once.
+	if (!v2 && has_native_ext("GL_EXT_frag_depth") &&
+	    probe_ext_frag_depth())
+		out.push_back("EXT_frag_depth");
+	// WEBGL_lose_context (both) — software-only per plan §2.1. Engine
+	// vends a spec-legal minimal object (no-op loseContext/restoreContext
+	// + isContextLost returning false). Event dispatch on canvas element
+	// is out of scope for a minimal impl; adding events later goes in a
+	// runtime shim without changing this advertising row.
+	out.push_back("WEBGL_lose_context");
+	// WEBGL_debug_shaders (both) — software-only. `getTranslatedShaderSource`
+	// returns the source as submitted (this stack does no WebGL→ES3
+	// translation), consistent with the Mesa GL_ARB_debug_shaders impl.
+	out.push_back("WEBGL_debug_shaders");
 	Local<Array> arr = Array::New(iso, (int)out.size());
 	for (size_t i = 0; i < out.size(); i++) {
 		arr->Set(c, (uint32_t)i,
@@ -2592,6 +2831,17 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"drawArrays", w_draw_arrays},
 	    {"drawElements", w_draw_elements},
 	    {"readPixels", w_read_pixels},
+	    // Phase-1 batch-2 — Unity-P1 v1 function surfaces. Aliases the v2
+	    // core natives so the WebGL1 ext objects (ANGLE_instanced_arrays,
+	    // WEBGL_draw_buffers) can vend `-ANGLE` / `-WEBGL` suffixed
+	    // methods that point at the SAME native handlers. Also flips
+	    // the report's `extInstancedArraysPresent: false` on v1 to true
+	    // (getBackendInfo shim probes `typeof gl.drawArraysInstanced ===
+	    // 'function'`; before this batch the v1 table lacked those).
+	    {"drawArraysInstanced", w_draw_arrays_instanced},
+	    {"drawElementsInstanced", w_draw_elements_instanced},
+	    {"vertexAttribDivisor", w_vertex_attrib_divisor},
+	    {"drawBuffers", w_draw_buffers},
 	    // Fork-specific hooks (canvas-runner expects them).
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},

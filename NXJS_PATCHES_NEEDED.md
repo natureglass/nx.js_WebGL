@@ -76,6 +76,7 @@ proposal verdict.
 | 45 | engine | upstream-candidate | not-submitted | `webgl2-rendering-context.ts: TS extension stub reached` | Phase-0: webgl2-rendering-context.ts landmine defuse — dead TS stubs throw instead of silent `[]`/null |
 | 46 | engine | upstream-candidate | not-submitted | `webgl_bridge.cc: GL_DEPTH24_STENCIL8` + `webgl_bridge.cc: \[bridge-fbo:` | Phase-0 commit 2: bridge FBO stencil contract — DEPTH24_STENCIL8 renderbuffer + combined attach + STENCIL_BITS=8 wire + [bridge-fbo] completeness assert |
 | 47 | engine | upstream-candidate | not-submitted | `webgl.cc: has_native_ext` + `webgl.cc: is_v2_context` + `webgl.cc: w_compressed_tex_image_2d` | Phase-1 batch 1: driver-probed advertisement + 16 batch-1 extension rows + compressed 2D upload natives + UNMASKED/MAX_ANISO getParameter branches |
+| 48 | engine | upstream-candidate | not-submitted | `webgl.cc: probe_ext_frag_depth` + `webgl.cc: ANGLE_instanced_arrays` + `webgl.cc: WEBGL_debug_shaders` | Phase-1 batch 2A: Unity-P1 v1 function surfaces (ANGLE_instanced_arrays, WEBGL_draw_buffers, EXT_frag_depth probe, OES_VAO list-flip) + WEBGL_lose_context / WEBGL_debug_shaders software minimal impls + WEBGL_compressed_texture_etc (rider 1) |
 
 ## DISPOSITION POLICY
 
@@ -2361,6 +2362,66 @@ Each has a matching `w_get_extension` branch returning the spec constants (singl
 - Any demo calling `gl.compressedTexImage2D(...)` throws `TypeError: is not a function` → FUNCS[] entries regressed. Grep both install_methods and install_methods_v2 for the two entries.
 
 **Sequencing.** First of three phase-1 extension batches. Batches 2 and 3 land after phase-1.5 core-native tiers per [docs/EXTENSION_PORT_PLAN.md §0.1.1](../brewser-runtime-v8/docs/EXTENSION_PORT_PLAN.md).
+
+---
+
+## #48 — Phase-1 batch 2A: Unity-P1 v1 function surfaces + software shims + rider-1 ETC2/EAC — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `probe_ext_frag_depth()` helper (module-scope, one-shot ESSL-100 compile probe) + 4 new forward decls + 4 new FUNCS[] entries in `install_methods` (v1) + 6 new `w_get_extension` branches + 7 new advertising rows in `w_get_supported_extensions`.
+
+**Blueprint.** Pre-migration [nxjs-source/source/webgl.c:2005-2235](../nxjs-source/source/webgl.c#L2005-L2235) — the v1/v2 spec-conformance model. Plan §3.2.
+
+**Rows added (7 advertising / 6 with ext object):**
+- `ANGLE_instanced_arrays` (v1) — aliases v2 core natives via 3 `-ANGLE`-suffixed methods + `VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE=0x88FE`. Gate: `GL_EXT_draw_instanced`.
+- `WEBGL_draw_buffers` (v1) — aliases v2's `drawBuffers` native + 34 constants (`MAX_COLOR_ATTACHMENTS_WEBGL`, `MAX_DRAW_BUFFERS_WEBGL`, `COLOR_ATTACHMENT{0..15}_WEBGL`, `DRAW_BUFFER{0..15}_WEBGL`). Gate: `GL_EXT_draw_buffers`.
+- `EXT_frag_depth` (v1) — advertise-only (enables `#extension GL_EXT_frag_depth : enable` + `gl_FragDepthEXT` writes in #version 100 shaders). Gate: `GL_EXT_frag_depth` + `probe_ext_frag_depth()` compile-probe. The probe emits `[frag-depth-probe] ACCEPT` or `[frag-depth-probe] REJECT log=...` to stderr once; grep result in hardware/Citron logs.
+- `OES_vertex_array_object` (v1) — list-flip. Existing ext-object branch (per #42) stays as-is; only `w_get_supported_extensions` grows to include the name. Retires the deliberate GETEXT_NONNULL_BUT_NOT_LISTED asymmetry called out in #42's rationale. Runtime pre-arm route unaffected (calls `getExtension` by name, receives the same object).
+- `WEBGL_lose_context` (both) — software-only minimal impl: `loseContext` / `restoreContext` are FunctionTemplate-wrapped no-ops; `isContextLost` aliases `w_is_context_lost` (returns false). No canvas-element event dispatch — future runtime shim can add `webglcontextlost`/`restored` events without changing this advertising row.
+- `WEBGL_debug_shaders` (both) — software-only. `getTranslatedShaderSource(shader)` extracts the K_SHADER handle, calls `glGetShaderSource` on it, returns the string as-submitted. This stack does no WebGL→ES3 shader translation (unlike ANGLE); the "translated" source is identical to what was submitted via `shaderSource`. Matches Mesa's `GL_ARB_debug_shaders` convention.
+- `WEBGL_compressed_texture_etc` (both, batch-2 rider-1) — ETC2/EAC 10 constants (`COMPRESSED_R11_EAC=0x9270`..`COMPRESSED_SRGB8_ALPHA8_ETC2_EAC=0x9279`). Bucket A (core ES3; no driver-token gate). Advertising is unconditional on both context types. **Batch 1 skipped this by OVERSIGHT** — the plan's §4.1 app-added list correctly included it but the batch-1 implementation only wired ETC1 via `GL_OES_compressed_ETC1_RGB8_texture`. Batch 2 closes the omission.
+
+**v1 FUNCS[] additions.** Four new entries in `install_methods()`:
+`drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`
+(three natives from `install_methods_v2` reused via forward decl), and
+`drawBuffers` (same). Consequence: the `getBackendInfo` shim's
+`typeof gl.drawArraysInstanced === 'function'` probe flips from `false`
+to `true` on v1 — matches v2's behavior post-batch-2.
+
+**Compile-probe pattern.** The `probe_ext_frag_depth()` helper is a
+process-wide, one-shot compile of a minimal #version 100 shader with
+`#extension GL_EXT_frag_depth : enable` and `gl_FragDepthEXT` writes.
+Result cached in `s_frag_depth_ok`. Distinctive stderr tag `[frag-depth-probe]`
+is the grep target for hardware/Citron acceptance verification. **Batch 3's
+`WEBGL_blend_func_extended` probe follows the same pattern** (change the
+`#extension` directive and the shader body; reuse the probe-result-caching
+shape).
+
+**Why upstream-vanilla lacks it.** Upstream nx.js exposes null-stubbed
+WebGL contexts. All of this is fork territory.
+
+**DISPOSITION:** `upstream-candidate`. The compile-probe helper +
+software-shim pattern are generic enough that any embedder implementing
+these WebGL extensions would benefit.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for
+`probe_ext_frag_depth`, `ANGLE_instanced_arrays`, `WEBGL_debug_shaders`,
+`WEBGL_compressed_texture_etc`. Recurrence tells:
+- Report renders `extInstancedArraysPresent: false` on v1 → the four
+  v1 FUNCS[] additions regressed. Grep both `install_methods` and
+  `install_methods_v2` for the entries.
+- Report renders `EXT_frag_depth = MISSING` on v1 despite driver token
+  presence → the compile probe rejected the directive OR the probe
+  regressed. Check `[frag-depth-probe]` in the boot log.
+- Three.js v1 demo regresses post-`OES_vertex_array_object` list-flip
+  (renders black or crashes on VAO ops) → Three.js discovered the ext
+  and switched to OES VAO code paths that expose a latent bug. Do NOT
+  revert the list-flip alone; add a targeted runtime shim that wraps
+  Three.js's ext discovery or fix the underlying VAO handling first.
+
+**Sequencing.** Ships as batch-2 Commit A. Rider-2 v2 spec-conformance
+prune ships as batch-2 Commit B (#49) — independently revertable.
 
 ---
 
