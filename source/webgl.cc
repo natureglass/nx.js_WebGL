@@ -741,6 +741,14 @@ FN(w_get_parameter) {
 	}
 }
 
+// Forward decls for VAO natives referenced by w_get_extension's
+// OES_vertex_array_object branch (RUNTIME_SHIMS #42 / pre-arm route).
+// Actual definitions live in the cut #3 VAO block near line 1580.
+FN(w_create_vertex_array);
+FN(w_bind_vertex_array);
+FN(w_delete_vertex_array);
+FN(w_is_vertex_array);
+
 FN(w_get_extension) {
 	Isolate *iso = info.GetIsolate();
 	if (info.Length() < 1 || !info[0]->IsString()) return;
@@ -804,6 +812,38 @@ FN(w_get_extension) {
 		make_obj_with({{"UNSIGNED_INT_24_8_WEBGL", 0x84FA}});
 		return;
 	}
+	if (strcmp(name, "OES_vertex_array_object") == 0) {
+		// WebGL 1 route for the runtime pre-arm shim (RUNTIME_SHIMS #42).
+		// ES3 core has glGenVertexArrays/glBindVertexArray/etc.; the v2
+		// context registers them as native methods (webgl.cc line 2359+).
+		// v1 has no core VAO API — this ext wires the SAME natives as
+		// OES-suffixed methods so the pre-arm's `ext.createVertexArrayOES()
+		// + ext.bindVertexArrayOES(vao)` reaches `w_bind_vertex_array`
+		// which shadow-writes `user_snap.vao` per patch #36 contract.
+		// VERTEX_ARRAY_BINDING_OES = 0x85B5 (ES3 core VERTEX_ARRAY_BINDING).
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso, "VERTEX_ARRAY_BINDING_OES")
+		              .ToLocalChecked(),
+		       Uint32::NewFromUnsigned(iso, 0x85B5)).Check();
+		o->Set(c, String::NewFromUtf8(iso, "createVertexArrayOES")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_create_vertex_array)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "bindVertexArrayOES")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_bind_vertex_array)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "deleteVertexArrayOES")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_delete_vertex_array)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		o->Set(c, String::NewFromUtf8(iso, "isVertexArrayOES")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_is_vertex_array)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
 	// Everything else: not advertised yet. Return null (the spec value for
 	// "extension not supported"). 2.E will widen this list as the slice
 	// demos hit it.
@@ -834,6 +874,7 @@ FN(w_get_supported_extensions) {
 	}
 	info.GetReturnValue().Set(arr);
 }
+
 // Phase-0 gap fill — restore native GL extension visibility the QuickJS-
 // era engine exposed via `gl.getBackendInfo().glExtensions` and which the
 // V8 migration dropped. Internal-only native (leading underscore names
@@ -1413,6 +1454,7 @@ FN(w_active_texture) {
 	glActiveTexture(unit);
 	if (st) st->user_snap.active_tex = (GLint)unit;
 }
+
 FN(w_tex_parameteri) {
 	enter_bracket();
 	glTexParameteri(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2));
@@ -1893,6 +1935,7 @@ FN(w_renderbuffer_storage) {
 }
 
 // ----- Draw -----
+
 FN(w_draw_arrays) {
 	enter_bracket();
 	glDrawArrays(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2));

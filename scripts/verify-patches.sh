@@ -273,6 +273,39 @@ check 37 "webgl.cc w_tex_sub_image_3d FN" \
     "$NXJS/source/webgl.cc" \
     'FN\(w_tex_sub_image_3d\)'
 
+# #40 and #41 — TOMBSTONED 2026-07-03 (see NXJS_PATCHES_ARCHIVE.md
+# #40-tombstoned / #41-tombstoned). Both were reverted after hardware
+# green on #42; guardrails below ensure neither the engine primitives
+# nor their runtime call sites accidentally reappear.
+check_absent 40 "webgl.cc has no w_reset_user_snap FN (tombstoned)" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_reset_user_snap\)'
+check_absent 40 "webgl.cc has no resetUserSnap FUNCS entry (tombstoned)" \
+    "$NXJS/source/webgl.cc" \
+    '"resetUserSnap"'
+check_absent 40 "gl-teardown.ts has no resetUserSnap runtime reference (tombstoned)" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'resetUserSnap'
+check_absent 41 "webgl.cc has no patch41:apply string (tombstoned)" \
+    "$NXJS/source/webgl.cc" \
+    'patch41:apply'
+check_absent 41 "webgl.cc has no dump_attribs_at_draw probe (tombstoned with #41)" \
+    "$NXJS/source/webgl.cc" \
+    'dump_attribs_at_draw'
+
+# #42 — engine OES_vertex_array_object advertising for v1 pre-arm route.
+# Runtime companion in RUNTIME_SHIMS.md #42; engine ext + runtime pre-arm
+# ship together — runtime block no-ops on v1 without the ext.
+check 42 "webgl.cc OES_vertex_array_object branch in w_get_extension" \
+    "$NXJS/source/webgl.cc" \
+    'OES_vertex_array_object'
+check 42 "webgl.cc forward decls for VAO natives used by ext branch" \
+    "$NXJS/source/webgl.cc" \
+    'RUNTIME_SHIMS #42 / pre-arm route'
+check 42 "webgl.cc OES ext exposes createVertexArrayOES/bindVertexArrayOES" \
+    "$NXJS/source/webgl.cc" \
+    '"bindVertexArrayOES"'
+
 echo
 echo "=== runtime ledger: brewser-runtime-v8/RUNTIME_SHIMS.md (in $RUNTIME) ==="
 
@@ -304,6 +337,62 @@ check 24 "cube-route-shim allocateCubeRTAtlas rescue" \
 check 24 "cube-route-shim framebufferTexture2D wrap" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     'framebufferTexture2D'
+
+# #39 — Phase A step a: GL teardown at shim chokepoint (runtime-side)
+check 39 "gl-teardown.ts installGLTeardownTracking export" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'export function installGLTeardownTracking'
+check 39 "gl-teardown.ts teardownGL export" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'export function teardownGL'
+check 39 "canvas-runner installs installGLTeardownTracking" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'installGLTeardownTracking\(gl\)'
+check 39 "canvas-runner exports teardownSharedScreenGL" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'export function teardownSharedScreenGL'
+check 39 "web-view.ts endSession calls teardownSharedScreenGL after endAppSession" \
+    "$RUNTIME/src/web-view.ts" \
+    'teardownSharedScreenGL\(\)'
+check 39 "webgl-shim installs installGLTeardownTracking (native path)" \
+    "$RUNTIME/src/shims/webgl-shim.ts" \
+    'installGLTeardownTracking\(nativeContext'
+# gl-state-sweep.ts and gl-frame-probe.ts were removed 2026-07-03 in the
+# post-#42-hardware-green cleanup; guardrails below ensure they don't creep back.
+check_absent 39 "gl-state-sweep.ts file removed (post-#42 cleanup)" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'installGLStateSweep'
+check_absent 39 "gl-frame-probe.ts references removed (post-#42 cleanup)" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'installGLFrameProbe'
+check_absent 39 "webgl-shim.ts has no state-sweep/frame-probe install (post-#42 cleanup)" \
+    "$RUNTIME/src/shims/webgl-shim.ts" \
+    'installGLStateSweep|installGLFrameProbe'
+
+# #42 — Post-teardown VAO pre-arm through wrapped surface (runtime block).
+# Companion engine change checked in the engine section above (#42).
+check 42 "gl-teardown.ts pre-arm block emits [gl-teardown:prearm] marker" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    '\[gl-teardown:prearm\]'
+check 42 "gl-teardown.ts pre-arm has WebGL2 route via gl.createVertexArray/bindVertexArray" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'glAny\.createVertexArray'
+check 42 "gl-teardown.ts pre-arm has WebGL1 route via OES_vertex_array_object" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'createVaoOES\.call\(ext\)'
+check 42 "gl-teardown.ts readCurrentVaoName reads VERTEX_ARRAY_BINDING for numeric log name" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'function readCurrentVaoName'
+# #42 follow-up (2026-07-03) — invariant enforcement: runtime-internal
+# code must never bind VAO 0 on a live tenant surface. Two violators
+# removed; grep_absent ensures they don't creep back in.
+check_absent 42 "canvas-runner.ts resetScreenGLForScript does NOT bindVertexArray(null)" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'gl2\.bindVertexArray\s*\(\s*null\s*\)'
+check_absent 42 "gl-teardown.ts resetStateToDefaults does NOT tryCall(gl.bindVertexArray, gl, null)" \
+    "$RUNTIME/src/scripts/gl-teardown.ts" \
+    'tryCall\s*\(\s*gl\.bindVertexArray\s*,\s*gl\s*,\s*null\s*\)'
+
 # #43 — Phase-0: native GL extension enumeration + [gl-ext-dump] boot log.
 check 43 "webgl.cc populate_native_extensions helper" \
     "$NXJS/source/webgl.cc" \
@@ -381,7 +470,6 @@ check 46 "webgl.cc w_get_parameter has explicit GL_STENCIL_BITS/GL_DEPTH_BITS ca
     "$NXJS/source/webgl.cc" \
     'case GL_STENCIL_BITS:'
 
-
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
@@ -448,6 +536,14 @@ for id in $script_ids_all; do
     case "$id" in
         [0-9]*|17-superseded) : ;;
         *) continue ;;
+    esac
+    # Tombstoned IDs: MOVED-in-ledger entries whose numeric ID we still
+    # reference via check_absent guardrails to catch regression.
+    # Currently: #40 and #41 (moved to NXJS_PATCHES_ARCHIVE.md
+    # 2026-07-03; guardrails ensure engine primitives + runtime call
+    # sites don't reappear).
+    case "$id" in
+        40|41) continue ;;
     esac
     if ! echo "$ledger_ids" | grep -qxF "$id"; then
         echo "  WARN: verify-patches.sh checks #$id but no ledger entry with that id exists"

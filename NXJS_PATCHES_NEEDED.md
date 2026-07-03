@@ -68,6 +68,9 @@ proposal verdict.
 | 35 | engine | upstream-candidate (with #6) | PR-drafted(PR-D) | `webgl_bridge.h: depth_mask` + `webgl_bridge.h: stencil_mask` | nx_gl_state_snap_t further extension: depth_mask + stencil_mask (cut #15) |
 | 36 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: nx_gl_state_snap_t user_snap` + `webgl.cc: user_snap.viewport[0]` | WebGL bracket-state-persistence via per-call shadow-tracked user_snap |
 | 37 | engine | upstream-candidate | not-submitted | `webgl.cc: w_tex_storage_3d` | v2 texStorage3D + texSubImage3D bindings (cut #32) |
+| 40 | **archive** (MOVED) | — | — | — | (tombstoned 2026-07-03; mechanism obsoleted by #42, see archive) |
+| 41 | **archive** (MOVED) | — | — | — | (tombstoned 2026-07-03; mechanism obsoleted by #42, see archive) |
+| 42 | engine | fork-only | n/a | `webgl.cc: OES_vertex_array_object` | OES_vertex_array_object ext for v1 pre-arm route (RUNTIME_SHIMS #42 companion) |
 | 43 | engine | upstream-candidate | not-submitted | `webgl.cc: populate_native_extensions` + `webgl.cc: \[gl-ext-dump\]` | Phase-0: native GL extension enumeration + `_getNativeExtensionsString`/`_getEglVersion` internals + `[gl-ext-dump]` boot log (RUNTIME_SHIMS #44 companion) |
 | 44 | **runtime** (MOVED) | fork-only | n/a | `webgl-ext-shim.ts: installGetBackendInfo` | Phase-0: `gl.getBackendInfo` runtime shim (engine #43 companion) |
 | 45 | engine | upstream-candidate | not-submitted | `webgl2-rendering-context.ts: TS extension stub reached` | Phase-0: webgl2-rendering-context.ts landmine defuse — dead TS stubs throw instead of silent `[]`/null |
@@ -2127,6 +2130,55 @@ Symptom re-appeared 2026-07-02 in spectraplay (MP3 Play button "does nothing"). 
 **UPSTREAM STATUS:** `not-submitted`. Bundle with PR-D (WebGL2 method surface) or ship as a small standalone PR alongside PR-A/F/C if PR-D lags.
 
 **RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `w_tex_storage_3d`. Recurrence tell: `webgl2-texture2darray` (or any DataArrayTexture demo) renders black with no error in nxjs-debug.log → this binding regressed.
+
+---
+
+## #40 — MOVED → [NXJS_PATCHES_ARCHIVE.md](NXJS_PATCHES_ARCHIVE.md) (#40-tombstoned)
+
+---
+
+## #41 — MOVED → [NXJS_PATCHES_ARCHIVE.md](NXJS_PATCHES_ARCHIVE.md) (#41-tombstoned)
+
+---
+
+## #42 — OES_vertex_array_object extension advertising for v1 pre-arm route — SHIPPED + HARDWARE-VERIFIED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `strcmp(name, "OES_vertex_array_object") == 0` branch in `w_get_extension` (after the existing `WEBGL_depth_texture` branch, before the trailing `SetNull()`) + 4 forward declarations near `w_get_extension`. NOT added to `getSupportedExtensions()` — Three.js and demo capability probes should NOT discover this at their normal advertising surface; only the runtime pre-arm code path in [gl-teardown.ts](../brewser-runtime-v8/src/scripts/gl-teardown.ts) queries it by name.
+
+**Root cause.** [RUNTIME_SHIMS.md #42](../brewser-runtime-v8/RUNTIME_SHIMS.md#42)'s pre-arm needs a JS-side VAO create + bind API on the WebGL 1 context. The v2 context registers `createVertexArray` / `bindVertexArray` / `deleteVertexArray` / `isVertexArray` natively at [webgl.cc:2359](source/webgl.cc#L2359); the v1 context does not, so a v1-context teardown has no way to shadow-write a non-zero value into `user_snap.vao` via any wrapped-surface call. Without this ext, a v1-context outgoing teardown (e.g. `sensors → next demo`) would leave `user_snap.vao = 0` and the pre-arm would silently no-op on v1 — the next demo would inherit poison from case-2 of #41 above.
+
+**Fix.** `w_get_extension('OES_vertex_array_object')` returns an object whose 4 methods point at the SAME native handlers the v2 FUNCS[] table uses (`w_create_vertex_array` / `w_bind_vertex_array` / `w_delete_vertex_array` / `w_is_vertex_array`), plus the `VERTEX_ARRAY_BINDING_OES` enum. Shape:
+
+```cpp
+if (strcmp(name, "OES_vertex_array_object") == 0) {
+    Local<Object> o = Object::New(iso);
+    o->Set(c, ..."VERTEX_ARRAY_BINDING_OES"..., Uint32(0x85B5));
+    o->Set(c, ..."createVertexArrayOES"..., FunctionTemplate::New(iso, w_create_vertex_array)->GetFunction(c));
+    o->Set(c, ..."bindVertexArrayOES"..., FunctionTemplate::New(iso, w_bind_vertex_array)->GetFunction(c));
+    o->Set(c, ..."deleteVertexArrayOES"..., FunctionTemplate::New(iso, w_delete_vertex_array)->GetFunction(c));
+    o->Set(c, ..."isVertexArrayOES"..., FunctionTemplate::New(iso, w_is_vertex_array)->GetFunction(c));
+    info.GetReturnValue().Set(o);
+    return;
+}
+```
+
+The forward decls at line 706-ish let `w_get_extension` (line 706) reference natives defined later at [webgl.cc:1579-1604](source/webgl.cc#L1579).
+
+**Why not advertise via `getSupportedExtensions`.** Two reasons:
+1. Only the runtime pre-arm code calls `getExtension('OES_vertex_array_object')` — no demo does. Adding to the SUPPORTED[] array would let Three.js and other capability probes discover it, potentially changing THEIR v1 rendering path (they'd start using OES VAOs where currently they wrap everything in a synthetic default-VAO). That's out of scope for #42.
+2. `getExtension` returning a valid object for a name not in `getSupportedExtensions()` is spec-legal — extension advertising is per-implementation.
+
+**Shadow-coherence.** `w_bind_vertex_array` at [webgl.cc:1593-1604](source/webgl.cc#L1593) shadow-writes `st->user_snap.vao = (GLint)v` per patch #36's contract. The OES-ext method is the SAME native — the shadow-write happens whether called as `gl.bindVertexArray(vao)` (v2) or `ext.bindVertexArrayOES(vao)` (v1 via OES). So the pre-arm's bind on v1 goes through the same shadow path as v2, keeping user_snap consistent regardless of which context flavor last touched it.
+
+**Why upstream-vanilla lacks it.** Companion to patches #36/#40/#41 (fork-only bracket-state persistence family for the Tegra WebGL↔Skia coexistence model). Not meaningful outside embedders that host multi-session GL apps under the shared-EGL-context bracket contract.
+
+**DISPOSITION:** `fork-only`. Retires with #36/#40/#41 when Phase-B per-demo EGL contexts land.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `OES_vertex_array_object`. Recurrence tell: hardware run of `bloom→exit→sensors` shows `[gl-teardown:prearm] vao=null v2=false` in the log — the ext returned no callable methods, either because the branch was removed OR because the forward decls were removed and the code silently fell through to a compile error masked by another handler.
+
+**Sequencing.** Ships in the same cut as [RUNTIME_SHIMS.md #42](../brewser-runtime-v8/RUNTIME_SHIMS.md#42) — engine + runtime together; the runtime pre-arm without the engine ext no-ops on v1.
 
 ---
 

@@ -989,6 +989,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
                               Local<Object> init_obj, const char *entrypoint,
                               int argc, char *argv[],
                               const nx_config_t *cfg) {
+
 	nx_init_account(iso, init_obj);
 	nx_init_album(iso, init_obj);
 	nx_init_applet(iso, init_obj);
