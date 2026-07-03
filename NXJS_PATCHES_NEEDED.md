@@ -75,6 +75,7 @@ proposal verdict.
 | 44 | **runtime** (MOVED) | fork-only | n/a | `webgl-ext-shim.ts: installGetBackendInfo` | Phase-0: `gl.getBackendInfo` runtime shim (engine #43 companion) |
 | 45 | engine | upstream-candidate | not-submitted | `webgl2-rendering-context.ts: TS extension stub reached` | Phase-0: webgl2-rendering-context.ts landmine defuse — dead TS stubs throw instead of silent `[]`/null |
 | 46 | engine | upstream-candidate | not-submitted | `webgl_bridge.cc: GL_DEPTH24_STENCIL8` + `webgl_bridge.cc: \[bridge-fbo:` | Phase-0 commit 2: bridge FBO stencil contract — DEPTH24_STENCIL8 renderbuffer + combined attach + STENCIL_BITS=8 wire + [bridge-fbo] completeness assert |
+| 47 | engine | upstream-candidate | not-submitted | `webgl.cc: has_native_ext` + `webgl.cc: is_v2_context` + `webgl.cc: w_compressed_tex_image_2d` | Phase-1 batch 1: driver-probed advertisement + 16 batch-1 extension rows + compressed 2D upload natives + UNMASKED/MAX_ANISO getParameter branches |
 
 ## DISPOSITION POLICY
 
@@ -2317,6 +2318,49 @@ Authoritative stencil FUNCTIONALITY verification is DEFERRED to the first stenci
 - Suite demo renders broken depth-tested geometry post-commit-2 → depth attachment regressed. Log `[bridge-fbo:complete]` should show `depth=24 stencil=8`; if `depth=` is wrong, the combined attach is misbehaving on this driver — revert to split-attach (`DEPTH_ATTACHMENT` + `STENCIL_ATTACHMENT` pointing at the same renderbuffer) as fallback.
 
 **Sequencing.** Ships as commit 2 of the phase-0 pair. Independently revertable via `git revert` of this commit alone; commit 1 (#43/#44/#45 introspection prerequisite) makes no rendering-behavior changes by construction.
+
+---
+
+## #47 — Phase-1 batch 1: driver-probed advertisement + 16 extension rows + compressed 2D upload natives + UNMASKED/MAX_ANISO getParameter — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `has_native_ext(token)` helper + `is_v2_context(info)` helper + rebuilt `w_get_supported_extensions` (kills the shared `SUPPORTED[9]` static; builds per-context list from statics + `has_native_ext`-gated adds) + 16 new branches in `w_get_extension` (14 driver-gated + WEBGL_debug_renderer_info + WEBGL_stencil_texturing) + 3 new `w_get_parameter` case blocks (UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL / MAX_TEXTURE_MAX_ANISOTROPY_EXT) + 2 new native FNs (`w_compressed_tex_image_2d` + `w_compressed_tex_sub_image_2d`) + FUNCS[] entries for both in `install_methods` (v1) AND `install_methods_v2` (v2).
+
+**Blueprint.** Pre-migration [nxjs-source/source/webgl.c:2005-2235](../nxjs-source/source/webgl.c#L2005-L2235) — the hybrid statics + driver-probed model. Same design ported to the V8 tree; `has_native_ext()` replaces `nx_webgl_egl_has_*` gates, with the enumeration cache from ledger #43.
+
+**Root cause / motivation.** Phase-0 shipped 9 hardcoded extensions on both v1 and v2 identically. WebGL spec requires v1 ≠ v2 lists, and Unity/itch/Three.js content probes ~30+ extensions before starting. Report app closes 8-10 audit rows per context type in this batch (see [docs/EXTENSION_PORT_PLAN.md §3.1](../brewser-runtime-v8/docs/EXTENSION_PORT_PLAN.md)).
+
+**Advertised rows added (16 total).** All driver-probed against the ledger #43 enumeration:
+- Both v1+v2: `EXT_depth_clamp`, `EXT_float_blend`, `EXT_texture_filter_anisotropic`, `EXT_texture_compression_bptc`, `EXT_texture_compression_rgtc`, `WEBGL_compressed_texture_s3tc`, `WEBGL_compressed_texture_s3tc_srgb`, `WEBGL_compressed_texture_etc1`, `WEBGL_compressed_texture_astc`, `WEBGL_debug_renderer_info`
+- v1 only: `WEBGL_color_buffer_float`
+- v2 only: `EXT_color_buffer_float`, `EXT_color_buffer_half_float`, `EXT_texture_norm16`, `EXT_render_snorm`, `WEBGL_stencil_texturing`
+
+Each has a matching `w_get_extension` branch returning the spec constants (single object per Khronos ext spec). WEBGL_compressed_texture_astc also vends a `getSupportedProfiles()` method returning `["ldr"]` or `["ldr","sliced_3d"]` per driver token presence.
+
+**getParameter branches.**
+- `UNMASKED_VENDOR_WEBGL` (0x9245) → `glGetString(GL_VENDOR)`.
+- `UNMASKED_RENDERER_WEBGL` (0x9246) → `glGetString(GL_RENDERER)`.
+- `MAX_TEXTURE_MAX_ANISOTROPY_EXT` (0x84FF) → `glGetFloatv` (spec is GLfloat, not GLint — the report's `maxAnisotropy: n/a` fix relies on returning a numeric value here).
+
+**Discovered gap: compressed 2D natives.** `w_compressed_tex_image_2d` and `w_compressed_tex_sub_image_2d` were ABSENT from FUNCS[] pre-batch-1 — advertising any compressed-format extension (S3TC/RGTC/BPTC/ETC1/ASTC) would have been a fake because the upload native would `TypeError`. Batch 1 wires them in the SAME commit as the advertising rows for the compressed families. Signature: WebGL1 7-arg form on both context types; the 8/9-arg WebGL2 PBO / typed-array-offset overloads are deferred (spec-legal — v2 falls back to the ArrayBufferView shape when the caller doesn't pass extras).
+
+**Advertising machinery.** `w_get_supported_extensions` now constructs the list per call, per context kind, via `is_v2_context(info)` inspection of the receiver's `__webgl2` property (set at `make_context_carrier` time). Zero engine state added beyond the ledger #43 cache. Ordering: always-on statics first, then v1-only statics, then driver-probed adds in category order. `has_native_ext()` is a binary_search over the sorted cache.
+
+**Retiring `SUPPORTED[9]`.** The static array at [webgl.cc:857-867 pre-batch-1](source/webgl.cc) is removed. Any post-batch-1 consumer that expected the exact 9-name list needs to re-verify via `getSupportedExtensions()` on a live context.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js exposes WebGL contexts as null-stubs. Extension advertising is entirely fork territory.
+
+**DISPOSITION:** `upstream-candidate`. Trivial extraction if upstream WebGL surface ever lands — the pattern (statics + native-probe helper + per-context branches) is the standard shape.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `has_native_ext`, `is_v2_context`, `w_compressed_tex_image_2d`. Recurrence tells:
+- Both context types report `9 supported extensions` on hardware → the SUPPORTED[9] static came back, or `w_get_supported_extensions` was replaced by phase-0's version. Check `has_native_ext(` presence at the switch construction site.
+- `MISSING` for every batch-1 row post-hardware → `has_native_ext()` returns false unconditionally. Verify `s_native_exts_populated=true` at the call site (ledger #43 populate should have run at first context creation).
+- Report app renders `unmaskedVendor:` empty despite advertising WEBGL_debug_renderer_info → the `case 0x9245`/`case 0x9246` branches regressed. Grep `case 0x9245` in `w_get_parameter`.
+- `maxAnisotropy: n/a` on hardware → EXT_texture_filter_anisotropic not advertised OR the `case 0x84FF` returns 0 (Number cast broken). Grep both.
+- Any demo calling `gl.compressedTexImage2D(...)` throws `TypeError: is not a function` → FUNCS[] entries regressed. Grep both install_methods and install_methods_v2 for the two entries.
+
+**Sequencing.** First of three phase-1 extension batches. Batches 2 and 3 land after phase-1.5 core-native tiers per [docs/EXTENSION_PORT_PLAN.md §0.1.1](../brewser-runtime-v8/docs/EXTENSION_PORT_PLAN.md).
 
 ---
 

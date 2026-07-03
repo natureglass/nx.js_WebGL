@@ -223,6 +223,43 @@ static void populate_native_extensions() {
 	fflush(stderr);
 }
 
+// Phase-1 batch-1 helper — probe whether the driver's native GL extension
+// list (populated at first context creation by populate_native_extensions()
+// per ledger #43) contains the given `GL_*` token as an exact match.
+// Cache is std::sort'ed; use binary search. Returns false before the
+// cache is populated, which is safe: the only caller is the per-context
+// getSupportedExtensions build path, which runs strictly AFTER
+// make_context_carrier's eager populate call.
+static bool has_native_ext(const char *token) {
+	if (!token || !s_native_exts_populated) return false;
+	return std::binary_search(s_native_ext_list.begin(),
+	                          s_native_ext_list.end(), std::string(token));
+}
+
+// Phase-1 batch-1 helper — v1 vs v2 context detection from the receiver
+// object. `make_context_carrier` at [webgl.cc: is_v2 ? Set(__webgl2)]
+// stamps `__webgl2 = true` on v2 carriers. All context-shared FNs
+// (`w_get_extension`, `w_get_supported_extensions`, `w_get_parameter`)
+// use this helper to branch v1/v2 without needing separate FUNCS[]
+// registrations. Falls back to false (v1) if the receiver lacks the
+// property. Uses `iso->GetCurrentContext()` directly rather than the
+// `cur()` helper because `cur()` is declared below this point in the
+// file and the ordering has not been reworked yet.
+static bool is_v2_context(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Context> c = iso->GetCurrentContext();
+	// V8 12.x removed `info.Holder()`; use `info.This()` which returns
+	// the receiver Local<Object> for the standard call site.
+	Local<Value> this_v = info.This();
+	if (!this_v->IsObject()) return false;
+	Local<Object> self = this_v.As<Object>();
+	Local<Value> v;
+	if (!self->Get(c, String::NewFromUtf8(iso, "__webgl2").ToLocalChecked())
+	         .ToLocal(&v))
+		return false;
+	return v->IsBoolean() && v.As<Boolean>()->Value();
+}
+
 void free_gl_obj(GLObj *o) { delete o; }
 
 Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
@@ -676,6 +713,34 @@ FN(w_get_parameter) {
 		        .ToLocalChecked());
 		return;
 	}
+	// Phase-1 batch-1 — WEBGL_debug_renderer_info unmasked pnames.
+	// UNMASKED_VENDOR_WEBGL (0x9245) → glGetString(GL_VENDOR);
+	// UNMASKED_RENDERER_WEBGL (0x9246) → glGetString(GL_RENDERER).
+	// Only meaningful when getExtension('WEBGL_debug_renderer_info')
+	// was called by the caller (spec-wise the extension gates access);
+	// we do not gate here — Three.js and diagnostic tools call these
+	// pnames unconditionally after successfully vending the ext object.
+	case 0x9245: /* UNMASKED_VENDOR_WEBGL */
+	case 0x9246: /* UNMASKED_RENDERER_WEBGL */ {
+		const GLenum native =
+		    (pname == 0x9245) ? GL_VENDOR : GL_RENDERER;
+		const GLubyte *s = glGetString(native);
+		const char *cs = s ? (const char *)s : "";
+		info.GetReturnValue().Set(
+		    String::NewFromUtf8(iso, cs, NewStringType::kNormal)
+		        .ToLocalChecked());
+		return;
+	}
+	// Phase-1 batch-1 — EXT_texture_filter_anisotropic MAX. Spec calls
+	// for glGetFloatv (max is a GLfloat like 16.0f), not glGetIntegerv.
+	// Fixes the report's `maxAnisotropy: n/a` reading which stayed n/a
+	// pre-batch-1 because the extension was never advertised.
+	case 0x84FF: /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */ {
+		GLfloat v = 0.f;
+		glGetFloatv(pname, &v);
+		info.GetReturnValue().Set(Number::New(iso, (double)v));
+		return;
+	}
 	case GL_DEPTH_WRITEMASK:
 	case GL_COLOR_WRITEMASK: {
 		GLboolean v[4] = {0, 0, 0, 0};
@@ -844,6 +909,218 @@ FN(w_get_extension) {
 		info.GetReturnValue().Set(o);
 		return;
 	}
+	// Phase-1 batch-1 — advertising + constants + compressed uploads.
+	// Every branch here has a matching row in
+	// `w_get_supported_extensions` (v1 or v2 gated per §1.2 of
+	// docs/EXTENSION_PORT_PLAN.md). Ordered alphabetically within
+	// category (EXT_* then OES_* then WEBGL_*) for grep-friendliness.
+	const bool v2 = is_v2_context(info);
+	// EXT_depth_clamp — enable-cap 0x864F, use via `gl.enable(DEPTH_CLAMP_EXT)`.
+	if (has_native_ext("GL_EXT_depth_clamp") &&
+	    strcmp(name, "EXT_depth_clamp") == 0) {
+		make_obj_with({{"DEPTH_CLAMP_EXT", 0x864F}});
+		return;
+	}
+	// EXT_float_blend — feature-flag stub (driver auto-enables blending
+	// of float render targets when this ext is exposed).
+	if (has_native_ext("GL_EXT_float_blend") &&
+	    strcmp(name, "EXT_float_blend") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// EXT_texture_filter_anisotropic — 2 constants; texParameteri accepts
+	// TEXTURE_MAX_ANISOTROPY_EXT as pname (0x84FE), getParameter accepts
+	// the MAX (0x84FF) via explicit branch added to `w_get_parameter`.
+	if (has_native_ext("GL_EXT_texture_filter_anisotropic") &&
+	    strcmp(name, "EXT_texture_filter_anisotropic") == 0) {
+		make_obj_with({{"TEXTURE_MAX_ANISOTROPY_EXT", 0x84FE},
+		                {"MAX_TEXTURE_MAX_ANISOTROPY_EXT", 0x84FF}});
+		return;
+	}
+	// EXT_texture_compression_bptc — 4 sized internalformats accepted by
+	// the new `compressedTexImage2D` native added in this batch.
+	if (has_native_ext("GL_EXT_texture_compression_bptc") &&
+	    strcmp(name, "EXT_texture_compression_bptc") == 0) {
+		make_obj_with({{"COMPRESSED_RGBA_BPTC_UNORM_EXT", 0x8E8C},
+		                {"COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT", 0x8E8D},
+		                {"COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT", 0x8E8E},
+		                {"COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT", 0x8E8F}});
+		return;
+	}
+	// EXT_texture_compression_rgtc — 4 constants.
+	if (has_native_ext("GL_EXT_texture_compression_rgtc") &&
+	    strcmp(name, "EXT_texture_compression_rgtc") == 0) {
+		make_obj_with({{"COMPRESSED_RED_RGTC1_EXT", 0x8DBB},
+		                {"COMPRESSED_SIGNED_RED_RGTC1_EXT", 0x8DBC},
+		                {"COMPRESSED_RED_GREEN_RGTC2_EXT", 0x8DBD},
+		                {"COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT", 0x8DBE}});
+		return;
+	}
+	// EXT_color_buffer_float (v2) — feature-flag stub. Driver-supplied
+	// sized RGBA32F etc. render-target formats work through core ES3
+	// `renderbufferStorage` / `texStorage2D` paths without an extension
+	// method surface.
+	if (v2 && has_native_ext("GL_EXT_color_buffer_float") &&
+	    strcmp(name, "EXT_color_buffer_float") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// EXT_color_buffer_half_float (v2) — feature-flag stub. Same
+	// justification as EXT_color_buffer_float; the RGBA16F / RG16F /
+	// R16F sized formats are core ES3.
+	if (v2 && has_native_ext("GL_EXT_color_buffer_float") &&
+	    strcmp(name, "EXT_color_buffer_half_float") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// EXT_texture_norm16 (v2) — 8 sized internalformats. Constants only;
+	// `texStorage2D` / `texImage2D` accept the values via ES3 core.
+	if (v2 && has_native_ext("GL_EXT_texture_norm16") &&
+	    strcmp(name, "EXT_texture_norm16") == 0) {
+		make_obj_with({{"R16_EXT", 0x822A},
+		                {"RG16_EXT", 0x822C},
+		                {"RGB16_EXT", 0x8054},
+		                {"RGBA16_EXT", 0x805B},
+		                {"R16_SNORM_EXT", 0x8F98},
+		                {"RG16_SNORM_EXT", 0x8F99},
+		                {"RGB16_SNORM_EXT", 0x8F9A},
+		                {"RGBA16_SNORM_EXT", 0x8F9B}});
+		return;
+	}
+	// EXT_render_snorm (v2) — feature-flag stub. Snorm sized formats
+	// accepted as render targets via ES3 core once the ext is exposed.
+	if (v2 && has_native_ext("GL_EXT_render_snorm") &&
+	    strcmp(name, "EXT_render_snorm") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// WEBGL_color_buffer_float (v1) — v1 alias for the color-buffer-float
+	// extension. Empty object per WebGL1 spec (no constants exposed by
+	// the WEBGL1 form).
+	if (!v2 && has_native_ext("GL_EXT_color_buffer_float") &&
+	    strcmp(name, "WEBGL_color_buffer_float") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	// WEBGL_compressed_texture_s3tc — 4 constants.
+	if (has_native_ext("GL_EXT_texture_compression_s3tc") &&
+	    strcmp(name, "WEBGL_compressed_texture_s3tc") == 0) {
+		make_obj_with({{"COMPRESSED_RGB_S3TC_DXT1_EXT", 0x83F0},
+		                {"COMPRESSED_RGBA_S3TC_DXT1_EXT", 0x83F1},
+		                {"COMPRESSED_RGBA_S3TC_DXT3_EXT", 0x83F2},
+		                {"COMPRESSED_RGBA_S3TC_DXT5_EXT", 0x83F3}});
+		return;
+	}
+	// WEBGL_compressed_texture_s3tc_srgb — 4 sRGB DXT constants.
+	if (has_native_ext("GL_EXT_texture_compression_s3tc_srgb") &&
+	    strcmp(name, "WEBGL_compressed_texture_s3tc_srgb") == 0) {
+		make_obj_with({{"COMPRESSED_SRGB_S3TC_DXT1_EXT", 0x8C4C},
+		                {"COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT", 0x8C4D},
+		                {"COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT", 0x8C4E},
+		                {"COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT", 0x8C4F}});
+		return;
+	}
+	// WEBGL_compressed_texture_etc1 — 1 constant (ES3 core supports ETC2
+	// which subsumes ETC1; the OES_compressed_ETC1_RGB8_texture native
+	// token still gates advertising per Khronos WEBGL1 extension shape).
+	if (has_native_ext("GL_OES_compressed_ETC1_RGB8_texture") &&
+	    strcmp(name, "WEBGL_compressed_texture_etc1") == 0) {
+		make_obj_with({{"COMPRESSED_RGB_ETC1_WEBGL", 0x8D64}});
+		return;
+	}
+	// WEBGL_compressed_texture_astc — 28 constants (14 LDR + 14 sRGB
+	// variants) + `getSupportedProfiles()` method returning the driver's
+	// ASTC profile list ("ldr", "hdr", "sliced_3d" per driver tokens).
+	if (has_native_ext("GL_KHR_texture_compression_astc_ldr") &&
+	    strcmp(name, "WEBGL_compressed_texture_astc") == 0) {
+		Local<Object> o = Object::New(iso);
+		auto set_u = [&](const char *k, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, k).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		// LDR sized internalformats (block sizes 4x4..12x12).
+		set_u("COMPRESSED_RGBA_ASTC_4x4_KHR", 0x93B0);
+		set_u("COMPRESSED_RGBA_ASTC_5x4_KHR", 0x93B1);
+		set_u("COMPRESSED_RGBA_ASTC_5x5_KHR", 0x93B2);
+		set_u("COMPRESSED_RGBA_ASTC_6x5_KHR", 0x93B3);
+		set_u("COMPRESSED_RGBA_ASTC_6x6_KHR", 0x93B4);
+		set_u("COMPRESSED_RGBA_ASTC_8x5_KHR", 0x93B5);
+		set_u("COMPRESSED_RGBA_ASTC_8x6_KHR", 0x93B6);
+		set_u("COMPRESSED_RGBA_ASTC_8x8_KHR", 0x93B7);
+		set_u("COMPRESSED_RGBA_ASTC_10x5_KHR", 0x93B8);
+		set_u("COMPRESSED_RGBA_ASTC_10x6_KHR", 0x93B9);
+		set_u("COMPRESSED_RGBA_ASTC_10x8_KHR", 0x93BA);
+		set_u("COMPRESSED_RGBA_ASTC_10x10_KHR", 0x93BB);
+		set_u("COMPRESSED_RGBA_ASTC_12x10_KHR", 0x93BC);
+		set_u("COMPRESSED_RGBA_ASTC_12x12_KHR", 0x93BD);
+		// sRGB variants.
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR", 0x93D0);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR", 0x93D1);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR", 0x93D2);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR", 0x93D3);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR", 0x93D4);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR", 0x93D5);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR", 0x93D6);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR", 0x93D7);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR", 0x93D8);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR", 0x93D9);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR", 0x93DA);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR", 0x93DB);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR", 0x93DC);
+		set_u("COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR", 0x93DD);
+		// `getSupportedProfiles()` — WebGL extension method returning
+		// the driver's profile list. Uses driver token detection to
+		// pick "ldr" (always if we're here), "hdr" (never on Mesa
+		// Nouveau — token GL_KHR_texture_compression_astc_hdr absent
+		// from the 134-list), and "sliced_3d" (gate on
+		// GL_KHR_texture_compression_astc_sliced_3d).
+		const bool has_sliced_3d =
+		    has_native_ext("GL_KHR_texture_compression_astc_sliced_3d");
+		// Static string list; V8 owns via FunctionTemplate data.
+		auto profiles_cb = [](const FunctionCallbackInfo<Value> &pinfo) {
+			Isolate *iso2 = pinfo.GetIsolate();
+			Local<Context> c2 = cur(iso2);
+			Local<Array> arr =
+			    Array::New(iso2, pinfo.Data()->IsBoolean() &&
+			                             pinfo.Data().As<Boolean>()->Value()
+			                         ? 2
+			                         : 1);
+			arr->Set(c2, 0,
+			         String::NewFromUtf8(iso2, "ldr").ToLocalChecked())
+			    .Check();
+			if (pinfo.Data()->IsBoolean() &&
+			    pinfo.Data().As<Boolean>()->Value()) {
+				arr->Set(c2, 1,
+				         String::NewFromUtf8(iso2, "sliced_3d").ToLocalChecked())
+				    .Check();
+			}
+			pinfo.GetReturnValue().Set(arr);
+		};
+		o->Set(c, String::NewFromUtf8(iso, "getSupportedProfiles")
+		              .ToLocalChecked(),
+		       FunctionTemplate::New(iso, profiles_cb,
+		                             Boolean::New(iso, has_sliced_3d))
+		           ->GetFunction(c).ToLocalChecked())
+		    .Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// WEBGL_debug_renderer_info — unmasked vendor / renderer via
+	// glGetString(GL_VENDOR / GL_RENDERER) through the corresponding
+	// `w_get_parameter` branches added in this batch. Constants exposed
+	// here; parameter fetch is a follow-up call from the app.
+	if (strcmp(name, "WEBGL_debug_renderer_info") == 0) {
+		make_obj_with({{"UNMASKED_VENDOR_WEBGL", 0x9245},
+		                {"UNMASKED_RENDERER_WEBGL", 0x9246}});
+		return;
+	}
+	// WEBGL_stencil_texturing (v2) — feature-flag stub. Core ES3.1
+	// TEXTURE_STENCIL_MODE pname is accepted by w_tex_parameteri
+	// pass-through; no method surface.
+	if (v2 && strcmp(name, "WEBGL_stencil_texturing") == 0) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
 	// Everything else: not advertised yet. Return null (the spec value for
 	// "extension not supported"). 2.E will widen this list as the slice
 	// demos hit it.
@@ -851,26 +1128,72 @@ FN(w_get_extension) {
 }
 FN(w_get_supported_extensions) {
 	Isolate *iso = info.GetIsolate();
-	// Advertise the extensions that w_get_extension hands back. Three.js's
-	// WebGLCapabilities checks getSupportedExtensions().indexOf(name) before
-	// calling getExtension on a few of them.
-	static const char *const SUPPORTED[] = {
-	    "EXT_blend_minmax",
-	    "OES_element_index_uint",
-	    "OES_standard_derivatives",
-	    "OES_texture_float",
-	    "OES_texture_float_linear",
-	    "OES_texture_half_float",
-	    "OES_texture_half_float_linear",
-	    "EXT_sRGB",
-	    "WEBGL_depth_texture",
-	};
-	const int N = (int)(sizeof(SUPPORTED) / sizeof(SUPPORTED[0]));
-	Local<Array> arr = Array::New(iso, N);
 	Local<Context> c = cur(iso);
-	for (int i = 0; i < N; i++) {
-		arr->Set(c, i,
-		         String::NewFromUtf8(iso, SUPPORTED[i]).ToLocalChecked()).Check();
+	const bool v2 = is_v2_context(info);
+	// Phase-1 batch-1 — driver-probed advertisement rebuild. Retires the
+	// shared static `SUPPORTED[9]` (both context types identical) that
+	// shipped through phase-0. Blueprint: pre-migration
+	// [nxjs-source/source/webgl.c:2005-2235] (14 always-on statics +
+	// ~27 driver-probed `nx_webgl_egl_has_*` gates + v1/v2 branches).
+	// This build is the same model on the V8 stack: `has_native_ext()`
+	// checks the enumeration populated by ledger #43's
+	// `populate_native_extensions()`. Every gated entry has a
+	// corresponding branch in `w_get_extension` — the two are
+	// consistent by construction.
+	std::vector<const char *> out;
+	// Always-on statics (both context kinds, core in ES3).
+	out.push_back("OES_standard_derivatives");
+	out.push_back("OES_texture_float");
+	out.push_back("OES_texture_float_linear");
+	out.push_back("OES_texture_half_float");
+	out.push_back("OES_texture_half_float_linear");
+	out.push_back("WEBGL_depth_texture");
+	out.push_back("WEBGL_debug_renderer_info");  // batch-1
+	// v1-only statics (v2 has them as core).
+	if (!v2) {
+		out.push_back("EXT_blend_minmax");
+		out.push_back("OES_element_index_uint");
+		out.push_back("EXT_sRGB");
+	}
+	// Batch-1 driver-probed advertising.
+	if (has_native_ext("GL_EXT_depth_clamp"))
+		out.push_back("EXT_depth_clamp");
+	if (has_native_ext("GL_EXT_float_blend"))
+		out.push_back("EXT_float_blend");
+	if (has_native_ext("GL_EXT_texture_filter_anisotropic"))
+		out.push_back("EXT_texture_filter_anisotropic");
+	if (has_native_ext("GL_EXT_texture_compression_bptc"))
+		out.push_back("EXT_texture_compression_bptc");
+	if (has_native_ext("GL_EXT_texture_compression_rgtc"))
+		out.push_back("EXT_texture_compression_rgtc");
+	if (has_native_ext("GL_EXT_texture_compression_s3tc"))
+		out.push_back("WEBGL_compressed_texture_s3tc");
+	if (has_native_ext("GL_EXT_texture_compression_s3tc_srgb"))
+		out.push_back("WEBGL_compressed_texture_s3tc_srgb");
+	if (has_native_ext("GL_OES_compressed_ETC1_RGB8_texture"))
+		out.push_back("WEBGL_compressed_texture_etc1");
+	if (has_native_ext("GL_KHR_texture_compression_astc_ldr"))
+		out.push_back("WEBGL_compressed_texture_astc");
+	// v1-only batch-1: WEBGL_color_buffer_float (v2 exposes via
+	// EXT_color_buffer_float per spec).
+	if (!v2 && has_native_ext("GL_EXT_color_buffer_float"))
+		out.push_back("WEBGL_color_buffer_float");
+	// v2-only batch-1: color-buffer float/half + norm16 + render_snorm +
+	// stencil_texturing (core ES3.1).
+	if (v2 && has_native_ext("GL_EXT_color_buffer_float")) {
+		out.push_back("EXT_color_buffer_float");
+		out.push_back("EXT_color_buffer_half_float");
+	}
+	if (v2 && has_native_ext("GL_EXT_texture_norm16"))
+		out.push_back("EXT_texture_norm16");
+	if (v2 && has_native_ext("GL_EXT_render_snorm"))
+		out.push_back("EXT_render_snorm");
+	if (v2)
+		out.push_back("WEBGL_stencil_texturing");  // ES3.1 core
+	Local<Array> arr = Array::New(iso, (int)out.size());
+	for (size_t i = 0; i < out.size(); i++) {
+		arr->Set(c, (uint32_t)i,
+		         String::NewFromUtf8(iso, out[i]).ToLocalChecked()).Check();
 	}
 	info.GetReturnValue().Set(arr);
 }
@@ -1612,6 +1935,56 @@ FN(w_tex_sub_image_2d) {
 	                pixels);
 }
 
+// Phase-1 batch-1 — compressed texture 2D uploads. Native
+// glCompressedTexImage2D takes an explicit imageSize argument; in WebGL
+// this comes from the ArrayBufferView's byteLength.
+// WebGL1 signature (7 args): (target, level, internalformat, width, height,
+// border, data). WebGL2 adds 8/9-arg PBO / typed-array-offset overloads
+// (imageSize + offset / srcOffset + srcLengthOverride) — deferred to a
+// later cut. Batch-1 supports the WebGL1 7-arg form on both context types;
+// spec-legal (v2 falls back to the ArrayBufferView shape when the caller
+// doesn't pass the extra args). Ledger row per plan §3.1's discovered
+// missing-native gap.
+FN(w_compressed_tex_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLsizei width = a_i32(info, 3);
+	const GLsizei height = a_i32(info, 4);
+	const GLint border = a_i32(info, 5);
+	size_t len = 0;
+	void *pixels = view_bytes(info[6], &len);
+	if (info[6]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[6].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[6]->IsNullOrUndefined()) { pixels = nullptr; len = 0; }
+	glCompressedTexImage2D(target, level, internalformat, width, height,
+	                       border, (GLsizei)len, pixels);
+}
+FN(w_compressed_tex_sub_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLint xoff = a_i32(info, 2);
+	const GLint yoff = a_i32(info, 3);
+	const GLsizei width = a_i32(info, 4);
+	const GLsizei height = a_i32(info, 5);
+	const GLenum format = a_u32(info, 6);
+	size_t len = 0;
+	void *pixels = view_bytes(info[7], &len);
+	if (info[7]->IsArrayBuffer()) {
+		Local<ArrayBuffer> ab = info[7].As<ArrayBuffer>();
+		pixels = ab->Data();
+		len = ab->ByteLength();
+	}
+	if (info[7]->IsNullOrUndefined()) { pixels = nullptr; len = 0; }
+	glCompressedTexSubImage2D(target, level, xoff, yoff, width, height,
+	                          format, (GLsizei)len, pixels);
+}
+
 // Phase 2.G.1 cut #25 (2026-07-01) — bound because cube-route-shim's
 // cube-RT-readback rescue needs it to blit scratch → atlas at face
 // offset (per NXJS_PATCHES_NEEDED.md #24). Never bound in QuickJS-era
@@ -2195,6 +2568,14 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"generateMipmap", w_generate_mipmap},
 	    {"texImage2D", w_tex_image_2d},
 	    {"texSubImage2D", w_tex_sub_image_2d},
+	    // Phase-1 batch-1 — compressed texture 2D upload path.
+	    // Missing FUNCS[] entries pre-batch-1 meant advertising any
+	    // compressed-format extension (S3TC/RGTC/BPTC/ETC1/ASTC) would
+	    // have been a fake — the constants would exist but the upload
+	    // native would be a TypeError. Added in the same batch as the
+	    // advertising rows for that family.
+	    {"compressedTexImage2D", w_compressed_tex_image_2d},
+	    {"compressedTexSubImage2D", w_compressed_tex_sub_image_2d},
 	    {"copyTexSubImage2D", w_copy_tex_sub_image_2d},
 	    {"createFramebuffer", w_create_framebuffer},
 	    {"deleteFramebuffer", w_delete_framebuffer},
@@ -2353,6 +2734,14 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"generateMipmap", w_generate_mipmap},
 	    {"texImage2D", w_tex_image_2d},
 	    {"texSubImage2D", w_tex_sub_image_2d},
+	    // Phase-1 batch-1 — compressed texture 2D upload path.
+	    // Missing FUNCS[] entries pre-batch-1 meant advertising any
+	    // compressed-format extension (S3TC/RGTC/BPTC/ETC1/ASTC) would
+	    // have been a fake — the constants would exist but the upload
+	    // native would be a TypeError. Added in the same batch as the
+	    // advertising rows for that family.
+	    {"compressedTexImage2D", w_compressed_tex_image_2d},
+	    {"compressedTexSubImage2D", w_compressed_tex_sub_image_2d},
 	    {"copyTexSubImage2D", w_copy_tex_sub_image_2d},
 	    {"createFramebuffer", w_create_framebuffer},
 	    {"deleteFramebuffer", w_delete_framebuffer},

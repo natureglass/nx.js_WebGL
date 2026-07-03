@@ -470,6 +470,57 @@ check 46 "webgl.cc w_get_parameter has explicit GL_STENCIL_BITS/GL_DEPTH_BITS ca
     "$NXJS/source/webgl.cc" \
     'case GL_STENCIL_BITS:'
 
+# #47 — Phase-1 batch 1: driver-probed advertisement + 16 rows + compressed
+# 2D natives + UNMASKED/MAX_ANISO getParameter branches.
+check 47 "webgl.cc has_native_ext helper" \
+    "$NXJS/source/webgl.cc" \
+    'static bool has_native_ext'
+check 47 "webgl.cc is_v2_context helper" \
+    "$NXJS/source/webgl.cc" \
+    'static bool is_v2_context'
+check 47 "webgl.cc w_get_supported_extensions is driver-probed (has_native_ext calls present)" \
+    "$NXJS/source/webgl.cc" \
+    'if \(has_native_ext\("GL_EXT_depth_clamp"\)\)'
+check_absent 47 "webgl.cc no longer has the shared SUPPORTED\[9\] static (retired)" \
+    "$NXJS/source/webgl.cc" \
+    'static const char \*const SUPPORTED\[\]'
+check 47 "webgl.cc w_get_extension has EXT_texture_filter_anisotropic branch" \
+    "$NXJS/source/webgl.cc" \
+    '"EXT_texture_filter_anisotropic"'
+check 47 "webgl.cc w_get_extension has WEBGL_compressed_texture_astc branch" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_compressed_texture_astc"'
+check 47 "webgl.cc w_get_extension has WEBGL_debug_renderer_info branch" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_debug_renderer_info"'
+check 47 "webgl.cc w_get_extension has WEBGL_stencil_texturing branch (v2 core-A)" \
+    "$NXJS/source/webgl.cc" \
+    '"WEBGL_stencil_texturing"'
+check 47 "webgl.cc w_get_extension has EXT_texture_norm16 branch (v2)" \
+    "$NXJS/source/webgl.cc" \
+    '"EXT_texture_norm16"'
+check 47 "webgl.cc w_get_parameter has UNMASKED_VENDOR_WEBGL case (0x9245)" \
+    "$NXJS/source/webgl.cc" \
+    'case 0x9245:'
+check 47 "webgl.cc w_get_parameter has UNMASKED_RENDERER_WEBGL case (0x9246)" \
+    "$NXJS/source/webgl.cc" \
+    'case 0x9246:'
+check 47 "webgl.cc w_get_parameter has MAX_TEXTURE_MAX_ANISOTROPY_EXT case (0x84FF)" \
+    "$NXJS/source/webgl.cc" \
+    'case 0x84FF:'
+check 47 "webgl.cc w_compressed_tex_image_2d FN" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_compressed_tex_image_2d\)'
+check 47 "webgl.cc w_compressed_tex_sub_image_2d FN" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_compressed_tex_sub_image_2d\)'
+check 47 "webgl.cc compressedTexImage2D wired in FUNCS[] (both v1+v2)" \
+    "$NXJS/source/webgl.cc" \
+    '"compressedTexImage2D", w_compressed_tex_image_2d'
+check 47 "webgl.cc compressedTexSubImage2D wired in FUNCS[] (both v1+v2)" \
+    "$NXJS/source/webgl.cc" \
+    '"compressedTexSubImage2D", w_compressed_tex_sub_image_2d'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
