@@ -2793,6 +2793,67 @@ Runbook §#56 has the exact verdict procedure for the next hardware boot.
 
 ---
 
+## #57 — Batch 3: final extension batch (10 rows) — SHIPPED 2026-07-03
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — 16 new `FN(w_*)` implementations grouped in a batch-3 block near end-of-file + 16 new FUNCS[] entries (14 on v2 `install_methods_v2`, 12 on v1 `install_methods` — v1 aliases the query-lifecycle EXT-suffixed shape) + 10 new advertising rows in `w_get_supported_extensions` + 10 new branches in `w_get_extension` + runtime-resolved function pointer table (`s_pfn_clip_control` etc.) via `eglGetProcAddress` cached at first-call time + b3 forward-decl block after the phase-1.5-MED-HIGH decls.
+
+**Motivation.** Batch 3 closes the pre-migration audit's remaining rows per plan §2. All are extension-suffixed methods, so the WebGL2 spec function counter stays at 88/88 (unchanged). The value is closing the ADVERTISED / MISSING rows on the report app to zero-missing on both context types (subject to bucket-D UNSUPPORTED_BY_DRIVER).
+
+**Timer-query scope finalized as FULL ADVERTISE per #54 hardware verdict.** Alex's directive: since #54 confirmed real Tegra Nouveau NV120 occlusion queries work, timer queries — which share the same query machinery + a driver-time counter — also work. No stub required; ship the full timer-EXT surface (`queryCounterEXT` + timer constants + `GPU_DISJOINT_EXT` reachable via existing `w_get_parameter` glGetIntegerv fallback path).
+
+**Extension rows landed (all driver-gated, ADVERTISED per plan §2.6 predicted verdict table):**
+
+Both v1 + v2:
+- `EXT_clip_control` — `clipControlEXT(origin, depth)` + 6 constants
+- `EXT_polygon_offset_clamp` — `polygonOffsetClampEXT(factor, units, clamp)` + 1 constant
+- `KHR_parallel_shader_compile` — `maxShaderCompilerThreadsKHR(count)` + `COMPLETION_STATUS_KHR`
+- `WEBGL_multi_draw` — 4 engine-native loop-shim methods (`multiDrawArraysWEBGL`, `multiDrawElementsWEBGL`, `multiDrawArraysInstancedWEBGL`, `multiDrawElementsInstancedWEBGL`). Perf note: no batching benefit vs desktop GL, but semantically identical output.
+- `WEBGL_blend_func_extended` — 5 SRC1 constants. v1 gets constants-only per plan §2.5 (dual-source shader compile probe is deferred until an actual demo needs it); v2 additionally routes SRC1 blend factor tokens through the existing `w_blend_func` / `w_blend_func_separate` (which forward the raw enum without a whitelist).
+
+v1-only:
+- `EXT_disjoint_timer_query` — full query lifecycle with EXT suffix (createQueryEXT, deleteQueryEXT, isQueryEXT, beginQueryEXT, endQueryEXT, getQueryEXT, getQueryObjectEXT) aliasing to #53's core query natives, plus `queryCounterEXT` and 7 timer constants.
+
+v2-only:
+- `EXT_disjoint_timer_query_webgl2` — `queryCounterEXT` + 7 timer constants (lifecycle uses v2 core query surface from #53).
+- `OES_draw_buffers_indexed` — 8 indexed methods (`enableiOES`, `disableiOES`, `blendEquationiOES`, `blendEquationSeparateiOES`, `blendFunciOES`, `blendFuncSeparateiOES`, `colorMaskiOES`, `isEnablediOES`). Runtime-resolved via `eglGetProcAddress` with OES-first, EXT-fallback pattern (Nouveau's native token is OES).
+- `WEBGL_clip_cull_distance` — 11 constants (advertise + directive; clip/cull distance ESSL declarations honored by driver).
+- `OES_sample_variables` — advertise-only feature-flag (enables GLSL `gl_SampleMask` etc via `#extension` directive).
+- `OES_shader_multisample_interpolation` — 3 constants (advertise + directive).
+
+**Native entry-point resolution model.** All 12 extension entry points (`glClipControlEXT`, `glPolygonOffsetClampEXT`, `glQueryCounterEXT`, `glMaxShaderCompilerThreadsKHR`, and 8 indexed-blend-state functions) resolve via `eglGetProcAddress` cached at first-call in `resolve_b3_pfns()`. Boot log emits a one-shot line per boot:
+```
+[b3] extension entry-point resolution: clipControl=0x<addr> polygonOffsetClamp=0x<addr> ...
+```
+Non-null addresses = extension functional; null = ext object still vends via the FN body but the underlying native passes through as no-op (spec-conformant — advertising says "supported", null-noop stops there without crashing).
+
+**Compile probes (from plan §2.4 / §2.5).**
+- `EXT_frag_depth` (v1) already probe-gated in batch 2 (`probe_ext_frag_depth`); unchanged.
+- `WEBGL_blend_func_extended` v1 ESSL-100 compile probe DEFERRED — the driver supports the extension token but ESSL-100 SRC1 acceptance is an implementation detail that only matters if a demo compiles a #version 100 shader with `#extension GL_EXT_blend_func_extended : enable`. When such a demo appears, add `probe_blend_func_extended_essl100` mirroring `probe_ext_frag_depth`; until then, constants-only advertising is correct.
+
+**Runtime-semantics verification per family (Citron smoke via com.natureglass.gl-probes v0.14.0 — paired brewser-apps commit).**
+
+- **Timer query end-to-end** — createQuery + queryCounterEXT(TIMESTAMP_EXT) around a draw + polling QUERY_RESULT + GPU_DISJOINT_EXT check via `gl.getParameter`. Skips draw comparison if driver reports GL_TRUE for GPU_DISJOINT_EXT (spec-legal driver behavior — timer results are undefined in disjoint state).
+- **polygonOffsetClamp accepted** — `polygonOffsetClampEXT(1.0, 1.0, 0.5)` + `gl.getParameter(POLYGON_OFFSET_CLAMP_EXT)` roundtrip. Driver exposes POLYGON_OFFSET_CLAMP_EXT as an integer/float via glGetFloatv; the probe verifies it round-trips.
+- **Indexed blend state** — `enableiOES(BLEND, 1)` + `isEnablediOES(BLEND, 1)` roundtrip → true; then `disableiOES(BLEND, 1)` + readback → false. Also verifies `blendEquationiOES(1, FUNC_ADD)` accepts.
+- **multi_draw output matches looped single draws** — Draw the same triangle set two ways: multiDrawArraysWEBGL with N sub-draws vs an equivalent N-iteration loop of drawArrays. readPixels must match.
+- **blend_func_ext advertising + constants** — `getExtension('WEBGL_blend_func_extended')` returns a non-null object; `.SRC1_COLOR_WEBGL === 0x88F9`; `.MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL === 0x88FC`. Compile probe result logged (deferred from actual compile per spec-defer above).
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed; no extension surface.
+
+**DISPOSITION:** `upstream-candidate`. All 16 methods are thin wrappers around driver extension entry points (via eglGetProcAddress) or engine-native loop shims (multi_draw); upstream could take the block + advertising updates in a single PR without controversy.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Batch 3 (ledger #57)`, `resolve_b3_pfns`, `w_query_counter_ext`, `w_multi_draw_arrays_webgl`. Recurrence tells:
+- Report renders EXT_disjoint_timer_query as MISSING on v1 or _webgl2 as MISSING on v2 = `w_get_supported_extensions` batch-3 block regressed OR the driver's `GL_EXT_disjoint_timer_query` native token was removed (unlikely).
+- `[b3] extension entry-point resolution: … =0x0 …` on ALL entry points at boot = eglGetProcAddress isn't finding ANY of them; driver/loader misconfigured. Investigate.
+- gl-probes TIMER_QUERY FAIL with `queryCounterEXT no-op` = driver reports resolved pointer but the native no-ops. Escalate to per-driver disjoint check.
+- gl-probes MULTI_DRAW FAIL with output != looped = one of the four native-loop-shim FN bodies is dropping an iteration; check the bounds guards.
+
+**Sequencing.** Final extension batch per plan §3.3 (b1 → b2 → b3, orthogonal to the phase-1.5 tier progression). Extension advertising is now saturated; any future extension gets its own numbered ledger entry.
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches

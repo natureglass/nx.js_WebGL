@@ -838,6 +838,76 @@ check 56 "webgl.cc [#56] proc-address resolution boot log" \
 check 56 "webgl.cc [#56] NX_56_DEBUG per-call diagnostic guard" \
     "$NXJS/source/webgl.cc" \
     '#ifdef NX_56_DEBUG'
+
+# #57 — Batch 3 final extension batch. All driver-gated advertising +
+# w_get_extension branches + FUNCS[] wiring.
+check 57 "webgl.cc [b3] resolve_b3_pfns proc-address resolver" \
+    "$NXJS/source/webgl.cc" \
+    'static void resolve_b3_pfns'
+check 57 "webgl.cc [b3] one-shot resolution boot log" \
+    "$NXJS/source/webgl.cc" \
+    '\[b3\] extension entry-point resolution'
+# Extension entry points.
+check 57 "webgl.cc [b3] w_clip_control_ext" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_clip_control_ext\)'
+check 57 "webgl.cc [b3] w_polygon_offset_clamp_ext" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_polygon_offset_clamp_ext\)'
+check 57 "webgl.cc [b3] w_query_counter_ext" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_query_counter_ext\)'
+check 57 "webgl.cc [b3] w_max_shader_compiler_threads_khr" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_max_shader_compiler_threads_khr\)'
+check 57 "webgl.cc [b3] w_enable_i / w_disable_i / w_is_enabled_i (OES_draw_buffers_indexed)" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_enable_i\)'
+check 57 "webgl.cc [b3] w_multi_draw_arrays_webgl" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_multi_draw_arrays_webgl\)'
+check 57 "webgl.cc [b3] w_multi_draw_elements_instanced_webgl" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_multi_draw_elements_instanced_webgl\)'
+# Advertising rows (in w_get_supported_extensions).
+check 57 "webgl.cc [b3] EXT_clip_control advertised" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("EXT_clip_control"\)'
+check 57 "webgl.cc [b3] EXT_disjoint_timer_query advertised (v1)" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("EXT_disjoint_timer_query"\)'
+check 57 "webgl.cc [b3] EXT_disjoint_timer_query_webgl2 advertised (v2)" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("EXT_disjoint_timer_query_webgl2"\)'
+check 57 "webgl.cc [b3] OES_draw_buffers_indexed advertised" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("OES_draw_buffers_indexed"\)'
+check 57 "webgl.cc [b3] WEBGL_multi_draw advertised" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("WEBGL_multi_draw"\)'
+check 57 "webgl.cc [b3] WEBGL_blend_func_extended advertised" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("WEBGL_blend_func_extended"\)'
+check 57 "webgl.cc [b3] KHR_parallel_shader_compile advertised" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("KHR_parallel_shader_compile"\)'
+check 57 "webgl.cc [b3] WEBGL_clip_cull_distance advertised (v2)" \
+    "$NXJS/source/webgl.cc" \
+    'out\.push_back\("WEBGL_clip_cull_distance"\)'
+# w_get_extension branches.
+check 57 "webgl.cc [b3] w_get_extension branch: EXT_clip_control" \
+    "$NXJS/source/webgl.cc" \
+    'strcmp\(name, "EXT_clip_control"\)'
+check 57 "webgl.cc [b3] w_get_extension branch: EXT_disjoint_timer_query" \
+    "$NXJS/source/webgl.cc" \
+    'strcmp\(name, "EXT_disjoint_timer_query"\)'
+check 57 "webgl.cc [b3] w_get_extension branch: WEBGL_multi_draw" \
+    "$NXJS/source/webgl.cc" \
+    'strcmp\(name, "WEBGL_multi_draw"\)'
+# Family marker.
+check 57 "webgl.cc [b3] block header comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Batch 3 \(ledger #57\)'
 # #52a fallback gate — new build define check.
 check 52 "webgl.cc [52a] fallback gate: NX_52A_DISABLE_FALLBACK ifndef guard present" \
     "$NXJS/source/webgl.cc" \

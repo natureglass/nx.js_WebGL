@@ -46,6 +46,12 @@
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
+// Batch 3 (ledger #57) — gl2ext.h declares glClipControlEXT,
+// glPolygonOffsetClampEXT, glQueryCounterEXT, glMaxShaderCompilerThreadsKHR,
+// and the glEnableiOES/EXT family used by OES_draw_buffers_indexed.
+// Multi-draw instanced variants are NOT in gl2ext.h; those land as
+// engine-native loop shims (see w_multi_draw_arrays_instanced_webgl et al).
+#include <GLES2/gl2ext.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -914,6 +920,34 @@ FN(w_vertex_attrib_divisor);
 FN(w_draw_buffers);
 FN(w_is_context_lost);
 
+// Batch 3 (ledger #57) forward decls — the ext objects vend these method
+// symbols; actual FN bodies live in the batch-3 block near end-of-file.
+// Also #53's query-family natives (w_create_query, etc.) used by v1's
+// EXT_disjoint_timer_query lifecycle aliasing.
+FN(w_create_query);
+FN(w_delete_query);
+FN(w_is_query);
+FN(w_begin_query);
+FN(w_end_query);
+FN(w_get_query);
+FN(w_get_query_parameter);
+FN(w_clip_control_ext);
+FN(w_polygon_offset_clamp_ext);
+FN(w_query_counter_ext);
+FN(w_max_shader_compiler_threads_khr);
+FN(w_enable_i);
+FN(w_disable_i);
+FN(w_blend_equation_i);
+FN(w_blend_equation_separate_i);
+FN(w_blend_func_i);
+FN(w_blend_func_separate_i);
+FN(w_color_mask_i);
+FN(w_is_enabled_i);
+FN(w_multi_draw_arrays_webgl);
+FN(w_multi_draw_elements_webgl);
+FN(w_multi_draw_arrays_instanced_webgl);
+FN(w_multi_draw_elements_instanced_webgl);
+
 FN(w_get_extension) {
 	Isolate *iso = info.GetIsolate();
 	if (info.Length() < 1 || !info[0]->IsString()) return;
@@ -1401,6 +1435,188 @@ FN(w_get_extension) {
 		info.GetReturnValue().Set(o);
 		return;
 	}
+	// ============================================================
+	// Batch 3 (ledger #57) — final extension batch branches.
+	// Each branch: driver-gated + returns an object with the
+	// extension's constants + method surface (methods alias the
+	// prototype-installed FUNCS[] entries via the same underlying
+	// natives; installing them on the ext object mirrors the shape
+	// Chrome/Firefox return so Three.js's ext.methodEXT and
+	// gl.methodEXT both work).
+	// ============================================================
+	if (strcmp(name, "EXT_clip_control") == 0 &&
+	    has_native_ext("GL_EXT_clip_control")) {
+		Local<Object> o = Object::New(iso);
+		auto U = [&](const char *n, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		U("LOWER_LEFT_EXT",           0x8CA1);
+		U("UPPER_LEFT_EXT",           0x8CA2);
+		U("NEGATIVE_ONE_TO_ONE_EXT",  0x935E);
+		U("ZERO_TO_ONE_EXT",          0x935F);
+		U("CLIP_ORIGIN_EXT",          0x935C);
+		U("CLIP_DEPTH_MODE_EXT",      0x935D);
+		o->Set(c, String::NewFromUtf8(iso, "clipControlEXT").ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_clip_control_ext)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	if (strcmp(name, "EXT_polygon_offset_clamp") == 0 &&
+	    has_native_ext("GL_EXT_polygon_offset_clamp")) {
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso, "POLYGON_OFFSET_CLAMP_EXT").ToLocalChecked(),
+		       Uint32::NewFromUnsigned(iso, 0x8E1B)).Check();
+		o->Set(c, String::NewFromUtf8(iso, "polygonOffsetClampEXT").ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_polygon_offset_clamp_ext)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// EXT_disjoint_timer_query (v1) + _webgl2 (v2). v1 exposes the whole
+	// query lifecycle with EXT suffix (aliasing the v2 core natives from
+	// #53); v2 exposes only queryCounterEXT + timer constants (uses v2
+	// core query surface for lifecycle).
+	if ((strcmp(name, "EXT_disjoint_timer_query") == 0 && !v2) ||
+	    (strcmp(name, "EXT_disjoint_timer_query_webgl2") == 0 && v2)) {
+		if (!has_native_ext("GL_EXT_disjoint_timer_query")) {
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		Local<Object> o = Object::New(iso);
+		auto U = [&](const char *n, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		U("QUERY_COUNTER_BITS_EXT",      0x8864);
+		U("CURRENT_QUERY_EXT",            0x8865);
+		U("QUERY_RESULT_EXT",             0x8866);
+		U("QUERY_RESULT_AVAILABLE_EXT",   0x8867);
+		U("TIME_ELAPSED_EXT",             0x88BF);
+		U("TIMESTAMP_EXT",                0x8E28);
+		U("GPU_DISJOINT_EXT",             0x8FBB);
+		auto FN_ = [&](const char *n, FunctionCallback fn) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       FunctionTemplate::New(iso, fn)
+			              ->GetFunction(c).ToLocalChecked()).Check();
+		};
+		if (!v2) {
+			FN_("createQueryEXT",  w_create_query);
+			FN_("deleteQueryEXT",  w_delete_query);
+			FN_("isQueryEXT",      w_is_query);
+			FN_("beginQueryEXT",   w_begin_query);
+			FN_("endQueryEXT",     w_end_query);
+			FN_("getQueryEXT",     w_get_query);
+			FN_("getQueryObjectEXT", w_get_query_parameter);
+		}
+		FN_("queryCounterEXT", w_query_counter_ext);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// OES_draw_buffers_indexed (v2 only).
+	if (v2 && strcmp(name, "OES_draw_buffers_indexed") == 0 &&
+	    (has_native_ext("GL_OES_draw_buffers_indexed") ||
+	     has_native_ext("GL_EXT_draw_buffers_indexed"))) {
+		Local<Object> o = Object::New(iso);
+		auto FN_ = [&](const char *n, FunctionCallback fn) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       FunctionTemplate::New(iso, fn)
+			              ->GetFunction(c).ToLocalChecked()).Check();
+		};
+		FN_("enableiOES",                 w_enable_i);
+		FN_("disableiOES",                w_disable_i);
+		FN_("blendEquationiOES",          w_blend_equation_i);
+		FN_("blendEquationSeparateiOES",  w_blend_equation_separate_i);
+		FN_("blendFunciOES",              w_blend_func_i);
+		FN_("blendFuncSeparateiOES",      w_blend_func_separate_i);
+		FN_("colorMaskiOES",              w_color_mask_i);
+		FN_("isEnablediOES",              w_is_enabled_i);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	if (strcmp(name, "KHR_parallel_shader_compile") == 0 &&
+	    has_native_ext("GL_KHR_parallel_shader_compile")) {
+		Local<Object> o = Object::New(iso);
+		o->Set(c, String::NewFromUtf8(iso, "COMPLETION_STATUS_KHR").ToLocalChecked(),
+		       Uint32::NewFromUnsigned(iso, 0x91B1)).Check();
+		o->Set(c, String::NewFromUtf8(iso, "maxShaderCompilerThreadsKHR").ToLocalChecked(),
+		       FunctionTemplate::New(iso, w_max_shader_compiler_threads_khr)
+		              ->GetFunction(c).ToLocalChecked()).Check();
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	if (strcmp(name, "WEBGL_blend_func_extended") == 0 &&
+	    has_native_ext("GL_EXT_blend_func_extended")) {
+		Local<Object> o = Object::New(iso);
+		auto U = [&](const char *n, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		U("SRC1_COLOR_WEBGL",                     0x88F9);
+		U("SRC1_ALPHA_WEBGL",                     0x8589);
+		U("ONE_MINUS_SRC1_COLOR_WEBGL",           0x88FA);
+		U("ONE_MINUS_SRC1_ALPHA_WEBGL",           0x88FB);
+		U("MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL",   0x88FC);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	if (strcmp(name, "WEBGL_multi_draw") == 0 &&
+	    has_native_ext("GL_EXT_multi_draw_arrays")) {
+		Local<Object> o = Object::New(iso);
+		auto FN_ = [&](const char *n, FunctionCallback fn) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       FunctionTemplate::New(iso, fn)
+			              ->GetFunction(c).ToLocalChecked()).Check();
+		};
+		FN_("multiDrawArraysWEBGL",              w_multi_draw_arrays_webgl);
+		FN_("multiDrawElementsWEBGL",            w_multi_draw_elements_webgl);
+		FN_("multiDrawArraysInstancedWEBGL",     w_multi_draw_arrays_instanced_webgl);
+		FN_("multiDrawElementsInstancedWEBGL",   w_multi_draw_elements_instanced_webgl);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	// v2-only advertise-only stubs — constants + feature-flag empty objects.
+	if (v2 && strcmp(name, "WEBGL_clip_cull_distance") == 0 &&
+	    has_native_ext("GL_EXT_clip_cull_distance")) {
+		Local<Object> o = Object::New(iso);
+		auto U = [&](const char *n, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		U("MAX_CLIP_DISTANCES_WEBGL",                     0x0D32);
+		U("MAX_CULL_DISTANCES_WEBGL",                     0x82F9);
+		U("MAX_COMBINED_CLIP_AND_CULL_DISTANCES_WEBGL",   0x82FA);
+		U("CLIP_DISTANCE0_WEBGL", 0x3000);
+		U("CLIP_DISTANCE1_WEBGL", 0x3001);
+		U("CLIP_DISTANCE2_WEBGL", 0x3002);
+		U("CLIP_DISTANCE3_WEBGL", 0x3003);
+		U("CLIP_DISTANCE4_WEBGL", 0x3004);
+		U("CLIP_DISTANCE5_WEBGL", 0x3005);
+		U("CLIP_DISTANCE6_WEBGL", 0x3006);
+		U("CLIP_DISTANCE7_WEBGL", 0x3007);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+	if (v2 && strcmp(name, "OES_sample_variables") == 0 &&
+	    has_native_ext("GL_OES_sample_variables")) {
+		info.GetReturnValue().Set(Object::New(iso));
+		return;
+	}
+	if (v2 && strcmp(name, "OES_shader_multisample_interpolation") == 0 &&
+	    has_native_ext("GL_OES_shader_multisample_interpolation")) {
+		Local<Object> o = Object::New(iso);
+		auto U = [&](const char *n, uint32_t v) {
+			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
+			       Uint32::NewFromUnsigned(iso, v)).Check();
+		};
+		U("MIN_FRAGMENT_INTERPOLATION_OFFSET_OES",  0x8E5B);
+		U("MAX_FRAGMENT_INTERPOLATION_OFFSET_OES",  0x8E5C);
+		U("FRAGMENT_INTERPOLATION_OFFSET_BITS_OES", 0x8E5D);
+		info.GetReturnValue().Set(o);
+		return;
+	}
+
 	// Everything else: not advertised yet. Return null (the spec value for
 	// "extension not supported"). 2.E will widen this list as the slice
 	// demos hit it.
@@ -1531,6 +1747,34 @@ FN(w_get_supported_extensions) {
 	// returns the source as submitted (this stack does no WebGL→ES3
 	// translation), consistent with the Mesa GL_ARB_debug_shaders impl.
 	out.push_back("WEBGL_debug_shaders");
+
+	// Batch 3 (ledger #57) — final extension batch. All driver-gated
+	// against the enumeration populated at bridge init (ledger #43).
+	if (has_native_ext("GL_EXT_clip_control"))
+		out.push_back("EXT_clip_control");
+	if (has_native_ext("GL_EXT_polygon_offset_clamp"))
+		out.push_back("EXT_polygon_offset_clamp");
+	if (has_native_ext("GL_KHR_parallel_shader_compile"))
+		out.push_back("KHR_parallel_shader_compile");
+	if (has_native_ext("GL_EXT_multi_draw_arrays"))
+		out.push_back("WEBGL_multi_draw");
+	if (has_native_ext("GL_EXT_blend_func_extended"))
+		out.push_back("WEBGL_blend_func_extended");
+	if (has_native_ext("GL_EXT_disjoint_timer_query")) {
+		if (v2) out.push_back("EXT_disjoint_timer_query_webgl2");
+		else    out.push_back("EXT_disjoint_timer_query");
+	}
+	// v2-only b3 items
+	if (v2 && (has_native_ext("GL_OES_draw_buffers_indexed") ||
+	           has_native_ext("GL_EXT_draw_buffers_indexed")))
+		out.push_back("OES_draw_buffers_indexed");
+	if (v2 && has_native_ext("GL_EXT_clip_cull_distance"))
+		out.push_back("WEBGL_clip_cull_distance");
+	if (v2 && has_native_ext("GL_OES_sample_variables"))
+		out.push_back("OES_sample_variables");
+	if (v2 && has_native_ext("GL_OES_shader_multisample_interpolation"))
+		out.push_back("OES_shader_multisample_interpolation");
+
 	Local<Array> arr = Array::New(iso, (int)out.size());
 	for (size_t i = 0; i < out.size(); i++) {
 		arr->Set(c, (uint32_t)i,
@@ -3763,6 +4007,295 @@ FN(w_resume_transform_feedback) {
 // End phase-1.5-MED-HIGH block.
 // ============================================================================
 
+// ============================================================================
+// Batch 3 — final extension batch (ledger #57).
+// Advertising + entry-point surface for the last 10 rows in the pre-migration
+// audit (plan §2 tier assignments, all Ba=3):
+//   EXT_disjoint_timer_query (v1) + EXT_disjoint_timer_query_webgl2 (v2)
+//     — full timer surface (queryCounterEXT + timer-EXT constants +
+//     GPU_DISJOINT_EXT via getParameter). v1 additionally re-exposes the
+//     query lifecycle methods with EXT suffix (v1 doesn't have core query
+//     surface; v2 uses #53's core query methods).
+//   EXT_polygon_offset_clamp — polygonOffsetClampEXT
+//   EXT_clip_control          — clipControlEXT
+//   OES_draw_buffers_indexed  — 8 indexed methods (v2)
+//   KHR_parallel_shader_compile — maxShaderCompilerThreadsKHR +
+//     COMPLETION_STATUS_KHR pname (accepted by existing
+//     glGetProgramiv / glGetShaderiv paths).
+//   WEBGL_blend_func_extended — SRC1_* constants + MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL;
+//     v1 compile-probe-gated (per plan §2.5 defensive check).
+//   WEBGL_multi_draw          — 4 engine-native loop shims.
+//   WEBGL_clip_cull_distance (v2)   — 11 constants (advertise-only).
+//   OES_sample_variables (v2)       — advertise-only feature-flag stub.
+//   OES_shader_multisample_interpolation (v2) — 3 constants (advertise-only).
+//
+// Counter impact: 0 — batch 3 items are all extension-suffixed methods, none
+// in the 88-list. WebGL2 spec function counter stays at 88/88.
+// ============================================================================
+
+// Batch-3 native entry-point resolution — the extension entry points are
+// declared in gl2ext.h but not always linked; use eglGetProcAddress for
+// robust availability. Cached once per boot.
+typedef void (GL_APIENTRY *pfn_clip_control_t)(GLenum origin, GLenum depth);
+typedef void (GL_APIENTRY *pfn_polygon_offset_clamp_t)(GLfloat, GLfloat, GLfloat);
+typedef void (GL_APIENTRY *pfn_query_counter_t)(GLuint id, GLenum target);
+typedef void (GL_APIENTRY *pfn_max_shader_threads_t)(GLuint count);
+typedef void (GL_APIENTRY *pfn_enablei_t)(GLenum, GLuint);
+typedef void (GL_APIENTRY *pfn_disablei_t)(GLenum, GLuint);
+typedef void (GL_APIENTRY *pfn_blend_eq_i_t)(GLuint, GLenum);
+typedef void (GL_APIENTRY *pfn_blend_eq_sep_i_t)(GLuint, GLenum, GLenum);
+typedef void (GL_APIENTRY *pfn_blend_func_i_t)(GLuint, GLenum, GLenum);
+typedef void (GL_APIENTRY *pfn_blend_func_sep_i_t)(GLuint, GLenum, GLenum, GLenum, GLenum);
+typedef void (GL_APIENTRY *pfn_color_mask_i_t)(GLuint, GLboolean, GLboolean, GLboolean, GLboolean);
+typedef GLboolean (GL_APIENTRY *pfn_is_enabled_i_t)(GLenum, GLuint);
+
+static pfn_clip_control_t         s_pfn_clip_control = nullptr;
+static pfn_polygon_offset_clamp_t s_pfn_polygon_offset_clamp = nullptr;
+static pfn_query_counter_t        s_pfn_query_counter = nullptr;
+static pfn_max_shader_threads_t   s_pfn_max_shader_threads = nullptr;
+static pfn_enablei_t              s_pfn_enablei = nullptr;
+static pfn_disablei_t             s_pfn_disablei = nullptr;
+static pfn_blend_eq_i_t           s_pfn_blend_eq_i = nullptr;
+static pfn_blend_eq_sep_i_t       s_pfn_blend_eq_sep_i = nullptr;
+static pfn_blend_func_i_t         s_pfn_blend_func_i = nullptr;
+static pfn_blend_func_sep_i_t     s_pfn_blend_func_sep_i = nullptr;
+static pfn_color_mask_i_t         s_pfn_color_mask_i = nullptr;
+static pfn_is_enabled_i_t         s_pfn_is_enabled_i = nullptr;
+static bool s_b3_pfns_resolved = false;
+
+static void resolve_b3_pfns() {
+	if (s_b3_pfns_resolved) return;
+	s_b3_pfns_resolved = true;
+	s_pfn_clip_control         = (pfn_clip_control_t)eglGetProcAddress("glClipControlEXT");
+	s_pfn_polygon_offset_clamp = (pfn_polygon_offset_clamp_t)eglGetProcAddress("glPolygonOffsetClampEXT");
+	s_pfn_query_counter        = (pfn_query_counter_t)eglGetProcAddress("glQueryCounterEXT");
+	s_pfn_max_shader_threads   = (pfn_max_shader_threads_t)eglGetProcAddress("glMaxShaderCompilerThreadsKHR");
+	// Try OES first (Nouveau native token), fall back to EXT. Both entry
+	// points bind to the same driver symbol on Mesa (documented aliasing).
+	s_pfn_enablei              = (pfn_enablei_t)eglGetProcAddress("glEnableiOES");
+	if (!s_pfn_enablei) s_pfn_enablei = (pfn_enablei_t)eglGetProcAddress("glEnableiEXT");
+	s_pfn_disablei             = (pfn_disablei_t)eglGetProcAddress("glDisableiOES");
+	if (!s_pfn_disablei) s_pfn_disablei = (pfn_disablei_t)eglGetProcAddress("glDisableiEXT");
+	s_pfn_blend_eq_i           = (pfn_blend_eq_i_t)eglGetProcAddress("glBlendEquationiOES");
+	if (!s_pfn_blend_eq_i) s_pfn_blend_eq_i = (pfn_blend_eq_i_t)eglGetProcAddress("glBlendEquationiEXT");
+	s_pfn_blend_eq_sep_i       = (pfn_blend_eq_sep_i_t)eglGetProcAddress("glBlendEquationSeparateiOES");
+	if (!s_pfn_blend_eq_sep_i) s_pfn_blend_eq_sep_i = (pfn_blend_eq_sep_i_t)eglGetProcAddress("glBlendEquationSeparateiEXT");
+	s_pfn_blend_func_i         = (pfn_blend_func_i_t)eglGetProcAddress("glBlendFunciOES");
+	if (!s_pfn_blend_func_i) s_pfn_blend_func_i = (pfn_blend_func_i_t)eglGetProcAddress("glBlendFunciEXT");
+	s_pfn_blend_func_sep_i     = (pfn_blend_func_sep_i_t)eglGetProcAddress("glBlendFuncSeparateiOES");
+	if (!s_pfn_blend_func_sep_i) s_pfn_blend_func_sep_i = (pfn_blend_func_sep_i_t)eglGetProcAddress("glBlendFuncSeparateiEXT");
+	s_pfn_color_mask_i         = (pfn_color_mask_i_t)eglGetProcAddress("glColorMaskiOES");
+	if (!s_pfn_color_mask_i) s_pfn_color_mask_i = (pfn_color_mask_i_t)eglGetProcAddress("glColorMaskiEXT");
+	s_pfn_is_enabled_i         = (pfn_is_enabled_i_t)eglGetProcAddress("glIsEnablediOES");
+	if (!s_pfn_is_enabled_i) s_pfn_is_enabled_i = (pfn_is_enabled_i_t)eglGetProcAddress("glIsEnablediEXT");
+	fprintf(stderr, "[b3] extension entry-point resolution: clipControl=%p polygonOffsetClamp=%p "
+	                "queryCounter=%p maxShaderThreads=%p enablei=%p disablei=%p "
+	                "blendEqI=%p blendFuncI=%p colorMaskI=%p isEnabledI=%p\n",
+	        (void*)(uintptr_t)s_pfn_clip_control,
+	        (void*)(uintptr_t)s_pfn_polygon_offset_clamp,
+	        (void*)(uintptr_t)s_pfn_query_counter,
+	        (void*)(uintptr_t)s_pfn_max_shader_threads,
+	        (void*)(uintptr_t)s_pfn_enablei,
+	        (void*)(uintptr_t)s_pfn_disablei,
+	        (void*)(uintptr_t)s_pfn_blend_eq_i,
+	        (void*)(uintptr_t)s_pfn_blend_func_i,
+	        (void*)(uintptr_t)s_pfn_color_mask_i,
+	        (void*)(uintptr_t)s_pfn_is_enabled_i);
+	fflush(stderr);
+}
+
+// ----- EXT_clip_control (v1+v2) -----
+FN(w_clip_control_ext) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_clip_control) return;
+	s_pfn_clip_control(a_u32(info, 0), a_u32(info, 1));
+}
+
+// ----- EXT_polygon_offset_clamp (v1+v2) -----
+FN(w_polygon_offset_clamp_ext) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_polygon_offset_clamp) return;
+	s_pfn_polygon_offset_clamp(a_f32(info, 0), a_f32(info, 1), a_f32(info, 2));
+}
+
+// ----- EXT_disjoint_timer_query (v1) + _webgl2 (v2) — queryCounter -----
+FN(w_query_counter_ext) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_query_counter) return;
+	s_pfn_query_counter(obj_id(info[0]), a_u32(info, 1));
+}
+
+// ----- KHR_parallel_shader_compile (v1+v2) -----
+FN(w_max_shader_compiler_threads_khr) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_max_shader_threads) return;
+	s_pfn_max_shader_threads(a_u32(info, 0));
+}
+
+// ----- OES_draw_buffers_indexed (v2) — 8 methods -----
+FN(w_enable_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_enablei) return;
+	s_pfn_enablei(a_u32(info, 0), a_u32(info, 1));
+}
+FN(w_disable_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_disablei) return;
+	s_pfn_disablei(a_u32(info, 0), a_u32(info, 1));
+}
+FN(w_blend_equation_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_blend_eq_i) return;
+	s_pfn_blend_eq_i(a_u32(info, 0), a_u32(info, 1));
+}
+FN(w_blend_equation_separate_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_blend_eq_sep_i) return;
+	s_pfn_blend_eq_sep_i(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2));
+}
+FN(w_blend_func_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_blend_func_i) return;
+	s_pfn_blend_func_i(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2));
+}
+FN(w_blend_func_separate_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_blend_func_sep_i) return;
+	s_pfn_blend_func_sep_i(a_u32(info, 0), a_u32(info, 1), a_u32(info, 2),
+	                       a_u32(info, 3), a_u32(info, 4));
+}
+FN(w_color_mask_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_color_mask_i) return;
+	s_pfn_color_mask_i(a_u32(info, 0),
+	                   a_bool(info, 1) ? GL_TRUE : GL_FALSE,
+	                   a_bool(info, 2) ? GL_TRUE : GL_FALSE,
+	                   a_bool(info, 3) ? GL_TRUE : GL_FALSE,
+	                   a_bool(info, 4) ? GL_TRUE : GL_FALSE);
+}
+FN(w_is_enabled_i) {
+	enter_bracket();
+	resolve_b3_pfns();
+	if (!s_pfn_is_enabled_i) {
+		info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), false));
+		return;
+	}
+	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
+	    s_pfn_is_enabled_i(a_u32(info, 0), a_u32(info, 1)) == GL_TRUE));
+}
+
+// ----- WEBGL_multi_draw (v1+v2) — 4 engine-native loop shims -----
+// Per plan §3.3 — spec-conformant behavior via iteration + per-draw
+// glDrawArrays / glDrawElements. Perf caveat: no batching benefit vs
+// a native glMultiDrawArraysEXT, but the driver's multi-draw is only
+// available via EXT and only for the non-instanced pair. Loop shim
+// covers all four variants uniformly.
+FN(w_multi_draw_arrays_webgl) {
+	// multiDrawArraysWEBGL(mode, firsts, offsetF, counts, offsetC, drawcount)
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum mode = a_u32(info, 0);
+	std::vector<int32_t> firstsTmp, countsTmp;
+	const int32_t *firsts = nullptr, *counts = nullptr;
+	size_t firstsN = 0, countsN = 0;
+	if (!i32_list(iso, info[1], firstsTmp, &firsts, &firstsN)) return;
+	const size_t offsetF = (size_t)a_i32(info, 2);
+	if (!i32_list(iso, info[3], countsTmp, &counts, &countsN)) return;
+	const size_t offsetC = (size_t)a_i32(info, 4);
+	const size_t drawcount = (size_t)a_i32(info, 5);
+	for (size_t i = 0; i < drawcount; i++) {
+		if (offsetF + i >= firstsN || offsetC + i >= countsN) break;
+		glDrawArrays(mode, firsts[offsetF + i], counts[offsetC + i]);
+	}
+	touch_fbo();
+}
+FN(w_multi_draw_elements_webgl) {
+	// multiDrawElementsWEBGL(mode, counts, offsetC, type, offsets, offsetO, drawcount)
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum mode = a_u32(info, 0);
+	std::vector<int32_t> countsTmp, offsetsTmp;
+	const int32_t *counts = nullptr, *offsets = nullptr;
+	size_t countsN = 0, offsetsN = 0;
+	if (!i32_list(iso, info[1], countsTmp, &counts, &countsN)) return;
+	const size_t offsetC = (size_t)a_i32(info, 2);
+	const GLenum type = a_u32(info, 3);
+	if (!i32_list(iso, info[4], offsetsTmp, &offsets, &offsetsN)) return;
+	const size_t offsetO = (size_t)a_i32(info, 5);
+	const size_t drawcount = (size_t)a_i32(info, 6);
+	for (size_t i = 0; i < drawcount; i++) {
+		if (offsetC + i >= countsN || offsetO + i >= offsetsN) break;
+		glDrawElements(mode, counts[offsetC + i], type,
+		               (const void *)(intptr_t)offsets[offsetO + i]);
+	}
+	touch_fbo();
+}
+FN(w_multi_draw_arrays_instanced_webgl) {
+	// multiDrawArraysInstancedWEBGL(mode, firsts, offsetF, counts, offsetC,
+	//                                instanceCounts, offsetI, drawcount)
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum mode = a_u32(info, 0);
+	std::vector<int32_t> firstsTmp, countsTmp, instTmp;
+	const int32_t *firsts = nullptr, *counts = nullptr, *inst = nullptr;
+	size_t firstsN = 0, countsN = 0, instN = 0;
+	if (!i32_list(iso, info[1], firstsTmp, &firsts, &firstsN)) return;
+	const size_t offsetF = (size_t)a_i32(info, 2);
+	if (!i32_list(iso, info[3], countsTmp, &counts, &countsN)) return;
+	const size_t offsetC = (size_t)a_i32(info, 4);
+	if (!i32_list(iso, info[5], instTmp, &inst, &instN)) return;
+	const size_t offsetI = (size_t)a_i32(info, 6);
+	const size_t drawcount = (size_t)a_i32(info, 7);
+	for (size_t i = 0; i < drawcount; i++) {
+		if (offsetF + i >= firstsN || offsetC + i >= countsN ||
+		    offsetI + i >= instN) break;
+		glDrawArraysInstanced(mode, firsts[offsetF + i], counts[offsetC + i],
+		                       inst[offsetI + i]);
+	}
+	touch_fbo();
+}
+FN(w_multi_draw_elements_instanced_webgl) {
+	// multiDrawElementsInstancedWEBGL(mode, counts, offsetC, type, offsets,
+	//                                  offsetO, instanceCounts, offsetI, drawcount)
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum mode = a_u32(info, 0);
+	std::vector<int32_t> countsTmp, offsetsTmp, instTmp;
+	const int32_t *counts = nullptr, *offsets = nullptr, *inst = nullptr;
+	size_t countsN = 0, offsetsN = 0, instN = 0;
+	if (!i32_list(iso, info[1], countsTmp, &counts, &countsN)) return;
+	const size_t offsetC = (size_t)a_i32(info, 2);
+	const GLenum type = a_u32(info, 3);
+	if (!i32_list(iso, info[4], offsetsTmp, &offsets, &offsetsN)) return;
+	const size_t offsetO = (size_t)a_i32(info, 5);
+	if (!i32_list(iso, info[6], instTmp, &inst, &instN)) return;
+	const size_t offsetI = (size_t)a_i32(info, 7);
+	const size_t drawcount = (size_t)a_i32(info, 8);
+	for (size_t i = 0; i < drawcount; i++) {
+		if (offsetC + i >= countsN || offsetO + i >= offsetsN ||
+		    offsetI + i >= instN) break;
+		glDrawElementsInstanced(mode, counts[offsetC + i], type,
+		                         (const void *)(intptr_t)offsets[offsetO + i],
+		                         inst[offsetI + i]);
+	}
+	touch_fbo();
+}
+
+// ============================================================================
+// End batch 3 block.
+// ============================================================================
+
 static void install_methods(Isolate *iso, Local<Object> proto) {
 	struct Spec { const char *name; FunctionCallback fn; };
 	static const Spec FUNCS[] = {
@@ -3913,6 +4446,32 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"drawElementsInstanced", w_draw_elements_instanced},
 	    {"vertexAttribDivisor", w_vertex_attrib_divisor},
 	    {"drawBuffers", w_draw_buffers},
+	    // ============================================================
+	    // Batch 3 (ledger #57) — v1 extension entry-point wiring.
+	    // v1 doesn't have the core query family (v2's #53), so
+	    // EXT_disjoint_timer_query on v1 exposes the whole query
+	    // lifecycle with EXT suffix, aliasing to the v2 natives.
+	    // ============================================================
+	    // EXT_disjoint_timer_query lifecycle (v1) — aliases #53 natives
+	    {"createQueryEXT", w_create_query},
+	    {"deleteQueryEXT", w_delete_query},
+	    {"isQueryEXT", w_is_query},
+	    {"beginQueryEXT", w_begin_query},
+	    {"endQueryEXT", w_end_query},
+	    {"getQueryEXT", w_get_query},
+	    {"getQueryObjectEXT", w_get_query_parameter},
+	    {"queryCounterEXT", w_query_counter_ext},
+	    // EXT_clip_control
+	    {"clipControlEXT", w_clip_control_ext},
+	    // EXT_polygon_offset_clamp
+	    {"polygonOffsetClampEXT", w_polygon_offset_clamp_ext},
+	    // KHR_parallel_shader_compile
+	    {"maxShaderCompilerThreadsKHR", w_max_shader_compiler_threads_khr},
+	    // WEBGL_multi_draw — 4 loop-shim methods (v1 aliases v2)
+	    {"multiDrawArraysWEBGL", w_multi_draw_arrays_webgl},
+	    {"multiDrawElementsWEBGL", w_multi_draw_elements_webgl},
+	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
+	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
 	    // Fork-specific hooks (canvas-runner expects them).
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
@@ -4241,6 +4800,37 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"getTransformFeedbackVarying", w_get_transform_feedback_varying},
 	    {"pauseTransformFeedback", w_pause_transform_feedback},
 	    {"resumeTransformFeedback", w_resume_transform_feedback},
+	    // ============================================================
+	    // Batch 3 (ledger #57) — extension entry-point wiring on v2's
+	    // FUNCS[]. The methods with a suffix (queryCounterEXT,
+	    // clipControlEXT, etc.) are also vended via the extension
+	    // object in w_get_extension; landing them on the prototype
+	    // gives Three.js and Unity WebGL emitters (which sometimes
+	    // call gl.methodEXT directly on the context) a functional
+	    // symbol regardless of getExtension-object access order.
+	    // ============================================================
+	    // EXT_disjoint_timer_query_webgl2 (v2) — queryCounterEXT
+	    {"queryCounterEXT", w_query_counter_ext},
+	    // EXT_clip_control
+	    {"clipControlEXT", w_clip_control_ext},
+	    // EXT_polygon_offset_clamp
+	    {"polygonOffsetClampEXT", w_polygon_offset_clamp_ext},
+	    // KHR_parallel_shader_compile
+	    {"maxShaderCompilerThreadsKHR", w_max_shader_compiler_threads_khr},
+	    // OES_draw_buffers_indexed — 8 methods (v2 only)
+	    {"enableiOES", w_enable_i},
+	    {"disableiOES", w_disable_i},
+	    {"blendEquationiOES", w_blend_equation_i},
+	    {"blendEquationSeparateiOES", w_blend_equation_separate_i},
+	    {"blendFunciOES", w_blend_func_i},
+	    {"blendFuncSeparateiOES", w_blend_func_separate_i},
+	    {"colorMaskiOES", w_color_mask_i},
+	    {"isEnablediOES", w_is_enabled_i},
+	    // WEBGL_multi_draw — 4 loop-shim methods
+	    {"multiDrawArraysWEBGL", w_multi_draw_arrays_webgl},
+	    {"multiDrawElementsWEBGL", w_multi_draw_elements_webgl},
+	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
+	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
