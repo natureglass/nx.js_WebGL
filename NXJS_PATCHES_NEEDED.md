@@ -86,6 +86,7 @@ proposal verdict.
 | 62 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_attached_shaders\)` | Tier 1: `getAttachedShaders(program)` — wraps GLuint names into K_SHADER JS Array. Empty array (not null) when nothing attached, spec. Unlocks misc-expando-loss, programs-program-test. |
 | 63 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_vertex_attrib_1fv\)` + `webgl.cc: FN\(w_vertex_attrib_4fv\)` | Tier 1: `vertexAttrib{1,2,3,4}fv(index, arr)` typed-array pointer variants of the scalar setters. Same macro shape as uniform_{N}fv. Unlocks attribs-gl-vertex-attrib-render (dynamic-form receiver). |
 | 64 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_snapshot_bridge_rgba8` + `webgl.h: nx_webgl_snapshot_bridge_rgba8` + `canvas.cc: nx_webgl_snapshot_bridge_rgba8` | Tier 1: Screen.toDataURL WebGL-surface readback. New public helper reads tenant FBO to a heap BGRA (top-down) buffer; `nx_canvas_proto_to_data_url` + `nx_canvas_to_buffer` branch through it before falling back to snapshot_pixels. Fixes `screen.toDataURL()` on WebGL-backed Screens returning empty raster. |
+| 65 | engine | upstream-candidate | not-submitted | `webgl.cc: has_compressed_format_advertised` + `webgl.cc: Tier 4 \(ledger #65\)` | Tier 4: compressed-format INVALID_ENUM validation gate in `w_compressed_tex_image_2d` + `w_compressed_tex_sub_image_2d`. Spec-required — WebGL implementations MUST reject unadvertised sized compressed internalformats before dispatching to the driver. Fixes 7 CITRON-observed hangs (hardware stall behavior unverified) in the `testCompressedFormatsUnavailableWhenExtensionDisabled` cluster (BPTC/RGTC/ETC/ETC1/PVRTC/ASTC/S3TC-sRGB). |
 
 ## DISPOSITION POLICY
 
@@ -3094,6 +3095,42 @@ canvas.cc's `nx_canvas_proto_to_data_url` gains one branch before the existing `
 - `screen.toDataURL()` returns a solid transparent-black PNG after a WebGL draw = the WebGL branch was removed from canvas.cc; the raster fallback ran and got the empty Skia surface.
 - Y-flipped image (upside-down) = the flip loop in `nx_webgl_snapshot_bridge_rgba8` regressed (swapped row indices, dropped the flip, etc.).
 - Wrong color channels (blue↔red) = the RGBA→BGRA swizzle regressed.
+
+---
+
+## #65 — Tier 4: compressed-format INVALID_ENUM validation gate — SHIPPED 2026-07-04
+
+**File(s):**
+- [source/webgl.cc](source/webgl.cc) — new `has_compressed_format_advertised(GLenum internalformat)` static helper in the namespace (right above `w_compressed_tex_image_2d`) + gate branch inside both `w_compressed_tex_image_2d` and `w_compressed_tex_sub_image_2d` (record INVALID_ENUM and return before touching the driver on unadvertised formats).
+- `sdmc:/switch/brewser/logs/full-webgl1-conformance-skip.txt` — 7 formerly-skipped compressed-format hang entries (BPTC/RGTC/ETC/ETC1/PVRTC/ASTC/S3TC-sRGB) REMOVED. The remaining 5 HANG entries stay with one-line comments explaining why each is retained.
+
+**Motivation.** The WebGL 1 conformance corpus contains a helper
+`testCompressedFormatsUnavailableWhenExtensionDisabled` that intentionally calls `glCompressedTexImage2D(target, 0, <unadvertised-format>, 4, 4, 0, data)` and asserts the call returns INVALID_ENUM without doing the upload. On Citron running Mesa-Nouveau, the pre-gate call did NOT return INVALID_ENUM at the driver — the WebGL runner **hung inside `runOneTest` before the test's START diag fired** across 7 tests (BPTC, RGTC, ETC, ETC1, PVRTC, ASTC, S3TC-sRGB). This is a **CITRON-observed hang; hardware stall behavior unverified** — Citron is a functional-iteration authority, never a driver-truth authority per the house rule reinforced in the 2026-07-04 shader-translation-cache-cliff diagnosis. Even if real Tegra doesn't stall, the fix is spec-required regardless: WebGL implementations MUST validate the internalformat against the currently-advertised extension set before dispatch. This gate makes us spec-compliant regardless of driver behavior.
+
+**Implementation shape.** The helper switches on internalformat and returns true iff the format is either ES3-core (ETC2/EAC — 0x9270..9) or maps to an extension token that `has_native_ext(...)` currently reports as advertised. Format-token → advertising-extension map:
+- 0x83F0..3 (S3TC DXT1/DXT1a/DXT3/DXT5) → GL_EXT_texture_compression_s3tc
+- 0x8C4C..F (S3TC sRGB) → GL_EXT_texture_compression_s3tc_srgb
+- 0x8D64 (ETC1 RGB8) → GL_OES_compressed_ETC1_RGB8_texture
+- 0x9270..9 (ETC2/EAC × 10) → ES3 core, always allowed
+- 0x8DBB..E (RGTC × 4) → GL_EXT_texture_compression_rgtc
+- 0x8E8C..F (BPTC × 4) → GL_EXT_texture_compression_bptc
+- 0x93B0..D + 0x93D0..D (ASTC LDR + sRGB, 28 formats total) → GL_KHR_texture_compression_astc_ldr
+- `default` (including PVRTC and any unaudited format) → false
+
+PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose the IMG or WEBGL_compressed_texture_pvrtc token, so any PVRTC format falls to the default `false` branch. Both `w_compressed_tex_image_2d` and `w_compressed_tex_sub_image_2d` share the same gate — trivial addition to the sub-image path because the arg has the same semantics (identifies the storage's sized compressed internalformat).
+
+**Skip-file change bundled.** The 7 compressed-cluster HANG entries (BPTC / RGTC / ETC / ETC1 / PVRTC / ASTC / S3TC-sRGB) come out of `sdmc:/switch/brewser/logs/full-webgl1-conformance-skip.txt` in the same commit as the gate — otherwise the re-baseline can't measure the unlock. `extensions-s3tc-and-rgtc` is kept skipped (it's the combined-cluster test outside Alex's explicit 7-name list; will unlock on re-baseline and can be removed then) plus 4 other unrelated HANGs. Post-edit the file holds 5 HANG entries + 4 CRASH entries + 1 cliff-artifact CRASH entry, each with an inline comment explaining why it stays.
+
+**Attribution — CITRON-observed only.** All 7 hang measurements come from Citron. Whether real Mesa-Nouveau on Tegra ALSO stalls without the gate is unverified — see the CITRON-only reclassification precedent in ledger #52a/#54/#55-pause. Code comments + this ledger entry + the corpus skip-file all say "CITRON-observed hang; hardware stall behavior unverified"; nowhere does the fix or its ledger say "Nouveau stalls" or attribute the hang to the driver. The fix is justified purely on WebGL spec grounds (spec-required validation before dispatch) — driver behavior is orthogonal.
+
+**DISPOSITION:** `upstream-candidate`. WebGL spec validation gap that upstream would fix identically.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `has_compressed_format_advertised` (helper decl) and `Tier 4 (ledger #65)` (block marker). Recurrence tells:
+- 7 compressed-format tests regress to HANG on Citron re-baseline = the gate branch was removed from one or both of the compressed FN bodies.
+- A conformance test compiling a shader that legitimately uses BPTC/RGTC/etc after `getExtension()` fails = the extension advertising side regressed, not the gate itself (advertising happens in `w_get_extension`; gate is downstream).
+- All ASTC tests fail with INVALID_ENUM even when the driver DOES expose ASTC = `has_native_ext("GL_KHR_texture_compression_astc_ldr")` returned false; native-ext cache didn't populate, unrelated to this entry.
 
 ---
 

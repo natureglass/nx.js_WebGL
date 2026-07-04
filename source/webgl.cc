@@ -2520,6 +2520,103 @@ FN(w_tex_sub_image_2d) {
 	                pixels);
 }
 
+// Tier 4 (ledger #65) — validation gate for compressed-texture uploads.
+//
+// Maps each sized compressed internalformat to the extension token that must
+// currently be advertised (via `has_native_ext`) for the format to be legal
+// input to `glCompressedTexImage2D` / `glCompressedTexSubImage2D`. Returns
+// true if the format IS advertised (either by a driver-gated extension or
+// as ES3 core, e.g. ETC2/EAC), false otherwise.
+//
+// Why this gate exists. The WebGL 1 conformance corpus contains a helper
+// `testCompressedFormatsUnavailableWhenExtensionDisabled` that intentionally
+// calls `glCompressedTexImage2D(target, 0, <unadvertised-format>, 4, 4, 0,
+// data)` and asserts the call returns INVALID_ENUM instead of doing the
+// upload. On Citron running Mesa-Nouveau, an unadvertised compressed format
+// does NOT return INVALID_ENUM at the driver — the WebGL runner hangs inside
+// `runOneTest` before the test's START diag fires (CITRON-observed hang;
+// hardware stall behavior unverified — Citron is a functional-iteration
+// authority, never a driver-truth authority per the house rule reinforced
+// in the 2026-07-04 cliff diagnosis). Independent of whether real Tegra
+// stalls, the fix is spec-required: WebGL implementations MUST validate the
+// internalformat against the currently-advertised extension set before
+// dispatching to the driver. This gate makes us spec-compliant regardless
+// of driver behavior.
+//
+// Format-token → advertising extension map (all sized ES3 internalformats):
+//   0x83F0..3         S3TC  DXT1/DXT1a/DXT3/DXT5     GL_EXT_texture_compression_s3tc
+//   0x8C4C..F         S3TC sRGB  DXT1/DXT1a/DXT3/DXT5 GL_EXT_texture_compression_s3tc_srgb
+//   0x8D64            ETC1 RGB8                       GL_OES_compressed_ETC1_RGB8_texture
+//   0x9270..9         ETC2 / EAC (10 formats)          ES3 core (always allowed)
+//   0x8DBB..E         RGTC (4 formats)                 GL_EXT_texture_compression_rgtc
+//   0x8E8C..F         BPTC (4 formats)                 GL_EXT_texture_compression_bptc
+//   0x93B0..D         ASTC LDR (14 formats)            GL_KHR_texture_compression_astc_ldr
+//   0x93D0..D         ASTC sRGB (14 formats)           GL_KHR_texture_compression_astc_ldr
+//
+// PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose
+// GL_IMG_texture_compression_pvrtc, so any PVRTC format is unadvertised and
+// falls through to the `default` branch (returns false → INVALID_ENUM).
+static bool has_compressed_format_advertised(GLenum internalformat) {
+	switch (internalformat) {
+	// S3TC
+	case 0x83F0:
+	case 0x83F1:
+	case 0x83F2:
+	case 0x83F3:
+		return has_native_ext("GL_EXT_texture_compression_s3tc");
+	// S3TC sRGB
+	case 0x8C4C:
+	case 0x8C4D:
+	case 0x8C4E:
+	case 0x8C4F:
+		return has_native_ext("GL_EXT_texture_compression_s3tc_srgb");
+	// ETC1
+	case 0x8D64:
+		return has_native_ext("GL_OES_compressed_ETC1_RGB8_texture");
+	// ETC2 / EAC — ES3 core; no ext gate. These are always allowed.
+	case 0x9270:
+	case 0x9271:
+	case 0x9272:
+	case 0x9273:
+	case 0x9274:
+	case 0x9275:
+	case 0x9276:
+	case 0x9277:
+	case 0x9278:
+	case 0x9279:
+		return true;
+	// RGTC
+	case 0x8DBB:
+	case 0x8DBC:
+	case 0x8DBD:
+	case 0x8DBE:
+		return has_native_ext("GL_EXT_texture_compression_rgtc");
+	// BPTC
+	case 0x8E8C:
+	case 0x8E8D:
+	case 0x8E8E:
+	case 0x8E8F:
+		return has_native_ext("GL_EXT_texture_compression_bptc");
+	// ASTC LDR (14 sized formats)
+	case 0x93B0: case 0x93B1: case 0x93B2: case 0x93B3:
+	case 0x93B4: case 0x93B5: case 0x93B6: case 0x93B7:
+	case 0x93B8: case 0x93B9: case 0x93BA: case 0x93BB:
+	case 0x93BC: case 0x93BD:
+	// ASTC sRGB (14 sized formats)
+	case 0x93D0: case 0x93D1: case 0x93D2: case 0x93D3:
+	case 0x93D4: case 0x93D5: case 0x93D6: case 0x93D7:
+	case 0x93D8: case 0x93D9: case 0x93DA: case 0x93DB:
+	case 0x93DC: case 0x93DD:
+		return has_native_ext("GL_KHR_texture_compression_astc_ldr");
+	default:
+		// Any format not in the map — including PVRTC and any future
+		// unaudited codec — is treated as unadvertised. WebGL implementations
+		// MUST return INVALID_ENUM on this path per the conformance corpus's
+		// testCompressedFormatsUnavailableWhenExtensionDisabled contract.
+		return false;
+	}
+}
+
 // Phase-1 batch-1 — compressed texture 2D uploads. Native
 // glCompressedTexImage2D takes an explicit imageSize argument; in WebGL
 // this comes from the ArrayBufferView's byteLength.
@@ -2530,6 +2627,12 @@ FN(w_tex_sub_image_2d) {
 // spec-legal (v2 falls back to the ArrayBufferView shape when the caller
 // doesn't pass the extra args). Ledger row per plan §3.1's discovered
 // missing-native gap.
+//
+// Tier 4 (ledger #65) — compressed-format validation gate. Rejects
+// unadvertised sized compressed internalformats with INVALID_ENUM BEFORE
+// touching the driver. Prevents CITRON-observed hangs in
+// testCompressedFormatsUnavailableWhenExtensionDisabled (hardware stall
+// behavior unverified per Citron / driver-authority house rule).
 FN(w_compressed_tex_image_2d) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
@@ -2538,6 +2641,14 @@ FN(w_compressed_tex_image_2d) {
 	const GLsizei width = a_i32(info, 3);
 	const GLsizei height = a_i32(info, 4);
 	const GLint border = a_i32(info, 5);
+	// Ledger #65 gate — return INVALID_ENUM without touching the driver if
+	// the requested internalformat is not currently advertised. Spec-required
+	// and dodges the CITRON-observed hang in
+	// testCompressedFormatsUnavailableWhenExtensionDisabled.
+	if (!has_compressed_format_advertised(internalformat)) {
+		record_error(GL_INVALID_ENUM);
+		return;
+	}
 	size_t len = 0;
 	void *pixels = view_bytes(info[6], &len);
 	if (info[6]->IsArrayBuffer()) {
@@ -2558,6 +2669,15 @@ FN(w_compressed_tex_sub_image_2d) {
 	const GLsizei width = a_i32(info, 4);
 	const GLsizei height = a_i32(info, 5);
 	const GLenum format = a_u32(info, 6);
+	// Ledger #65 gate — mirrors the w_compressed_tex_image_2d branch. The
+	// format arg here is spec-named `format` (parity with texSubImage2D) but
+	// it identifies the same sized compressed internalformat as the allocated
+	// storage, so the same advertising check applies. Spec-required
+	// INVALID_ENUM on unadvertised formats.
+	if (!has_compressed_format_advertised(format)) {
+		record_error(GL_INVALID_ENUM);
+		return;
+	}
 	size_t len = 0;
 	void *pixels = view_bytes(info[7], &len);
 	if (info[7]->IsArrayBuffer()) {

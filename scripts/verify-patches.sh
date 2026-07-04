@@ -1027,6 +1027,21 @@ check 64 "canvas.cc [tier1] nx_webgl_snapshot_bridge_rgba8 call sites" \
     "$NXJS/source/canvas.cc" \
     'nx_webgl_snapshot_bridge_rgba8'
 
+# #65 — Tier 4: compressed-format INVALID_ENUM validation gate. Helper decl
+# + block marker + gate branches inside both compressed FN bodies.
+check 65 "webgl.cc [tier4] has_compressed_format_advertised helper" \
+    "$NXJS/source/webgl.cc" \
+    'static bool has_compressed_format_advertised'
+check 65 "webgl.cc [tier4] block marker comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Tier 4 \(ledger #65\)'
+check 65 "webgl.cc [tier4] w_compressed_tex_image_2d gate branch" \
+    "$NXJS/source/webgl.cc" \
+    'if \(!has_compressed_format_advertised\(internalformat\)\)'
+check 65 "webgl.cc [tier4] w_compressed_tex_sub_image_2d gate branch" \
+    "$NXJS/source/webgl.cc" \
+    'if \(!has_compressed_format_advertised\(format\)\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
