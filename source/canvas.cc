@@ -18,7 +18,8 @@
 #include "path2d.h"
 #include "image.h"
 #include "util.h"
-#include "webgl.h"   // Tier 1 (ledger #64) — nx_webgl_snapshot_bridge_rgba8
+#include "webgl.h"          // Tier 1 (ledger #64) — nx_webgl_snapshot_bridge_rgba8
+#include "webgl_bridge.h"   // Tier-A refine — nx_webgl_bridge_is_initialized + fbo_size
 #include "wrap.h"
 #include <alloca.h>
 #include <math.h>
@@ -2791,12 +2792,21 @@ void nx_canvas_to_buffer(const FunctionCallbackInfo<Value> &info) {
 	if (quality < 0.0) quality = 0.0;
 	if (quality > 1.0) quality = 1.0;
 	NX_INIT_WORK_T(encode_async_t);
-	// Tier 1 (ledger #64) — WebGL-surface readback path, mirror of the
-	// synchronous toDataURL branch. WebGL snapshot MUST happen on the main
-	// thread (this fn body is the main-thread half — async dispatch is only
-	// the encode). Raster fallback keeps 2D-canvas behavior intact.
+	// Tier 1 (ledger #64, refined post-#66 regression) — WebGL-surface
+	// readback path, mirror of the synchronous toDataURL branch. Only
+	// fires when we're likely on the Screen canvas (bridge FBO dimensions
+	// match canvas + surface never dirty). WebGL snapshot MUST happen on
+	// the main thread (this fn body is the main-thread half — async
+	// dispatch is only the encode).
+	int fbo_w2 = 0, fbo_h2 = 0;
+	nx_webgl_bridge_fbo_size(&fbo_w2, &fbo_h2);
+	const bool likely_screen2 =
+	    nx_webgl_bridge_is_initialized() &&
+	    fbo_w2 > 0 && fbo_h2 > 0 &&
+	    (int)canvas->width == fbo_w2 && (int)canvas->height == fbo_h2;
 	data->pixels = nullptr;
-	if (nx_webgl_snapshot_bridge_rgba8(&data->width, &data->height,
+	if (likely_screen2 &&
+	    nx_webgl_snapshot_bridge_rgba8(&data->width, &data->height,
 	                                    &data->pixels)) {
 		data->stride = data->width * 4;
 	} else {
@@ -2833,13 +2843,25 @@ void nx_canvas_proto_to_data_url(const FunctionCallbackInfo<Value> &info) {
 	if (quality > 1.0) quality = 1.0;
 	int w = 0, h = 0, stride = 0;
 	uint8_t *pixels = nullptr;
-	// Tier 1 (ledger #64) — WebGL-surface readback path. When Screen carries
-	// an active WebGL bridge, its raster surface (`canvas->data`) is empty
-	// because rendering lands in the tenant EGL FBO, not the Skia raster
-	// backing. Read the FBO instead. On failure (bridge not up / OOM / GL
-	// error) fall through to the raster path — which is correct for 2D
-	// canvases and for WebGL Screens where the readback couldn't run.
-	if (nx_webgl_snapshot_bridge_rgba8(&w, &h, &pixels)) {
+	// Tier 1 (ledger #64, refined post-#66 regression) — WebGL-surface
+	// readback path. Only fires when we're likely on the Screen canvas
+	// carrying an active WebGL bridge: the bridge FBO's dimensions must
+	// match this canvas's dimensions AND surface_dirty must be false
+	// (raster surface never touched). Prior unconditional check caused
+	// OffscreenCanvas.convertToBlob (and my Tier-A #66 canvasToImageBitmap
+	// helper) to grab tenant FBO pixels instead of the caller's canvas.
+	int fbo_w = 0, fbo_h = 0;
+	nx_webgl_bridge_fbo_size(&fbo_w, &fbo_h);
+	// Heuristic: WebGL bridge is up AND this canvas's dimensions match the
+	// bridge FBO exactly. There's only one bridge FBO per process and it's
+	// created at Screen's dimensions (1280×720 or similar); an arbitrary
+	// OffscreenCanvas of test-typical 128×128 or 64×64 won't match, so we
+	// correctly fall through to the raster path for the caller.
+	const bool likely_screen =
+	    nx_webgl_bridge_is_initialized() &&
+	    fbo_w > 0 && fbo_h > 0 &&
+	    (int)canvas->width == fbo_w && (int)canvas->height == fbo_h;
+	if (likely_screen && nx_webgl_snapshot_bridge_rgba8(&w, &h, &pixels)) {
 		stride = w * 4;
 	} else {
 		w = 0; h = 0; stride = 0; pixels = nullptr;
