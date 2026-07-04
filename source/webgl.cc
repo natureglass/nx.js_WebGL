@@ -1112,7 +1112,7 @@ FN(w_get_extension) {
 	// Wrapping into a local helper keeps the return + track pair symmetric
 	// with make_obj_with above.
 	auto set_empty_obj = [&]() {
-		set_empty_obj();
+		info.GetReturnValue().Set(Object::New(iso));
 		record_ext_enabled(name);
 	};
 	// WebGL1 extensions whose enum constants are numerically identical to
