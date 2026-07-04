@@ -89,6 +89,7 @@ proposal verdict.
 | 65 | engine | upstream-candidate | not-submitted | `webgl.cc: has_compressed_format_advertised` + `webgl.cc: Tier 4 \(ledger #65\)` | Tier 4: compressed-format INVALID_ENUM validation gate in `w_compressed_tex_image_2d` + `w_compressed_tex_sub_image_2d`. Spec-required — WebGL implementations MUST reject unadvertised sized compressed internalformats before dispatching to the driver. Fixes 7 CITRON-observed hangs (hardware stall behavior unverified) in the `testCompressedFormatsUnavailableWhenExtensionDisabled` cluster (BPTC/RGTC/ETC/ETC1/PVRTC/ASTC/S3TC-sRGB). |
 | 66 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: tryUnwrapCanvas` + `image-bitmap.ts: canvasToImageBitmap` | Tier-A: `createImageBitmap` source-type expansion. Pre-#66 impl handled ONLY `Blob` and threw for every other spec-defined `ImageBitmapSource`. Adds `HTMLCanvasElement` (nx.js Screen / OffscreenCanvas + brewser-runtime live-DOM `<canvas>` LiveElement via `.offscreen` duck-unwrap), `ImageData` (via scratch OffscreenCanvas + putImageData), `ImageBitmap` (via drawImage round-trip), `HTMLImageElement` (nx.js Image duck-typed on `naturalWidth`/`naturalHeight`). Unlocks up to 40 conformance tests across 5 `textures-image_bitmap_from_*` sub-clusters × 8 texture formats. HTMLVideoElement branch throws a distinct diagnostic (needs canvas.cc video-frame-capture path). |
 | 67 | engine | upstream-candidate | not-submitted | `webgl.cc: enabled_exts` + `webgl.cc: record_ext_enabled` + `webgl.cc: is_ext_enabled` | Tier-A: `getParameter` extension-gated pname enforcement. Per WebGL spec § 5.14.3, extension-gated pnames MUST return null (+ INVALID_ENUM) until `getExtension` has been called for their gating extension. Pre-#67 they returned real values unconditionally, causing 6-8 conformance FAILs. Adds per-context `enabled_exts` set populated at every success branch in `w_get_extension` and consulted by 8 new/modified pname branches in `w_get_parameter`: `CLIP_ORIGIN_EXT` / `CLIP_DEPTH_MODE_EXT` / `DEPTH_CLAMP_EXT` / `POLYGON_OFFSET_CLAMP_EXT` / `MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL` / `FRAGMENT_SHADER_DERIVATIVE_HINT_OES` / `COMPLETION_STATUS_KHR` + gating on the existing `UNMASKED_VENDOR/RENDERER_WEBGL` + `MAX_TEXTURE_MAX_ANISOTROPY_EXT` branches. |
+| 68 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_detect_link_attrib_aliasing` + `webgl.cc: programs_with_aliased_link` | Tier-A: attribute-aliasing link failure detection. WebGL spec §5.14.9: `linkProgram` MUST fail when two active attributes end up bound to the same location via `bindAttribLocation`. Mesa-Nouveau (observed) still succeeds the driver-level link. Post-link scan iterates `glGetActiveAttrib` × `glGetAttribLocation`, detects any two active attribs sharing a location, and marks the program in a per-context set. `w_get_program_parameter` overrides `LINK_STATUS` to false for marked programs. Fixes `attribs-gl-bindAttribLocation-aliasing` (32 aliased-location assertions). |
 
 ## DISPOSITION POLICY
 
@@ -3194,6 +3195,35 @@ PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose the IM
 - All 7 extension tests above regress with real values returned instead of null = one of the 8 `case` branches in `w_get_parameter` regressed (lost its `is_ext_enabled(...)` guard or fell through to `default:`).
 - ONE test regresses = a specific pname's gating extension name is misspelled in its `is_ext_enabled(...)` call (e.g. `EXT_clip_control` vs `WEBGL_clip_control`).
 - All 7 tests regress with values EVEN AFTER `getExtension` = `record_ext_enabled` isn't being called from `w_get_extension`'s success branches (grep for `record_ext_enabled(name)` — should have ~16 occurrences).
+
+---
+
+## #68 — Tier-A: attribute-aliasing link failure detection — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `programs_with_aliased_link: std::unordered_set<GLuint>` field on `WebGLState` + `nx_detect_link_attrib_aliasing(GLuint program)` static helper + updated `w_link_program` (calls the detector after `glLinkProgram`) + updated `w_get_program_parameter` (overrides LINK_STATUS to false for marked programs) + updated `w_delete_program` (clears the aliased-link record on delete).
+
+**Motivation.** WebGL spec §5.14.9: "If any bound attribute is bound to the same location as another bound attribute, `linkProgram` shall fail with a linking error." Mesa-Nouveau (observed on Citron) succeeds the driver-level link and lets both aliased names read at the same location. The conformance test `attribs-gl-bindAttribLocation-aliasing` probes this with all 32 possible attribute-index pairs (`Link should fail when both attributes are aliased to location 0`, `1`, `2`, ..., `31`) and FAILs across the whole set pre-#68.
+
+**Implementation.** Post-link scan (runs at the tail of every `glLinkProgram` call):
+
+1. Query `GL_LINK_STATUS` — if the driver already reported failure, there's nothing to override and we clear the aliased flag.
+2. Query `GL_ACTIVE_ATTRIBUTES` count.
+3. For each active attrib, `glGetActiveAttrib(program, i, ...)` → name; `glGetAttribLocation(program, name)` → location.
+4. Skip GL-reserved names (start with `gl_`) — they're pre-linked to fixed pipeline slots and can't participate in user aliasing.
+5. Insert location into a per-call `std::unordered_set<GLint>`. If insertion FAILS (location already present), two active attribs are aliased → mark the program.
+
+`w_get_program_parameter`'s LINK_STATUS branch consults `programs_with_aliased_link` and overrides the driver's `true` to `false` when the program is marked. `w_delete_program` erases the flag on delete so a subsequent `glGenProgram` reuse doesn't inherit stale state.
+
+**Deferred spec detail.** `getProgramInfoLog` still returns whatever the driver wrote (which for a driver that thought the link succeeded is empty or non-diagnostic). Adding a synthetic info-log entry describing the aliasing is a spec-nice-to-have; the conformance test only inspects LINK_STATUS, so it's out of MVP scope.
+
+**DISPOSITION:** `upstream-candidate`. Spec-required behavior that every WebGL implementation needs; upstream would take the scan verbatim.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `nx_detect_link_attrib_aliasing`, `programs_with_aliased_link`, and `Ledger #68` in `w_link_program` + `w_get_program_parameter`. Recurrence tells:
+- `attribs-gl-bindAttribLocation-aliasing` regresses to FAIL on ALL 32 assertions = the scan helper is no longer being called from `w_link_program`, or the aliased-set field was removed from WebGLState.
+- Only SOME assertions fail = the loop bailed early (check the `break;` after `aliased = true;` is inside the `for` and not before the location check).
+- The test PASSES the aliased assertions but a legitimate compile-only test that binds two identical names to the same location starts failing = the scan is flagging non-aliased cases (the `!seen_locations.insert(loc).second` should only fire for truly-duplicate locations; verify the set is per-call, not per-context).
 
 ---
 

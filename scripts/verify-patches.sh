@@ -1097,6 +1097,23 @@ check 67 "webgl.cc [tier-a] MAX_TEXTURE_MAX_ANISOTROPY_EXT gated" \
     "$NXJS/source/webgl.cc" \
     'is_ext_enabled\("EXT_texture_filter_anisotropic"\)'
 
+# #68 — Tier-A: attribute-aliasing link failure detection.
+check 68 "webgl.cc [tier-a] programs_with_aliased_link field" \
+    "$NXJS/source/webgl.cc" \
+    'std::unordered_set<GLuint> programs_with_aliased_link'
+check 68 "webgl.cc [tier-a] nx_detect_link_attrib_aliasing helper" \
+    "$NXJS/source/webgl.cc" \
+    'static void nx_detect_link_attrib_aliasing'
+check 68 "webgl.cc [tier-a] Ledger #68 comment in w_link_program" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #68 — post-link aliased-attribute check'
+check 68 "webgl.cc [tier-a] LINK_STATUS override in w_get_program_parameter" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #68 — LINK_STATUS override for aliased-attribute programs'
+check 68 "webgl.cc [tier-a] delete_program clears aliased record" \
+    "$NXJS/source/webgl.cc" \
+    'programs_with_aliased_link\.erase\(id\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

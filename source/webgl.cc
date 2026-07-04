@@ -199,6 +199,18 @@ struct WebGLState {
 	// leaves the pname queryable on v2) but WON'T fail any tests: v1 and v2
 	// vend different pname sets, and no test crosses the boundary.
 	std::unordered_set<std::string> enabled_exts;
+	// Ledger #68 — per-program flag: is the link marked as failed because
+	// two active attribs ended up at the same location? WebGL spec §5.14.9
+	// requires linkProgram to fail when bindAttribLocation aliases two
+	// active attributes to the same index. Mesa-Nouveau (and some other
+	// GLES drivers) may still succeed the driver-level link and return
+	// GL_LINK_STATUS = TRUE; the conformance test
+	// `attribs-gl-bindAttribLocation-aliasing` explicitly probes this
+	// with 32 aliased-location pairs. We detect aliasing post-link and,
+	// if any pair is found, override LINK_STATUS to FALSE for that
+	// program. Keyed by program name; entries live until the program is
+	// deleted OR until a subsequent linkProgram clears/updates the flag.
+	std::unordered_set<GLuint> programs_with_aliased_link;
 };
 
 WebGLState *st = nullptr;
@@ -2242,7 +2254,14 @@ FN(w_create_program) {
 }
 FN(w_delete_program) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteProgram(id);
+	if (id) {
+		glDeleteProgram(id);
+		// Ledger #68 — clear any aliased-link record for this program name
+		// so a fresh program allocated later with the same GLuint doesn't
+		// inherit the stale aliased state (glGenProgram reuse is spec-legal
+		// after delete).
+		if (st) st->programs_with_aliased_link.erase(id);
+	}
 }
 FN(w_is_program) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -2254,7 +2273,69 @@ FN(w_attach_shader) {
 FN(w_detach_shader) {
 	glDetachShader(obj_id(info[0]), obj_id(info[1]));
 }
-FN(w_link_program) { enter_bracket(); glLinkProgram(obj_id(info[0])); }
+// Ledger #68 — post-link scan for aliased attribute locations. WebGL spec
+// §5.14.9: linkProgram MUST fail when two active attributes end up bound
+// to the same location. Some drivers (Mesa-Nouveau observed) succeed the
+// link and let both names read at the same location. This helper walks
+// the program's active attribs, resolves each name's real location via
+// glGetAttribLocation, and if two active attribs share a location it
+// records the program as aliased-link-failed. `w_get_program_parameter`
+// then reports GL_LINK_STATUS = false for the recorded programs.
+//
+// Runs only when the driver reported success (there's nothing to override
+// if the driver already failed). Skips inactive/-1 attribs (they're not
+// what the spec's aliasing rule targets).
+static void nx_detect_link_attrib_aliasing(GLuint program) {
+	if (!st || program == 0) return;
+	GLint link_ok = 0;
+	glGetProgramiv(program, GL_LINK_STATUS, &link_ok);
+	if (!link_ok) {
+		st->programs_with_aliased_link.erase(program);
+		return;
+	}
+	GLint active_count = 0;
+	glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &active_count);
+	GLint max_name_len = 0;
+	glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &max_name_len);
+	if (max_name_len < 1) max_name_len = 1;
+	std::vector<char> name_buf((size_t)max_name_len + 1);
+	std::unordered_set<GLint> seen_locations;
+	bool aliased = false;
+	for (GLint i = 0; i < active_count; i++) {
+		GLsizei nlen = 0;
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveAttrib(program, (GLuint)i, max_name_len, &nlen,
+		                   &size, &type, name_buf.data());
+		if (nlen <= 0) continue;
+		// Skip GL-reserved names — they're pre-linked to fixed pipeline
+		// slots and can't participate in user aliasing.
+		if (name_buf[0] == 'g' && name_buf[1] == 'l' && name_buf[2] == '_')
+			continue;
+		const GLint loc = glGetAttribLocation(program, name_buf.data());
+		if (loc < 0) continue;
+		if (!seen_locations.insert(loc).second) {
+			// Duplicate location — two active attribs aliased.
+			aliased = true;
+			break;
+		}
+	}
+	if (aliased) {
+		st->programs_with_aliased_link.insert(program);
+	} else {
+		st->programs_with_aliased_link.erase(program);
+	}
+}
+
+FN(w_link_program) {
+	enter_bracket();
+	const GLuint p = obj_id(info[0]);
+	glLinkProgram(p);
+	// Ledger #68 — post-link aliased-attribute check. Runs unconditionally
+	// (whether the driver reported success or failure) so a subsequent
+	// linkProgram on the same program clears any stale aliased flag.
+	nx_detect_link_attrib_aliasing(p);
+}
 FN(w_validate_program) { enter_bracket(); glValidateProgram(obj_id(info[0])); }
 FN(w_use_program) {
 	enter_bracket();
@@ -2269,6 +2350,16 @@ FN(w_get_program_parameter) {
 	glGetProgramiv(p, pname, &v);
 	if (pname == GL_DELETE_STATUS || pname == GL_LINK_STATUS ||
 	    pname == GL_VALIDATE_STATUS) {
+		// Ledger #68 — LINK_STATUS override for aliased-attribute programs.
+		// The driver may have succeeded the link despite spec violation;
+		// nx_detect_link_attrib_aliasing (run at the tail of w_link_program)
+		// marks such programs and we report FALSE here so
+		// `attribs-gl-bindAttribLocation-aliasing` sees a spec-correct
+		// failure verdict.
+		if (pname == GL_LINK_STATUS && v != 0 && st &&
+		    st->programs_with_aliased_link.count(p) > 0) {
+			v = 0;
+		}
 		info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v != 0));
 	} else {
 		info.GetReturnValue().Set(Int32::New(info.GetIsolate(), v));
