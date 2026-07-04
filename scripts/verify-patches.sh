@@ -1042,6 +1042,26 @@ check 65 "webgl.cc [tier4] w_compressed_tex_sub_image_2d gate branch" \
     "$NXJS/source/webgl.cc" \
     'if \(!has_compressed_format_advertised\(format\)\)'
 
+# #66 — Tier-A: createImageBitmap source-type expansion.
+check 66 "image-bitmap.ts [tier-a] tryUnwrapCanvas helper" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'function tryUnwrapCanvas'
+check 66 "image-bitmap.ts [tier-a] canvasToImageBitmap helper" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'function canvasToImageBitmap'
+check 66 "image-bitmap.ts [tier-a] ImageData source branch" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'image instanceof ImageData'
+check 66 "image-bitmap.ts [tier-a] ImageBitmap source branch" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'image instanceof ImageBitmap'
+check 66 "image-bitmap.ts [tier-a] live-DOM CANVAS unwrap" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    "tagName\?: string.*=== 'CANVAS'|tagName === 'CANVAS'"
+check 66 "image-bitmap.ts [tier-a] HTMLVideoElement diagnostic (not silently supported)" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'HTMLVideoElement source not yet supported'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

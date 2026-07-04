@@ -87,6 +87,7 @@ proposal verdict.
 | 63 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_vertex_attrib_1fv\)` + `webgl.cc: FN\(w_vertex_attrib_4fv\)` | Tier 1: `vertexAttrib{1,2,3,4}fv(index, arr)` typed-array pointer variants of the scalar setters. Same macro shape as uniform_{N}fv. Unlocks attribs-gl-vertex-attrib-render (dynamic-form receiver). |
 | 64 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_snapshot_bridge_rgba8` + `webgl.h: nx_webgl_snapshot_bridge_rgba8` + `canvas.cc: nx_webgl_snapshot_bridge_rgba8` | Tier 1: Screen.toDataURL WebGL-surface readback. New public helper reads tenant FBO to a heap BGRA (top-down) buffer; `nx_canvas_proto_to_data_url` + `nx_canvas_to_buffer` branch through it before falling back to snapshot_pixels. Fixes `screen.toDataURL()` on WebGL-backed Screens returning empty raster. |
 | 65 | engine | upstream-candidate | not-submitted | `webgl.cc: has_compressed_format_advertised` + `webgl.cc: Tier 4 \(ledger #65\)` | Tier 4: compressed-format INVALID_ENUM validation gate in `w_compressed_tex_image_2d` + `w_compressed_tex_sub_image_2d`. Spec-required — WebGL implementations MUST reject unadvertised sized compressed internalformats before dispatching to the driver. Fixes 7 CITRON-observed hangs (hardware stall behavior unverified) in the `testCompressedFormatsUnavailableWhenExtensionDisabled` cluster (BPTC/RGTC/ETC/ETC1/PVRTC/ASTC/S3TC-sRGB). |
+| 66 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: tryUnwrapCanvas` + `image-bitmap.ts: canvasToImageBitmap` | Tier-A: `createImageBitmap` source-type expansion. Pre-#66 impl handled ONLY `Blob` and threw for every other spec-defined `ImageBitmapSource`. Adds `HTMLCanvasElement` (nx.js Screen / OffscreenCanvas + brewser-runtime live-DOM `<canvas>` LiveElement via `.offscreen` duck-unwrap), `ImageData` (via scratch OffscreenCanvas + putImageData), `ImageBitmap` (via drawImage round-trip), `HTMLImageElement` (nx.js Image duck-typed on `naturalWidth`/`naturalHeight`). Unlocks up to 40 conformance tests across 5 `textures-image_bitmap_from_*` sub-clusters × 8 texture formats. HTMLVideoElement branch throws a distinct diagnostic (needs canvas.cc video-frame-capture path). |
 
 ## DISPOSITION POLICY
 
@@ -3131,6 +3132,39 @@ PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose the IM
 - 7 compressed-format tests regress to HANG on Citron re-baseline = the gate branch was removed from one or both of the compressed FN bodies.
 - A conformance test compiling a shader that legitimately uses BPTC/RGTC/etc after `getExtension()` fails = the extension advertising side regressed, not the gate itself (advertising happens in `w_get_extension`; gate is downstream).
 - All ASTC tests fail with INVALID_ENUM even when the driver DOES expose ASTC = `has_native_ext("GL_KHR_texture_compression_astc_ldr")` returned false; native-ext cache didn't populate, unrelated to this entry.
+
+---
+
+## #66 — Tier-A: `createImageBitmap` source-type expansion — SHIPPED 2026-07-04
+
+**File(s):** [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) — full rewrite of the `createImageBitmap` async body + two new local helpers (`canvasToImageBitmap`, `tryUnwrapCanvas`) + new imports of `ImageData` and `OffscreenCanvas`.
+
+**Motivation.** The pre-#66 impl handled ONLY `Blob` sources and threw `Unsupported image source: ${constructor.name}` for every other spec-defined `ImageBitmapSource`. WebGL 1 conformance surfaced 40 tests spanning 5 sub-clusters (× 8 texture formats each) that FAIL as a direct consequence:
+- `textures-image_bitmap_from_canvas-*` — 8 tests, source is a brewser-runtime live-DOM `<canvas>` LiveElement
+- `textures-image_bitmap_from_image_bitmap-*` — 8 tests, source is a prior ImageBitmap
+- `textures-image_bitmap_from_image_data-*` — 8 tests, source is ImageData
+- `textures-image_bitmap_from_video-*` — 8 tests, source is HTMLVideoElement
+- `textures-image_bitmap_from_blob-*` — 8 tests (also affected by a separate `Unsupported image format` gap when the buffer is BMP; that's downstream of this entry)
+
+**Design.** Every non-Blob source funnels through a single common tail — `canvasToImageBitmap(canvas)` — that encodes to PNG via `$.canvasToBuffer(canvas, 'image/png')` and decodes into a fresh `ImageBitmap` via `$.imageDecode`. That keeps the encode/decode contract in one place. Per-source-type routing decides HOW to land the source pixels on a canvas first:
+
+- **Blob** — unchanged (arrayBuffer → imageDecode)
+- **HTMLCanvasElement / OffscreenCanvas / live-DOM `<canvas>` LiveElement** — `tryUnwrapCanvas` returns the source or its `.offscreen` OffscreenCanvas; canvas encodes directly, no scratch needed. The LiveElement unwrap forces `getContext('2d')` first because brewser-runtime allocates `.offscreen` lazily.
+- **ImageData** — scratch `new OffscreenCanvas(w, h)` + `getContext('2d')` + `putImageData(imageData, 0, 0)` + encode. putImageData is the only path that lands unpremultiplied RGBA.
+- **ImageBitmap** — scratch canvas + `drawImage(bitmap, 0, 0)` + encode. Uses the existing canvas.cc `SkImage` cache path.
+- **HTMLImageElement (nx.js Image)** — duck-typed on `naturalWidth` + `naturalHeight` (avoiding a hard `Image` import — Image drags the fetch polyfills in). Scratch canvas + `drawImage(image, 0, 0)` + encode.
+- **HTMLVideoElement** — throws a distinct diagnostic: "needs canvas.cc drawImage video-frame-capture path". Deferred until video's `drawImage` acceptance lands.
+
+**Duck-typing rationale for the live-DOM canvas branch.** `image-bitmap.ts` lives under `nxjs-source-v8/packages/runtime/src/` and cannot import from `brewser-runtime-v8/src/`. brewser-runtime's `LiveElement` (per `live-dom.ts:1088-1091, 2288-2308`) allocates a lazy `.offscreen: OffscreenCanvas` backing on the first `getContext('2d')` call and delegates `toDataURL` / `convertToBlob` / `toBlob` through to it. `tryUnwrapCanvas` mirrors that lazy-allocation pattern: call `getContext('2d')` first (forces `.offscreen` to exist), then read `.offscreen` and check it's an `OffscreenCanvas` instance. Zero brewser-runtime coupling — the duck-typing is purely structural.
+
+**DISPOSITION:** `upstream-candidate`. Upstream nx.js's `createImageBitmap` has the same gap; the branches added here work against any embedder (the live-DOM canvas path is opt-in via the `.tagName === 'CANVAS'` + `.offscreen` duck-type, harmless for non-brewser callers).
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) for `tryUnwrapCanvas`, `canvasToImageBitmap`, and the six source-type branch comments (`// 1. Blob`, `// 2. Canvas-like`, `// 3. ImageData`, `// 4. Draw-able source`, `// 5. HTMLImageElement`, `// 6. HTMLVideoElement`). Recurrence tells:
+- All 8 `textures-image_bitmap_from_canvas-*` tests regress to `Unsupported image source: _LiveElement` = the `tryUnwrapCanvas` duck-type broke (likely `.tagName === 'CANVAS'` check flipped to something else, or the `.offscreen` field name changed on brewser-runtime's side).
+- All 8 `textures-image_bitmap_from_image_data-*` tests regress with a `putImageData` error = the ImageData branch's `getContext('2d')` returned null or the branch was moved above the Blob one and swallowed the wrong source.
+- `textures-image_bitmap_from_video-*` starts throwing `Image or Canvas expected` (from canvas.cc drawImage) instead of the distinct diagnostic = the deferred Video branch was replaced with a drawImage attempt without wiring the C++ side.
 
 ---
 
