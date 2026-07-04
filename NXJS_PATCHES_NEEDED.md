@@ -79,6 +79,7 @@ proposal verdict.
 | 48 | engine | upstream-candidate | not-submitted | `webgl.cc: probe_ext_frag_depth` + `webgl.cc: ANGLE_instanced_arrays` + `webgl.cc: WEBGL_debug_shaders` | Phase-1 batch 2A: Unity-P1 v1 function surfaces (ANGLE_instanced_arrays, WEBGL_draw_buffers, EXT_frag_depth probe, OES_VAO list-flip) + WEBGL_lose_context / WEBGL_debug_shaders software minimal impls + WEBGL_compressed_texture_etc (rider 1) |
 | 49 | engine | upstream-candidate | not-submitted | `webgl.cc: v2_rider2` + `webgl.cc: Rider 2 explicit list` | Phase-1 batch 2B: Rider 2 v2 spec-conformance prune — 5 WebGL1-only extensions return null on v2 (OES_standard_derivatives, OES_texture_float, OES_texture_half_float, OES_texture_half_float_linear, WEBGL_depth_texture) — Chrome / Firefox match |
 | 50 | engine | upstream-candidate | not-submitted | `webgl.cc: Phase-1.5-LOW` + `webgl.cc: w_get_buffer_sub_data` + `webgl.cc: OES_fbo_render_mipmap` | Phase-1.5-LOW: 30 core WebGL2 methods (buffer 2, framebuffer thin 6, 3D texture 3, uint uniforms 8, non-square matrix 6, clear buffer 4, draw range 1) + rider OES_fbo_render_mipmap on v1 (batch-2 defect fix). Counter 17→47/88. |
+| 58 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_uniform\)` + `webgl.cc: Tier 1 \(ledger #58\)` | Tier 1 batch (WebGL1 ERROR-bucket spec-hole fills): `getUniform(program, location)` — full type-switched dispatch covering scalar/vecN/matN/non-square (bool/int/uint/float + samplers). Unlocks 20 uniforms-no-over-optimization-on-uniform-array-* tests + uniforms-uniform-default-values. |
 
 ## DISPOSITION POLICY
 
@@ -2930,6 +2931,41 @@ Non-null addresses = extension functional; null = ext object still vends via the
 - gl-probes MULTI_DRAW FAIL with output != looped = one of the four native-loop-shim FN bodies is dropping an iteration; check the bounds guards.
 
 **Sequencing.** Final extension batch per plan §3.3 (b1 → b2 → b3, orthogonal to the phase-1.5 tier progression). Extension advertising is now saturated; any future extension gets its own numbered ledger entry.
+
+---
+
+## #58 — Tier 1: `getUniform(program, location)` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_get_uniform)` body in the Tier-1 block ending line ~4402 (`// End Tier 1 block.`) + FUNCS[] entry `{"getUniform", w_get_uniform}` in both `install_methods` (v1) and `install_methods_v2`.
+
+**Motivation.** Cold-restart batched Citron baseline of the full 745-test WebGL 1 conformance corpus surfaced 78 STATUS:ERROR tests (test JS threw an uncaught exception before any assertion ran). 35 of those cluster into 7 bridge methods absent from `FUNCS[]`. `getUniform` is the largest single win — 20 tests from the `uniforms-no-over-optimization-on-uniform-array-*` family + `uniforms-uniform-default-values` ERROR on `gl.getUniform is not a function` at test-body start.
+
+**Spec subtlety the failing cluster exists to check.** For an array uniform, `getUniform` on the per-element location returned by `getUniformLocation("u[i]")` MUST return only element `i` — never the whole array. A compiler that collapses the array to a single storage location would return the same value for every element; the `no-over-optimization` test proves that doesn't happen. The impl walks the program's active-uniform list (via `glGetActiveUniform` — no cached program state), resolves each uniform's base location via `glGetUniformLocation`, matches the requested location against `[base, base + size)`, then dispatches the correct `glGetUniform*v` variant per the resolved type.
+
+**Type dispatch table (spec-mandated JS return shapes).**
+- `GL_FLOAT` → `number` (JS)
+- `GL_FLOAT_VEC{2,3,4}` → `Float32Array({2,3,4})`
+- `GL_FLOAT_MAT{2,3,4}` → `Float32Array({4,9,16})`
+- `GL_FLOAT_MAT{2x3,2x4,3x2,3x4,4x2,4x3}` → `Float32Array({6,8,6,12,8,12})` (WebGL2)
+- `GL_INT` / `GL_UNSIGNED_INT` / samplers → `number`
+- `GL_INT_VEC{2,3,4}` → `Int32Array({2,3,4})`
+- `GL_UNSIGNED_INT_VEC{2,3,4}` → `Uint32Array({2,3,4})` (WebGL2)
+- `GL_BOOL` → `boolean`; `GL_BOOL_VEC{2,3,4}` → plain JS `Array<boolean>({2,3,4})`
+
+**Sampler default branch.** All opaque sampler types (SAMPLER_2D / SAMPLER_CUBE / SAMPLER_3D / SAMPLER_2D_SHADOW / integer- and unsigned-sampler variants, plus any future sampler enum added by extension) read back as one `GLint` (bound texture-unit index) — spec-compliant and forward-compatible with new sampler enums. Handled by the `default` arm.
+
+**Why upstream-vanilla lacks it.** Upstream nx.js WebGL is null-stubbed pre-migration; the V8 fork's WebGL surface (webgl.cc) has grown method-by-method as demos surfaced calls. `getUniform` was never demanded by any demo in phases 2.C–2.G but IS demanded by the conformance corpus.
+
+**DISPOSITION:** `upstream-candidate`. Pure spec-hole fill, zero Brewser coupling; upstream could take the FN + FUNCS[] entries as-is.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `FN(w_get_uniform)` and the two `{"getUniform", w_get_uniform}` FUNCS entries (one per install_methods table). Recurrence tells:
+- 20 `uniforms-no-over-optimization-on-uniform-array-*` tests regress from PASS/FAIL to STATUS:ERROR with `gl.getUniform is not a function` = one of the two FUNCS[] entries dropped, or the FN body was removed.
+- A subset of those 20 tests PASSes but reports "over-optimization: expected 1.5, got 0.5" (or similar shape) = the per-element location logic in the impl broke — likely `[base, base + size)` was replaced with a whole-array read that always returns element 0. Re-check the `location` arg is passed directly to `glGetUniform*v`, not `base`.
+- New uniform type (e.g. a sampler variant added by a future extension) returns wrong shape = the default sampler branch is too broad. Fine-tune the switch.
+
+**Sequencing.** First of the Tier 1 batch (#58–#64) — shipped alone. #59–#63 land next as a batch; #64 (Screen.toDataURL) after that; #65 (compressed-format INVALID_ENUM gate) closes the batch bundled with the corpus skip-file edit.
 
 ---
 

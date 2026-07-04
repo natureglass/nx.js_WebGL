@@ -4401,6 +4401,195 @@ FN(w_multi_draw_elements_instanced_webgl) {
 // End batch 3 block.
 // ============================================================================
 
+// ============================================================================
+// Tier 1 batch (ledger #58) — WebGL1 conformance ERROR-bucket engine fill.
+// Cold-restart batched Citron baseline surfaced 7 methods absent from the
+// v1/v2 FUNCS[] tables (see webgl1-results.json). getUniform is the largest
+// win: 20 tests from the `uniforms-no-over-optimization-on-uniform-array-*`
+// cluster ERROR on `gl.getUniform is not a function` before any assertion
+// runs. All 7 methods are core WebGL1 spec surface — pure spec-hole fills
+// with zero Brewser coupling, i.e. upstream-PR-ready.
+// ============================================================================
+
+// #58 — getUniform(program, location). Reads back the current value of a
+// uniform on the given program. The 20 failing tests exercise the array-
+// element form: getUniformLocation("u[i]") gives a per-element location, and
+// getUniform on that location must return ONLY element i — never the whole
+// array. That's spec-required and is what the "no-over-optimization" cluster
+// checks (a compiler that collapses the array to a single storage location
+// would return the same value for every element; the test proves it doesn't).
+//
+// Implementation shape: WebGL doesn't hand us the uniform's TYPE at call
+// time — we're given only (program, location). GL exposes the type only via
+// glGetActiveUniform(program, index). So we walk the program's active-
+// uniform list, resolve each uniform's base location via glGetUniformLocation,
+// and match `location` against [baseLoc, baseLoc + size). Once the type is
+// known, dispatch the matching glGetUniform*v variant and box the JS return:
+//
+//   float / int / uint / bool scalar   → number / boolean
+//   {float,int,uint}Vec{2,3,4}         → {Float32,Int32,Uint32}Array(N)
+//   boolVec{2,3,4}                     → plain JS Array of booleans
+//   floatMat{2,3,4}                    → Float32Array(N*N)
+//   floatMat{2x3,2x4,3x2,3x4,4x2,4x3}  → Float32Array(rows*cols) (WebGL2)
+//   sampler*                           → number (GLint TU index)
+//
+// The scan is O(active_uniforms) per call — acceptable because active-uniform
+// counts are typically small (<20) and getUniform is not on a hot path
+// (introspection / debug surface only). No program-state cache: driver-
+// direct glGetActiveUniform queries stay authoritative per the stop-and-
+// report policy in the ledger #58 spec.
+//
+// GL_* constants below are stable across all GLES3 headers (Khronos-assigned
+// values in the WebGL / ES3 spec); using hex literals here avoids a header-
+// availability dance if a future toolchain hides one behind a version gate.
+FN(w_get_uniform) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	Local<Context> c = cur(iso);
+	const GLuint program = obj_id(info[0]);
+	const GLint location = uniform_loc(info[1]);
+	if (program == 0 || location < 0) {
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	// Resolve the type by scanning active uniforms until one whose location
+	// range [base, base + size) contains the requested location.
+	GLint active_count = 0;
+	glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active_count);
+	GLint max_name_len = 0;
+	glGetProgramiv(program, GL_ACTIVE_UNIFORM_MAX_LENGTH, &max_name_len);
+	if (max_name_len < 1) max_name_len = 1;
+	std::vector<char> name_buf((size_t)max_name_len + 1);
+	GLenum uni_type = 0;
+	GLint uni_size = 0;
+	bool found = false;
+	for (GLint i = 0; i < active_count; i++) {
+		GLsizei nlen = 0;
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveUniform(program, (GLuint)i, max_name_len, &nlen,
+		                    &size, &type, name_buf.data());
+		if (nlen <= 0) continue;
+		const GLint base = glGetUniformLocation(program, name_buf.data());
+		if (base < 0) continue;
+		if (location >= base && location < base + size) {
+			uni_type = type;
+			uni_size = size;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		// Location doesn't map to any active uniform — spec: INVALID_OPERATION.
+		record_error(GL_INVALID_OPERATION);
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	(void)uni_size;
+
+	// Component-count table by uniform type. n_components is the number of
+	// scalars glGetUniform*v writes into the destination for ONE location
+	// (not the whole array — location is per-element per WebGL spec).
+	auto box_float_array = [&](GLint n) {
+		std::vector<GLfloat> buf((size_t)n, 0.0f);
+		glGetUniformfv(program, location, buf.data());
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, (size_t)n * sizeof(GLfloat));
+		memcpy(ab->Data(), buf.data(), (size_t)n * sizeof(GLfloat));
+		info.GetReturnValue().Set(Float32Array::New(ab, 0, n));
+	};
+	auto box_int_array = [&](GLint n) {
+		std::vector<GLint> buf((size_t)n, 0);
+		glGetUniformiv(program, location, buf.data());
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, (size_t)n * sizeof(GLint));
+		memcpy(ab->Data(), buf.data(), (size_t)n * sizeof(GLint));
+		info.GetReturnValue().Set(Int32Array::New(ab, 0, n));
+	};
+	auto box_uint_array = [&](GLint n) {
+		std::vector<GLuint> buf((size_t)n, 0u);
+		glGetUniformuiv(program, location, buf.data());
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, (size_t)n * sizeof(GLuint));
+		memcpy(ab->Data(), buf.data(), (size_t)n * sizeof(GLuint));
+		info.GetReturnValue().Set(Uint32Array::New(ab, 0, n));
+	};
+	auto box_bool_scalar = [&]() {
+		GLint v = 0;
+		glGetUniformiv(program, location, &v);
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
+	};
+	auto box_bool_vec = [&](GLint n) {
+		std::vector<GLint> buf((size_t)n, 0);
+		glGetUniformiv(program, location, buf.data());
+		Local<Array> arr = Array::New(iso, n);
+		for (GLint i = 0; i < n; i++)
+			arr->Set(c, (uint32_t)i, Boolean::New(iso, buf[(size_t)i] != 0)).Check();
+		info.GetReturnValue().Set(arr);
+	};
+	auto box_float_scalar = [&]() {
+		GLfloat v = 0.0f;
+		glGetUniformfv(program, location, &v);
+		info.GetReturnValue().Set(Number::New(iso, (double)v));
+	};
+	auto box_int_scalar = [&]() {
+		GLint v = 0;
+		glGetUniformiv(program, location, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+	};
+	auto box_uint_scalar = [&]() {
+		GLuint v = 0u;
+		glGetUniformuiv(program, location, &v);
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, v));
+	};
+
+	switch (uni_type) {
+	// Float scalar + vector
+	case 0x1406 /* GL_FLOAT */:      box_float_scalar(); return;
+	case 0x8B50 /* GL_FLOAT_VEC2 */: box_float_array(2); return;
+	case 0x8B51 /* GL_FLOAT_VEC3 */: box_float_array(3); return;
+	case 0x8B52 /* GL_FLOAT_VEC4 */: box_float_array(4); return;
+	// Int scalar + vector
+	case 0x1404 /* GL_INT */:      box_int_scalar(); return;
+	case 0x8B53 /* GL_INT_VEC2 */: box_int_array(2); return;
+	case 0x8B54 /* GL_INT_VEC3 */: box_int_array(3); return;
+	case 0x8B55 /* GL_INT_VEC4 */: box_int_array(4); return;
+	// Uint scalar + vector (WebGL2)
+	case 0x1405 /* GL_UNSIGNED_INT */:      box_uint_scalar(); return;
+	case 0x8DC6 /* GL_UNSIGNED_INT_VEC2 */: box_uint_array(2); return;
+	case 0x8DC7 /* GL_UNSIGNED_INT_VEC3 */: box_uint_array(3); return;
+	case 0x8DC8 /* GL_UNSIGNED_INT_VEC4 */: box_uint_array(4); return;
+	// Bool scalar + vector — WebGL spec: scalar→boolean, vecN→Array of boolean.
+	case 0x8B56 /* GL_BOOL */:      box_bool_scalar(); return;
+	case 0x8B57 /* GL_BOOL_VEC2 */: box_bool_vec(2); return;
+	case 0x8B58 /* GL_BOOL_VEC3 */: box_bool_vec(3); return;
+	case 0x8B59 /* GL_BOOL_VEC4 */: box_bool_vec(4); return;
+	// Square float matrices
+	case 0x8B5A /* GL_FLOAT_MAT2 */: box_float_array(2 * 2); return;
+	case 0x8B5B /* GL_FLOAT_MAT3 */: box_float_array(3 * 3); return;
+	case 0x8B5C /* GL_FLOAT_MAT4 */: box_float_array(4 * 4); return;
+	// Non-square float matrices (WebGL2). Naming convention: MAT<C>x<R> means
+	// C columns × R rows — total scalars = C * R.
+	case 0x8B65 /* GL_FLOAT_MAT2x3 */: box_float_array(2 * 3); return;
+	case 0x8B66 /* GL_FLOAT_MAT2x4 */: box_float_array(2 * 4); return;
+	case 0x8B67 /* GL_FLOAT_MAT3x2 */: box_float_array(3 * 2); return;
+	case 0x8B68 /* GL_FLOAT_MAT3x4 */: box_float_array(3 * 4); return;
+	case 0x8B69 /* GL_FLOAT_MAT4x2 */: box_float_array(4 * 2); return;
+	case 0x8B6A /* GL_FLOAT_MAT4x3 */: box_float_array(4 * 3); return;
+	default:
+		// All sampler / opaque types — WebGL spec returns the bound texture
+		// unit index as a plain number. Covers SAMPLER_2D (0x8B5E), SAMPLER_CUBE
+		// (0x8B60), SAMPLER_3D (0x8B5F), SAMPLER_2D_SHADOW (0x8B62), sampler
+		// array/shadow variants (0x8DC1..0x8DCA), integer/unsigned samplers
+		// (0x8DC9..0x8DD7), etc. — everything reads through glGetUniformiv as
+		// one GLint. Safer than enumerating each sampler variant one-by-one
+		// (new sampler types could be added by a future extension).
+		box_int_scalar();
+		return;
+	}
+}
+
+// ============================================================================
+// End Tier 1 block.
+// ============================================================================
+
 static void install_methods(Isolate *iso, Local<Object> proto) {
 	struct Spec { const char *name; FunctionCallback fn; };
 	static const Spec FUNCS[] = {
@@ -4577,6 +4766,12 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"multiDrawElementsWEBGL", w_multi_draw_elements_webgl},
 	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
 	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
+	    // ============================================================
+	    // Tier 1 (ledger #58) — WebGL1 spec-hole fill for the
+	    // conformance ERROR bucket. See the Tier 1 block comment above
+	    // for scope. Same entries land on both v1 + v2 FUNCS[].
+	    // ============================================================
+	    {"getUniform", w_get_uniform},
 	    // Fork-specific hooks (canvas-runner expects them).
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
@@ -4936,6 +5131,11 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"multiDrawElementsWEBGL", w_multi_draw_elements_webgl},
 	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
 	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
+	    // ============================================================
+	    // Tier 1 (ledger #58) — v2 mirror of the v1 spec-hole fills.
+	    // Same body impl functions; shared across contexts.
+	    // ============================================================
+	    {"getUniform", w_get_uniform},
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {

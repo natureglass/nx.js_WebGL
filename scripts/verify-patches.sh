@@ -944,6 +944,17 @@ check 52 "webgl.cc [52a] fallback gate: NX_52A_DISABLE_FALLBACK ifndef guard pre
     "$NXJS/source/webgl.cc" \
     '#ifndef NX_52A_DISABLE_FALLBACK'
 
+# #58 — Tier 1: getUniform full type-switched impl.
+check 58 "webgl.cc [tier1] w_get_uniform FN body" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_uniform\)'
+check 58 "webgl.cc [tier1] getUniform FUNCS entry (v1 + v2)" \
+    "$NXJS/source/webgl.cc" \
+    '\{"getUniform", w_get_uniform\}'
+check 58 "webgl.cc [tier1] block header comment present" \
+    "$NXJS/source/webgl.cc" \
+    'Tier 1 \(ledger #58\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
