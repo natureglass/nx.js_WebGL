@@ -47,3 +47,19 @@ bool nx_tight_memory(void);
 // retain it.
 class SkSurface;
 void nx_webgl_compose_if_active(SkSurface *target);
+
+// Tier 1 (ledger #64) — WebGL-surface framebuffer readback for the
+// canvas.cc toDataURL / toBuffer path. When the Screen surface carries an
+// active WebGL bridge, `nx_canvas_proto_to_data_url` calls this to grab the
+// tenant FBO's current color contents INSTEAD OF `snapshot_pixels`, whose
+// raster path returns empty bytes on WebGL-backed Screens.
+//
+// Semantics on success: `*out_bgra` is a fresh heap buffer of size
+// (*out_w) * (*out_h) * 4, top-down BGRA (matching `encode_pixels`'s
+// pixmap contract in canvas.cc); the caller `free()`s it.
+//
+// Returns false when the bridge is not initialized, when the FBO has zero
+// dimensions, or when either malloc / glReadPixels fails — callers must
+// fall through to the existing raster path in that case.
+bool nx_webgl_snapshot_bridge_rgba8(int *out_w, int *out_h,
+                                     uint8_t **out_bgra);

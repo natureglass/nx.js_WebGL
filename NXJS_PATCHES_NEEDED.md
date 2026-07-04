@@ -85,6 +85,7 @@ proposal verdict.
 | 61 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_framebuffer_attachment_parameter\)` | Tier 1: `getFramebufferAttachmentParameter(target, attachment, pname)` pname-switched read. ATTACHMENT_OBJECT_NAME wraps into K_TEXTURE or K_RENDERBUFFER per preflight OBJECT_TYPE; other pnames → number. Unlocks extensions-webgl-draw-buffers, renderbuffers-framebuffer-test. |
 | 62 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_attached_shaders\)` | Tier 1: `getAttachedShaders(program)` — wraps GLuint names into K_SHADER JS Array. Empty array (not null) when nothing attached, spec. Unlocks misc-expando-loss, programs-program-test. |
 | 63 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_vertex_attrib_1fv\)` + `webgl.cc: FN\(w_vertex_attrib_4fv\)` | Tier 1: `vertexAttrib{1,2,3,4}fv(index, arr)` typed-array pointer variants of the scalar setters. Same macro shape as uniform_{N}fv. Unlocks attribs-gl-vertex-attrib-render (dynamic-form receiver). |
+| 64 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_snapshot_bridge_rgba8` + `webgl.h: nx_webgl_snapshot_bridge_rgba8` + `canvas.cc: nx_webgl_snapshot_bridge_rgba8` | Tier 1: Screen.toDataURL WebGL-surface readback. New public helper reads tenant FBO to a heap BGRA (top-down) buffer; `nx_canvas_proto_to_data_url` + `nx_canvas_to_buffer` branch through it before falling back to snapshot_pixels. Fixes `screen.toDataURL()` on WebGL-backed Screens returning empty raster. |
 
 ## DISPOSITION POLICY
 
@@ -3056,6 +3057,43 @@ The OBJECT_NAME branch does a preflight `glGetFramebufferAttachmentParameteriv(.
 **DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
 
 **RE-APPLY / VERIFY NOTE.** Grep for `FN(w_vertex_attrib_1fv)` (and the 2fv/3fv/4fv siblings — all four are macro-generated so grepping `w_vertex_attrib_4fv` is the canonical check) + the eight `{"vertexAttrib{N}fv", ...}` FUNCS entries (4 in v1, 4 in v2). Recurrence tell: `attribs-gl-vertex-attrib-render` regresses to `is not a function` on `gl.vertexAttrib3fv` or similar.
+
+---
+
+## #64 — Tier 1: `Screen.toDataURL` WebGL-surface readback path — SHIPPED 2026-07-04
+
+**File(s):**
+- [source/webgl.cc](source/webgl.cc) — new `nx_webgl_snapshot_bridge_rgba8()` helper (public, outside anon namespace, sits right above `nx_init_webgl`).
+- [source/webgl.h](source/webgl.h) — extern declaration + docstring.
+- [source/canvas.cc](source/canvas.cc) — `nx_canvas_proto_to_data_url` AND `nx_canvas_to_buffer` gain a WebGL-surface branch that runs BEFORE `snapshot_pixels`; +1 `#include "webgl.h"`.
+
+**Motivation.** 1 conformance test ERRORs on `glCanvas.toDataURL is not a function` (`canvas-framebuffer-bindings-affected-by-to-data-url`) AND — independent of that specific test — `Screen.toDataURL()` on a Screen carrying an active WebGL context previously returned the empty raster snapshot: canvas.cc's fallback path pulled from `canvas->data` (the raster surface backing), which is unused when Screen renders through the EGL tenant FBO. This lands the WebGL-surface readback so `screen.toDataURL()` returns the actual WebGL draw output.
+
+**Test-unlock caveat.** The failing conformance test invokes `document.getElementById('webgl-canvas').toDataURL()` — a live-DOM canvas element proxied through brewser-runtime-v8's live-dom shim, NOT `screen` directly. Whether the test flips PASS depends on the runtime routing `.toDataURL` through to Screen. The engine-side fix is complete regardless. If Alex's re-baseline shows the test still ERRORs on `is not a function`, the residual fix is a runtime shim (RUNTIME_SHIMS.md scope, deferred beyond this session per the read-only-runtime policy in the task spec).
+
+**Implementation shape — `nx_webgl_snapshot_bridge_rgba8(int *out_w, int *out_h, uint8_t **out_bgra)`:**
+1. Bail with `false` if `!nx_webgl_bridge_is_initialized()` OR the FBO size is 0×0.
+2. Save current `GL_READ_FRAMEBUFFER_BINDING` + `GL_PACK_ALIGNMENT`.
+3. Drain pre-existing `glGetError` so the post-read check reflects only this readback.
+4. Bind bridge FBO to `GL_READ_FRAMEBUFFER`; force `GL_PACK_ALIGNMENT = 1` (defensive — width×4 is always 4-aligned but future-proof against non-RGBA reads).
+5. `glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba)`.
+6. Restore READ_FRAMEBUFFER + PACK_ALIGNMENT (BEFORE the second malloc so an OOM in step 7 doesn't leave the binding dangling).
+7. Second malloc for the BGRA output; return `false` on OOM (frees `rgba`).
+8. Y-flip AND RGBA→BGRA swizzle in one pass. `encode_pixels` in canvas.cc expects top-down BGRA per its Skia paint pixmap contract.
+9. Return `true` + out-params (`*out_bgra` is caller-owned, caller `free()`s).
+
+Does NOT call `enter_bracket()` — the sequence only touches `READ_FRAMEBUFFER_BINDING` (which the 2.B state snap doesn't cover; patch #17 later added it only for the ACTIVE probe path) and `PACK_ALIGNMENT` (not in the snap). Skia uses `DRAW_FRAMEBUFFER_BINDING` for its own rendering; the two are independent in ES3. State discipline preserved without perturbing bracket machinery — bracket call sites are frozen this session (blast-radius rule).
+
+canvas.cc's `nx_canvas_proto_to_data_url` gains one branch before the existing `snapshot_pixels` call: if `nx_webgl_snapshot_bridge_rgba8()` returns true, use its BGRA buffer; otherwise fall through to the raster path. Same shape mirrored in `nx_canvas_to_buffer` (the async `toBlob` sibling); the WebGL readback must happen on the main thread — that's where `nx_canvas_to_buffer`'s body already runs (only the ENCODE is dispatched to the pool).
+
+**DISPOSITION:** `upstream-candidate`. Upstream nx.js's `screen.toDataURL()` on WebGL-backed Screen has the same empty-raster gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `nx_webgl_snapshot_bridge_rgba8`, [source/webgl.h](source/webgl.h) for the same, and [source/canvas.cc](source/canvas.cc) for both the `#include "webgl.h"` line and the `nx_webgl_snapshot_bridge_rgba8` call sites (2 — sync + async). Recurrence tells:
+- `screen.toDataURL()` returns a solid transparent-black PNG after a WebGL draw = the WebGL branch was removed from canvas.cc; the raster fallback ran and got the empty Skia surface.
+- Y-flipped image (upside-down) = the flip loop in `nx_webgl_snapshot_bridge_rgba8` regressed (swapped row indices, dropped the flip, etc.).
+- Wrong color channels (blue↔red) = the RGBA→BGRA swizzle regressed.
 
 ---
 

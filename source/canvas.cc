@@ -18,6 +18,7 @@
 #include "path2d.h"
 #include "image.h"
 #include "util.h"
+#include "webgl.h"   // Tier 1 (ledger #64) — nx_webgl_snapshot_bridge_rgba8
 #include "wrap.h"
 #include <alloca.h>
 #include <math.h>
@@ -2790,8 +2791,22 @@ void nx_canvas_to_buffer(const FunctionCallbackInfo<Value> &info) {
 	if (quality < 0.0) quality = 0.0;
 	if (quality > 1.0) quality = 1.0;
 	NX_INIT_WORK_T(encode_async_t);
-	data->pixels =
-	    snapshot_pixels(canvas, &data->width, &data->height, &data->stride);
+	// Tier 1 (ledger #64) — WebGL-surface readback path, mirror of the
+	// synchronous toDataURL branch. WebGL snapshot MUST happen on the main
+	// thread (this fn body is the main-thread half — async dispatch is only
+	// the encode). Raster fallback keeps 2D-canvas behavior intact.
+	data->pixels = nullptr;
+	if (nx_webgl_snapshot_bridge_rgba8(&data->width, &data->height,
+	                                    &data->pixels)) {
+		data->stride = data->width * 4;
+	} else {
+		data->width = 0; data->height = 0; data->stride = 0;
+		data->pixels = nullptr;
+	}
+	if (!data->pixels) {
+		data->pixels = snapshot_pixels(canvas, &data->width, &data->height,
+		                               &data->stride);
+	}
 	data->type = type_code;
 	data->quality = quality;
 	info.GetReturnValue().Set(
@@ -2816,8 +2831,20 @@ void nx_canvas_proto_to_data_url(const FunctionCallbackInfo<Value> &info) {
 			quality = 0.92;
 	if (quality < 0.0) quality = 0.0;
 	if (quality > 1.0) quality = 1.0;
-	int w, h, stride;
-	uint8_t *pixels = snapshot_pixels(canvas, &w, &h, &stride);
+	int w = 0, h = 0, stride = 0;
+	uint8_t *pixels = nullptr;
+	// Tier 1 (ledger #64) — WebGL-surface readback path. When Screen carries
+	// an active WebGL bridge, its raster surface (`canvas->data`) is empty
+	// because rendering lands in the tenant EGL FBO, not the Skia raster
+	// backing. Read the FBO instead. On failure (bridge not up / OOM / GL
+	// error) fall through to the raster path — which is correct for 2D
+	// canvases and for WebGL Screens where the readback couldn't run.
+	if (nx_webgl_snapshot_bridge_rgba8(&w, &h, &pixels)) {
+		stride = w * 4;
+	} else {
+		w = 0; h = 0; stride = 0; pixels = nullptr;
+	}
+	if (!pixels) pixels = snapshot_pixels(canvas, &w, &h, &stride);
 	uint8_t *buf = NULL;
 	size_t buf_size = 0;
 	int rc = encode_pixels(pixels, w, h, stride, type_code, quality, &buf,

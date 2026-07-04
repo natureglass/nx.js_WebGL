@@ -5586,6 +5586,106 @@ void nx_webgl_compose_if_active(SkSurface *target) {
 	if (target) nx_webgl_bridge_compose(target);
 }
 
+// Tier 1 (ledger #64) — WebGL-surface framebuffer readback for Screen.toDataURL.
+//
+// Reads the tenant FBO's current color contents to a heap-allocated BGRA
+// buffer, top-down (Y-flipped relative to GL's bottom-up), so canvas.cc's
+// `encode_pixels` path (Skia PNG encoder + libjpeg-turbo + libwebp — all
+// consuming a top-down BGRA pixmap) can hand back a data URL over what
+// WebGL rendered without needing a separate encode surface.
+//
+// Ownership: on success, `*out_bgra` is a fresh malloc()'d buffer of size
+// `(*out_w) * (*out_h) * 4` bytes; the caller `free()`s it. On failure,
+// nothing is written to the out-params and the function returns false.
+//
+// State discipline. The function saves + restores GL_READ_FRAMEBUFFER_BINDING
+// and GL_PACK_ALIGNMENT around the call. It deliberately does NOT enter the
+// per-frame bracket (`enter_bracket()`), because:
+//   - `enter_bracket()` binds DRAW_FRAMEBUFFER (not READ_FRAMEBUFFER) to the
+//     tenant FBO — Skia's rendering uses DRAW_FRAMEBUFFER, and the two are
+//     independent in ES3. Reading from the tenant FBO via READ_FRAMEBUFFER
+//     doesn't disturb Skia's DRAW state.
+//   - The 2.B nx_gl_state_snap_t does NOT cover READ_FRAMEBUFFER (patch #17
+//     later added it only for the ACTIVE probe path). Not entering the
+//     bracket keeps this readback outside the frozen bracket-machinery
+//     contract (blast-radius rule in this session).
+//   - PACK_ALIGNMENT is not in the snap either; we save+restore it locally.
+//
+// Returns false if the bridge isn't initialized, the FBO has zero dimensions,
+// or the malloc fails. Caller falls through to the existing raster path.
+bool nx_webgl_snapshot_bridge_rgba8(int *out_w, int *out_h,
+                                     uint8_t **out_bgra) {
+	if (!out_w || !out_h || !out_bgra) return false;
+	if (!nx_webgl_bridge_is_initialized()) return false;
+	GLuint fbo = nx_webgl_bridge_fbo_id();
+	if (fbo == 0) return false;
+	int fbo_w = 0, fbo_h = 0;
+	nx_webgl_bridge_fbo_size(&fbo_w, &fbo_h);
+	if (fbo_w <= 0 || fbo_h <= 0) return false;
+
+	// Save the two GL states we're about to touch. Values 0 (default binding)
+	// / 4 (default alignment) are safe restore defaults if the query fails.
+	GLint saved_read_fbo = 0;
+	GLint saved_pack_align = 4;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &saved_read_fbo);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &saved_pack_align);
+
+	// Drain any pre-existing GL error so a post-read glGetError reflects only
+	// this readback.
+	while (glGetError() != GL_NO_ERROR) { /* drain */ }
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+	const size_t px_count = (size_t)fbo_w * (size_t)fbo_h;
+	const size_t byte_count = px_count * 4;
+	uint8_t *rgba = (uint8_t *)malloc(byte_count);
+	if (!rgba) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)saved_read_fbo);
+		glPixelStorei(GL_PACK_ALIGNMENT, saved_pack_align);
+		return false;
+	}
+	glReadPixels(0, 0, fbo_w, fbo_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	const GLenum read_err = glGetError();
+
+	// Restore state before allocating the destination buffer, so an OOM on
+	// the second malloc doesn't leave the readback bindings dangling.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)saved_read_fbo);
+	glPixelStorei(GL_PACK_ALIGNMENT, saved_pack_align);
+
+	if (read_err != GL_NO_ERROR) {
+		free(rgba);
+		return false;
+	}
+
+	uint8_t *bgra = (uint8_t *)malloc(byte_count);
+	if (!bgra) {
+		free(rgba);
+		return false;
+	}
+	// Y-flip + RGBA→BGRA swizzle in one pass. GL returns bottom-up; PNG/JPEG
+	// encoders + canvas.cc's Skia paint pixmap all expect top-down BGRA.
+	for (int y = 0; y < fbo_h; y++) {
+		const uint8_t *src_row = rgba + (size_t)(fbo_h - 1 - y) * (size_t)fbo_w * 4;
+		uint8_t *dst_row = bgra + (size_t)y * (size_t)fbo_w * 4;
+		for (int x = 0; x < fbo_w; x++) {
+			const uint8_t r = src_row[x * 4 + 0];
+			const uint8_t g = src_row[x * 4 + 1];
+			const uint8_t b = src_row[x * 4 + 2];
+			const uint8_t a = src_row[x * 4 + 3];
+			dst_row[x * 4 + 0] = b;
+			dst_row[x * 4 + 1] = g;
+			dst_row[x * 4 + 2] = r;
+			dst_row[x * 4 + 3] = a;
+		}
+	}
+	free(rgba);
+	*out_w = fbo_w;
+	*out_h = fbo_h;
+	*out_bgra = bgra;
+	return true;
+}
+
 void nx_init_webgl(v8::Isolate *iso, v8::Local<v8::Object> init_obj) {
 	NX_SET_FUNC(init_obj, "webglContextNew", nx_webgl_context_new);
 	NX_SET_FUNC(init_obj, "webglInitClass", nx_webgl_init_class);

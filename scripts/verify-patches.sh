@@ -1012,6 +1012,21 @@ check 63 "webgl.cc [tier1] vertexAttrib4fv FUNCS entry" \
     "$NXJS/source/webgl.cc" \
     '\{"vertexAttrib4fv", w_vertex_attrib_4fv\}'
 
+# #64 — Tier 1: Screen.toDataURL WebGL-surface readback. Public helper in
+# webgl.cc + extern in webgl.h + call sites in canvas.cc (sync + async).
+check 64 "webgl.cc [tier1] nx_webgl_snapshot_bridge_rgba8 impl body" \
+    "$NXJS/source/webgl.cc" \
+    'bool nx_webgl_snapshot_bridge_rgba8'
+check 64 "webgl.h [tier1] nx_webgl_snapshot_bridge_rgba8 extern decl" \
+    "$NXJS/source/webgl.h" \
+    'bool nx_webgl_snapshot_bridge_rgba8'
+check 64 "canvas.cc [tier1] webgl.h include" \
+    "$NXJS/source/canvas.cc" \
+    '#include "webgl.h"'
+check 64 "canvas.cc [tier1] nx_webgl_snapshot_bridge_rgba8 call sites" \
+    "$NXJS/source/canvas.cc" \
+    'nx_webgl_snapshot_bridge_rgba8'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
