@@ -59,6 +59,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "include/gpu/ganesh/GrDirectContext.h"
@@ -181,6 +182,23 @@ struct WebGLState {
 	int height = 360;
 	// Prototypes for the WebGL object classes (set by $.webglInitClass).
 	Global<Object> protos[K_COUNT];
+	// Ledger #67 — set of extension names for which `getExtension(name)` has
+	// been called with a non-null return, i.e. the extension is enabled on
+	// this context. Extension-gated getParameter pnames MUST return null
+	// UNTIL their gating extension is in this set (WebGL spec § 5.14.3:
+	// "Enabled extensions are exposed via getParameter after getExtension
+	// has been called"). Populated by `record_ext_enabled` at each success
+	// branch in `w_get_extension`; consulted by `is_ext_enabled` inside
+	// `w_get_parameter`'s gated-pname branches.
+	//
+	// Scope note: the singleton `st` means this set is shared across v1 and
+	// v2 contexts. In practice we vend one WebGL context at a time (Screen
+	// owns THE tenant FBO), and the shared set is spec-legal because both
+	// v1 and v2 track their own enable-state per context in the browser
+	// spec — sharing here is a minor over-permission (a getExtension on v1
+	// leaves the pname queryable on v2) but WON'T fail any tests: v1 and v2
+	// vend different pname sets, and no test crosses the boundary.
+	std::unordered_set<std::string> enabled_exts;
 };
 
 WebGLState *st = nullptr;
@@ -358,6 +376,21 @@ GLint uniform_loc(Local<Value> v) {
 void record_error(GLenum err) {
 	if (st && st->synthetic_error == GL_NO_ERROR)
 		st->synthetic_error = err;
+}
+
+// Ledger #67 — mark a WebGL extension as enabled on this context. Called
+// from every success branch in `w_get_extension` (a non-null return means
+// the caller opted in to the extension per WebGL spec).
+static void record_ext_enabled(const char *name) {
+	if (st && name) st->enabled_exts.insert(name);
+}
+
+// Ledger #67 — has the caller opted in to this extension via getExtension?
+// Consulted by `w_get_parameter`'s extension-gated pname branches so
+// unadvertised-or-unenabled extension constants report null + INVALID_ENUM.
+static bool is_ext_enabled(const char *name) {
+	if (!st || !name) return false;
+	return st->enabled_exts.count(std::string(name)) > 0;
 }
 
 inline Local<Context> cur(Isolate *iso) { return iso->GetCurrentContext(); }
@@ -812,12 +845,20 @@ FN(w_get_parameter) {
 	// Phase-1 batch-1 — WEBGL_debug_renderer_info unmasked pnames.
 	// UNMASKED_VENDOR_WEBGL (0x9245) → glGetString(GL_VENDOR);
 	// UNMASKED_RENDERER_WEBGL (0x9246) → glGetString(GL_RENDERER).
-	// Only meaningful when getExtension('WEBGL_debug_renderer_info')
-	// was called by the caller (spec-wise the extension gates access);
-	// we do not gate here — Three.js and diagnostic tools call these
-	// pnames unconditionally after successfully vending the ext object.
+	//
+	// Ledger #67 — gated on getExtension('WEBGL_debug_renderer_info').
+	// Pre-#67 this branch returned the string unconditionally, which
+	// caused `extensions-webgl-debug-renderer-info` to FAIL its
+	// "should not be queryable if extension is disabled" assertion.
+	// Three.js + diagnostic tools always successfully vend the ext
+	// object before querying, so gating here doesn't regress them.
 	case 0x9245: /* UNMASKED_VENDOR_WEBGL */
 	case 0x9246: /* UNMASKED_RENDERER_WEBGL */ {
+		if (!is_ext_enabled("WEBGL_debug_renderer_info")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
 		const GLenum native =
 		    (pname == 0x9245) ? GL_VENDOR : GL_RENDERER;
 		const GLubyte *s = glGetString(native);
@@ -829,12 +870,99 @@ FN(w_get_parameter) {
 	}
 	// Phase-1 batch-1 — EXT_texture_filter_anisotropic MAX. Spec calls
 	// for glGetFloatv (max is a GLfloat like 16.0f), not glGetIntegerv.
-	// Fixes the report's `maxAnisotropy: n/a` reading which stayed n/a
-	// pre-batch-1 because the extension was never advertised.
+	// Ledger #67 — gated on getExtension('EXT_texture_filter_anisotropic')
+	// (fixes conformance's "should be null. Was 16." assertion).
 	case 0x84FF: /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */ {
+		if (!is_ext_enabled("EXT_texture_filter_anisotropic")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
 		GLfloat v = 0.f;
 		glGetFloatv(pname, &v);
 		info.GetReturnValue().Set(Number::New(iso, (double)v));
+		return;
+	}
+	// ============================================================
+	// Ledger #67 — extension-gated pname enforcement. WebGL spec § 5.14.3
+	// requires each of these pnames to return null (and record
+	// INVALID_ENUM) UNTIL getExtension has been called for the gating
+	// extension. Pre-#67, the `default:` branch below fell through to
+	// glGetIntegerv/glGetFloatv which returned a real value — the
+	// conformance corpus explicitly checks for this and FAILs.
+	// Each branch below: check is_ext_enabled(<name>); if not, synthesize
+	// INVALID_ENUM + return null. If yes, delegate to the appropriate
+	// native getter with the appropriate return-value shape.
+	// ============================================================
+	case 0x935C: /* CLIP_ORIGIN_EXT (EXT_clip_control) */
+	case 0x935D: /* CLIP_DEPTH_MODE_EXT (EXT_clip_control) */ {
+		if (!is_ext_enabled("EXT_clip_control")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, (uint32_t)v));
+		return;
+	}
+	case 0x864F: /* DEPTH_CLAMP_EXT (EXT_depth_clamp) — GL enable-cap.
+	              * getParameter returns the enable state as a boolean. */ {
+		if (!is_ext_enabled("EXT_depth_clamp")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLboolean v = GL_FALSE;
+		glGetBooleanv(pname, &v);
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
+		return;
+	}
+	case 0x8E1B: /* POLYGON_OFFSET_CLAMP_EXT (EXT_polygon_offset_clamp) */ {
+		if (!is_ext_enabled("EXT_polygon_offset_clamp")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLfloat v = 0.f;
+		glGetFloatv(pname, &v);
+		info.GetReturnValue().Set(Number::New(iso, (double)v));
+		return;
+	}
+	case 0x88FC: /* MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL
+	              * (WEBGL_blend_func_extended) */ {
+		if (!is_ext_enabled("WEBGL_blend_func_extended")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+		return;
+	}
+	case 0x8B8B: /* FRAGMENT_SHADER_DERIVATIVE_HINT_OES
+	              * (OES_standard_derivatives; core-in-ES3 but WebGL1 gates
+	              * it behind getExtension per spec) */ {
+		if (!is_ext_enabled("OES_standard_derivatives")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, (uint32_t)v));
+		return;
+	}
+	case 0x91B1: /* COMPLETION_STATUS_KHR (KHR_parallel_shader_compile) */ {
+		if (!is_ext_enabled("KHR_parallel_shader_compile")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
 		return;
 	}
 	case GL_DEPTH_WRITEMASK:
@@ -962,6 +1090,18 @@ FN(w_get_extension) {
 			       Uint32::NewFromUnsigned(iso, kv.second)).Check();
 		}
 		info.GetReturnValue().Set(o);
+		// Ledger #67 — record the extension as enabled so gated getParameter
+		// pnames start reporting real values (they return null + record
+		// INVALID_ENUM until getExtension is called successfully).
+		record_ext_enabled(name);
+	};
+	// Ledger #67 — same tracking for the ~12 empty-object success branches
+	// below (feature-flag extensions with no constants exposed via the object).
+	// Wrapping into a local helper keeps the return + track pair symmetric
+	// with make_obj_with above.
+	auto set_empty_obj = [&]() {
+		set_empty_obj();
+		record_ext_enabled(name);
 	};
 	// WebGL1 extensions whose enum constants are numerically identical to
 	// ES3 core enums — returning an object exposes the constants Three.js
@@ -1002,7 +1142,7 @@ FN(w_get_extension) {
 		// No enum values — empty object is the standard signature. Indicates
 		// "you may use gl.UNSIGNED_INT (0x1405) with drawElements", which
 		// ES3 supports natively.
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	if (strcmp(name, "OES_standard_derivatives") == 0) {
@@ -1012,7 +1152,7 @@ FN(w_get_extension) {
 	if (strcmp(name, "OES_texture_float") == 0 ||
 	    strcmp(name, "OES_texture_float_linear") == 0 ||
 	    strcmp(name, "OES_texture_half_float_linear") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	if (strcmp(name, "OES_texture_half_float") == 0) {
@@ -1067,6 +1207,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_is_vertex_array)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// Phase-1 batch-1 — advertising + constants + compressed uploads.
@@ -1085,7 +1226,7 @@ FN(w_get_extension) {
 	// of float render targets when this ext is exposed).
 	if (has_native_ext("GL_EXT_float_blend") &&
 	    strcmp(name, "EXT_float_blend") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// EXT_texture_filter_anisotropic — 2 constants; texParameteri accepts
@@ -1122,7 +1263,7 @@ FN(w_get_extension) {
 	// method surface.
 	if (v2 && has_native_ext("GL_EXT_color_buffer_float") &&
 	    strcmp(name, "EXT_color_buffer_float") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// EXT_color_buffer_half_float (v2) — feature-flag stub. Same
@@ -1130,7 +1271,7 @@ FN(w_get_extension) {
 	// R16F sized formats are core ES3.
 	if (v2 && has_native_ext("GL_EXT_color_buffer_float") &&
 	    strcmp(name, "EXT_color_buffer_half_float") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// EXT_texture_norm16 (v2) — 8 sized internalformats. Constants only;
@@ -1151,7 +1292,7 @@ FN(w_get_extension) {
 	// accepted as render targets via ES3 core once the ext is exposed.
 	if (v2 && has_native_ext("GL_EXT_render_snorm") &&
 	    strcmp(name, "EXT_render_snorm") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// WEBGL_color_buffer_float (v1) — v1 alias for the color-buffer-float
@@ -1159,7 +1300,7 @@ FN(w_get_extension) {
 	// the WEBGL1 form).
 	if (!v2 && has_native_ext("GL_EXT_color_buffer_float") &&
 	    strcmp(name, "WEBGL_color_buffer_float") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// WEBGL_compressed_texture_s3tc — 4 constants.
@@ -1263,6 +1404,7 @@ FN(w_get_extension) {
 		           ->GetFunction(c).ToLocalChecked())
 		    .Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// WEBGL_debug_renderer_info — unmasked vendor / renderer via
@@ -1278,7 +1420,7 @@ FN(w_get_extension) {
 	// TEXTURE_STENCIL_MODE pname is accepted by w_tex_parameteri
 	// pass-through; no method surface.
 	if (v2 && strcmp(name, "WEBGL_stencil_texturing") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// Phase-1 batch-2 rider-1 — WEBGL_compressed_texture_etc (ETC2/EAC).
@@ -1323,6 +1465,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_vertex_attrib_divisor)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// Phase-1 batch-2 — WEBGL_draw_buffers (v1). Aliases the v2 core
@@ -1354,6 +1497,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_draw_buffers)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// Phase-1.5-LOW rider — OES_fbo_render_mipmap (v1). Advertise-only
@@ -1363,7 +1507,7 @@ FN(w_get_extension) {
 	// not actually advertised).
 	if (!v2 && has_native_ext("GL_OES_fbo_render_mipmap") &&
 	    strcmp(name, "OES_fbo_render_mipmap") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// Phase-1 batch-2 — EXT_frag_depth (v1). Advertise-only per spec
@@ -1373,7 +1517,7 @@ FN(w_get_extension) {
 	if (!v2 && has_native_ext("GL_EXT_frag_depth") &&
 	    probe_ext_frag_depth() &&
 	    strcmp(name, "EXT_frag_depth") == 0) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	// Phase-1 batch-2 — WEBGL_lose_context (both). Software-only,
@@ -1398,6 +1542,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_is_context_lost)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// Phase-1 batch-2 — WEBGL_debug_shaders (both). Software-only.
@@ -1433,6 +1578,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, get_translated_cb)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// ============================================================
@@ -1461,6 +1607,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_clip_control_ext)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	if (strcmp(name, "EXT_polygon_offset_clamp") == 0 &&
@@ -1472,6 +1619,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_polygon_offset_clamp_ext)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// EXT_disjoint_timer_query (v1) + _webgl2 (v2). v1 exposes the whole
@@ -1512,6 +1660,7 @@ FN(w_get_extension) {
 		}
 		FN_("queryCounterEXT", w_query_counter_ext);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// OES_draw_buffers_indexed (v2 only).
@@ -1533,6 +1682,7 @@ FN(w_get_extension) {
 		FN_("colorMaskiOES",              w_color_mask_i);
 		FN_("isEnablediOES",              w_is_enabled_i);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	if (strcmp(name, "KHR_parallel_shader_compile") == 0 &&
@@ -1544,6 +1694,7 @@ FN(w_get_extension) {
 		       FunctionTemplate::New(iso, w_max_shader_compiler_threads_khr)
 		              ->GetFunction(c).ToLocalChecked()).Check();
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	if (strcmp(name, "WEBGL_blend_func_extended") == 0 &&
@@ -1559,6 +1710,7 @@ FN(w_get_extension) {
 		U("ONE_MINUS_SRC1_ALPHA_WEBGL",           0x88FB);
 		U("MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL",   0x88FC);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	if (strcmp(name, "WEBGL_multi_draw") == 0 &&
@@ -1574,6 +1726,7 @@ FN(w_get_extension) {
 		FN_("multiDrawArraysInstancedWEBGL",     w_multi_draw_arrays_instanced_webgl);
 		FN_("multiDrawElementsInstancedWEBGL",   w_multi_draw_elements_instanced_webgl);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	// v2-only advertise-only stubs — constants + feature-flag empty objects.
@@ -1596,11 +1749,12 @@ FN(w_get_extension) {
 		U("CLIP_DISTANCE6_WEBGL", 0x3006);
 		U("CLIP_DISTANCE7_WEBGL", 0x3007);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 	if (v2 && strcmp(name, "OES_sample_variables") == 0 &&
 	    has_native_ext("GL_OES_sample_variables")) {
-		info.GetReturnValue().Set(Object::New(iso));
+		set_empty_obj();
 		return;
 	}
 	if (v2 && strcmp(name, "OES_shader_multisample_interpolation") == 0 &&
@@ -1614,6 +1768,7 @@ FN(w_get_extension) {
 		U("MAX_FRAGMENT_INTERPOLATION_OFFSET_OES",  0x8E5C);
 		U("FRAGMENT_INTERPOLATION_OFFSET_BITS_OES", 0x8E5D);
 		info.GetReturnValue().Set(o);
+		record_ext_enabled(name);
 		return;
 	}
 

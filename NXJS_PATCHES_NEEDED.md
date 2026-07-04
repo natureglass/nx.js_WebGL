@@ -88,6 +88,7 @@ proposal verdict.
 | 64 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_webgl_snapshot_bridge_rgba8` + `webgl.h: nx_webgl_snapshot_bridge_rgba8` + `canvas.cc: nx_webgl_snapshot_bridge_rgba8` | Tier 1: Screen.toDataURL WebGL-surface readback. New public helper reads tenant FBO to a heap BGRA (top-down) buffer; `nx_canvas_proto_to_data_url` + `nx_canvas_to_buffer` branch through it before falling back to snapshot_pixels. Fixes `screen.toDataURL()` on WebGL-backed Screens returning empty raster. |
 | 65 | engine | upstream-candidate | not-submitted | `webgl.cc: has_compressed_format_advertised` + `webgl.cc: Tier 4 \(ledger #65\)` | Tier 4: compressed-format INVALID_ENUM validation gate in `w_compressed_tex_image_2d` + `w_compressed_tex_sub_image_2d`. Spec-required — WebGL implementations MUST reject unadvertised sized compressed internalformats before dispatching to the driver. Fixes 7 CITRON-observed hangs (hardware stall behavior unverified) in the `testCompressedFormatsUnavailableWhenExtensionDisabled` cluster (BPTC/RGTC/ETC/ETC1/PVRTC/ASTC/S3TC-sRGB). |
 | 66 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: tryUnwrapCanvas` + `image-bitmap.ts: canvasToImageBitmap` | Tier-A: `createImageBitmap` source-type expansion. Pre-#66 impl handled ONLY `Blob` and threw for every other spec-defined `ImageBitmapSource`. Adds `HTMLCanvasElement` (nx.js Screen / OffscreenCanvas + brewser-runtime live-DOM `<canvas>` LiveElement via `.offscreen` duck-unwrap), `ImageData` (via scratch OffscreenCanvas + putImageData), `ImageBitmap` (via drawImage round-trip), `HTMLImageElement` (nx.js Image duck-typed on `naturalWidth`/`naturalHeight`). Unlocks up to 40 conformance tests across 5 `textures-image_bitmap_from_*` sub-clusters × 8 texture formats. HTMLVideoElement branch throws a distinct diagnostic (needs canvas.cc video-frame-capture path). |
+| 67 | engine | upstream-candidate | not-submitted | `webgl.cc: enabled_exts` + `webgl.cc: record_ext_enabled` + `webgl.cc: is_ext_enabled` | Tier-A: `getParameter` extension-gated pname enforcement. Per WebGL spec § 5.14.3, extension-gated pnames MUST return null (+ INVALID_ENUM) until `getExtension` has been called for their gating extension. Pre-#67 they returned real values unconditionally, causing 6-8 conformance FAILs. Adds per-context `enabled_exts` set populated at every success branch in `w_get_extension` and consulted by 8 new/modified pname branches in `w_get_parameter`: `CLIP_ORIGIN_EXT` / `CLIP_DEPTH_MODE_EXT` / `DEPTH_CLAMP_EXT` / `POLYGON_OFFSET_CLAMP_EXT` / `MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL` / `FRAGMENT_SHADER_DERIVATIVE_HINT_OES` / `COMPLETION_STATUS_KHR` + gating on the existing `UNMASKED_VENDOR/RENDERER_WEBGL` + `MAX_TEXTURE_MAX_ANISOTROPY_EXT` branches. |
 
 ## DISPOSITION POLICY
 
@@ -3165,6 +3166,34 @@ PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose the IM
 - All 8 `textures-image_bitmap_from_canvas-*` tests regress to `Unsupported image source: _LiveElement` = the `tryUnwrapCanvas` duck-type broke (likely `.tagName === 'CANVAS'` check flipped to something else, or the `.offscreen` field name changed on brewser-runtime's side).
 - All 8 `textures-image_bitmap_from_image_data-*` tests regress with a `putImageData` error = the ImageData branch's `getContext('2d')` returned null or the branch was moved above the Blob one and swallowed the wrong source.
 - `textures-image_bitmap_from_video-*` starts throwing `Image or Canvas expected` (from canvas.cc drawImage) instead of the distinct diagnostic = the deferred Video branch was replaced with a drawImage attempt without wiring the C++ side.
+
+---
+
+## #67 — Tier-A: `getParameter` extension-gated pname enforcement — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `enabled_exts: std::unordered_set<std::string>` field in `WebGLState` + `record_ext_enabled(name)` / `is_ext_enabled(name)` helpers + `set_empty_obj()` lambda inside `w_get_extension` + `record_ext_enabled(name)` at every success branch in `w_get_extension` (via the make_obj_with lambda's tail + explicit calls at all custom-object branches) + 6 new `case` branches and 2 modified branches in `w_get_parameter`.
+
+**Motivation.** WebGL 1 spec § 5.14.3 requires extension-gated pnames to return null (with INVALID_ENUM) UNTIL the caller invokes `getExtension` for the gating extension. Pre-#67 our engine returned real values unconditionally for these pnames, causing the WebGL 1 conformance corpus's "should be null" and "should not be queryable if extension is disabled" assertions to FAIL across 6-8 tests:
+- `extensions-ext-clip-control` — `CLIP_ORIGIN_EXT` / `CLIP_DEPTH_MODE_EXT` should be null
+- `extensions-ext-depth-clamp` — `DEPTH_CLAMP_EXT` should be null
+- `extensions-ext-polygon-offset-clamp` — `POLYGON_OFFSET_CLAMP_EXT` should be null
+- `extensions-webgl-blend-func-extended` — `MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL` should be null
+- `extensions-oes-standard-derivatives` — `FRAGMENT_SHADER_DERIVATIVE_HINT_OES` should not be queryable
+- `extensions-webgl-debug-renderer-info` — `UNMASKED_VENDOR/RENDERER_WEBGL` should not be queryable
+- `extensions-ext-texture-filter-anisotropic` — `MAX_TEXTURE_MAX_ANISOTROPY_EXT` should be null
+
+**Implementation.** Per-context tracking: `WebGLState.enabled_exts` holds every extension name for which `getExtension(name)` returned non-null. Population happens at every success branch in `w_get_extension` — the `make_obj_with` lambda and the new `set_empty_obj()` lambda both call `record_ext_enabled(name)` after setting the return value, and each custom-object branch (ASTC, WEBGL_lose_context, batch-3 vend-methods variants, etc.) has an explicit `record_ext_enabled(name);` before its `return;`. Consumption happens in `w_get_parameter` at 6 new `case` branches (CLIP_ORIGIN / CLIP_DEPTH_MODE / DEPTH_CLAMP / POLYGON_OFFSET_CLAMP / MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL / FRAGMENT_SHADER_DERIVATIVE_HINT / COMPLETION_STATUS_KHR) plus updates to the 2 existing branches (UNMASKED_VENDOR/RENDERER + MAX_TEXTURE_MAX_ANISOTROPY_EXT) that pre-#67 returned unconditionally. Each gated branch: `if (!is_ext_enabled(<name>)) { record_error(GL_INVALID_ENUM); SetNull(); return; }` then delegates to the appropriate `glGet{Integer,Boolean,Float,String}v` variant with the spec-correct JS boxing (integer, boolean, float, or string).
+
+**Scope note.** The `enabled_exts` set lives on the singleton `st` and is shared across v1 and v2 contexts. In practice we vend one WebGL context at a time (Screen owns THE tenant FBO), and v1/v2 vend different pname sets so cross-context leakage isn't testable. Spec-perfect per-context isolation would require moving `enabled_exts` onto the JS receiver object; deferred until a demo/test forces the isolation.
+
+**DISPOSITION:** `upstream-candidate`. Pure spec-hole fill, upstream would take the exact shape.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `enabled_exts`, `record_ext_enabled`, `is_ext_enabled`. Also grep for `Ledger #67` block header inside `w_get_parameter`. Recurrence tells:
+- All 7 extension tests above regress with real values returned instead of null = one of the 8 `case` branches in `w_get_parameter` regressed (lost its `is_ext_enabled(...)` guard or fell through to `default:`).
+- ONE test regresses = a specific pname's gating extension name is misspelled in its `is_ext_enabled(...)` call (e.g. `EXT_clip_control` vs `WEBGL_clip_control`).
+- All 7 tests regress with values EVEN AFTER `getExtension` = `record_ext_enabled` isn't being called from `w_get_extension`'s success branches (grep for `record_ext_enabled(name)` — should have ~16 occurrences).
 
 ---
 

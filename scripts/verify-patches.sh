@@ -1062,6 +1062,41 @@ check 66 "image-bitmap.ts [tier-a] HTMLVideoElement diagnostic (not silently sup
     "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
     'HTMLVideoElement source not yet supported'
 
+# #67 — Tier-A: getParameter extension-gated pname enforcement.
+check 67 "webgl.cc [tier-a] WebGLState.enabled_exts field" \
+    "$NXJS/source/webgl.cc" \
+    'std::unordered_set<std::string> enabled_exts'
+check 67 "webgl.cc [tier-a] record_ext_enabled helper" \
+    "$NXJS/source/webgl.cc" \
+    'static void record_ext_enabled'
+check 67 "webgl.cc [tier-a] is_ext_enabled helper" \
+    "$NXJS/source/webgl.cc" \
+    'static bool is_ext_enabled'
+check 67 "webgl.cc [tier-a] Ledger #67 gated-pname block header" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #67 — extension-gated pname enforcement'
+check 67 "webgl.cc [tier-a] CLIP_ORIGIN_EXT gated branch" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("EXT_clip_control"\)'
+check 67 "webgl.cc [tier-a] DEPTH_CLAMP_EXT gated branch" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("EXT_depth_clamp"\)'
+check 67 "webgl.cc [tier-a] POLYGON_OFFSET_CLAMP_EXT gated branch" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("EXT_polygon_offset_clamp"\)'
+check 67 "webgl.cc [tier-a] MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL gated branch" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("WEBGL_blend_func_extended"\)'
+check 67 "webgl.cc [tier-a] FRAGMENT_SHADER_DERIVATIVE_HINT_OES gated branch" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("OES_standard_derivatives"\)'
+check 67 "webgl.cc [tier-a] UNMASKED_VENDOR/RENDERER_WEBGL gated" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("WEBGL_debug_renderer_info"\)'
+check 67 "webgl.cc [tier-a] MAX_TEXTURE_MAX_ANISOTROPY_EXT gated" \
+    "$NXJS/source/webgl.cc" \
+    'is_ext_enabled\("EXT_texture_filter_anisotropic"\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
