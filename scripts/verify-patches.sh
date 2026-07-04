@@ -953,7 +953,64 @@ check 58 "webgl.cc [tier1] getUniform FUNCS entry (v1 + v2)" \
     '\{"getUniform", w_get_uniform\}'
 check 58 "webgl.cc [tier1] block header comment present" \
     "$NXJS/source/webgl.cc" \
-    'Tier 1 \(ledger #58\)'
+    'Tier 1 batch \(ledger #58\)'
+
+# #59 — Tier 1: copyTexImage2D thin wrapper.
+check 59 "webgl.cc [tier1] w_copy_tex_image_2d FN body" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_copy_tex_image_2d\)'
+check 59 "webgl.cc [tier1] copyTexImage2D FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"copyTexImage2D", w_copy_tex_image_2d\}'
+
+# #60 — Tier 1: getVertexAttrib pname-switched impl.
+check 60 "webgl.cc [tier1] w_get_vertex_attrib FN body" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_vertex_attrib\)'
+check 60 "webgl.cc [tier1] getVertexAttrib FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"getVertexAttrib", w_get_vertex_attrib\}'
+# BUFFER_BINDING pname branch (spec-critical: returns Buffer wrapper).
+check 60 "webgl.cc [tier1] w_get_vertex_attrib BUFFER_BINDING branch present" \
+    "$NXJS/source/webgl.cc" \
+    'GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING'
+
+# #61 — Tier 1: getFramebufferAttachmentParameter pname-switched impl.
+check 61 "webgl.cc [tier1] w_get_framebuffer_attachment_parameter FN body" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_framebuffer_attachment_parameter\)'
+check 61 "webgl.cc [tier1] getFramebufferAttachmentParameter FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter\}'
+
+# #62 — Tier 1: getAttachedShaders returns Array of shader wrappers.
+check 62 "webgl.cc [tier1] w_get_attached_shaders FN body" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_attached_shaders\)'
+check 62 "webgl.cc [tier1] getAttachedShaders FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"getAttachedShaders", w_get_attached_shaders\}'
+
+# #63 — Tier 1: vertexAttrib{1,2,3,4}fv macro-generated wrappers. FN bodies
+# are produced by the VA_FV(N) macro; grep for the macro definition + the
+# four invocations. Also verify all 4 FUNCS entries wire the resulting
+# symbols (1fv + 4fv are the range endpoints — if either is missing the
+# macro block was truncated or the FUNCS block regressed).
+check 63 "webgl.cc [tier1] VA_FV macro definition present" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_vertex_attrib_##N##fv\)'
+check 63 "webgl.cc [tier1] VA_FV(1) invocation" \
+    "$NXJS/source/webgl.cc" \
+    '^VA_FV\(1\)'
+check 63 "webgl.cc [tier1] VA_FV(4) invocation" \
+    "$NXJS/source/webgl.cc" \
+    '^VA_FV\(4\)'
+check 63 "webgl.cc [tier1] vertexAttrib1fv FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"vertexAttrib1fv", w_vertex_attrib_1fv\}'
+check 63 "webgl.cc [tier1] vertexAttrib4fv FUNCS entry" \
+    "$NXJS/source/webgl.cc" \
+    '\{"vertexAttrib4fv", w_vertex_attrib_4fv\}'
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="

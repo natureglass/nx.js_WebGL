@@ -80,6 +80,11 @@ proposal verdict.
 | 49 | engine | upstream-candidate | not-submitted | `webgl.cc: v2_rider2` + `webgl.cc: Rider 2 explicit list` | Phase-1 batch 2B: Rider 2 v2 spec-conformance prune — 5 WebGL1-only extensions return null on v2 (OES_standard_derivatives, OES_texture_float, OES_texture_half_float, OES_texture_half_float_linear, WEBGL_depth_texture) — Chrome / Firefox match |
 | 50 | engine | upstream-candidate | not-submitted | `webgl.cc: Phase-1.5-LOW` + `webgl.cc: w_get_buffer_sub_data` + `webgl.cc: OES_fbo_render_mipmap` | Phase-1.5-LOW: 30 core WebGL2 methods (buffer 2, framebuffer thin 6, 3D texture 3, uint uniforms 8, non-square matrix 6, clear buffer 4, draw range 1) + rider OES_fbo_render_mipmap on v1 (batch-2 defect fix). Counter 17→47/88. |
 | 58 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_uniform\)` + `webgl.cc: Tier 1 \(ledger #58\)` | Tier 1 batch (WebGL1 ERROR-bucket spec-hole fills): `getUniform(program, location)` — full type-switched dispatch covering scalar/vecN/matN/non-square (bool/int/uint/float + samplers). Unlocks 20 uniforms-no-over-optimization-on-uniform-array-* tests + uniforms-uniform-default-values. |
+| 59 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_copy_tex_image_2d\)` | Tier 1: `copyTexImage2D(target, level, internalformat, x, y, w, h, border)` thin wrapper. Sibling of `copyTexSubImage2D` (2.G.1 cut #25). Unlocks 7 tests: misc-uninitialized-test, rendering-clear-after-copyTexImage2D, textures-misc-copy-tex-image-2d-formats/-crash/-texture-copying-and-deletion/-feedback-loops/-texture-npot. |
+| 60 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_vertex_attrib\)` | Tier 1: `getVertexAttrib(index, pname)` pname-switched read. BUFFER_BINDING → K_BUFFER wrapper; ENABLED/NORMALIZED/INTEGER → bool; SIZE/STRIDE/TYPE/DIVISOR → number; CURRENT_VERTEX_ATTRIB → Float32Array(4). Unlocks extensions-angle-instanced-arrays, extensions-oes-vertex-array-object. |
+| 61 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_framebuffer_attachment_parameter\)` | Tier 1: `getFramebufferAttachmentParameter(target, attachment, pname)` pname-switched read. ATTACHMENT_OBJECT_NAME wraps into K_TEXTURE or K_RENDERBUFFER per preflight OBJECT_TYPE; other pnames → number. Unlocks extensions-webgl-draw-buffers, renderbuffers-framebuffer-test. |
+| 62 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_get_attached_shaders\)` | Tier 1: `getAttachedShaders(program)` — wraps GLuint names into K_SHADER JS Array. Empty array (not null) when nothing attached, spec. Unlocks misc-expando-loss, programs-program-test. |
+| 63 | engine | upstream-candidate | not-submitted | `webgl.cc: FN\(w_vertex_attrib_1fv\)` + `webgl.cc: FN\(w_vertex_attrib_4fv\)` | Tier 1: `vertexAttrib{1,2,3,4}fv(index, arr)` typed-array pointer variants of the scalar setters. Same macro shape as uniform_{N}fv. Unlocks attribs-gl-vertex-attrib-render (dynamic-form receiver). |
 
 ## DISPOSITION POLICY
 
@@ -2966,6 +2971,91 @@ Non-null addresses = extension functional; null = ext object still vends via the
 - New uniform type (e.g. a sampler variant added by a future extension) returns wrong shape = the default sampler branch is too broad. Fine-tune the switch.
 
 **Sequencing.** First of the Tier 1 batch (#58–#64) — shipped alone. #59–#63 land next as a batch; #64 (Screen.toDataURL) after that; #65 (compressed-format INVALID_ENUM gate) closes the batch bundled with the corpus skip-file edit.
+
+---
+
+## #59 — Tier 1: `copyTexImage2D` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_copy_tex_image_2d)` body in the Tier-1 block + FUNCS[] entry in v1 + v2 tables.
+
+**Motivation.** 7 conformance tests ERROR on `gl.copyTexImage2D is not a function` (`misc-uninitialized-test`, `rendering-clear-after-copyTexImage2D`, `textures-misc-copy-tex-image-2d-formats`, `-crash`, `-texture-copying-and-deletion`, `-feedback-loops`, `-texture-npot`). The sub-image sibling (`copyTexSubImage2D`) was added at 2.G.1 cut #25 (see comment at existing `w_copy_tex_sub_image_2d`); the full-image variant was skipped because no v1/v2 demo through 2.G exercised it. Conformance does.
+
+**Implementation shape.** Thin `glCopyTexImage2D` wrapper matching the ES2/ES3 signature `(target, level, internalformat, x, y, width, height, border)`. Same 8-arg call shape as `w_copy_tex_sub_image_2d` at line ~2581 (which uses xoffset/yoffset instead of internalformat/border). No format translation needed — `copyTexImage2D` uses ES2/ES3 unsized internalformats directly.
+
+**DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep for `FN(w_copy_tex_image_2d)` and the two `{"copyTexImage2D", w_copy_tex_image_2d}` FUNCS entries. Recurrence tell: any of the 7 tests above regresses to `gl.copyTexImage2D is not a function`.
+
+---
+
+## #60 — Tier 1: `getVertexAttrib(index, pname)` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_get_vertex_attrib)` body in the Tier-1 block + FUNCS[] entry in v1 + v2 tables.
+
+**Motivation.** 2 conformance tests ERROR on `gl.getVertexAttrib is not a function` (`extensions-angle-instanced-arrays`, `extensions-oes-vertex-array-object`). Both introspect attribute state after configuring buffers.
+
+**Pname-switched return shapes.**
+- `GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING` (0x889F) → Buffer wrapper (or null when 0) via the existing K_BUFFER handle kind
+- `GL_VERTEX_ATTRIB_ARRAY_ENABLED` (0x8622) / `_NORMALIZED` (0x886A) / `_INTEGER` (0x88FD, WebGL2) → boolean
+- `GL_VERTEX_ATTRIB_ARRAY_SIZE` (0x8623) / `_STRIDE` (0x8624) / `_DIVISOR` (0x88FE) → number (Int32)
+- `GL_VERTEX_ATTRIB_ARRAY_TYPE` (0x8625) → number (Uint32 — it's a GL enum token)
+- `GL_CURRENT_VERTEX_ATTRIB` (0x8626) → `Float32Array(4)`
+
+Uses `glGetVertexAttribiv` for the integer/boolean pnames and `glGetVertexAttribfv` for `CURRENT_VERTEX_ATTRIB`. Wraps the buffer name back into a WebGL Buffer object using `new_gl_obj(iso, K_BUFFER, id)` — spec-required (the caller expects a `WebGLBuffer` reference, not a raw GLuint name). Unknown pname records `GL_INVALID_ENUM` and returns null.
+
+**DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep for `FN(w_get_vertex_attrib)` and the two `{"getVertexAttrib", w_get_vertex_attrib}` FUNCS entries. Recurrence tells:
+- `extensions-angle-instanced-arrays` regresses to `is not a function` = FUNCS[] entry dropped.
+- Test asserts `gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING) instanceof WebGLBuffer === true` and it returns `null` or a number = the K_BUFFER wrap regressed to raw GLuint return.
+
+---
+
+## #61 — Tier 1: `getFramebufferAttachmentParameter(target, attachment, pname)` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_get_framebuffer_attachment_parameter)` body in the Tier-1 block + FUNCS[] entry in v1 + v2 tables.
+
+**Motivation.** 2 conformance tests ERROR on `gl.getFramebufferAttachmentParameter is not a function` (`extensions-webgl-draw-buffers`, `renderbuffers-framebuffer-test`).
+
+**Pname-switched return shapes.**
+- `GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME` (0x8CD1) → Texture wrapper OR Renderbuffer wrapper depending on the preflight query for `GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE` (0x8CD0). Returns null when OBJECT_TYPE is GL_NONE or the name is 0.
+- All other pnames (TYPE / LEVEL / CUBE_MAP_FACE / LAYER / COMPONENT_TYPE / RED_SIZE / ..) → number (Int32).
+
+The OBJECT_NAME branch does a preflight `glGetFramebufferAttachmentParameteriv(..., OBJECT_TYPE, ...)` so we know which handle kind to wrap the name into. Same pattern as spec.
+
+**DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep for `FN(w_get_framebuffer_attachment_parameter)` and the two `{"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter}` FUNCS entries. Recurrence tell: `renderbuffers-framebuffer-test` regresses to `is not a function`.
+
+---
+
+## #62 — Tier 1: `getAttachedShaders(program)` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_get_attached_shaders)` body in the Tier-1 block + FUNCS[] entry in v1 + v2 tables.
+
+**Motivation.** 2 conformance tests ERROR on `gl.getAttachedShaders is not a function` (`misc-expando-loss`, `programs-program-test`).
+
+**Implementation shape.** Query attached-shader count via `glGetProgramiv(GL_ATTACHED_SHADERS)`, then `glGetAttachedShaders` into a `std::vector<GLuint>`, then wrap each name back to a `WebGLShader` JS object via `new_gl_obj(iso, K_SHADER, name)` and pack into a JS `Array`. Spec: returns array of shader wrappers, empty `Array` if none attached (not null); returns null only when the program handle itself is 0.
+
+**DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep for `FN(w_get_attached_shaders)` and the two `{"getAttachedShaders", w_get_attached_shaders}` FUNCS entries. Recurrence tells:
+- `misc-expando-loss` regresses to `is not a function` = FUNCS[] entry dropped.
+- Test asserts shader `instanceof WebGLShader` on the returned wrapper and it's `false` = the K_SHADER prototype isn't stamped on the wrapper (`new_gl_obj` should apply the shader proto automatically — recheck the impl).
+
+---
+
+## #63 — Tier 1: `vertexAttrib{1,2,3,4}fv(index, arr)` — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `FN(w_vertex_attrib_1fv)`..`_4fv` bodies (macro-generated) in the Tier-1 block + FUNCS[] entries in v1 + v2 tables (4 entries per table).
+
+**Motivation.** At least 1 conformance test ERRORs on a dynamic-form call to `gl.vertexAttrib*fv(index, arr)` (surfaced under the `<dynamic>` receiver bucket in the ERROR classification: `attribs-gl-vertex-attrib-render`). The scalar variants (`vertexAttrib{1,2,3,4}f`) were bound at 2.C but the typed-array pointer variants (`fv`) were missed.
+
+**Implementation shape.** Four thin wrappers via a `VA_FV(N)` macro that mirrors the existing `UNI_FV(N)` macro at line ~2288: uses `f32_list` to unwrap `Float32Array` or plain JS array into a contiguous float pointer, guards `n >= N` before dispatch, then calls `glVertexAttrib{N}fv(index, ptr)`.
+
+**DISPOSITION:** `upstream-candidate`. **UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep for `FN(w_vertex_attrib_1fv)` (and the 2fv/3fv/4fv siblings — all four are macro-generated so grepping `w_vertex_attrib_4fv` is the canonical check) + the eight `{"vertexAttrib{N}fv", ...}` FUNCS entries (4 in v1, 4 in v2). Recurrence tell: `attribs-gl-vertex-attrib-render` regresses to `is not a function` on `gl.vertexAttrib3fv` or similar.
 
 ---
 

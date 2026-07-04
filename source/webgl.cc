@@ -4586,6 +4586,192 @@ FN(w_get_uniform) {
 	}
 }
 
+// #59 — copyTexImage2D(target, level, internalformat, x, y, w, h, border).
+// Thin glCopyTexImage2D wrapper. Reads from the current READ_FRAMEBUFFER
+// (ES3) or FRAMEBUFFER (ES2) at (x, y) w×h and allocates fresh mipmap-level
+// storage in the currently-bound target texture using the given
+// internalformat. Sibling of w_copy_tex_sub_image_2d (ledger 2.G.1 cut #25)
+// which uses xoffset/yoffset into existing storage; this variant allocates.
+// Unlocks 7 tests: misc-uninitialized-test, rendering-clear-after-
+// copyTexImage2D, textures-misc-copy-tex-image-2d-formats, -crash,
+// -texture-copying-and-deletion, -feedback-loops, -texture-npot.
+FN(w_copy_tex_image_2d) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLint level = a_i32(info, 1);
+	const GLenum internalformat = a_u32(info, 2);
+	const GLint x = a_i32(info, 3);
+	const GLint y = a_i32(info, 4);
+	const GLsizei width = a_i32(info, 5);
+	const GLsizei height = a_i32(info, 6);
+	const GLint border = a_i32(info, 7);
+	glCopyTexImage2D(target, level, internalformat, x, y, width, height,
+	                 border);
+}
+
+// #60 — getVertexAttrib(index, pname). Pname-switched read of the vertex-
+// attribute-array state at `index`. GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING
+// returns a WebGLBuffer wrapper (never a raw GLuint), so the caller can
+// `instanceof WebGLBuffer` — that's what extensions-angle-instanced-arrays
+// checks. CURRENT_VERTEX_ATTRIB returns a Float32Array(4). Everything else
+// is an integer- or boolean-typed pname.
+//
+// Hex constants used inline where the token isn't guaranteed to be defined
+// under gl3.h (INTEGER + DIVISOR are ES3-core; TYPE / STRIDE etc are ES2).
+FN(w_get_vertex_attrib) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLuint index = a_u32(info, 0);
+	const GLenum pname = a_u32(info, 1);
+	switch (pname) {
+	case 0x889F /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */: {
+		GLint v = 0;
+		glGetVertexAttribiv(index, pname, &v);
+		if (v == 0) {
+			info.GetReturnValue().SetNull();
+		} else {
+			info.GetReturnValue().Set(
+			    new_gl_obj(iso, K_BUFFER, (GLuint)v));
+		}
+		return;
+	}
+	case 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */:
+	case 0x886A /* GL_VERTEX_ATTRIB_ARRAY_NORMALIZED */:
+	case 0x88FD /* GL_VERTEX_ATTRIB_ARRAY_INTEGER (WebGL2) */: {
+		GLint v = 0;
+		glGetVertexAttribiv(index, pname, &v);
+		info.GetReturnValue().Set(Boolean::New(iso, v != 0));
+		return;
+	}
+	case 0x8623 /* GL_VERTEX_ATTRIB_ARRAY_SIZE */:
+	case 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */:
+	case 0x88FE /* GL_VERTEX_ATTRIB_ARRAY_DIVISOR (WebGL2 core) */: {
+		GLint v = 0;
+		glGetVertexAttribiv(index, pname, &v);
+		info.GetReturnValue().Set(Int32::New(iso, v));
+		return;
+	}
+	case 0x8625 /* GL_VERTEX_ATTRIB_ARRAY_TYPE */: {
+		GLint v = 0;
+		glGetVertexAttribiv(index, pname, &v);
+		info.GetReturnValue().Set(Uint32::NewFromUnsigned(iso, (uint32_t)v));
+		return;
+	}
+	case 0x8626 /* GL_CURRENT_VERTEX_ATTRIB */: {
+		GLfloat v[4] = {0, 0, 0, 0};
+		glGetVertexAttribfv(index, pname, v);
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, 4 * sizeof(GLfloat));
+		memcpy(ab->Data(), v, 4 * sizeof(GLfloat));
+		info.GetReturnValue().Set(Float32Array::New(ab, 0, 4));
+		return;
+	}
+	default: {
+		// Unknown pname — spec: INVALID_ENUM, return null.
+		record_error(GL_INVALID_ENUM);
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	}
+}
+
+// #61 — getFramebufferAttachmentParameter(target, attachment, pname). Pname-
+// switched read of FBO attachment metadata. ATTACHMENT_OBJECT_NAME returns a
+// wrapper of the attached object — either K_TEXTURE or K_RENDERBUFFER,
+// depending on ATTACHMENT_OBJECT_TYPE. Everything else is integer.
+FN(w_get_framebuffer_attachment_parameter) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	const GLenum target = a_u32(info, 0);
+	const GLenum attachment = a_u32(info, 1);
+	const GLenum pname = a_u32(info, 2);
+	if (pname == 0x8CD1 /* GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME */) {
+		// Preflight the OBJECT_TYPE to decide which wrapper kind to use.
+		GLint obj_type = 0;
+		glGetFramebufferAttachmentParameteriv(
+		    target, attachment,
+		    0x8CD0 /* GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE */, &obj_type);
+		GLint name = 0;
+		glGetFramebufferAttachmentParameteriv(target, attachment, pname,
+		                                       &name);
+		if (obj_type == 0 /* GL_NONE */ || name == 0) {
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		if (obj_type == (GLint)GL_TEXTURE) {
+			info.GetReturnValue().Set(
+			    new_gl_obj(iso, K_TEXTURE, (GLuint)name));
+			return;
+		}
+		if (obj_type == (GLint)GL_RENDERBUFFER) {
+			info.GetReturnValue().Set(
+			    new_gl_obj(iso, K_RENDERBUFFER, (GLuint)name));
+			return;
+		}
+		// Unknown attached-object type — spec doesn't define this, but
+		// returning null is safest (matches Chrome / Firefox).
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	// All other pnames are integer-valued (TYPE / LEVEL / CUBE_MAP_FACE /
+	// LAYER / RED_SIZE / GREEN_SIZE / BLUE_SIZE / ALPHA_SIZE / DEPTH_SIZE /
+	// STENCIL_SIZE / COMPONENT_TYPE / COLOR_ENCODING). Return as number.
+	GLint v = 0;
+	glGetFramebufferAttachmentParameteriv(target, attachment, pname, &v);
+	info.GetReturnValue().Set(Int32::New(iso, v));
+}
+
+// #62 — getAttachedShaders(program). Returns a JS Array of WebGLShader
+// wrappers for the shaders currently attached to `program`. Empty array
+// when nothing is attached (not null — spec).
+FN(w_get_attached_shaders) {
+	enter_bracket();
+	Isolate *iso = info.GetIsolate();
+	Local<Context> c = cur(iso);
+	const GLuint program = obj_id(info[0]);
+	if (program == 0) {
+		info.GetReturnValue().SetNull();
+		return;
+	}
+	GLint count = 0;
+	glGetProgramiv(program, GL_ATTACHED_SHADERS, &count);
+	if (count < 0) count = 0;
+	std::vector<GLuint> names((size_t)count, 0u);
+	GLsizei got = 0;
+	if (count > 0) {
+		glGetAttachedShaders(program, (GLsizei)count, &got, names.data());
+		if (got < 0) got = 0;
+		if ((GLint)got > count) got = (GLsizei)count;
+	}
+	Local<Array> arr = Array::New(iso, (int)got);
+	for (GLsizei i = 0; i < got; i++) {
+		arr->Set(c, (uint32_t)i,
+		          new_gl_obj(iso, K_SHADER, names[(size_t)i])).Check();
+	}
+	info.GetReturnValue().Set(arr);
+}
+
+// #63 — vertexAttrib{1,2,3,4}fv(index, values). Typed-array pointer variants
+// of the scalar setters at line ~2273. Same unwrap pattern as uniform_{N}fv
+// (via the shared f32_list helper — handles both Float32Array and plain JS
+// arrays). glVertexAttrib1fv accepts a pointer to one float, 2fv two, etc.
+#define VA_FV(N) \
+FN(w_vertex_attrib_##N##fv) { \
+	enter_bracket(); \
+	Isolate *iso = info.GetIsolate(); \
+	const GLuint index = a_u32(info, 0); \
+	std::vector<float> tmp; \
+	const float *p = nullptr; \
+	size_t n = 0; \
+	if (!f32_list(iso, info[1], tmp, &p, &n)) return; \
+	if (n < N) return; \
+	glVertexAttrib##N##fv(index, p); \
+}
+VA_FV(1)
+VA_FV(2)
+VA_FV(3)
+VA_FV(4)
+#undef VA_FV
+
 // ============================================================================
 // End Tier 1 block.
 // ============================================================================
@@ -4767,11 +4953,19 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
 	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
 	    // ============================================================
-	    // Tier 1 (ledger #58) — WebGL1 spec-hole fill for the
+	    // Tier 1 (ledger #58–#63) — WebGL1 spec-hole fill for the
 	    // conformance ERROR bucket. See the Tier 1 block comment above
 	    // for scope. Same entries land on both v1 + v2 FUNCS[].
 	    // ============================================================
 	    {"getUniform", w_get_uniform},
+	    {"copyTexImage2D", w_copy_tex_image_2d},
+	    {"getVertexAttrib", w_get_vertex_attrib},
+	    {"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter},
+	    {"getAttachedShaders", w_get_attached_shaders},
+	    {"vertexAttrib1fv", w_vertex_attrib_1fv},
+	    {"vertexAttrib2fv", w_vertex_attrib_2fv},
+	    {"vertexAttrib3fv", w_vertex_attrib_3fv},
+	    {"vertexAttrib4fv", w_vertex_attrib_4fv},
 	    // Fork-specific hooks (canvas-runner expects them).
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
@@ -5132,10 +5326,18 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"multiDrawArraysInstancedWEBGL", w_multi_draw_arrays_instanced_webgl},
 	    {"multiDrawElementsInstancedWEBGL", w_multi_draw_elements_instanced_webgl},
 	    // ============================================================
-	    // Tier 1 (ledger #58) — v2 mirror of the v1 spec-hole fills.
+	    // Tier 1 (ledger #58–#63) — v2 mirror of the v1 spec-hole fills.
 	    // Same body impl functions; shared across contexts.
 	    // ============================================================
 	    {"getUniform", w_get_uniform},
+	    {"copyTexImage2D", w_copy_tex_image_2d},
+	    {"getVertexAttrib", w_get_vertex_attrib},
+	    {"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter},
+	    {"getAttachedShaders", w_get_attached_shaders},
+	    {"vertexAttrib1fv", w_vertex_attrib_1fv},
+	    {"vertexAttrib2fv", w_vertex_attrib_2fv},
+	    {"vertexAttrib3fv", w_vertex_attrib_3fv},
+	    {"vertexAttrib4fv", w_vertex_attrib_4fv},
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
