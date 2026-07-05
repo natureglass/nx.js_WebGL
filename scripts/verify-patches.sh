@@ -1151,6 +1151,17 @@ check 70 "webgl-rendering-context.ts [tier-a] prototype wrap install" \
     "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
     'const p: any = WebGLRenderingContext\.prototype'
 
+# #71 — Tier-A: ImageBitmap-source short-circuit in the WebGL 1 shim.
+check 71 "webgl-rendering-context.ts [tier-a] ImageBitmap import" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    "import \{ ImageBitmap \} from './image-bitmap'"
+check 71 "webgl-rendering-context.ts [tier-a] Ledger #71 header comment" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'Ledger #71 — ImageBitmap passthrough'
+check 71 "webgl-rendering-context.ts [tier-a] instanceof ImageBitmap short-circuit (both wrappers)" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'last instanceof ImageBitmap'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

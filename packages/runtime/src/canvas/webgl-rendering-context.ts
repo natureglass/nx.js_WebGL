@@ -21,6 +21,7 @@
  */
 import { $ } from '../$';
 import { def, proto, createInternal } from '../utils';
+import { ImageBitmap } from './image-bitmap';
 import { ImageData } from './image-data';
 import { OffscreenCanvas } from './offscreen-canvas';
 import {
@@ -659,6 +660,36 @@ function sourceToPixels(src: any): {
 	if (typeof nativeTexImage2D === 'function') {
 		p.texImage2D = function (...args: any[]) {
 			const last = args[args.length - 1];
+			// Ledger #71 — ImageBitmap passthrough. sourceToPixels always
+			// produces 4-byte RGBA per pixel, but the caller may request a
+			// smaller format (RGB, LUMINANCE, ALPHA, LUMINANCE_ALPHA) or
+			// packed 16-bit type (5_6_5, 4_4_4_4, 5_5_5_1). Passing 4 bpp
+			// RGBA when the driver reads 3 bpp misaligns every pixel
+			// (observed as `was 255,255,0` where the R of pixel N leaks
+			// into the RGB of pixel N-1). Route ImageBitmap sources
+			// directly to the native so #69's `convert_image_source_to_gl_
+			// pixels` in webgl.cc does the byte-stride-correct conversion
+			// via `nx_get_image`. ImageBitmap is nx_image_t under the hood
+			// (per #66's construction).
+			if (last instanceof ImageBitmap) {
+				if (args.length === 6) {
+					// (target, level, internalformat, format, type, source)
+					// → (target, level, IF, w, h, 0, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						last.width,
+						last.height,
+						0,
+						args[3],
+						args[4],
+						last,
+					];
+				}
+				// 9-arg: source is already at args[8]; args pass through.
+				return nativeTexImage2D.apply(this, args);
+			}
 			if (isTexImageSource(last)) {
 				const px = sourceToPixels(last);
 				if (args.length === 6) {
@@ -683,6 +714,26 @@ function sourceToPixels(src: any): {
 		};
 		p.texSubImage2D = function (...args: any[]) {
 			const last = args[args.length - 1];
+			// Ledger #71 — same short-circuit as texImage2D above. See there
+			// for rationale.
+			if (last instanceof ImageBitmap) {
+				if (args.length === 7) {
+					// (target, level, xoff, yoff, format, type, source)
+					// → (target, level, xoff, yoff, w, h, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						args[3],
+						last.width,
+						last.height,
+						args[4],
+						args[5],
+						last,
+					];
+				}
+				return nativeTexSubImage2D.apply(this, args);
+			}
 			if (isTexImageSource(last)) {
 				const px = sourceToPixels(last);
 				if (args.length === 7) {
