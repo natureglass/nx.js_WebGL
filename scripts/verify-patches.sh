@@ -1131,6 +1131,26 @@ check 69 "webgl.cc [tier-a] w_tex_sub_image_2d image-source path" \
     "$NXJS/source/webgl.cc" \
     'Ledger #69 — ImageBitmap / Image source path mirrors w_tex_image_2d'
 
+# #70 — Tier-A: TexImageSource normalization shim for WebGL 1.
+check 70 "webgl-rendering-context.ts [tier-a] ImageData import" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    "import \{ ImageData \} from './image-data'"
+check 70 "webgl-rendering-context.ts [tier-a] OffscreenCanvas import" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    "import \{ OffscreenCanvas \} from './offscreen-canvas'"
+check 70 "webgl-rendering-context.ts [tier-a] Ledger #70 header comment" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'Ledger #70 — TexImageSource normalization shim for WebGL 1'
+check 70 "webgl-rendering-context.ts [tier-a] isTexImageSource helper" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'function isTexImageSource'
+check 70 "webgl-rendering-context.ts [tier-a] sourceToPixels helper" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'function sourceToPixels'
+check 70 "webgl-rendering-context.ts [tier-a] prototype wrap install" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'const p: any = WebGLRenderingContext\.prototype'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

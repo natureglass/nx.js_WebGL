@@ -21,6 +21,8 @@
  */
 import { $ } from '../$';
 import { def, proto, createInternal } from '../utils';
+import { ImageData } from './image-data';
+import { OffscreenCanvas } from './offscreen-canvas';
 import {
 	WebGLBuffer,
 	WebGLFramebuffer,
@@ -596,6 +598,115 @@ $.webglInitClass(WebGLRenderingContext, {
 	WebGLActiveInfo,
 	WebGLShaderPrecisionFormat,
 });
+
+// ---------------------------------------------------------------------------
+// Ledger #70 — TexImageSource normalization shim for WebGL 1.
+// Mirrors the WebGL 2 shim in webgl2-rendering-context.ts (~line 1204). The
+// native texImage2D / texSubImage2D bindings only handle ArrayBufferView /
+// PBO-offset pixel data (fixed 9-arg / 10-arg signatures). WebGL 1 spec's
+// 6-arg TexImageSource overloads — `texImage2D(target, level, IF, format,
+// type, source)` and `texSubImage2D(target, level, xoff, yoff, format, type,
+// source)` — arrive at the native with the ImageBitmap in info[5], NOT
+// info[8], so `pixels` reads as undefined and the texture stays cleared.
+// Convert the source to raw RGBA bytes via an OffscreenCanvas round-trip
+// and reshape the arg list to the 9-arg form before dispatching. #69 (the
+// engine-side nx_image_t handler) remains a spec-compliance fallback for
+// direct 9-arg calls that pass an nx_image_t as the pixels arg.
+// ---------------------------------------------------------------------------
+
+function isTexImageSource(v: any): boolean {
+	return (
+		v !== null &&
+		typeof v === 'object' &&
+		!ArrayBuffer.isView(v) &&
+		typeof v.width === 'number' &&
+		typeof v.height === 'number'
+	);
+}
+
+function sourceToPixels(src: any): {
+	data: Uint8Array;
+	width: number;
+	height: number;
+} {
+	let id: ImageData;
+	if (src instanceof ImageData) {
+		id = src;
+	} else {
+		// Rasterize through an offscreen 2D canvas; getImageData() returns
+		// non-premultiplied RGBA, which is exactly what GL expects with the
+		// default UNPACK_PREMULTIPLY_ALPHA_WEBGL = false.
+		const c = new OffscreenCanvas(src.width, src.height);
+		const ctx = c.getContext('2d');
+		ctx.drawImage(src, 0, 0);
+		id = ctx.getImageData(0, 0, src.width, src.height) as ImageData;
+	}
+	return {
+		data: new Uint8Array(
+			id.data.buffer,
+			id.data.byteOffset,
+			id.data.byteLength,
+		),
+		width: id.width,
+		height: id.height,
+	};
+}
+
+{
+	const p: any = WebGLRenderingContext.prototype;
+	const nativeTexImage2D = p.texImage2D;
+	const nativeTexSubImage2D = p.texSubImage2D;
+	if (typeof nativeTexImage2D === 'function') {
+		p.texImage2D = function (...args: any[]) {
+			const last = args[args.length - 1];
+			if (isTexImageSource(last)) {
+				const px = sourceToPixels(last);
+				if (args.length === 6) {
+					// (target, level, internalformat, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						px.width,
+						px.height,
+						0,
+						args[3],
+						args[4],
+						px.data,
+					];
+				} else {
+					// (..., width, height, border, format, type, source)
+					args[args.length - 1] = px.data;
+				}
+			}
+			return nativeTexImage2D.apply(this, args);
+		};
+		p.texSubImage2D = function (...args: any[]) {
+			const last = args[args.length - 1];
+			if (isTexImageSource(last)) {
+				const px = sourceToPixels(last);
+				if (args.length === 7) {
+					// (target, level, xoffset, yoffset, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						args[3],
+						px.width,
+						px.height,
+						args[4],
+						args[5],
+						px.data,
+					];
+				} else {
+					// (..., width, height, format, type, source)
+					args[args.length - 1] = px.data;
+				}
+			}
+			return nativeTexSubImage2D.apply(this, args);
+		};
+	}
+}
 
 /**
  * @ignore
