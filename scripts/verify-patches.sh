@@ -1358,6 +1358,9 @@ check 84 "canvas-runner.ts [tier-a] installVideoImageBitmapShim called from inst
 check 84 "live-video.ts [tier-a] brewser://→sdmc:/switch/brewser/ translation in resolveSourceForDecoder" \
     "$RUNTIME/src/scripts/live-video.ts" \
     "replace\\(/\\^brewser:\\\\/\\\\/\\/i, 'sdmc:/switch/brewser/'"
+check 84 "live-video.ts [tier-a] captureVideoFrameToBitmap forces SW reopen on HW decoder pre-first-frame" \
+    "$RUNTIME/src/scripts/live-video.ts" \
+    'openDecoder\(el, st0, false\)'
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.mp4)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.mp4"
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.webmvp8.webm)" \
