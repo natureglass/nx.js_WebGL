@@ -1163,15 +1163,12 @@ check 71 "webgl-rendering-context.ts [tier-a] instanceof ImageBitmap short-circu
     'last instanceof ImageBitmap'
 
 # #72 — Tier-A: default viewport at context creation + un-mult removal.
-check 72 "webgl.cc [tier-a] Ledger #72 header comment" \
+check 72 "webgl.cc [tier-a] Ledger #72 viewport seed in enter_bracket" \
     "$NXJS/source/webgl.cc" \
-    'Ledger #72 — seed default viewport'
-check 72 "webgl.cc [tier-a] glViewport seed at context creation" \
+    'Ledger #72 — before capturing user_snap for the first time'
+check 72 "webgl.cc [tier-a] glViewport seed with canvas dims" \
     "$NXJS/source/webgl.cc" \
-    'glViewport\(0, 0, w, h\)'
-check 72 "webgl.cc [tier-a] user_snap.viewport seed" \
-    "$NXJS/source/webgl.cc" \
-    'st->user_snap\.viewport\[2\] = w'
+    'glViewport\(0, 0, \(GLsizei\)st->width, \(GLsizei\)st->height\)'
 check 72 "webgl.cc [tier-a] un-mult removed from tex_image_2d" \
     "$NXJS/source/webgl.cc" \
     'Ledger #72 — image_bitmap conformance tests do NOT call'

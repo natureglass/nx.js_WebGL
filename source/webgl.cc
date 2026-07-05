@@ -595,6 +595,17 @@ void enter_bracket() {
 	// what the demo INTENDED (per WebGL spec, that's what should persist
 	// across bracket boundaries).
 	if (!st->user_snap_valid) {
+		// Ledger #72 — before capturing user_snap for the first time, seed
+		// the GL viewport to canvas dimensions per WebGL 1 § 5.14.3
+		// ("Initially the viewport rectangle is (0, 0, drawingBufferWidth,
+		// drawingBufferHeight)"). Skia paints between context creation and
+		// the demo's first WebGL call, leaving whatever viewport it needed —
+		// empirically observed at 8×8 during a Tier-A image_bitmap diag,
+		// causing full-viewport quads to render into a corner. Seed here
+		// (not context_new) because Skia's late paint could clobber a
+		// context_new-time seed before we capture user_snap; putting it
+		// inside enter_bracket() guarantees the seed survives to capture.
+		glViewport(0, 0, (GLsizei)st->width, (GLsizei)st->height);
 		nx_gl_state_save(&st->user_snap);
 		st->user_snap_valid = true;
 	} else {
@@ -6106,35 +6117,6 @@ static Local<Object> make_context_carrier(Isolate *iso,
 		}
 	}
 	nx_webgl_bridge_set_webgl_owned(true);
-
-	// Ledger #72 — seed default viewport to canvas dimensions.
-	//
-	// WebGL 1 spec § 5.14.3: "When a new WebGL context is created its viewport
-	// is set to `(0, 0, drawingBufferWidth, drawingBufferHeight)`." Chrome /
-	// Firefox honor this; the caller is expected to be able to rely on the
-	// default viewport without an explicit `gl.viewport(0, 0, w, h)` call.
-	//
-	// Our engine previously inherited whatever viewport Skia's Ganesh left in
-	// GL state (empirically observed at 8×8 or 1×1 via a diag on drawArrays)
-	// — a tenant-FBO-init or sampler-init call somewhere left the viewport
-	// small, so any WebGL test that skipped `gl.viewport` rendered its full-
-	// viewport quad into an 8×8 corner. Test read positions beyond that
-	// corner sampled the framebuffer clear color (0,0,0,1), giving the
-	// signature "only the bottom-left pixel matches source (0,0), all other
-	// positions read 0,0,0". Traced during Ledger #72 diagnosis of the
-	// image_bitmap texture tests.
-	//
-	// The fix is 4 lines: set the GL viewport now (context is current — the
-	// bridge init above proves that), and mirror it into `user_snap.viewport`
-	// so the very first bracket-restore doesn't overwrite it back to zeros.
-	// user_snap.valid stays false — it flips true on the FIRST enter_bracket
-	// after the user starts calling GL, at which point the seed viewport is
-	// captured (if the user hasn't already changed it via w_viewport).
-	glViewport(0, 0, w, h);
-	st->user_snap.viewport[0] = 0;
-	st->user_snap.viewport[1] = 0;
-	st->user_snap.viewport[2] = w;
-	st->user_snap.viewport[3] = h;
 
 	// Phase-0 — populate the native GL extension cache and emit the
 	// [gl-ext-dump] one-shot boot log. Bridge init above guarantees the
