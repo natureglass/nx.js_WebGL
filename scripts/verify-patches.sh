@@ -1199,6 +1199,23 @@ check 73 "image-bitmap.ts [tier-a] canvasToImageBitmap opts threaded through" \
     "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
     'canvasToImageBitmap\(oc, opts\)'
 
+# #74 — Track-A DrumBrake wasm interpreter opt-in gate + empirical wasm-tier probe.
+check 74 "config.h wasm_interpreter_opt_in field" \
+    "$NXJS/source/config.h" \
+    '^\s*bool wasm_interpreter_opt_in;'
+check 74 "config.cc wasm_interpreter parse branch" \
+    "$NXJS/source/config.cc" \
+    'str_ieq\(name, "wasm_interpreter"\)'
+check 74 "main.cc --wasm-jitless conditional append (gated on wasm_interpreter_opt_in)" \
+    "$NXJS/source/main.cc" \
+    'V8::SetFlagsFromString\("--wasm-jitless"\)'
+check 74 "main.cc nx_probe_wasm_tier helper defined" \
+    "$NXJS/source/main.cc" \
+    'static void nx_probe_wasm_tier'
+check 74 "main.cc [wasm] mode= boot log line" \
+    "$NXJS/source/main.cc" \
+    '\[wasm\] mode=%s'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

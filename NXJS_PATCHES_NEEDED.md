@@ -95,6 +95,7 @@ proposal verdict.
 | 71 | **runtime** | upstream-candidate | not-submitted | `webgl-rendering-context.ts: Ledger #71` + `webgl-rendering-context.ts: last instanceof ImageBitmap` | Tier-A: ImageBitmap-source short-circuit in the WebGL 1 shim so #69's C++ conversion path fires. Post-#70 the tier-70 re-baseline flipped only 2 of 40 image_bitmap tests because `sourceToPixels` always emits 4-byte RGBA, but WebGL 1 conformance iterates smaller formats (RGB, LUMINANCE, LUMINANCE_ALPHA, ALPHA) + packed 16-bit types (5_6_5, 4_4_4_4, 5_5_5_1). Passing 4 bpp RGBA when the driver reads 3 bpp misaligns every pixel — pixel N's RGB reads as `[A_{N-1}, R_N, G_N]` (observed `was 255,255,0` where `128,0,0` was expected). Fix: before falling into `sourceToPixels`, check `last instanceof ImageBitmap` and passthrough to the native with an arg-reshape (6-arg → 9-arg, 7-arg sub → 9-arg). ImageBitmap wraps `nx_image_t` (per #66's construction) so #69's `nx_get_image` + `convert_image_source_to_gl_pixels` in webgl.cc runs and produces byte-stride-correct output for the caller's `(format, type)`. Covers all 5 non-video `_from_*` clusters (blob / canvas / image / image_bitmap / image_data) × 8 formats = ~40 tests. `_from_video` still deferred by #66. Non-ImageBitmap sources (raw ImageData / SVG image / webgl canvas / video — used by `textures-{image_data,svg_image,webgl_canvas,video}-*`) still route through the buggy `sourceToPixels` and will need a follow-up ledger entry that mirrors #69's conversion matrix in JS. |
 | 72 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #72 — seed default viewport` + `webgl.cc: glViewport(0, 0, w, h)` in context_new + `webgl.cc: source is premultiplied BGRA` (un-mult removal) | Tier-A: (a) seed default GL viewport at context creation to canvas dimensions per WebGL 1 spec § 5.14.3, and (b) remove un-multiplication from #69's C++ conversion for ImageBitmap sources. Post-#71 the tier-71 re-baseline confirmed my C++ code path IS running for ImageBitmap uploads AND scratch bytes are correct for all 4 pixels of the test's 2×2 source — but only the drawing bottom-left pixel matched source (0,0); every other position read `0,0,0`. A drawArrays-time diag revealed `viewport=(0,0,8,8)` (later `(0,0,1,1)` on the first call) on a canvas whose HTML declares `width=32 height=32`. Our engine inherited whatever viewport Skia's Ganesh left in GL state — a small size — because `nx_webgl_context_new` never called `glViewport`, and the WebGL spec says the caller can rely on the default viewport = drawingBufferWidth × drawingBufferHeight. Tests that never explicitly call `gl.viewport(...)` (which is most conformance tests, including all `textures-image_bitmap_from_*` and many others) rendered their full-viewport quad into an 8×8 corner; readbacks beyond that corner sampled the framebuffer clear color, giving the specific signature "only bottom-left pixel matches source (0,0)". Fix (a): `glViewport(0, 0, w, h)` after bridge init in `make_context_carrier`, plus mirror into `user_snap.viewport` so the first bracket restore doesn't overwrite it. Fix (b): image_bitmap tests do NOT call `pixelStorei(UNPACK_PREMULTIPLY_ALPHA_WEBGL, ...)` (verified via a pixelStorei diag); the test's expected values assume the bitmap's own premultipliedAlpha state is preserved through upload (matches Chrome). Un-multiplying with flag=FALSE produced `255,0,0` where test expected `128,0,0` for half-alpha red. Fixed by hardcoding `un_premultiply = false` in both `w_tex_image_2d` and `w_tex_sub_image_2d`. Broad impact: fix (a) unblocks any test that skipped explicit viewport (many conformance tests do); fix (b) restores spec-correct behavior for ImageBitmap upload. |
 | 73 | engine + **runtime** | upstream-candidate | not-submitted | `image.cc: Ledger #73 — optional 3rd arg` + `image.cc: bool premultiply = true` + `image-bitmap.ts: Ledger #73 — extract flipY / unpremul` + `image-bitmap.ts: extractOpts` | Tier-A: honor `createImageBitmap({imageOrientation, premultiplyAlpha})` options. Post-#72 the RGB test's iteration 1 (`flipY=false, premultiplyAlpha=premultiply`) passes fully, but iterations 2/3/4 fail because #66's `canvasToImageBitmap` ignores those options — all 4 bitmap variants come out with the same premultiplied, non-flipped pixels. Fix: (a) engine — extend `nx_image_write_rgba` in `image.cc` with an optional 3rd arg `premultiply` (default `true` preserves the existing video-frame delivery contract used by `Switch.VideoDecoder`); when `false`, write raw RGBA→BGRA without alpha multiplication. (b) runtime — add `extractOpts` in `image-bitmap.ts` reading `opts.imageOrientation === 'flipY'` and `opts.premultiplyAlpha === 'none'`, thread `opts` through all 4 non-Blob `canvasToImageBitmap` call sites (canvas / ImageData / ImageBitmap / HTMLImageElement). For `flipY`: compose the source into a scratch OffscreenCanvas with a Y-mirror transform (`ctx.scale(1, -1); ctx.translate(0, -h); drawImage(src, 0, 0)`) before encoding. For `unpremul`: skip the PNG round-trip (which always premultiplies on decode) and store raw `getImageData` bytes via `imageWriteRGBA(bmp, bytes, false)`. Fast path (no options) is unchanged — hot callers pay zero perf cost. Blob source path deferred (tier-A blob tests all fail upstream at "Unsupported image format" for BMP; a `_from_blob` option-honoring pass would need re-routing through a scratch canvas). |
+| 74 | engine | fork-only (upstream-candidate later) | not-submitted | `config.h: wasm_interpreter_opt_in` + `config.cc: str_ieq(name, "wasm_interpreter")` + `main.cc: --wasm-jitless` + `main.cc: nx_probe_wasm_tier` + `main.cc: \[wasm\] mode=` | Track-A: DrumBrake wasm interpreter opt-in gate + empirical wasm-tier boot probe. Adds `[v8] wasm_interpreter = on\|off` (default off); when on AND runtime selects jitless mode, appends `--wasm-jitless` so V8's in-tree DrumBrake interpreter runs WebAssembly instead of Liftoff (which needs the JIT code arena we don't have under Citron / applet jitless). Hardware/JIT flag string is byte-identical (gate is READ but not applied). A minimal 34-byte execution probe (compile+instantiate+call `f()->i32` returning 42) runs after Isolate+Context init but before runtime.js; logs `[wasm] mode=jit(liftoff)` / `drumbrake` / `unavailable` empirically from the outcome — truth-in-labeling, not just "the validator ran". Fail-soft: every fallible V8 step falls through to `unavailable`, TryCatch+Reset internally, zero abort paths. **Inert on the shipping switch-v8 monolith** (built without `v8_enable_drumbrake=true`); expected result today is `mode=unavailable` under Citron regardless of gate state. Companion Track B (out-of-band, TooTallNate/pacman-packages rebuild with `v8_enable_drumbrake=true`) activates DrumBrake; acceptance gate is `scripts/verify-drumbrake-monolith.sh` — must print PRESENT (nm sees `GenericJSToWasmInterpreterWrapper\|WasmInterpreterRuntime\|WasmBytecodeGenerator` symbols) before flipping any default. Upstream-candidate future PR (V8's DrumBrake benefits any nx.js embedder in emulator / no-JIT environments) — queued behind existing PR backlog. |
 
 ## DISPOSITION POLICY
 
@@ -3473,6 +3474,129 @@ All 4 iterations should pass. Estimated tier-A test coverage flip: ~30 of the 40
 - iter 3-4 top/bottom swap breaks = the `flipY` scale/translate composition regressed — either the transform matrix flipped sign or the `staging` canvas isn't being drawn into.
 - All 4 iterations regress identically = `extractOpts` returned `{ flipY: false, unpremul: false }` for every call (the option-detection logic broke).
 - `Switch.VideoDecoder` frame-delivery hangs or shows corruption = the `premultiply=true` default in `imageWriteRGBA` regressed (all frames land as raw RGBA→BGRA without premul).
+
+---
+
+## #74 — Track-A: DrumBrake wasm interpreter opt-in gate + empirical wasm-tier boot probe
+
+**File(s):**
+- [source/config.h](source/config.h) — INI doc block for `[v8] wasm_interpreter = on|off`; new `bool wasm_interpreter_opt_in;` field on `nx_config_t`.
+- [source/config.cc](source/config.cc) — parse branch for `wasm_interpreter` key inside the `[v8]` section; default-init in `nx_config_defaults`.
+- [source/main.cc](source/main.cc) — conditional `V8::SetFlagsFromString("--wasm-jitless")` in the jitless branch of the flag setup; new static helper `nx_probe_wasm_tier(Isolate*, Local<Context>, bool can_jit)` and its call site after `Context::Scope` but before runtime.js.
+- [scripts/verify-drumbrake-monolith.sh](scripts/verify-drumbrake-monolith.sh) — Track-B acceptance gate script (out-of-tree toolchain probe).
+
+**Motivation.** Under Citron and in `[v8] jit = off` launches, V8 runs `--jitless` and the shipping switch-v8 monolith has **no** WebAssembly implementation at all (Liftoff needs the JIT code arena; the interpreter side of V8 was never enabled at build time). Every WASM app hits a hard error at first `WebAssembly.compile` / instantiate. V8 upstream ships an in-tree wasm interpreter — DrumBrake — enabled via GN arg `v8_enable_drumbrake=true` and runtime flag `--wasm-jitless`. This entry wires the engine-side glue so that once a DrumBrake-enabled monolith is installed (Track B, out-of-band pacman-packages rebuild), Citron/jitless launches get functional WASM (interpreter-tier).
+
+Track-A-first strategy: land the gate + probe now, defaulted off, byte-identical to today on the JIT branch. The empirical probe reports the real runtime tier — not what the flag string claims — so the boot log stays truthful across all four verification-matrix rows (V1 gate-off / V2 gate-on / V3 hardware-JIT / V4 post-Track-B).
+
+**Exact change.**
+
+1. `source/config.h`: extend the `[v8]` INI doc block near the top of the file with `wasm_interpreter = off` under `jit` and `flags`, plus a paragraph documenting the semantic (Citron-only; inert on JIT branch; no-op until Track B). Add `bool wasm_interpreter_opt_in;` after `webgl_state_probe_active` in `nx_config_t`.
+
+2. `source/config.cc`: add a new branch inside the `[v8]` section handler (adjacent to the existing `code_headroom_mb`/`wasm` branch — DISTINCT key, no collision). Accept `on|true|1` / `off|false|0` case-insensitive; anything else logs `v8.wasm_interpreter="…" not honored: invalid (use on|off)` and keeps the default. Initialize `cfg->wasm_interpreter_opt_in = false` in `nx_config_defaults`.
+
+3. `source/main.cc`, flag setup (currently around line 1734): inside the `else` (jitless) branch of `if (can_jit) { … } else { … }`, add — AFTER the base `SetFlagsFromString("--jitless …")` call — a gated second call:
+
+```cpp
+if (nx_ctx->config.wasm_interpreter_opt_in) {
+    V8::SetFlagsFromString("--wasm-jitless");
+    fprintf(stderr,
+            "[v8] wasm_interpreter=on -> --wasm-jitless appended "
+            "(DrumBrake selected iff monolith supports it)\n");
+    fflush(stderr);
+}
+```
+
+The JIT branch (`if (can_jit)`) is UNTOUCHED — flag string is byte-identical to today. This is a load-bearing invariant: verify-patches.sh check `[v8-jit] byte-identical` greps for the exact JIT flag literal to catch regressions.
+
+4. `source/main.cc`, new probe (definition near the other V8-helper statics, e.g. after `nx_v8_fatal_cb`):
+
+```cpp
+static void nx_probe_wasm_tier(Isolate *iso, Local<Context> ctx, bool can_jit) {
+    HandleScope hs(iso);
+    TryCatch tc(iso);
+
+    // 34-byte MVP module: exports `f: () -> i32` returning i32.const 42.
+    static const char kProbeSrc[] =
+        "(function(){"
+        "var b=new Uint8Array(["
+        "0,97,115,109,1,0,0,0,"
+        "1,5,1,96,0,1,127,"
+        "3,2,1,0,"
+        "7,5,1,1,102,0,0,"
+        "10,6,1,4,0,65,42,11"
+        "]);"
+        "var m=new WebAssembly.Module(b);"
+        "var i=new WebAssembly.Instance(m);"
+        "return i.exports.f();"
+        "})()";
+
+    bool executes = false;
+    Local<String> src;
+    if (String::NewFromUtf8(iso, kProbeSrc, NewStringType::kNormal)
+            .ToLocal(&src)) {
+        Local<Script> scr;
+        if (Script::Compile(ctx, src).ToLocal(&scr)) {
+            Local<Value> res;
+            if (scr->Run(ctx).ToLocal(&res)) {
+                double d = 0.0;
+                if (res->NumberValue(ctx).To(&d) && d == 42.0)
+                    executes = true;
+            }
+        }
+    }
+    if (tc.HasCaught()) tc.Reset();
+
+    const char *mode;
+    if (!executes)     mode = "unavailable";
+    else if (can_jit)  mode = "jit(liftoff)";
+    else               mode = "drumbrake";
+    fprintf(stderr, "[wasm] mode=%s\n", mode);
+    fflush(stderr);
+}
+```
+
+Call site: inside the `Context::Scope context_scope(context);` block, immediately after entering the scope and before any user-visible setup:
+
+```cpp
+Context::Scope context_scope(context);
+nx_probe_wasm_tier(iso, context, can_jit);
+Local<Object> global = context->Global();
+```
+
+**Design invariants (Amendments A + B from Phase 1 review).**
+
+- **Executes, not validates.** The probe module contains one exported function that runs `i32.const 42; end` and returns the value. A build with `WebAssembly.Module` present but no execution tier (which the current shipping monolith might expose — `Module` validation may not require the interpreter) will FAIL at `new WebAssembly.Instance(m)` or at `i.exports.f()`, correctly reporting `mode=unavailable`. A build with DrumBrake sees `executes = true` and reports `mode=drumbrake`.
+- **Zero abort paths.** Every V8 API used in the probe is the fallible variant. `NewFromUtf8` uses `ToLocal` (not `ToLocalChecked` — that would abort on empty). `Script::Compile`, `Run`, `NumberValue` — all `.ToLocal(...)` / `.To(...)`. `nx_str` is deliberately NOT used because it aborts on empty. Any hop that returns empty falls through to `mode=unavailable` without touching V8's abort path.
+- **No exception leakage.** `tc.HasCaught() && tc.Reset()` clears the isolate's pending-exception flag before the probe returns, so runtime.js and user code start clean.
+
+**Symptom it fixes.**
+
+- Under Citron / `[v8] jit = off`, apps that try `WebAssembly.compile(...)` currently throw or hang without a diagnostic. After #74: the boot log reports `[wasm] mode=unavailable` on the current monolith (making the missing capability observable), or `[wasm] mode=drumbrake` on a Track-B monolith (WASM apps run). The gate is opt-in so no default behavior changes.
+
+**Fail-soft verification (V1/V2 rows of the acceptance matrix).**
+
+- **V1 — current monolith, gate off, Citron:** flag string identical to pre-#74. Probe compiles+runs; either `WebAssembly` is absent (TypeError) or Module/Instance construction throws. Probe reports `[wasm] mode=unavailable`. App boots normally.
+- **V2 — current monolith, gate on, Citron:** flag string has `--wasm-jitless` appended. Probe still fails (no DrumBrake in binary). Reports `[wasm] mode=unavailable`. App still boots; the `[v8] wasm_interpreter=on -> --wasm-jitless appended` log line confirms the gate reached V8.
+- **V3 — hardware, JIT, any gate:** flag string byte-identical to pre-#74 on the JIT branch (gate is READ but not consumed). Probe compiles via Liftoff, executes, returns 42 → `[wasm] mode=jit(liftoff)`.
+- **V4 — post-Track-B monolith, gate on, Citron:** probe compiles via DrumBrake, executes, returns 42 → `[wasm] mode=drumbrake`.
+
+**Track-B acceptance gate.** Before flipping the default from off to on (or from opt-in to auto-detect), run `scripts/verify-drumbrake-monolith.sh`. Passes when the aarch64 cross-nm (or host `nm` fallback) on `$DEVKITPRO/portlibs/switch/lib/libv8_monolith.a` matches DrumBrake-specific tokens (`GenericJSToWasmInterpreterWrapper`, `GenericWasmToJSInterpreterWrapper`, `WasmInterpreterRuntime`, `WasmInterpreterObject`, `WasmBytecodeGenerator`). Bare `WasmInterpreter` / `WasmBytecode` are deliberately NOT used as tells — the V8 devtools inspector API (compiled unconditionally) exports `getWasmBytecode` etc. and would false-positive; the shipping V8 15.0 monolith reports 0 matches with the narrowed needle, matching the expected pre-Track-B "MISSING" outcome. Script prefers `$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm` when present, falling back to host `nm`.
+
+**Upstream posture.** Marked `fork-only (upstream-candidate later)` — the gate + empirical probe benefit any nx.js embedder in emulator / no-JIT environments (iOS, Cobalt/Starboard-like sandboxes, etc.). PR queued behind the existing PR-A/-C/-D/-F backlog; do NOT foreclose upstream by leaving fork-specific baggage in the change. The one Horizon-specific piece is the `nx_ctx->config` field name, easy to lift.
+
+**Known non-goals.**
+
+- No SIMD / threads / GC coverage on the DrumBrake path — those are DrumBrake's own gaps. SIMD modules will throw `CompileError` under Track B; test titles that require v128 become hardware-only (documented behavior, no mitigation).
+- Perf: interpreter tier is order-of-magnitude slower than Liftoff. This is a dev-iteration path, not a ship perf target.
+- No changes to the `[v8] wasm = on|off` / `code_headroom_mb` sugar (JIT-arena headroom). Distinct concern; distinct key.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/config.h](source/config.h) for `wasm_interpreter_opt_in` (must appear as a struct field, not just in a comment). Grep [source/config.cc](source/config.cc) for `str_ieq(name, "wasm_interpreter")` (parse branch). Grep [source/main.cc](source/main.cc) for `--wasm-jitless` (flag append) + `nx_probe_wasm_tier` (helper) + `\[wasm\] mode=` (boot log). Recurrence tells:
+- `[wasm] mode=` line missing from a Citron boot log entirely = the probe call site regressed (context_scope block was refactored and the call site dropped) OR the probe function was inlined / removed.
+- Log says `[wasm] mode=jit(liftoff)` when the flag `--jitless` is in effect = the `can_jit` argument to the probe is wired to the wrong branch condition; check that main.cc's `nx_probe_wasm_tier(iso, context, can_jit)` uses the same `can_jit` bool that gates `SetFlagsFromString`.
+- Log says `[wasm] mode=unavailable` after Track B was verified via `scripts/verify-drumbrake-monolith.sh` = the empirical probe caught a real regression (either `--wasm-jitless` isn't reaching V8 or DrumBrake's arm64 support is incomplete for the specific opcode set — the probe uses only `i32.const` + return, so an incomplete opcode set is unlikely; look at flag ordering vs. `V8::Initialize()`).
+- Log says `[wasm] mode=drumbrake` while the shipped monolith is confirmed to have NO DrumBrake symbols via nm = extremely unlikely (would require `WebAssembly.Module`/`Instance`/`f()` all succeeding without an interpreter); if seen, cross-check `scripts/verify-drumbrake-monolith.sh` and re-inspect the monolith build recipe.
+- Hardware JIT branch flag string diverges from pre-#74 = the JIT branch was accidentally extended with the `wasm_interpreter_opt_in` check. That's a spec violation of this entry's byte-identical-JIT-flag invariant; revert to the plain string.
 
 ---
 
