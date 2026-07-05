@@ -1233,6 +1233,26 @@ check_absent 75 "cube-route-shim.ts [tier-a] imageSourceToBytes helper removed" 
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     'function imageSourceToBytes'
 
+# #76 — Tier-A: pre-atlas texParameteri/f cache on cube textures.
+check 76 "cube-route-shim.ts [tier-a] Ledger #76 header comment" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #76 — pre-atlas texParameteri/f cache'
+check 76 "cube-route-shim.ts [tier-a] pendingCubeParams WeakMap declared" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'const pendingCubeParams = new WeakMap<WebGLTexture, PendingParam\[\]>'
+check 76 "cube-route-shim.ts [tier-a] stashPendingCubeParam helper" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'function stashPendingCubeParam'
+check 76 "cube-route-shim.ts [tier-a] applyPendingCubeParams helper" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'function applyPendingCubeParams'
+check 76 "cube-route-shim.ts [tier-a] stash call from texParameteri wrap" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    "stashPendingCubeParam\(tex, pname, param, 'i'\)"
+check 76 "cube-route-shim.ts [tier-a] stash call from texParameterf wrap" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    "stashPendingCubeParam\(tex, pname, param, 'f'\)"
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
