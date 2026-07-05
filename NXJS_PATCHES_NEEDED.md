@@ -3584,7 +3584,28 @@ Local<Object> global = context->Global();
 - **V3 — hardware, JIT, any gate:** flag string byte-identical to pre-#74 on the JIT branch (gate is READ but not consumed). Probe compiles via Liftoff, executes, returns 42 → `[wasm] mode=jit(liftoff)`.
 - **V4 — post-Track-B monolith, gate on, Citron:** probe compiles via DrumBrake, executes, returns 42 → `[wasm] mode=drumbrake`.
 
-**Track-B acceptance gate.** Before flipping the default from off to on (or from opt-in to auto-detect), run `scripts/verify-drumbrake-monolith.sh`. Passes when the aarch64 cross-nm (or host `nm` fallback) on `$DEVKITPRO/portlibs/switch/lib/libv8_monolith.a` matches DrumBrake-specific tokens (`GenericJSToWasmInterpreterWrapper`, `GenericWasmToJSInterpreterWrapper`, `WasmInterpreterRuntime`, `WasmInterpreterObject`, `WasmBytecodeGenerator`). Bare `WasmInterpreter` / `WasmBytecode` are deliberately NOT used as tells — the V8 devtools inspector API (compiled unconditionally) exports `getWasmBytecode` etc. and would false-positive; the shipping V8 15.0 monolith reports 0 matches with the narrowed needle, matching the expected pre-Track-B "MISSING" outcome. Script prefers `$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm` when present, falling back to host `nm`.
+**Track-B acceptance gate.** Before flipping the default from off to on (or from opt-in to auto-detect), run `scripts/verify-drumbrake-monolith.sh`. Passes when the aarch64 cross-nm (or host `nm` fallback) on `$DEVKITPRO/portlibs/switch/lib/libv8_monolith.a` matches DrumBrake-specific tokens (`GenericJSToWasmInterpreterWrapper`, `GenericWasmToJSInterpreterWrapper`, `WasmInterpreterRuntime`, `WasmInterpreterObject`, `WasmBytecodeGenerator`). Bare `WasmInterpreter` / `WasmBytecode` are deliberately NOT used as tells — the V8 devtools inspector API (compiled unconditionally) exports `getWasmBytecode` etc. and would false-positive; the shipping `switch-v8 15.0.243-9` monolith reports 0 matches with the narrowed needle, matching the expected pre-Track-B "MISSING" outcome. Script prefers `$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm` when present, falling back to host `nm`.
+
+**Post-Phase-2 verification results (2026-07-05).** V1 + V2 rows of the matrix confirmed on Citron with switch-v8 15.0.243-9 (DrumBrake absent per gate script, expected). Boot log evidence, verbatim from `sdmc:/switch/nxjs-debug.log`:
+
+```
+=== V1 (gate off, Citron) ===
+[detect] target=citron (auto: A=1 B=1 C=1 score=3/3) -> mode=jitless
+[v8] mem_total=3285 MiB free=3 MiB regime=application -> mode=jitless (Ignition only)
+[v8] max_heap=512 MiB (arena=1024 MiB free=3 MiB)
+[wasm] mode=unavailable
+
+=== V2 (gate on, Citron) ===
+[detect] target=citron (auto: A=1 B=1 C=1 score=3/3) -> mode=jitless
+[v8] wasm_interpreter=on -> --wasm-jitless appended (DrumBrake selected iff monolith supports it)
+[v8] mem_total=3285 MiB free=3 MiB regime=application -> mode=jitless (Ignition only)
+[v8] max_heap=512 MiB (arena=1024 MiB free=3 MiB)
+[wasm] mode=unavailable
+```
+
+Fail-soft contract holds: both boots reach normal browsing state (log continues into `[brewser:img-probe]` / `[page-mouse-fwd]` / `[button-router]` events for hundreds more lines), no abort, no fatal, WASM Probe app loads its assets cleanly. V3 (hardware JIT) and V4 (post-Track-B) remain pending as designed.
+
+**Size neutrality (measured off-branch, 2026-07-05).** Baseline `nxjs.nro` built at `v8-migration` tip (commit 4584588) = 56,652,621 bytes; post-#74 `nxjs.nro` built at `wasm-drumbrake-track-a` tip = 56,652,621 bytes. **NRO delta = 0 bytes** — the ~520-byte `.text` growth (baseline 54,399,835 → post-#74 54,400,355 bytes, +0.001% of engine text) is absorbed by NRO's page-alignment padding. `.data` and `.bss` unchanged. Confirms the "no visible size cost" expectation for the config gate + probe on the current monolith.
 
 **Upstream posture.** Marked `fork-only (upstream-candidate later)` — the gate + empirical probe benefit any nx.js embedder in emulator / no-JIT environments (iOS, Cobalt/Starboard-like sandboxes, etc.). PR queued behind the existing PR-A/-C/-D/-F backlog; do NOT foreclose upstream by leaving fork-specific baggage in the change. The one Horizon-specific piece is the `nx_ctx->config` field name, easy to lift.
 
