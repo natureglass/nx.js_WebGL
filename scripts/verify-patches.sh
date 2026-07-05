@@ -1253,6 +1253,14 @@ check 76 "cube-route-shim.ts [tier-a] stash call from texParameterf wrap" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     "stashPendingCubeParam\(tex, pname, param, 'f'\)"
 
+# #77 — Tier-A: null-source cube-face texImage2D early-return for faces 1-5.
+check 77 "cube-route-shim.ts [tier-a] Ledger #77 header comment" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #77 — null/undefined-source cube-face texImage2D with state'
+check 77 "cube-route-shim.ts [tier-a] null-source early-return branch" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'if \(source === null \|\| source === undefined\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
