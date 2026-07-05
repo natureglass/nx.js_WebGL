@@ -1342,6 +1342,26 @@ check 83 "image-bitmap.ts [tier-a] Blob branch options-path uses imageCopyPixels
     "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
     '\$\.imageCopyPixels\(bmp, decoded, !opts\.unpremul, opts\.flipY\)'
 
+# #84 — Tier-A: createImageBitmap(<video>) runtime shim.
+check 84 "live-video.ts [tier-a] Ledger #84 header comment" \
+    "$RUNTIME/src/scripts/live-video.ts" \
+    'Ledger #84'
+check 84 "live-video.ts [tier-a] installVideoImageBitmapShim exported" \
+    "$RUNTIME/src/scripts/live-video.ts" \
+    'export function installVideoImageBitmapShim'
+check 84 "live-video.ts [tier-a] VIDEO_IMG_BITMAP_SHIM_BRAND symbol" \
+    "$RUNTIME/src/scripts/live-video.ts" \
+    'VIDEO_IMG_BITMAP_SHIM_BRAND'
+check 84 "canvas-runner.ts [tier-a] installVideoImageBitmapShim called from installPageGlobals" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'installVideoImageBitmapShim\(\)'
+check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.mp4)" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.mp4"
+check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.webmvp8.webm)" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.webmvp8.webm"
+check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
