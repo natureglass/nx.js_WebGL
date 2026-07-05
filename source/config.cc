@@ -149,6 +149,18 @@ static int ini_cb(void *user, const char *section, const char *name,
 		} else if (str_ieq(name, "flags")) {
 			free(cfg->v8_flags);
 			cfg->v8_flags = strdup(value);
+		} else if (str_ieq(name, "wasm_interpreter")) {
+			// NXJS_PATCHES_NEEDED.md #74 — Track-A DrumBrake gate.
+			if (str_ieq(value, "on") || str_ieq(value, "true") ||
+			    str_ieq(value, "1"))
+				cfg->wasm_interpreter_opt_in = true;
+			else if (str_ieq(value, "off") || str_ieq(value, "false") ||
+			         str_ieq(value, "0"))
+				cfg->wasm_interpreter_opt_in = false;
+			else
+				cfg_log("v8.wasm_interpreter=\"%s\" not honored: invalid "
+				        "(use on|off)",
+				        value);
 		} else if (str_ieq(name, "code_headroom_mb") ||
 		           str_ieq(name, "wasm")) {
 			// `wasm = on/off` is sugar for code_headroom_mb = 64 / 0.
@@ -402,6 +414,7 @@ void nx_config_defaults(nx_config_t *cfg) {
 	cfg->webgl_test_fbo = false;
 	cfg->webgl_state_probe = false;
 	cfg->webgl_state_probe_active = false;
+	cfg->wasm_interpreter_opt_in = false;
 	cfg->loaded = false;
 }
 

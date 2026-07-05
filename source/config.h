@@ -10,6 +10,18 @@
 //   [v8]
 //   jit   = auto            ; auto (regime-based) | on | off
 //   flags = --expose-gc     ; appended after the runtime's default V8 flags
+//   wasm_interpreter = off  ; NXJS_PATCHES_NEEDED.md #74 — Track-A DrumBrake gate.
+//                           ; on|off (default off). When on AND the jitless branch
+//                           ; is selected (Citron / [v8] jit = off), appends
+//                           ; `--wasm-jitless` so V8's DrumBrake interpreter runs
+//                           ; wasm without needing the JIT code arena. Inert on
+//                           ; the JIT branch (JIT flag string is byte-identical
+//                           ; whether the gate is on or off). No-op today because
+//                           ; the shipped switch-v8 monolith was NOT built with
+//                           ; `v8_enable_drumbrake=true`; the boot-time probe
+//                           ; will report `[wasm] mode=unavailable` until a
+//                           ; drumbrake-enabled monolith is installed (see
+//                           ; scripts/verify-drumbrake-monolith.sh).
 //
 //   [memory]
 //   heap_limit = 256MiB     ; KiB/MiB/GiB suffix or raw bytes; clamped to fit
@@ -226,6 +238,15 @@ typedef struct {
 	// true. Depends on webgl_state_probe being true (active reuses passive's
 	// enable pathway for hook wiring).
 	bool webgl_state_probe_active;
+	// [v8] wasm_interpreter — Track-A DrumBrake gate (NXJS_PATCHES_NEEDED.md
+	// #74). Defaults false; opt-in via `[v8] wasm_interpreter = on`. When true
+	// AND the runtime selects jitless mode, the flag string appended to V8
+	// includes `--wasm-jitless`, routing WebAssembly through V8's in-tree
+	// DrumBrake interpreter instead of Liftoff. On the JIT branch this field
+	// is READ but does not change the flag string (byte-identical) — the gate
+	// is Citron/jitless-only. Inert until the switch-v8 monolith is rebuilt
+	// with `v8_enable_drumbrake=true`.
+	bool wasm_interpreter_opt_in;
 	nx_socket_config_t socket;
 	nx_threadpool_config_t threadpool; // [threadpool] libuv pool overrides
 	nx_console_config_t console; // [console] styling, exposed on $.config.console
