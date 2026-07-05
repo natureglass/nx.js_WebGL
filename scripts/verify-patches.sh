@@ -1216,6 +1216,23 @@ check 74 "main.cc [wasm] mode= boot log line" \
     "$NXJS/source/main.cc" \
     '\[wasm\] mode=%s'
 
+# #75 — Tier-A: TEXTURE_CUBE_MAP ImageBitmap upload support in cube-route-shim.
+check 75 "cube-route-shim.ts [tier-a] Ledger #75 header comment" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #75 — the pre-#75 helper `imageSourceToBytes`'
+check 75 "cube-route-shim.ts [tier-a] allocateCubeRTAtlas split (base atlas unconditional)" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #75 — split path\. Base atlas allocation is ALWAYS done'
+check 75 "cube-route-shim.ts [tier-a] hasRescueDeps local gate" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'const hasRescueDeps = !!\(origFramebufferTexture2D'
+check 75 "cube-route-shim.ts [tier-a] image-source 7-arg native forward" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #75 — image sources \(ImageBitmap primarily'
+check_absent 75 "cube-route-shim.ts [tier-a] imageSourceToBytes helper removed" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'function imageSourceToBytes'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
