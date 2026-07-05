@@ -506,6 +506,17 @@ export interface Init {
 	imageWriteRGBA(
 		img: Image | ImageBitmap,
 		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+		premultiply?: boolean,
+	): void;
+	// Ledger #78 — engine-side BGRA byte copy with premul-state conversion
+	// + optional Y-flip. Reads src.unpremultiplied and dst premul target
+	// to decide whether to do a same-state memcpy, premultiply, or
+	// un-premultiply during the row-by-row copy.
+	imageCopyPixels(
+		dst: Image | ImageBitmap,
+		src: Image | ImageBitmap,
+		dstPremultiply: boolean,
+		flipY?: boolean,
 	): void;
 
 	// irs.c

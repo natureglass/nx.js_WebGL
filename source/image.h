@@ -35,6 +35,14 @@ typedef struct {
 	bool data_needs_js_free; // (legacy flag; now always malloc/free or tjFree)
 	enum ImageFormat format;
 	void *cached_sk_image; // sk_sp<SkImage>* — lazily built in canvas.cc
+	// Ledger #78 — tracks whether `data` holds unpremultiplied BGRA. Default
+	// false (all decode paths + imageWriteRGBA(premultiply=true) store
+	// premultiplied BGRA). Set to true only by imageWriteRGBA(premultiply=
+	// false) — WebGL 1 image_bitmap conformance's premultiplyAlpha=none
+	// variants store raw RGBA→BGRA to preserve alpha=0 pixels' RGB channels
+	// through the createImageBitmap round-trip (canvas 2D storage is premul
+	// and would zero the RGB channels of alpha=0 pixels).
+	bool unpremultiplied;
 } nx_image_t;
 
 // Release an image's cached SkImage (if any). Defined in canvas.cc where the

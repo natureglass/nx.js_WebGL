@@ -1197,7 +1197,7 @@ check 73 "image-bitmap.ts [tier-a] unpremul option check" \
     "premultiplyAlpha === 'none'"
 check 73 "image-bitmap.ts [tier-a] canvasToImageBitmap opts threaded through" \
     "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
-    'canvasToImageBitmap\(oc, opts\)'
+    'canvasToImageBitmap\(\w+, opts\)'
 
 # #74 — Track-A DrumBrake wasm interpreter opt-in gate + empirical wasm-tier probe.
 check 74 "config.h wasm_interpreter_opt_in field" \
@@ -1260,6 +1260,32 @@ check 77 "cube-route-shim.ts [tier-a] Ledger #77 header comment" \
 check 77 "cube-route-shim.ts [tier-a] null-source early-return branch" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     'if \(source === null \|\| source === undefined\)'
+
+# #78 — Tier-A: preserve alpha=0 pixels' RGB across createImageBitmap round-trip.
+check 78 "image.h [tier-a] unpremultiplied field on nx_image_t" \
+    "$NXJS/source/image.h" \
+    '^\s*bool unpremultiplied;'
+check 78 "image.cc [tier-a] Ledger #78 header comment" \
+    "$NXJS/source/image.cc" \
+    'Ledger #78 — imageCopyPixels'
+check 78 "image.cc [tier-a] nx_image_copy_pixels definition" \
+    "$NXJS/source/image.cc" \
+    '^void nx_image_copy_pixels\('
+check 78 "image.cc [tier-a] imageCopyPixels registration" \
+    "$NXJS/source/image.cc" \
+    'NX_SET_FUNC\(init_obj, "imageCopyPixels"'
+check 78 "image.cc [tier-a] unpremultiplied set in imageWriteRGBA" \
+    "$NXJS/source/image.cc" \
+    'image->unpremultiplied = !premultiply'
+check 78 "image-bitmap.ts [tier-a] Ledger #78 header comments" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'Ledger #78'
+check 78 "image-bitmap.ts [tier-a] ImageBitmap branch uses imageCopyPixels" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    '\$\.imageCopyPixels\(bmp, image, !opts\.unpremul, opts\.flipY\)'
+check 78 "\$.ts [tier-a] imageCopyPixels signature" \
+    "$NXJS/packages/runtime/src/\$.ts" \
+    'imageCopyPixels\('
 
 echo
 echo "=== meta-check: ledger vs script coverage ==="

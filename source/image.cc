@@ -273,6 +273,10 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 	if (info.Length() >= 3 && info[2]->IsBoolean()) {
 		premultiply = info[2]->BooleanValue(iso);
 	}
+	// Ledger #78 — record premul state on the image so downstream
+	// createImageBitmap(imageBitmap, opts) can convert correctly instead
+	// of losing alpha=0 pixels' RGB channels through a canvas round-trip.
+	image->unpremultiplied = !premultiply;
 	uint8_t *dst = image->data;
 	size_t pixels = (size_t)image->width * (size_t)image->height;
 	for (size_t i = 0; i < pixels; i++) {
@@ -308,6 +312,88 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 	// texture cache keys on the SkImage identity and every subsequent draw
 	// re-uses the first frame's texture upload.
 	nx_image_release_cache(image);
+}
+
+// Ledger #78 — imageCopyPixels(dst, src, dstPremultiply, flipY). Copies
+// src.data (BGRA) to dst.data (BGRA) with premul-state conversion and
+// optional Y-flip. Bypasses the canvas 2D round-trip that
+// createImageBitmap's ImageBitmap / HTMLImageElement source branches
+// previously used — that round-trip zeroed the RGB channels of any
+// alpha=0 pixel because canvas 2D storage is premul (and premul
+// (r, g, b, 0) = (0, 0, 0, 0)). This helper reads src.unpremultiplied
+// to decide the conversion:
+//   - same premul state: byte copy (fast path, preserves alpha=0 RGB).
+//   - src unpremul → dst premul: R,G,B *= alpha/255 (rounding).
+//   - src premul → dst unpremul: R,G,B *= 255/alpha (undefined at
+//     alpha=0; spec-per-Canvas-2D returns 0 in that case, matching the
+//     existing WebGL upload path).
+// dst.unpremultiplied is set to !dstPremultiply; dst dims must match
+// src dims (caller allocates via imageNew(w, h) beforehand).
+void nx_image_copy_pixels(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (info.Length() < 3) {
+		nx_throw(iso, "imageCopyPixels: expected (dst, src, dstPremultiply, "
+		              "[flipY])");
+		return;
+	}
+	nx_image_t *dst = nx_get_image(iso, info[0]);
+	nx_image_t *src = nx_get_image(iso, info[1]);
+	if (!dst || !src) {
+		nx_throw(iso, "imageCopyPixels: both args must be Images");
+		return;
+	}
+	if (!dst->data || !src->data ||
+	    dst->width != src->width || dst->height != src->height) {
+		nx_throw(iso,
+		         "imageCopyPixels: dst must be allocated at src dimensions");
+		return;
+	}
+	const bool dst_premultiply = info[2]->BooleanValue(iso);
+	const bool flip_y = info.Length() >= 4 && info[3]->BooleanValue(iso);
+	const bool src_unpremul = src->unpremultiplied;
+	const bool same_state = src_unpremul == !dst_premultiply;
+	const uint32_t W = src->width;
+	const uint32_t H = src->height;
+	for (uint32_t y = 0; y < H; y++) {
+		const uint32_t src_y = flip_y ? (H - 1 - y) : y;
+		const uint8_t *src_row = src->data + (size_t)src_y * (size_t)W * 4;
+		uint8_t *dst_row = dst->data + (size_t)y * (size_t)W * 4;
+		if (same_state) {
+			memcpy(dst_row, src_row, (size_t)W * 4);
+			continue;
+		}
+		for (uint32_t x = 0; x < W; x++) {
+			uint8_t b = src_row[x * 4 + 0];
+			uint8_t g = src_row[x * 4 + 1];
+			uint8_t r = src_row[x * 4 + 2];
+			uint8_t a = src_row[x * 4 + 3];
+			if (src_unpremul && !dst_premultiply) {
+				// Same state — handled by same_state above; unreachable.
+			} else if (src_unpremul && dst_premultiply) {
+				// unpremul → premul.
+				b = (uint8_t)(((int)b * (int)a + 127) / 255);
+				g = (uint8_t)(((int)g * (int)a + 127) / 255);
+				r = (uint8_t)(((int)r * (int)a + 127) / 255);
+			} else if (!src_unpremul && !dst_premultiply) {
+				// premul → unpremul. Divide by alpha; alpha=0 leaves
+				// channels at 0 (matches canvas 2D getImageData behavior).
+				if (a > 0 && a < 255) {
+					int nb = ((int)b * 255 + a / 2) / a;
+					int ng = ((int)g * 255 + a / 2) / a;
+					int nr = ((int)r * 255 + a / 2) / a;
+					b = (uint8_t)(nb > 255 ? 255 : nb);
+					g = (uint8_t)(ng > 255 ? 255 : ng);
+					r = (uint8_t)(nr > 255 ? 255 : nr);
+				}
+			}
+			dst_row[x * 4 + 0] = b;
+			dst_row[x * 4 + 1] = g;
+			dst_row[x * 4 + 2] = r;
+			dst_row[x * 4 + 3] = a;
+		}
+	}
+	dst->unpremultiplied = !dst_premultiply;
+	nx_image_release_cache(dst);
 }
 
 void nx_image_get_width(const FunctionCallbackInfo<Value> &info) {
@@ -382,4 +468,5 @@ void nx_init_image(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "imageDecode", nx_image_decode);
 	NX_SET_FUNC(init_obj, "imageClose", nx_image_close);
 	NX_SET_FUNC(init_obj, "imageWriteRGBA", nx_image_write_rgba);
+	NX_SET_FUNC(init_obj, "imageCopyPixels", nx_image_copy_pixels);
 }

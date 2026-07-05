@@ -252,20 +252,39 @@ export async function createImageBitmap(
 		return canvasToImageBitmap(unwrappedCanvas, opts);
 	}
 
-	// 3. ImageData source — copy pixels through a scratch OffscreenCanvas.
-	//    putImageData is the only path that lands unpremultiplied RGBA into
-	//    a canvas surface (drawImage doesn't accept ImageData).
+	// 3. ImageData source — Ledger #78. Bypass the canvas round-trip and
+	//    write pixels straight to the bitmap via imageWriteRGBA (premultiply
+	//    flag = !opts.unpremul). The pre-#78 path went through OffscreenCanvas
+	//    + putImageData + getImageData, which zeroes RGB channels of any
+	//    alpha=0 pixel — canvas 2D storage is premul and (r, g, b, 0)
+	//    premul = (0, 0, 0, 0). WebGL 1 image_bitmap conformance's
+	//    `_from_image_data-*` tests uses ImageData with (255, 0, 0, 0) at
+	//    tr / br positions and expects them preserved through the
+	//    `premultiplyAlpha: "none"` round-trip; the canvas path failed
+	//    those checks. flipY is handled by pre-flipping the ImageData
+	//    bytes in JS (small Uint8ClampedArray → Uint8Array copy).
 	if (image instanceof ImageData) {
 		if (!(image.width > 0 && image.height > 0)) {
 			throw new Error('ImageData source has zero dimensions');
 		}
-		const oc = new OffscreenCanvas(image.width, image.height);
-		const ctx = oc.getContext('2d');
-		if (!ctx) {
-			throw new Error('Failed to acquire 2D context for ImageData round-trip');
+		const w = image.width;
+		const h = image.height;
+		const bmp = proto($.imageNew(w, h), ImageBitmap);
+		let bytes: Uint8Array | Uint8ClampedArray = image.data;
+		if (opts.flipY) {
+			const flipped = new Uint8Array(w * h * 4);
+			const stride = w * 4;
+			for (let y = 0; y < h; y++) {
+				const srcOffset = (h - 1 - y) * stride;
+				const dstOffset = y * stride;
+				for (let x = 0; x < stride; x++) {
+					flipped[dstOffset + x] = image.data[srcOffset + x];
+				}
+			}
+			bytes = flipped;
 		}
-		ctx.putImageData(image, 0, 0);
-		return canvasToImageBitmap(oc, opts);
+		$.imageWriteRGBA(bmp, bytes, !opts.unpremul);
+		return bmp;
 	}
 
 	// 4. Draw-able source — HTMLImageElement (nx.js Image), ImageBitmap,
@@ -278,19 +297,23 @@ export async function createImageBitmap(
 	//    it above alongside Blob) because drawImage(bitmap, 0, 0) is the
 	//    natural copy path: rebuilding the pixel bytes off the source is
 	//    what canvas.cc's SkImage cache already does for every draw.
+	// Ledger #78 — ImageBitmap source. Bypass the drawImage-onto-canvas
+	// round-trip via imageCopyPixels (engine-side BGRA byte copy with
+	// premul-state conversion + optional Y-flip). The pre-#78 canvas path
+	// destroyed alpha=0 pixels' RGB channels for the same reason the
+	// ImageData branch above described. WebGL 1 image_bitmap conformance's
+	// `_from_image_bitmap-*` tests use a source ImageBitmap that was
+	// itself created from an ImageData with alpha=0 pixels (via the fixed
+	// ImageData branch), so this branch also needs to preserve those.
 	if (image instanceof ImageBitmap) {
 		const w = image.width;
 		const h = image.height;
 		if (!(w > 0 && h > 0)) {
 			throw new Error('ImageBitmap source has zero dimensions');
 		}
-		const oc = new OffscreenCanvas(w, h);
-		const ctx = oc.getContext('2d');
-		if (!ctx) {
-			throw new Error('Failed to acquire 2D context for ImageBitmap round-trip');
-		}
-		ctx.drawImage(image, 0, 0);
-		return canvasToImageBitmap(oc, opts);
+		const bmp = proto($.imageNew(w, h), ImageBitmap);
+		$.imageCopyPixels(bmp, image, !opts.unpremul, opts.flipY);
+		return bmp;
 	}
 
 	// 5. HTMLImageElement (nx.js Image). Duck-type on `naturalWidth` +
@@ -313,15 +336,13 @@ export async function createImageBitmap(
 		if (!(w > 0 && h > 0)) {
 			throw new Error('Image source has zero dimensions (still loading?)');
 		}
-		const oc = new OffscreenCanvas(w, h);
-		const ctx = oc.getContext('2d');
-		if (!ctx) {
-			throw new Error('Failed to acquire 2D context for Image round-trip');
-		}
-		// drawImage's C++ impl (canvas.cc::nx_canvas_context_2d_draw_image)
-		// accepts nx_image_t via nx_get_image; nx.js Image satisfies it.
-		ctx.drawImage(image as CanvasImageSource, 0, 0);
-		return canvasToImageBitmap(oc, opts);
+		// Ledger #78 — nx.js Image is nx_image_t under the hood; the
+		// engine-side imageCopyPixels reads its BGRA data + premul flag
+		// directly. Bypasses the same canvas round-trip data-loss as the
+		// ImageBitmap branch above.
+		const bmp = proto($.imageNew(w, h), ImageBitmap);
+		$.imageCopyPixels(bmp, image, !opts.unpremul, opts.flipY);
+		return bmp;
 	}
 
 	// 6. HTMLVideoElement — deliberately not supported yet. drawImage's

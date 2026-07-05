@@ -99,6 +99,7 @@ proposal verdict.
 | 75 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #75` + `cube-route-shim.ts: hasRescueDeps` | Tier-A: TEXTURE_CUBE_MAP ImageBitmap upload support in the cube-route-shim. Post-#71 the TEXTURE_2D iterations of the `textures-image_bitmap_from_*` cluster all pass; the CUBE_MAP portion of the same tests still fails. Two shim-side bugs: (a) the 6-arg `texImage2D(cube-face, ..., imageBitmap)` path converted the source to bytes via `imageSourceToBytes` (OffscreenCanvas + drawImage + getImageData → always 4-bpp RGBA) then fed those bytes to `origTexSubImage2D` with the caller's `format` — same byte-stride misalignment #71 fixed at TEXTURE_2D; (b) the useTexSubImage path (texImage2D-with-null then texSubImage2D-with-bitmap) never allocated an atlas because `allocateCubeRTAtlas` bailed on missing rescue deps (WebGL 1 has no `blitFramebuffer`), so the rewritten `sampler2D` shader read from whatever Skia had bound at TEXTURE_2D[TU]. Fix: (a) forward image sources as a 7-arg `origTexSubImage2D(TEXTURE_2D, 0, fIdx*W, 0, format, type, source)` so the prototype-level #70/#71 shim short-circuits ImageBitmap to native + #69's engine-side `convert_image_source_to_gl_pixels` does format-aware conversion; (b) split `allocateCubeRTAtlas` — base atlas allocation is unconditional (needed for useTexSubImage), scratch + `isRenderTarget` flag is still gated on rescue deps (only WebGL 2 or WebGL 1 with EXT_framebuffer_blit gets the FBO-write rescue). Deleted the dead `imageSourceToBytes` helper. Unblocks the CUBE_MAP portion of ~24 `_from_{canvas,image,image_bitmap,image_data}-*` tests × 8 formats each. Sibling runtime fix to engine #69 + shim #70/#71; zero engine delta. |
 | 76 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #76` + `cube-route-shim.ts: pendingCubeParams` + `cube-route-shim.ts: applyPendingCubeParams` | Tier-A: pre-atlas `texParameteri` / `texParameterf` cache on cube textures. Post-#75 the image_bitmap cube-face tests had the correct sample HUE but were off by 12-28 units on intensity (243 vs 255 full-brightness, 151/156 vs 128 half-brightness) — exceeding the ±10 tolerance. Root cause: WebGL 1 conformance calls `gl.texParameteri(TEXTURE_CUBE_MAP, TEXTURE_MIN_FILTER, NEAREST)` + MAG_FILTER + WRAP_S/T BEFORE the first `texImage2D` upload; at that moment the shim has no `cubeStates` entry for the tex, so the wrap silently drops the call. The atlas then gets the hard-coded LINEAR/CLAMP defaults from the alloc block, and LINEAR filtering across texel centers introduces sub-texel blending that dims full-brightness / brightens half-brightness pixels via the shim's non-integer atlas sample UVs. Fix: stash pre-alloc `texParameteri` / `texParameterf` calls in a per-tex `pendingCubeParams` WeakMap; drain and replay them at all three atlas-alloc sites (the inline `texImage2D` alloc block for image sources + `allocateCubeRTAtlas` for null-source WebGL 1 + `allocateCubeRTAtlasSized` for WebGL 2 `texStorage2D`), AFTER the LINEAR/CLAMP defaults so caller intent wins. WRAP_S/T stay forced to CLAMP_TO_EDGE during replay (REPEAT on a 6×1 strip would bleed adjacent faces). Last-write-wins per pname dedup keeps replay bounded. Sibling to #75; zero engine delta. |
 | 77 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #77` + `cube-route-shim.ts: null/undefined-source cube-face texImage2D with state already existing` | Tier-A: null-source cube-face `texImage2D` early-return for faces 1-5 after atlas alloc. Post-#76 the image_bitmap cube-face color checks all PASS but the trailing `glErrorShouldBe(NO_ERROR)` on the useTexSubImage variant of CUBE_MAP iterations FAILs with getError returning a value that glEnumToString name-collides against `drawingBufferWidth` — i.e., a real GL error was raised, small numeric value coincidentally equal to canvas.width. Root cause: after face 0's null-source `texImage2D` triggers `allocateCubeRTAtlas` (creating state), faces 1-5's null-source `texImage2D` calls fall past the `!state` block into the pixels block and issue `origTexSubImage2D(TEXTURE_2D, 0, fIdx*W, 0, format, type, null)` — a 7-arg call. The prototype #70/#71 shim short-circuits null (neither `instanceof ImageBitmap` nor `isTexImageSource`) and forwards 7-arg to native `w_tex_sub_image_2d`, which misreads `a_i32(info, 4)=format` as `width` and `a_i32(info, 5)=type` as `height` (7-arg vs 9-arg signature mismatch) and issues an absurd `glTexSubImage2D` that raises a real GL error. Fix: add an early-return for `source === null / undefined` after the `!state` block — forward to `origTexImage2D` so the actual cube-face storage is allocated for that face (needed for the subsequent `texSubImage2D` upload's target validity), skip the pixels block entirely. Atlas already allocated at face 0; no atlas update needed. Sibling to #75/#76; zero engine delta. | 
+| 78 | engine + **runtime** | upstream-candidate | not-submitted | `image.h: bool unpremultiplied;` + `image.cc: nx_image_copy_pixels` + `image.cc: Ledger #78` + `image-bitmap.ts: Ledger #78` + `image-bitmap.ts: imageCopyPixels(bmp, image` | Tier-A: preserve alpha=0 pixels' RGB channels across `createImageBitmap` round-trip. Post-#77 the `_from_image_bitmap-*` and `_from_image_data-*` clusters (14 tests total) FAIL 7/8 each with `(0, 0, 0)` at right-half pixel positions where the source ImageData had `(255, 0, 0, 0)` — canvas 2D storage is premul and premul (r, g, b, 0) = (0, 0, 0, 0), so any round-trip through a canvas destroys the RGB channels for alpha=0 pixels. Fix: track premul state on nx_image_t via a new `unpremultiplied` field (default false; set to true by `imageWriteRGBA(bmp, buf, false)`); add engine-side `imageCopyPixels(dst, src, dstPremultiply, [flipY])` native that does row-by-row BGRA copy with premul-state conversion and Y-flip; rewrite three source branches in `createImageBitmap` to bypass the canvas round-trip: ImageData → direct `imageWriteRGBA`; ImageBitmap → direct `imageCopyPixels`; HTMLImageElement → same as ImageBitmap. Canvas / OffscreenCanvas branch unchanged (canvas storage can't originate the problem cell in the first place). |
 
 ## DISPOSITION POLICY
 
@@ -3635,6 +3636,56 @@ Fail-soft contract holds: both boots reach normal browsing state (log continues 
 ---
 
 ## #77 — MOVED → [brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md) (#77)
+
+---
+
+## #78 — Tier-A: preserve alpha=0 pixels' RGB channels across `createImageBitmap` round-trip — SHIPPED 2026-07-05
+
+**File(s):**
+- [source/image.h](source/image.h) — new `bool unpremultiplied` field on `nx_image_t` (default false via `calloc` in `nx_image_new`).
+- [source/image.cc](source/image.cc) — set `unpremultiplied = !premultiply` in `nx_image_write_rgba`; new `nx_image_copy_pixels(dst, src, dstPremultiply, [flipY])` native + `imageCopyPixels` registration in `nx_init_image`.
+- [packages/runtime/src/$.ts](packages/runtime/src/$.ts) — `imageWriteRGBA` gains optional `premultiply` param in the type; new `imageCopyPixels(dst, src, dstPremultiply, flipY?)` signature.
+- [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) — three source-branch rewrites: `ImageData` bypasses canvas → `imageWriteRGBA` direct write; `ImageBitmap` bypasses `drawImage` → `imageCopyPixels`; `HTMLImageElement` same as ImageBitmap.
+
+**Motivation.** Post-#77 the WebGL 1 image_bitmap conformance cluster shows `_from_canvas-*` PASSing (5/8 RGB/RGBA variants) but `_from_image_bitmap-*` and `_from_image_data-*` still FAIL 7/8 each. Same signature: color assertions at right-half positions (tr, br) return `(0, 0, 0)` when the test expects `(255, 0, 0)` — specifically on the `premultiplyAlpha=none` iterations.
+
+Root cause. Both `_from_image_bitmap` and `_from_image_data` use a source `ImageData` with **alpha=0 pixels containing non-zero RGB** (`(255, 0, 0, 0)` at tr / `(0, 255, 0, 0)` at br). Chrome preserves the ImageData bytes verbatim through `createImageBitmap(imageData, {premultiplyAlpha: "none"})`; the test then samples the created bitmap and expects the raw RGB channels to survive.
+
+Pre-#78 our impl routed every non-Blob `createImageBitmap` source through a canvas 2D round-trip. Canvas 2D storage is premultiplied BGRA — any pixel with alpha=0 and non-zero RGB (like `(255, 0, 0, 0)`) cannot be represented in premul storage: the premultiplication zeroes the RGB channels, producing `(0, 0, 0, 0)` premul. Round-trip via `putImageData` / `drawImage` → canvas → `getImageData` returns `(0, 0, 0, 0)` because there is no way to recover the original RGB from a `(0, 0, 0, 0)` premul cell.
+
+**Fix — three parts.**
+
+**Engine part 1.** Track premul state on `nx_image_t` via a new `bool unpremultiplied` field. `nx_image_new` defaults it to `false` (via `calloc`); `nx_image_write_rgba` sets it to `!premultiply`. PNG / JPEG / WebP decode paths leave the default `false` since decode produces premul BGRA per `nx_image_decode`'s existing contract.
+
+**Engine part 2.** New `nx_image_copy_pixels(dst, src, dstPremultiply, [flipY])` native. Reads `src->data` (BGRA in `src->unpremultiplied` state) and writes to `dst->data` (BGRA in `!dstPremultiply` state), converting row-by-row:
+
+- Same premul state: `memcpy` row (fast path — preserves alpha=0 pixels' RGB verbatim).
+- Unpremul → premul: `R,G,B *= alpha/255` with `+127` rounding, alpha preserved.
+- Premul → unpremul: `R,G,B *= 255/alpha` with `+alpha/2` rounding and 255 clamp; alpha=0 leaves channels at 0 (matches Canvas 2D `getImageData` behavior).
+
+`flipY` is baked in via `src_y = flip_y ? (H - 1 - y) : y` when picking the source row.
+
+**Runtime part.** All three affected `createImageBitmap` source branches in [image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) bypass the canvas round-trip:
+
+- `ImageData` branch — direct `$.imageWriteRGBA(bmp, imageData.data, !opts.unpremul)`. `flipY` is handled by pre-flipping the ImageData bytes in JS.
+- `ImageBitmap` branch — direct `$.imageCopyPixels(bmp, src, !opts.unpremul, opts.flipY)`.
+- `HTMLImageElement` (nx.js Image) branch — same as `ImageBitmap` since nx.js Image is `nx_image_t`.
+
+The Canvas / OffscreenCanvas branch still routes through `canvasToImageBitmap` — canvas surfaces can't originate alpha=0 pixels with non-zero RGB (the fillRect / draw calls that populate them would zero the RGB during composite).
+
+**Scope.** Fixes the ~14 tests in `_from_image_data-*` and `_from_image_bitmap-*` clusters (RGB / RGBA / LUMINANCE / LUMINANCE_ALPHA formats × 2 clusters — ALPHA variants are trivial passes with all-zero expected values).
+
+**DISPOSITION:** `upstream-candidate`. Both the field addition and the new native are spec-compliance fixes for `createImageBitmap`'s premultiplyAlpha option; upstream nx.js has the same gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/image.h](source/image.h) for `bool unpremultiplied;`. Grep [source/image.cc](source/image.cc) for `nx_image_copy_pixels`, `imageCopyPixels`, and `Ledger #78`. Grep [packages/runtime/src/$.ts](packages/runtime/src/$.ts) for `imageCopyPixels(`. Grep [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) for `Ledger #78` and `imageCopyPixels(bmp, image`. Recurrence tells:
+
+- Both `_from_image_data-*` and `_from_image_bitmap-*` regress to `(0, 0, 0)` at right-half on premultiplyAlpha=none = one of the three source-branch rewrites regressed. Check that the ImageData branch is NOT calling `canvasToImageBitmap` (grep for that call inside the `image instanceof ImageData` block); if reintroduced, pixels round-trip through canvas 2D and lose alpha=0 RGB.
+- Only `_from_image_bitmap-*` regresses = the ImageBitmap branch regressed. Grep for `imageCopyPixels(bmp, image, !opts.unpremul, opts.flipY)` in that block.
+- Only `flipY=true` iterations regress = flipY handling regressed. For ImageData: check the JS-side row-reverse copy loop. For ImageBitmap / HTMLImageElement: check `opts.flipY` is the 4th arg to `imageCopyPixels`.
+- `Switch.VideoDecoder` frame delivery breaks = `nx_image_write_rgba`'s default premultiply=true regressed OR the new `unpremultiplied` field is being read incorrectly downstream. Video path is 2-arg call, expects `unpremultiplied=false`.
+- `createImageBitmap(canvas, {premultiplyAlpha: "none"})` on a canvas regresses = the canvas branch was accidentally changed. Should still route through `canvasToImageBitmap` (correct because canvas can't originate the problem cell).
 
 ---
 
