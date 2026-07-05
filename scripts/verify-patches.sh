@@ -1162,6 +1162,23 @@ check 71 "webgl-rendering-context.ts [tier-a] instanceof ImageBitmap short-circu
     "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
     'last instanceof ImageBitmap'
 
+# #72 — Tier-A: default viewport at context creation + un-mult removal.
+check 72 "webgl.cc [tier-a] Ledger #72 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #72 — seed default viewport'
+check 72 "webgl.cc [tier-a] glViewport seed at context creation" \
+    "$NXJS/source/webgl.cc" \
+    'glViewport\(0, 0, w, h\)'
+check 72 "webgl.cc [tier-a] user_snap.viewport seed" \
+    "$NXJS/source/webgl.cc" \
+    'st->user_snap\.viewport\[2\] = w'
+check 72 "webgl.cc [tier-a] un-mult removed from tex_image_2d" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #72 — image_bitmap conformance tests do NOT call'
+check 72 "webgl.cc [tier-a] un-mult removed from tex_sub_image_2d" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #72 — see w_tex_image_2d'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
