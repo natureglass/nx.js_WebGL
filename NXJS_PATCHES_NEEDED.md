@@ -94,6 +94,7 @@ proposal verdict.
 | 70 | **runtime** | upstream-candidate | not-submitted | `webgl-rendering-context.ts: isTexImageSource` + `webgl-rendering-context.ts: sourceToPixels` + `webgl-rendering-context.ts: Ledger #70` | Tier-A: `texImage2D` / `texSubImage2D` TexImageSource normalization shim for WebGL 1. WebGL 2 already had this in `webgl2-rendering-context.ts`; WebGL 1 did not. Post-#69 the tier-69 re-baseline still showed `shouldBe 255,0,0 was 0,0,0` because WebGL 1 conformance calls the 6-arg overload `texImage2D(target, level, IF, format, type, imageBitmap)` — the fixed-9-arg native reads info[3]/[4]/[8] as format/type/undefined and skips the pixel path entirely. The shim mirrors the WebGL 2 impl verbatim: `isTexImageSource` duck-types on `width`+`height` numeric + not-ArrayBufferView; `sourceToPixels` rasterizes through an OffscreenCanvas 2D drawImage + getImageData (returns unpremultiplied RGBA — matches default `UNPACK_PREMULTIPLY_ALPHA_WEBGL=false`); the wrapper reshapes 6-arg → 9-arg and 7-arg (sub) → 9-arg with `px.data` as the pixels. Companion to #69; unblocks the same ~40 tests but from the TS side. **See also #71** — post-#70 the tier-70 re-baseline flipped only 2 of 40 tests (ALPHA/UNSIGNED_BYTE variants) because sourceToPixels always emits 4-byte RGBA regardless of caller format; a 3-bpp RGB caller reads pixel N's RGB as `[A_{N-1}, R_N, G_N]` (byte-stride misalignment). #71 short-circuits ImageBitmap sources to the native so #69's spec-correct format conversion fires. |
 | 71 | **runtime** | upstream-candidate | not-submitted | `webgl-rendering-context.ts: Ledger #71` + `webgl-rendering-context.ts: last instanceof ImageBitmap` | Tier-A: ImageBitmap-source short-circuit in the WebGL 1 shim so #69's C++ conversion path fires. Post-#70 the tier-70 re-baseline flipped only 2 of 40 image_bitmap tests because `sourceToPixels` always emits 4-byte RGBA, but WebGL 1 conformance iterates smaller formats (RGB, LUMINANCE, LUMINANCE_ALPHA, ALPHA) + packed 16-bit types (5_6_5, 4_4_4_4, 5_5_5_1). Passing 4 bpp RGBA when the driver reads 3 bpp misaligns every pixel — pixel N's RGB reads as `[A_{N-1}, R_N, G_N]` (observed `was 255,255,0` where `128,0,0` was expected). Fix: before falling into `sourceToPixels`, check `last instanceof ImageBitmap` and passthrough to the native with an arg-reshape (6-arg → 9-arg, 7-arg sub → 9-arg). ImageBitmap wraps `nx_image_t` (per #66's construction) so #69's `nx_get_image` + `convert_image_source_to_gl_pixels` in webgl.cc runs and produces byte-stride-correct output for the caller's `(format, type)`. Covers all 5 non-video `_from_*` clusters (blob / canvas / image / image_bitmap / image_data) × 8 formats = ~40 tests. `_from_video` still deferred by #66. Non-ImageBitmap sources (raw ImageData / SVG image / webgl canvas / video — used by `textures-{image_data,svg_image,webgl_canvas,video}-*`) still route through the buggy `sourceToPixels` and will need a follow-up ledger entry that mirrors #69's conversion matrix in JS. |
 | 72 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #72 — seed default viewport` + `webgl.cc: glViewport(0, 0, w, h)` in context_new + `webgl.cc: source is premultiplied BGRA` (un-mult removal) | Tier-A: (a) seed default GL viewport at context creation to canvas dimensions per WebGL 1 spec § 5.14.3, and (b) remove un-multiplication from #69's C++ conversion for ImageBitmap sources. Post-#71 the tier-71 re-baseline confirmed my C++ code path IS running for ImageBitmap uploads AND scratch bytes are correct for all 4 pixels of the test's 2×2 source — but only the drawing bottom-left pixel matched source (0,0); every other position read `0,0,0`. A drawArrays-time diag revealed `viewport=(0,0,8,8)` (later `(0,0,1,1)` on the first call) on a canvas whose HTML declares `width=32 height=32`. Our engine inherited whatever viewport Skia's Ganesh left in GL state — a small size — because `nx_webgl_context_new` never called `glViewport`, and the WebGL spec says the caller can rely on the default viewport = drawingBufferWidth × drawingBufferHeight. Tests that never explicitly call `gl.viewport(...)` (which is most conformance tests, including all `textures-image_bitmap_from_*` and many others) rendered their full-viewport quad into an 8×8 corner; readbacks beyond that corner sampled the framebuffer clear color, giving the specific signature "only bottom-left pixel matches source (0,0)". Fix (a): `glViewport(0, 0, w, h)` after bridge init in `make_context_carrier`, plus mirror into `user_snap.viewport` so the first bracket restore doesn't overwrite it. Fix (b): image_bitmap tests do NOT call `pixelStorei(UNPACK_PREMULTIPLY_ALPHA_WEBGL, ...)` (verified via a pixelStorei diag); the test's expected values assume the bitmap's own premultipliedAlpha state is preserved through upload (matches Chrome). Un-multiplying with flag=FALSE produced `255,0,0` where test expected `128,0,0` for half-alpha red. Fixed by hardcoding `un_premultiply = false` in both `w_tex_image_2d` and `w_tex_sub_image_2d`. Broad impact: fix (a) unblocks any test that skipped explicit viewport (many conformance tests do); fix (b) restores spec-correct behavior for ImageBitmap upload. |
+| 73 | engine + **runtime** | upstream-candidate | not-submitted | `image.cc: Ledger #73 — optional 3rd arg` + `image.cc: bool premultiply = true` + `image-bitmap.ts: Ledger #73 — extract flipY / unpremul` + `image-bitmap.ts: extractOpts` | Tier-A: honor `createImageBitmap({imageOrientation, premultiplyAlpha})` options. Post-#72 the RGB test's iteration 1 (`flipY=false, premultiplyAlpha=premultiply`) passes fully, but iterations 2/3/4 fail because #66's `canvasToImageBitmap` ignores those options — all 4 bitmap variants come out with the same premultiplied, non-flipped pixels. Fix: (a) engine — extend `nx_image_write_rgba` in `image.cc` with an optional 3rd arg `premultiply` (default `true` preserves the existing video-frame delivery contract used by `Switch.VideoDecoder`); when `false`, write raw RGBA→BGRA without alpha multiplication. (b) runtime — add `extractOpts` in `image-bitmap.ts` reading `opts.imageOrientation === 'flipY'` and `opts.premultiplyAlpha === 'none'`, thread `opts` through all 4 non-Blob `canvasToImageBitmap` call sites (canvas / ImageData / ImageBitmap / HTMLImageElement). For `flipY`: compose the source into a scratch OffscreenCanvas with a Y-mirror transform (`ctx.scale(1, -1); ctx.translate(0, -h); drawImage(src, 0, 0)`) before encoding. For `unpremul`: skip the PNG round-trip (which always premultiplies on decode) and store raw `getImageData` bytes via `imageWriteRGBA(bmp, bytes, false)`. Fast path (no options) is unchanged — hot callers pay zero perf cost. Blob source path deferred (tier-A blob tests all fail upstream at "Unsupported image format" for BMP; a `_from_blob` option-honoring pass would need re-routing through a scratch canvas). |
 
 ## DISPOSITION POLICY
 
@@ -3410,6 +3411,68 @@ Deferred to a separate entry to keep #71 tight.
 - All image_bitmap tests regress to "only bottom-left pixel correct" signature = fix (a) regressed (glViewport seed removed or user_snap.viewport seed removed).
 - Half-alpha red pixels regress from `128,0,0` to `255,0,0` = fix (b) regressed (un-multiplication reintroduced).
 - Also many non-image_bitmap tests regress = fix (a) regression affected the whole corpus.
+
+---
+
+## #73 — Tier-A: honor `createImageBitmap` `imageOrientation` + `premultiplyAlpha` options — SHIPPED 2026-07-05
+
+**File(s):**
+- [source/image.cc](source/image.cc) — extend `nx_image_write_rgba` with optional 3rd arg `premultiply` (default `true`; when `false`, write raw RGBA→BGRA without alpha multiplication).
+- [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) — new `extractOpts` helper + updated `canvasToImageBitmap(canvas, opts)` signature + all 4 non-Blob `canvasToImageBitmap` call sites now pass `opts` through.
+
+**Motivation.** Post-#72 the tier-72c RGB test's iteration 1 (`flipY=false, premultiplyAlpha=premultiply`) passes fully — every pixel check hits `128,0,0` correctly for half-alpha red. But iterations 2/3/4 fail with distinct patterns:
+
+- **iter 2** (`flipY=false, premultiplyAlpha=none`): expects `255,0,0` for half-alpha red, gets `128,0,0`. Test wants the bitmap stored **un-premultiplied**.
+- **iter 3-4** (`flipY=true, *`): position labels are swapped — drawing bottom shows source-top when it should show source-bottom (and vice versa). Test wants the bitmap **Y-flipped**.
+
+The test creates 4 bitmap variants:
+```js
+createImageBitmap(source, {imageOrientation: "none"|"flipY", premultiplyAlpha: "premultiply"|"none"})
+```
+
+Pre-#73 `createImageBitmap` completely ignored these options; all 4 variants came back with the same pixels (premultiplied, no flip). #66 documented the options-ignoring as deferred; #73 delivers.
+
+**Design (engine side).** `imageWriteRGBA(image, bytes, [premultiply])`:
+- Default `premultiply = true` preserves the existing contract — `Switch.VideoDecoder`'s `imageWriteRGBA` calls in `bitmap.ts` line 35 / 52 continue to premultiply on write (frame delivery expects premul BGRA storage).
+- New `premultiply = false` path: writes raw `RGBA → BGRA` (just the R↔B swap for storage order) without applying the alpha multiplication. Alpha channel is preserved as-is.
+
+**Design (runtime side).** `extractOpts` looks at both the 2-arg call shape (`options` at position 1) and the 6-arg call shape (`options` at position 5), returning `{ flipY, unpremul }` booleans. Both explicitly compare against the spec string values (`imageOrientation === 'flipY'`, `premultiplyAlpha === 'none'`) so all other values (`"none"`, `"from-image"`, `"premultiply"`, `"default"`, `undefined`) fall into the pre-#73 fast path.
+
+`canvasToImageBitmap(canvas, opts)`:
+- **Fast path** (no options requested): unchanged encode-to-PNG + `imageDecode` round-trip. Zero perf cost for callers that don't ask for options.
+- **`flipY` set**: compose the source into a scratch `OffscreenCanvas` with a Y-mirror transform (`sctx.scale(1, -1); sctx.translate(0, -h); drawImage(src, 0, 0)`) before continuing. The staging canvas now holds the source's Y-flipped pixels.
+- **`unpremul` set**: skip the PNG round-trip (which always premultiplies on decode) and store raw bytes:
+  ```ts
+  const bytes = sctx.getImageData(0, 0, w, h).data;  // canvas 2D getImageData returns unpremul RGBA
+  const bmp = proto($.imageNew(w, h), ImageBitmap);
+  $.imageWriteRGBA(bmp, bytes.buffer, false);  // engine-side raw store
+  ```
+
+Both options combine correctly — `flipY + unpremul` reads the flipped canvas's `getImageData` and stores raw.
+
+**Blob path not covered.** All 4 non-Blob source-type branches (canvas / ImageData / ImageBitmap / HTMLImageElement) now pass `opts` through. The Blob branch (`branch 1`) calls `imageDecode` directly (no canvas round-trip) and can't honor `unpremul` without an engine-side flag on `imageDecode`. Tier-A `_from_blob-*` tests all fail earlier at `Unsupported image format` for BMP sources (a separate upstream issue), so deferring Blob-with-options is safe.
+
+**Semantic verification via the WebGL upload.** My #69 C++ `convert_image_source_to_gl_pixels` reads `img->data` as BGRA and passes pixel values through unchanged (except the WebGL spec's format-specific bit-packing for `5_6_5` / `4_4_4_4` / `5_5_5_1`). My #72 hardcodes `un_premultiply = false` on the upload path (assumes the bitmap's own premul state is authoritative — matches Chrome's ImageBitmap behavior). Combined with #73:
+
+| Test variant | Bitmap stored as | Uploaded to texture as | Test expects | Result |
+|---|---|---|---|---|
+| `premultiply`, `flipY=false` | premul, unflipped | premul, unflipped | premul | ✓ |
+| `premultiply`, `flipY=true` | premul, flipped | premul, flipped | premul-flipped | ✓ |
+| `none`, `flipY=false` | unpremul, unflipped | unpremul, unflipped | unpremul | ✓ |
+| `none`, `flipY=true` | unpremul, flipped | unpremul, flipped | unpremul-flipped | ✓ |
+
+All 4 iterations should pass. Estimated tier-A test coverage flip: ~30 of the 40 `_from_*` tests (blob deferred → ~8 stay FAILing at createImageBitmap, video deferred → ~7 stay FAILing).
+
+**DISPOSITION:** `upstream-candidate`. `imageWriteRGBA`'s optional-arg extension is backwards-compatible. Runtime-side options handling is spec-required — upstream `nx.js` has the same gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/image.cc](source/image.cc) for `Ledger #73 — optional 3rd arg` + `bool premultiply = true`. Grep [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) for `Ledger #73 — extract flipY`, `extractOpts`, and 4 occurrences of `canvasToImageBitmap(..., opts)`. Recurrence tells:
+- iter 1 of RGB test regresses to `128,0,0 was 255,0,0` = the `un_premultiply = false` hardcode from #72 regressed (unrelated to #73).
+- iter 2 regresses to `255,0,0 was 128,0,0` = the `unpremul` path in `canvasToImageBitmap` broke — either the engine `imageWriteRGBA` 3rd-arg check regressed, or the `extractOpts` no longer sees `premultiplyAlpha === 'none'`.
+- iter 3-4 top/bottom swap breaks = the `flipY` scale/translate composition regressed — either the transform matrix flipped sign or the `staging` canvas isn't being drawn into.
+- All 4 iterations regress identically = `extractOpts` returned `{ flipY: false, unpremul: false }` for every call (the option-detection logic broke).
+- `Switch.VideoDecoder` frame-delivery hangs or shows corruption = the `premultiply=true` default in `imageWriteRGBA` regressed (all frames land as raw RGBA→BGRA without premul).
 
 ---
 

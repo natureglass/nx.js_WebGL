@@ -1176,6 +1176,29 @@ check 72 "webgl.cc [tier-a] un-mult removed from tex_sub_image_2d" \
     "$NXJS/source/webgl.cc" \
     'Ledger #72 — see w_tex_image_2d'
 
+# #73 — Tier-A: honor createImageBitmap imageOrientation + premultiplyAlpha.
+check 73 "image.cc [tier-a] Ledger #73 header comment" \
+    "$NXJS/source/image.cc" \
+    'Ledger #73 — optional 3rd arg'
+check 73 "image.cc [tier-a] premultiply flag default true" \
+    "$NXJS/source/image.cc" \
+    'bool premultiply = true'
+check 73 "image-bitmap.ts [tier-a] Ledger #73 header comment" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'Ledger #73 — extract flipY'
+check 73 "image-bitmap.ts [tier-a] extractOpts helper" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'function extractOpts'
+check 73 "image-bitmap.ts [tier-a] flipY option check" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    "imageOrientation === 'flipY'"
+check 73 "image-bitmap.ts [tier-a] unpremul option check" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    "premultiplyAlpha === 'none'"
+check 73 "image-bitmap.ts [tier-a] canvasToImageBitmap opts threaded through" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'canvasToImageBitmap\(oc, opts\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

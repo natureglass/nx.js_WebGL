@@ -60,20 +60,92 @@ export interface ImageBitmapOptions {
 	resizeWidth?: number;
 }
 
+// Ledger #73 — extract flipY / unpremul flags from createImageBitmap options
+// (both call-shape variants: 2-arg with options, 6-arg with options at the
+// tail). WebGL 1 conformance's image_bitmap tests iterate 4 bitmap variants
+// via `{imageOrientation: "none"|"flipY", premultiplyAlpha: "premultiply"|
+// "none"}`; each variant must produce distinct pixel bytes. Pre-#73 all
+// four variants came out identical (premul, no flip) because these options
+// were ignored, which made the "flipY=true" and "premultiplyAlpha=none"
+// iterations fail even though iteration 1 (flipY=false, premultiply) hit
+// PASS after #72 landed.
+interface BitmapOpts {
+	flipY: boolean;
+	unpremul: boolean;
+}
+function extractOpts(
+	optionsOrSx: ImageBitmapOptions | number | undefined,
+	tailOptions: ImageBitmapOptions | undefined,
+): BitmapOpts {
+	let opts: ImageBitmapOptions | undefined;
+	if (typeof optionsOrSx === 'object' && optionsOrSx !== null) {
+		opts = optionsOrSx;
+	} else if (typeof tailOptions === 'object' && tailOptions !== null) {
+		opts = tailOptions;
+	}
+	return {
+		flipY: opts?.imageOrientation === 'flipY',
+		unpremul: opts?.premultiplyAlpha === 'none',
+	};
+}
+
 // #66 — internal helper: encode a canvas (Screen / OffscreenCanvas / any
 // nx_canvas_t) to PNG bytes then round-trip through $.imageDecode into a
 // fresh ImageBitmap. Every non-Blob source path funnels through this at
 // the tail; keeping it in one place makes the encode/decode contract easy
-// to audit.
+// to audit. #73 extends the signature to honor createImageBitmap options:
+// flipY draws the source into a scratch canvas mirrored on Y before
+// encoding; unpremul skips the PNG round-trip (which always premultiplies
+// on decode) and stores raw getImageData bytes via imageWriteRGBA with
+// premultiply=false.
 async function canvasToImageBitmap(
 	canvas: unknown,
+	opts: BitmapOpts = { flipY: false, unpremul: false },
 ): Promise<ImageBitmap> {
-	const buf = await $.canvasToBuffer(
-		canvas as OffscreenCanvas,
-		'image/png',
-	);
-	const bmp = proto($.imageNew(), ImageBitmap);
-	await $.imageDecode(bmp, buf);
+	const src = canvas as OffscreenCanvas;
+	// Fast path: no options → unchanged encode/decode round-trip. Keeps
+	// hot paths (drawImage callers not requesting options) at zero perf
+	// cost — no getImageData copy, no scratch canvas allocation.
+	if (!opts.flipY && !opts.unpremul) {
+		const buf = await $.canvasToBuffer(src, 'image/png');
+		const bmp = proto($.imageNew(), ImageBitmap);
+		await $.imageDecode(bmp, buf);
+		return bmp;
+	}
+	// Options path. If flipY, compose the source into a scratch canvas
+	// with a Y-mirror transform. Then either encode+decode (premul stays)
+	// or read raw bytes and store via imageWriteRGBA(premultiply=false).
+	const w = src.width;
+	const h = src.height;
+	let staging: OffscreenCanvas = src;
+	if (opts.flipY) {
+		staging = new OffscreenCanvas(w, h);
+		const sctx = staging.getContext('2d');
+		if (!sctx) {
+			throw new Error('Failed to acquire 2D context for flipY staging');
+		}
+		sctx.save();
+		sctx.scale(1, -1);
+		sctx.translate(0, -h);
+		sctx.drawImage(src, 0, 0);
+		sctx.restore();
+	}
+	if (!opts.unpremul) {
+		const buf = await $.canvasToBuffer(staging, 'image/png');
+		const bmp = proto($.imageNew(), ImageBitmap);
+		await $.imageDecode(bmp, buf);
+		return bmp;
+	}
+	// Unpremul path: getImageData returns unpremultiplied RGBA; imageDecode
+	// would re-premultiply, so route around it via imageWriteRGBA with
+	// premultiply=false (Ledger #73's engine-side companion to this shim).
+	const sctx = staging.getContext('2d');
+	if (!sctx) {
+		throw new Error('Failed to acquire 2D context for unpremul readback');
+	}
+	const bytes = sctx.getImageData(0, 0, w, h).data;
+	const bmp = proto($.imageNew(w, h), ImageBitmap);
+	$.imageWriteRGBA(bmp, bytes.buffer, false);
 	return bmp;
 }
 
@@ -138,6 +210,14 @@ export async function createImageBitmap(
 	_sh?: number,
 	_options?: ImageBitmapOptions,
 ): Promise<ImageBitmap> {
+	// Ledger #73 — extract flipY / unpremul from the caller's options and
+	// thread them through the source-type branches below. Each branch that
+	// ultimately calls canvasToImageBitmap now passes `opts` so the helper
+	// can apply the transform (flipY at composite time, unpremul via the
+	// raw imageWriteRGBA path). Sub-rect (sx/sy/sw/sh) still ignored —
+	// deferred until a test needs it. See canvasToImageBitmap for the
+	// per-option implementation strategy.
+	const opts = extractOpts(_optionsOrSx, _options);
 	// #66 — WebGL 1 conformance surfaced 40 tests (5 source-type clusters ×
 	// 8 texture formats) that FAIL because the pre-#66 impl only handled
 	// Blob and threw for every other spec-defined ImageBitmapSource. The
@@ -169,7 +249,7 @@ export async function createImageBitmap(
 	//    Screen.toBlob both use internally), then decode.
 	const unwrappedCanvas = tryUnwrapCanvas(image);
 	if (unwrappedCanvas) {
-		return canvasToImageBitmap(unwrappedCanvas);
+		return canvasToImageBitmap(unwrappedCanvas, opts);
 	}
 
 	// 3. ImageData source — copy pixels through a scratch OffscreenCanvas.
@@ -185,7 +265,7 @@ export async function createImageBitmap(
 			throw new Error('Failed to acquire 2D context for ImageData round-trip');
 		}
 		ctx.putImageData(image, 0, 0);
-		return canvasToImageBitmap(oc);
+		return canvasToImageBitmap(oc, opts);
 	}
 
 	// 4. Draw-able source — HTMLImageElement (nx.js Image), ImageBitmap,
@@ -210,7 +290,7 @@ export async function createImageBitmap(
 			throw new Error('Failed to acquire 2D context for ImageBitmap round-trip');
 		}
 		ctx.drawImage(image, 0, 0);
-		return canvasToImageBitmap(oc);
+		return canvasToImageBitmap(oc, opts);
 	}
 
 	// 5. HTMLImageElement (nx.js Image). Duck-type on `naturalWidth` +
@@ -241,7 +321,7 @@ export async function createImageBitmap(
 		// drawImage's C++ impl (canvas.cc::nx_canvas_context_2d_draw_image)
 		// accepts nx_image_t via nx_get_image; nx.js Image satisfies it.
 		ctx.drawImage(image as CanvasImageSource, 0, 0);
-		return canvasToImageBitmap(oc);
+		return canvasToImageBitmap(oc, opts);
 	}
 
 	// 6. HTMLVideoElement — deliberately not supported yet. drawImage's

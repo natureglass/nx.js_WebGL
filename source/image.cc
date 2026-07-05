@@ -235,7 +235,7 @@ void nx_image_close(const FunctionCallbackInfo<Value> &info) {
 void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	if (info.Length() < 2) {
-		nx_throw(iso, "imageWriteRGBA: expected (image, bytes)");
+		nx_throw(iso, "imageWriteRGBA: expected (image, bytes, [premultiply])");
 		return;
 	}
 	nx_image_t *image = nx_get_image(iso, info[0]);
@@ -261,6 +261,18 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 		nx_throw(iso, "imageWriteRGBA: buffer smaller than expected");
 		return;
 	}
+	// Ledger #73 — optional 3rd arg `premultiply` (default true) controls
+	// whether the RGB channels are multiplied by alpha before storage.
+	// createImageBitmap({premultiplyAlpha: "none"}) needs the bitmap
+	// stored with UN-premultiplied pixels so texImage2D can hand them
+	// straight through to the driver (matches the Chrome behavior our
+	// #72 hardcoded "no un-multiply" bakes into the WebGL upload path).
+	// Default true preserves the existing video-frame delivery contract
+	// used by Switch.VideoDecoder (bitmap.ts::imageWriteRGBA).
+	bool premultiply = true;
+	if (info.Length() >= 3 && info[2]->IsBoolean()) {
+		premultiply = info[2]->BooleanValue(iso);
+	}
 	uint8_t *dst = image->data;
 	size_t pixels = (size_t)image->width * (size_t)image->height;
 	for (size_t i = 0; i < pixels; i++) {
@@ -268,7 +280,13 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 		uint8_t g = src[i * 4 + 1];
 		uint8_t b = src[i * 4 + 2];
 		uint8_t a = src[i * 4 + 3];
-		if (a == 0) {
+		if (!premultiply) {
+			// Raw store: keep RGBA values as-is, just swap R↔B for BGRA order.
+			dst[i * 4 + 0] = b;
+			dst[i * 4 + 1] = g;
+			dst[i * 4 + 2] = r;
+			dst[i * 4 + 3] = a;
+		} else if (a == 0) {
 			dst[i * 4 + 0] = 0;
 			dst[i * 4 + 1] = 0;
 			dst[i * 4 + 2] = 0;
