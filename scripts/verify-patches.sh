@@ -1310,7 +1310,10 @@ check 81 "live-dom.ts [tier-a] Ledger #81 header comment" \
     'Ledger #81'
 check 81 "live-dom.ts [tier-a] activeBase reads globalThis.location.href before livePageBase" \
     "$RUNTIME/src/scripts/live-dom.ts" \
-    'const activeBase = liveHref \?\? livePageBase'
+    'let activeBase = liveHref \?\? livePageBase'
+check 81 "live-dom.ts [tier-a] activeBase normalized to directory URL (strip filename)" \
+    "$RUNTIME/src/scripts/live-dom.ts" \
+    'activeBase\.substring\(0, lastSlash \+ 1\)'
 
 # #82 — Tier-A: canvasToImageBitmap fast-path fallback on encode/decode
 # failure — raw getImageData + imageWriteRGBA route.
