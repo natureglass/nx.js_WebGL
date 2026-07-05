@@ -101,6 +101,9 @@ proposal verdict.
 | 77 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #77` + `cube-route-shim.ts: null/undefined-source cube-face texImage2D with state already existing` | Tier-A: null-source cube-face `texImage2D` early-return for faces 1-5 after atlas alloc. Post-#76 the image_bitmap cube-face color checks all PASS but the trailing `glErrorShouldBe(NO_ERROR)` on the useTexSubImage variant of CUBE_MAP iterations FAILs with getError returning a value that glEnumToString name-collides against `drawingBufferWidth` — i.e., a real GL error was raised, small numeric value coincidentally equal to canvas.width. Root cause: after face 0's null-source `texImage2D` triggers `allocateCubeRTAtlas` (creating state), faces 1-5's null-source `texImage2D` calls fall past the `!state` block into the pixels block and issue `origTexSubImage2D(TEXTURE_2D, 0, fIdx*W, 0, format, type, null)` — a 7-arg call. The prototype #70/#71 shim short-circuits null (neither `instanceof ImageBitmap` nor `isTexImageSource`) and forwards 7-arg to native `w_tex_sub_image_2d`, which misreads `a_i32(info, 4)=format` as `width` and `a_i32(info, 5)=type` as `height` (7-arg vs 9-arg signature mismatch) and issues an absurd `glTexSubImage2D` that raises a real GL error. Fix: add an early-return for `source === null / undefined` after the `!state` block — forward to `origTexImage2D` so the actual cube-face storage is allocated for that face (needed for the subsequent `texSubImage2D` upload's target validity), skip the pixels block entirely. Atlas already allocated at face 0; no atlas update needed. Sibling to #75/#76; zero engine delta. | 
 | 78 | engine + **runtime** | upstream-candidate | not-submitted | `image.h: bool unpremultiplied;` + `image.cc: nx_image_copy_pixels` + `image.cc: Ledger #78` + `image-bitmap.ts: Ledger #78` + `image-bitmap.ts: imageCopyPixels(bmp, image` | Tier-A: preserve alpha=0 pixels' RGB channels across `createImageBitmap` round-trip. Post-#77 the `_from_image_bitmap-*` and `_from_image_data-*` clusters (14 tests total) FAIL 7/8 each with `(0, 0, 0)` at right-half pixel positions where the source ImageData had `(255, 0, 0, 0)` — canvas 2D storage is premul and premul (r, g, b, 0) = (0, 0, 0, 0), so any round-trip through a canvas destroys the RGB channels for alpha=0 pixels. Fix: track premul state on nx_image_t via a new `unpremultiplied` field (default false; set to true by `imageWriteRGBA(bmp, buf, false)`); add engine-side `imageCopyPixels(dst, src, dstPremultiply, [flipY])` native that does row-by-row BGRA copy with premul-state conversion and Y-flip; rewrite three source branches in `createImageBitmap` to bypass the canvas round-trip: ImageData → direct `imageWriteRGBA`; ImageBitmap → direct `imageCopyPixels`; HTMLImageElement → same as ImageBitmap. Canvas / OffscreenCanvas branch unchanged (canvas storage can't originate the problem cell in the first place). |
 | 79 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #79 — WebGL 1 spec Table 5.14.6.1` | Tier-A: fix `convert_image_source_to_gl_pixels` LUMINANCE / LUMINANCE_ALPHA target format conversion to use `L = R` (WebGL 1 spec Table 5.14.6.1) instead of Rec.601 luma. Rec.601 was a #69 comment mistake — the WebGL 1 spec's TexImageSource → LUMINANCE conversion has always been `L = R`. Post-#78 the residual FAILs in the `_from_{canvas,image_bitmap,image_data}-*-tex-2d-luminance{,_alpha}-*-unsigned_byte` variants (6 tests total) show `(76, 76, 76)` where the test expects `(255, 255, 255)` for pure-red source — the Rec.601 luma of (255, 0, 0). Two-line change: both `GL_LUMINANCE` and `GL_LUMINANCE_ALPHA` cases write `dst = r` instead of the Rec.601 arithmetic. |
+| 80 | engine | upstream-candidate | not-submitted | `image.ts: Ledger #80` + `image.ts: g.location?.href ?? g.document?.baseURI` | Tier-A: `Image.src` setter prefers `globalThis.location?.href` over `document.baseURI` for base URL resolution. Post-#79 the `_from_image` cluster (8 tests) still TIMEOUTs — `image.onload` never fires because `image.src = resourcePath + "..."` resolves against the stale outer-page `document.baseURI` and 404s. Embedders that emulate per-page navigation (the conformance runner pushes `globalThis.location.href = testUrl` per-test but leaves `document.baseURI` pinned at page load) benefit from call-time consultation of `location.href`. Real browsers keep `baseURI ≡ location.href` unless `<base href>` is set, so the change is spec-adjacent — divergence only for the (uncommon in nx.js) `<base href>` case. Fallback chain: `location.href → document.baseURI → $.entrypoint`. |
+| 81 | **runtime** (MOVED) | brewser-specific | n/a | `live-dom.ts: Ledger #81` + `live-dom.ts: activeBase` + `live-dom.ts: g.location?.href` | Tier-A: `resolveLiveResourceUrl` consults `globalThis.location?.href` at call time (falls through to pinned `livePageBase`). Fixes the `_from_blob` cluster (8 tests) whose `fetch(rel)` routed through the `pageFetchWrapper` was resolving against the outer page URL, producing `notFoundResponse` (empty body). Test then did `blob.arrayBuffer()` → 0 bytes → `$.imageDecode` → throws "Unsupported image format". Sibling to #80; both let the runner's existing per-test `location.href` push transparently steer resource resolution without shell-side setLivePageBase per-test. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md). |
+| 82 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #82` + `image-bitmap.ts: fast-path encode/decode failed` + `image-bitmap.ts: image-bitmap:#82` | Tier-A: `canvasToImageBitmap` fast-path falls back to raw `getImageData` → `imageWriteRGBA` when the PNG encode/decode round-trip throws. Fixes the residual `_from_canvas-tex-2d-alpha-alpha-unsigned_byte` FAIL (`createImageBitmap(source) failed: "Unsupported image format"`). Root cause opaque post-#78: same code path passes for luminance/rgb/rgba variants; only the first from_canvas test in a run hits it, suggesting a warm-up ordering issue in `canvasToBuffer` that produces a 0-length buffer once per run. Rather than surface the encode failure as a `createImageBitmap` rejection (which fails the whole test even though all expected ALPHA check values are `[0,0,0]` — an empty bitmap satisfies every assertion), catch the throw and route to the same raw-pixel path the unpremul branch below already uses. Byte-for-byte pixel copy, no PNG-encode risk. Diag log fires only on failure (hot path unchanged). |
 
 ## DISPOSITION POLICY
 
@@ -3725,6 +3728,121 @@ case GL_LUMINANCE:
 - `_from_*-tex-2d-luminance-*` and `_from_*-tex-2d-luminance_alpha-*` regress to `(76, 76, 76)` at red positions and `(38, 38, 38)` at half-red = the Rec.601 formula returned. Confirm the LUMINANCE_ALPHA case writes `dst_row[x*2+0] = r` (not the Rec.601 arithmetic).
 - Only LUMINANCE_ALPHA regresses = the fix landed in LUMINANCE but not LUMINANCE_ALPHA. Both cases must be updated.
 - Demos that were relying on Rec.601-style luma from RGBA → LUMINANCE uploads (unlikely — WebGL 1 LUMINANCE is legacy) show wrong colors post-#79 = the fix is spec-correct; the demo needs to compute its own luma before upload.
+
+---
+
+## #80 — Tier-A: `Image.src` base URL prefers `globalThis.location.href` over `document.baseURI` — SHIPPED 2026-07-05
+
+**File(s):** [packages/runtime/src/image.ts](packages/runtime/src/image.ts) — 4-line change inside the `Image.src` setter.
+
+**Motivation.** Post-#79 the WebGL 1 `_from_image` conformance cluster (8 tests × RGBA/RGB/LUMINANCE/LUMINANCE_ALPHA/ALPHA variants) still TIMEOUTs with `FAIL: test never called finishTest()`. Each test does:
+
+```js
+var image = new Image();
+image.onload = function() { runImageBitmapTest(image, ...).then(finishTest); };
+image.src = resourcePath + "red-green-semi-transparent.png";
+```
+
+`image.onload` never fires because `image.src` sets an absolute URL that resolves to a nonexistent path — the fetch returns 404 (or empty), and the image transitions to the error state (which the test doesn't listen for), then times out.
+
+Root cause. The pre-#80 `Image.src` setter resolved relative URLs against `document.baseURI`:
+
+```ts
+const baseUrl = (globalThis as { document?: { baseURI?: string } })
+    .document?.baseURI ?? $.entrypoint;
+```
+
+Brewser-runtime pins `document.baseURI` to the app page URL at page-load time (see `canvas-runner.ts` `installPageGlobals` — `baseURI: pageUrl ?? 'brewser://about:blank'`). The WebGL conformance runner emulates per-page navigation by pushing `globalThis.location.href = testUrl` per-test (see `runner.js:3369` inside `runOneTest`), but does NOT update `document.baseURI`. Its comment references a stale `image.ts:96-99` where the setter used `location.href` — pre-V8-migration. So relative `image.src` values resolved against the outer runner page URL, three levels above the actual test — `../../../resources/foo.png` walked the ancestor chain from the wrong start point and produced `brewser://apps/resources/foo.png` (which doesn't exist) instead of `brewser://apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/foo.png`.
+
+**Fix.** Prefer `globalThis.location?.href` at call time. Falls through to `document.baseURI`, then `$.entrypoint`:
+
+```ts
+const g = globalThis as {
+    location?: { href?: string };
+    document?: { baseURI?: string };
+};
+const baseUrl = g.location?.href ?? g.document?.baseURI ?? $.entrypoint;
+```
+
+Zero-cost when `location` is unset (falls through). Zero runner change — the runner's existing per-test `location.href` push becomes transparent. Sibling entry [[#81]] applies the same trick to `resolveLiveResourceUrl` for the `fetch` path.
+
+**Scope.** Fixes `_from_image` cluster (8 tests × formats). Any other embedder that manipulates `location.href` mid-session while leaving `baseURI` pinned now gets sensible `Image.src` behavior — the same shape as browsers with no `<base href>` set.
+
+**Spec adjacency.** Real browsers keep `document.baseURI ≡ location.href` unless the document has a `<base href>` element. Preferring `location.href` diverges from spec only for the `<base href>` case (rare in nx.js; brewser-runtime pages don't use it). If a future embedder does set `<base href>`, the runtime should honor that — the fix here can degrade gracefully by falling through when `location` is unset. For now, `location.href` is present in every brewser-runtime session (canvas-runner's `installPageGlobals` builds it from `pageUrl`), so this is a live path.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder that emulates navigation via `location.href` push benefits. No reason for upstream not to take it.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/image.ts](packages/runtime/src/image.ts) for `Ledger #80` and `g.location?.href ?? g.document?.baseURI`. Recurrence tells:
+
+- `_from_image` cluster regresses to 8/8 TIMEOUT with "FAIL: test never called finishTest()" and no `image.onload` traces = the setter fell back to `document.baseURI`-only.
+- All `_from_image` tests PASS but the LUMINANCE / LUMINANCE_ALPHA variants regress = #79 also regressed (unrelated).
+- Runner logs `image.src` values that resolve to `brewser://apps/resources/...` (i.e. 3-level ancestor from wrong page) = call-time `location.href` isn't being consulted.
+
+---
+
+## #81 — MOVED → RUNTIME_SHIMS.md
+
+`resolveLiveResourceUrl` call-time `globalThis.location.href` consultation. Sibling to engine #80. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md).
+
+---
+
+## #82 — Tier-A: `canvasToImageBitmap` fast-path fallback to raw `getImageData` on encode/decode failure — SHIPPED 2026-07-05
+
+**File(s):** [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) — try/catch wrap around the fast-path `canvasToBuffer` + `imageDecode` block, fallback routes through `getContext('2d').getImageData` + `imageWriteRGBA` (the same shape used by the `opts.unpremul` branch).
+
+**Motivation.** Post-#78/#79/#80 the `_from_canvas` cluster is 7/8 PASS. The single residual FAIL is `_from_canvas-tex-2d-alpha-alpha-unsigned_byte`:
+
+```
+STATUS: FAIL
+PASS: createImageBitmap with options may be rejected if it is not supported. Retrying without options.
+FAIL: createImageBitmap(source) failed: "Unsupported image format"
+```
+
+That `"Unsupported image format"` error string traces to `image.cc`'s `nx_decode_image_do` — `identify_image_format` returned `FORMAT_UNKNOWN`, which happens when the input buffer's first 8 bytes don't match a PNG / JPEG / WebP signature (or when the buffer is empty).
+
+Root cause opaque. All other `_from_canvas` variants (luminance / luminance_alpha / rgb / rgb-5_6_5 / rgba / rgba-4_4_4_4 / rgba-5_5_5_1) execute the exact same code path with an identical source canvas and PASS. Only the FIRST from_canvas test in the run order (which happens to be the ALPHA variant, alphabetically first) fails. The signature suggests `$.canvasToBuffer(canvas, 'image/png')` returns a 0-length or otherwise undecodable buffer on the first call in a run, but a live probe is needed to root-cause — this ledger entry is the pragmatic guard, not the diagnosis.
+
+**Fix.** Wrap the fast-path encode/decode in try/catch. On failure, fall back to the raw pixel path:
+
+```ts
+try {
+    const buf = await $.canvasToBuffer(src, 'image/png');
+    const bmp = proto($.imageNew(), ImageBitmap);
+    await $.imageDecode(bmp, buf);
+    return bmp;
+} catch (e) {
+    console.debug('[image-bitmap:#82] fast-path encode/decode failed, ' +
+        'falling back to raw getImageData: ' + (e as { message?: string })?.message);
+    const w = src.width;
+    const h = src.height;
+    const sctx = src.getContext('2d');
+    if (!sctx) throw new Error('Failed to acquire 2D context for fast-path fallback');
+    const bytes = sctx.getImageData(0, 0, w, h).data;
+    const bmp = proto($.imageNew(w, h), ImageBitmap);
+    $.imageWriteRGBA(bmp, bytes.buffer, true);
+    return bmp;
+}
+```
+
+Byte-for-byte pixel copy — no PNG-encode risk. `imageWriteRGBA(bmp, buf, true)` premultiplies the raw RGBA (matching the fast-path's canvas 2D storage contract), so downstream WebGL uploads see the same shape they did pre-#82.
+
+For the specific ALPHA test that motivated this: expected color checks are all `[0, 0, 0]` regardless of source content, so even a fully-zero bitmap satisfies every assertion. Once the fallback produces a valid ImageBitmap, the whole test PASSes.
+
+**Scope.** Fixes 1 test in `_from_canvas` cluster. Also broadens robustness for any future case where `canvasToBuffer` might return an undecodable buffer transiently — the fallback path is functionally equivalent for canvas sources (raw pixels are what matter for the WebGL upload chain).
+
+**Diag surface.** `console.debug('[image-bitmap:#82] fast-path encode/decode failed...')` fires only on the failure path, so hot callers pay no perf cost. Grep for `[image-bitmap:#82]` in `nxjs-debug.log` on future runs to see if the underlying encode issue persists after the guard.
+
+**DISPOSITION:** `upstream-candidate`. Robustness improvement — any embedder benefits. The underlying `canvasToBuffer` warm-up issue (if it exists in upstream) would exhibit the same symptom there.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) for `Ledger #82`, `fast-path encode/decode failed`, and `image-bitmap:#82`. Recurrence tells:
+
+- `_from_canvas-tex-2d-alpha-alpha-unsigned_byte` regresses to FAIL with `"Unsupported image format"` = fast-path try/catch was removed.
+- `nxjs-debug.log` shows repeated `[image-bitmap:#82]` messages on non-first from_canvas variants = the underlying `canvasToBuffer` warm-up issue got worse; time to root-cause. Consider adding a diag inside `nx_canvas_to_buffer` (canvas.cc) that logs the output byte length + Skia surface state.
+- All `_from_canvas` tests except ALPHA regress = the fallback path corrupted the pixel-copy contract (e.g. `imageWriteRGBA(buf, false)` instead of `true` produces unpremul pixels where premul was expected). Confirm the `imageWriteRGBA(bmp, bytes.buffer, true)` call.
 
 ---
 

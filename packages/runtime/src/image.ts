@@ -107,14 +107,24 @@ export class Image extends EventTarget {
 	}
 
 	set src(val: string) {
-		// Late-bound base URL: prefer `document.baseURI` at call time (set
-		// per-session by embedders like brewser-runtime, so each app's
-		// `./assets/foo.png` resolves against the app's page URL, not the
-		// engine entrypoint). Falls back to `$.entrypoint` for standalone
-		// nx.js apps where no document is present.
+		// Ledger #80 — prefer `globalThis.location?.href` over
+		// `document.baseURI`. Embedders that emulate per-page navigation by
+		// pushing a fresh `location.href` (e.g. the webgl-conformance runner
+		// evaluating each test HTML in-place) leave `document.baseURI` pinned
+		// at the outer page URL, so relative `image.src` values were
+		// resolving against the wrong base — the from_image cluster's
+		// `image.src = resourcePath + "..."` fetches 404'd and `onload`
+		// never fired (TIMEOUT). `location.href` is the more responsive
+		// signal here: real browsers keep `baseURI ≡ location.href` unless
+		// `<base href>` is set, so preferring location.href diverges only
+		// for the (uncommon in nx.js) `<base href>` case. Falls back to
+		// `document.baseURI` then `$.entrypoint`.
+		const g = globalThis as {
+			location?: { href?: string };
+			document?: { baseURI?: string };
+		};
 		const baseUrl =
-			(globalThis as { document?: { baseURI?: string } }).document
-				?.baseURI ?? $.entrypoint;
+			g.location?.href ?? g.document?.baseURI ?? $.entrypoint;
 		const url = new URL(val, baseUrl);
 		const internal = _(this);
 		internal.src = url;

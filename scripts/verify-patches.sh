@@ -1295,6 +1295,35 @@ check_absent 79 "webgl.cc [tier-a] Rec.601 luma formula removed from convert_ima
     "$NXJS/source/webgl.cc" \
     'r \* 299 \+ g \* 587 \+ b \* 114'
 
+# #80 — Tier-A: Image.src baseURL prefers globalThis.location.href.
+check 80 "image.ts [tier-a] Ledger #80 header comment" \
+    "$NXJS/packages/runtime/src/image.ts" \
+    'Ledger #80'
+check 80 "image.ts [tier-a] baseUrl consults location.href before baseURI" \
+    "$NXJS/packages/runtime/src/image.ts" \
+    'g\.location\?\.href \?\? g\.document\?\.baseURI'
+
+# #81 — Tier-A: resolveLiveResourceUrl prefers globalThis.location.href
+# at call time (MOVED to runtime — brewser-runtime-v8/RUNTIME_SHIMS.md).
+check 81 "live-dom.ts [tier-a] Ledger #81 header comment" \
+    "$RUNTIME/src/scripts/live-dom.ts" \
+    'Ledger #81'
+check 81 "live-dom.ts [tier-a] activeBase reads globalThis.location.href before livePageBase" \
+    "$RUNTIME/src/scripts/live-dom.ts" \
+    'const activeBase = liveHref \?\? livePageBase'
+
+# #82 — Tier-A: canvasToImageBitmap fast-path fallback on encode/decode
+# failure — raw getImageData + imageWriteRGBA route.
+check 82 "image-bitmap.ts [tier-a] Ledger #82 header comment" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'Ledger #82'
+check 82 "image-bitmap.ts [tier-a] fast-path try/catch fallback diag marker" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    '\[image-bitmap:#82\] fast-path encode/decode failed'
+check 82 "image-bitmap.ts [tier-a] fallback writes premultiplied via imageWriteRGBA(bmp, ..., true)" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    '\$\.imageWriteRGBA\(bmp, bytes\.buffer, true\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

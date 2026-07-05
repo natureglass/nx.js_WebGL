@@ -107,10 +107,48 @@ async function canvasToImageBitmap(
 	// hot paths (drawImage callers not requesting options) at zero perf
 	// cost — no getImageData copy, no scratch canvas allocation.
 	if (!opts.flipY && !opts.unpremul) {
-		const buf = await $.canvasToBuffer(src, 'image/png');
-		const bmp = proto($.imageNew(), ImageBitmap);
-		await $.imageDecode(bmp, buf);
-		return bmp;
+		// Ledger #82 — canvasToBuffer('image/png') can occasionally return
+		// a zero-length or otherwise undecodable buffer (observed as
+		// `$.imageDecode` throwing "Unsupported image format" on the first
+		// from_canvas conformance variant in a run; subsequent identical
+		// tests pass, so the root cause is a warm-up ordering issue not
+		// yet root-caused). Instead of surfacing that as a
+		// createImageBitmap rejection — which fails the whole test even
+		// when the caller's expected pixel values are all-zero and an
+		// empty bitmap would satisfy every check — fall through to the
+		// same raw getImageData → imageWriteRGBA path the unpremul branch
+		// below already uses. Byte-for-byte pixel copy, no PNG-encode
+		// risk. Diag log gives a future investigator a marker to grep for
+		// in nxjs-debug.log without breaking the hot-path zero-cost
+		// property (log only fires on failure).
+		try {
+			const buf = await $.canvasToBuffer(src, 'image/png');
+			const bmp = proto($.imageNew(), ImageBitmap);
+			await $.imageDecode(bmp, buf);
+			return bmp;
+		} catch (e) {
+			console.debug(
+				'[image-bitmap:#82] fast-path encode/decode failed, ' +
+					'falling back to raw getImageData: ' +
+					(e as { message?: string })?.message,
+			);
+			const w = src.width;
+			const h = src.height;
+			const sctx = src.getContext('2d');
+			if (!sctx) {
+				throw new Error(
+					'Failed to acquire 2D context for fast-path fallback',
+				);
+			}
+			const bytes = sctx.getImageData(0, 0, w, h).data;
+			const bmp = proto($.imageNew(w, h), ImageBitmap);
+			// getImageData returns unpremultiplied RGBA; write with
+			// premultiply=true to match the fast-path's canvas 2D storage
+			// contract (premultiplied). Preserves the invariant that
+			// non-option callers get a premul-stored ImageBitmap.
+			$.imageWriteRGBA(bmp, bytes.buffer, true);
+			return bmp;
+		}
 	}
 	// Options path. If flipY, compose the source into a scratch canvas
 	// with a Y-mirror transform. Then either encode+decode (premul stays)
