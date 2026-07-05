@@ -1333,6 +1333,15 @@ check 82 "image-bitmap.ts [tier-a] fallback writes premultiplied via imageWriteR
     "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
     '\$\.imageWriteRGBA\(bmp, bytes\.buffer, true\)'
 
+# #83 — Tier-A: createImageBitmap(Blob, opts) honors imageOrientation
+# + premultiplyAlpha via post-decode imageCopyPixels step.
+check 83 "image-bitmap.ts [tier-a] Ledger #83 header comment" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    'Ledger #83'
+check 83 "image-bitmap.ts [tier-a] Blob branch options-path uses imageCopyPixels" \
+    "$NXJS/packages/runtime/src/canvas/image-bitmap.ts" \
+    '\$\.imageCopyPixels\(bmp, decoded, !opts\.unpremul, opts\.flipY\)'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

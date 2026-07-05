@@ -104,6 +104,7 @@ proposal verdict.
 | 80 | engine | upstream-candidate | not-submitted | `image.ts: Ledger #80` + `image.ts: g.location?.href ?? g.document?.baseURI` | Tier-A: `Image.src` setter prefers `globalThis.location?.href` over `document.baseURI` for base URL resolution. Post-#79 the `_from_image` cluster (8 tests) still TIMEOUTs — `image.onload` never fires because `image.src = resourcePath + "..."` resolves against the stale outer-page `document.baseURI` and 404s. Embedders that emulate per-page navigation (the conformance runner pushes `globalThis.location.href = testUrl` per-test but leaves `document.baseURI` pinned at page load) benefit from call-time consultation of `location.href`. Real browsers keep `baseURI ≡ location.href` unless `<base href>` is set, so the change is spec-adjacent — divergence only for the (uncommon in nx.js) `<base href>` case. Fallback chain: `location.href → document.baseURI → $.entrypoint`. |
 | 81 | **runtime** (MOVED) | brewser-specific | n/a | `live-dom.ts: Ledger #81` + `live-dom.ts: activeBase` + `live-dom.ts: g.location?.href` | Tier-A: `resolveLiveResourceUrl` consults `globalThis.location?.href` at call time (falls through to pinned `livePageBase`). Fixes the `_from_blob` cluster (8 tests) whose `fetch(rel)` routed through the `pageFetchWrapper` was resolving against the outer page URL, producing `notFoundResponse` (empty body). Test then did `blob.arrayBuffer()` → 0 bytes → `$.imageDecode` → throws "Unsupported image format". Sibling to #80; both let the runner's existing per-test `location.href` push transparently steer resource resolution without shell-side setLivePageBase per-test. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md). |
 | 82 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #82` + `image-bitmap.ts: fast-path encode/decode failed` + `image-bitmap.ts: image-bitmap:#82` | Tier-A: `canvasToImageBitmap` fast-path falls back to raw `getImageData` → `imageWriteRGBA` when the PNG encode/decode round-trip throws. Fixes the residual `_from_canvas-tex-2d-alpha-alpha-unsigned_byte` FAIL (`createImageBitmap(source) failed: "Unsupported image format"`). Root cause opaque post-#78: same code path passes for luminance/rgb/rgba variants; only the first from_canvas test in a run hits it, suggesting a warm-up ordering issue in `canvasToBuffer` that produces a 0-length buffer once per run. Rather than surface the encode failure as a `createImageBitmap` rejection (which fails the whole test even though all expected ALPHA check values are `[0,0,0]` — an empty bitmap satisfies every assertion), catch the throw and route to the same raw-pixel path the unpremul branch below already uses. Byte-for-byte pixel copy, no PNG-encode risk. Diag log fires only on failure (hot path unchanged). |
+| 83 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #83` + `image-bitmap.ts: imageCopyPixels(bmp, decoded` | Tier-A: `createImageBitmap(Blob, opts)` honors `opts.imageOrientation` and `opts.premultiplyAlpha` via a post-decode `imageCopyPixels` step. Pre-#83 the Blob branch decoded the PNG/JPEG/WebP straight into an ImageBitmap and returned it — options ignored — so `_from_blob` variants with `premultiplyAlpha: "none"` had their alpha=0.5 red pixel sample as `128,0,0` (premultiplied) instead of the expected `255,0,0` (raw), and `imageOrientation: "flipY"` iterations sampled top/bottom in un-flipped positions. Fast path (no options) returns the decoded bitmap unchanged. Options path allocates a sized destination ImageBitmap and calls `$.imageCopyPixels(dst, src, !opts.unpremul, opts.flipY)` — same primitive #78 uses for ImageBitmap / HTMLImageElement branches. Fixes 7 of 8 `_from_blob-tex-2d-*` variants (the 8th, ALPHA, was already passing because all expected values are `[0,0,0]` regardless of premul state). |
 
 ## DISPOSITION POLICY
 
@@ -3843,6 +3844,78 @@ For the specific ALPHA test that motivated this: expected color checks are all `
 - `_from_canvas-tex-2d-alpha-alpha-unsigned_byte` regresses to FAIL with `"Unsupported image format"` = fast-path try/catch was removed.
 - `nxjs-debug.log` shows repeated `[image-bitmap:#82]` messages on non-first from_canvas variants = the underlying `canvasToBuffer` warm-up issue got worse; time to root-cause. Consider adding a diag inside `nx_canvas_to_buffer` (canvas.cc) that logs the output byte length + Skia surface state.
 - All `_from_canvas` tests except ALPHA regress = the fallback path corrupted the pixel-copy contract (e.g. `imageWriteRGBA(buf, false)` instead of `true` produces unpremul pixels where premul was expected). Confirm the `imageWriteRGBA(bmp, bytes.buffer, true)` call.
+
+---
+
+## #83 — Tier-A: `createImageBitmap(Blob, opts)` honors `imageOrientation` + `premultiplyAlpha` — SHIPPED 2026-07-05
+
+**File(s):** [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) — extend the `image instanceof Blob` branch with a fast path (no options) + options path (imageCopyPixels).
+
+**Motivation.** tier-82c re-baseline (post-#81b URL resolution fix) flipped `_from_blob` cluster from 0/8 to 1/8. The 8th (ALPHA) passed because all expected values in ALPHA tests are `[0,0,0]` regardless of premul/flip state — an unchanged bitmap satisfies every assertion. The 7 remaining FAILs across LUMINANCE / LUMINANCE_ALPHA / RGB / RGB-5_6_5 / RGBA / RGBA-4_4_4_4 / RGBA-5_5_5_1 all share two failure signatures:
+
+Signature A — `premultiplyAlpha: "none"` iterations (2/8 of the per-test iteration matrix):
+```
+FAIL: shouldBe 255,0,0 +/-10   at (20, 8) expected: 255,0,0 was 128,0,0
+```
+
+The alpha=0.5 source pixel encoded as premul red `(128, 0, 0, 128)` in the ImageBitmap should sample as `(255, 0, 0)` when `premultiplyAlpha: "none"` — the raw un-multiplied value — but samples as `(128, 0, 0)` = the premul-preserved value.
+
+Signature B — `imageOrientation: "flipY"` iterations (2/8 of the matrix):
+```
+FAIL: shouldBe 255,0,0 +/-10   at (8, 24) expected: 255,0,0 was 0,255,0
+FAIL: shouldBe 0,255,0 +/-10   at (8, 8) expected: 0,255,0 was 255,0,0
+```
+
+Top and bottom are swapped — the ImageBitmap wasn't flipped despite `imageOrientation: "flipY"`.
+
+Root cause. Pre-#83 the `Blob` source branch:
+
+```ts
+if (image instanceof Blob) {
+    const buf = await image.arrayBuffer();
+    const img = proto($.imageNew(), ImageBitmap);
+    await $.imageDecode(img, buf);
+    return img;    // opts.flipY / opts.unpremul both silently ignored
+}
+```
+
+Ignored `opts` entirely. Every Blob-sourced `createImageBitmap` call — regardless of what options the caller passed — returned the raw `imageDecode`d output (premultiplied BGRA, un-flipped). The four `Promise.all([p1, p2, p3, p4])` calls in `runImageBitmapTest` produced four IDENTICAL bitmaps instead of four variants, and every non-default iteration FAILed.
+
+The other source-type branches (Canvas / ImageData / ImageBitmap / HTMLImageElement) were updated in #73 (canvas fast/options paths) + #78 (ImageBitmap + HTMLImageElement branches route through `imageCopyPixels`) to honor `opts`. The Blob branch was overlooked in both prior ledger entries because — before #81b — the Blob path never got past the URL resolver, so its options-handling gap was masked.
+
+**Fix.** Extend the Blob branch with a fast path (no options → return decoded bitmap directly) and an options path (allocate a sized destination, call `imageCopyPixels` for premul-state conversion + Y-flip):
+
+```ts
+if (image instanceof Blob) {
+    const buf = await image.arrayBuffer();
+    const decoded = proto($.imageNew(), ImageBitmap);
+    await $.imageDecode(decoded, buf);
+    if (!opts.flipY && !opts.unpremul) {
+        return decoded;
+    }
+    const w = decoded.width;
+    const h = decoded.height;
+    const bmp = proto($.imageNew(w, h), ImageBitmap);
+    $.imageCopyPixels(bmp, decoded, !opts.unpremul, opts.flipY);
+    return bmp;
+}
+```
+
+`imageCopyPixels` is the same primitive the ImageBitmap + HTMLImageElement branches use (added in #78). It does row-by-row BGRA copy with premul-state conversion (unpremul↔premul via multiply/divide by alpha) and optional Y-flip in one pass. Fast path (no options) is unchanged — hot callers pay zero cost.
+
+**Scope.** Fixes 7 of 8 `_from_blob-tex-2d-*` variants. ALPHA (the 8th) was already passing at tier-82c. Combined with the sibling ImageBitmap / HTMLImageElement / ImageData branches (all shipped in #78), every `_from_*` cluster now honors `opts` symmetrically.
+
+**Why the Blob path uses `imageDecode + imageCopyPixels` (not `imageWriteRGBA`).** The decoded PNG/JPEG/WebP bytes live in the first `nx_image_t` after `imageDecode` — no easy way to intercept the pre-premul RGBA before storage. `imageCopyPixels` handles the round-trip via engine-side C code (fast) without an extra JS getImageData copy. If a future upstream decode wants to preserve un-premul bytes natively, the Blob path could bypass this copy entirely.
+
+**DISPOSITION:** `upstream-candidate`. WebGL 1 spec (via HTML createImageBitmap) mandates option honoring for every source type; the Blob source is a spec-required target. Any nx.js embedder benefits.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/image-bitmap.ts](packages/runtime/src/canvas/image-bitmap.ts) for `Ledger #83` and `imageCopyPixels(bmp, decoded`. Recurrence tells:
+
+- `_from_blob-*` variants regress to 1/8 PASS (only ALPHA) = the options-path branch was removed. Look for the `if (!opts.flipY && !opts.unpremul)` guard and the subsequent `imageCopyPixels` call.
+- All `_from_blob-*` variants FAIL with `"Unsupported image format"` = #81b's URL resolution regressed (a pre-req for #83 to be exercised).
+- `_from_blob-*` variants pass but `_from_image-*` regresses = shared `imageCopyPixels` primitive changed shape; check that the same signature `(dst, src, dstPremultiply, flipY)` is honored on both call sites (image-bitmap.ts branches for Blob AND ImageBitmap AND HTMLImageElement).
 
 ---
 

@@ -271,14 +271,32 @@ export async function createImageBitmap(
 	//     accept video sources yet, so we throw a distinct error rather
 	//     than silently producing an empty bitmap.
 
-	// 1. Blob source — decode buffer directly. Unchanged from the pre-#66
-	//    impl; kept in the first branch since it's the only path that
-	//    doesn't need a scratch canvas.
+	// 1. Blob source — decode buffer directly. Fast path (no options)
+	//    returns the decoded ImageBitmap as-is; options path routes
+	//    through imageCopyPixels for premul-state conversion + Y-flip.
+	//    Ledger #83 — pre-#83 the Blob branch ignored opts entirely,
+	//    so `_from_blob` cluster iterations with `premultiplyAlpha:
+	//    "none"` (alpha=0.5 red at 128,0,0 sampled as 255,0,0 expected
+	//    → actual 128,0,0 was PREMULTIPLIED not un-multiplied) and
+	//    `imageOrientation: "flipY"` (top pixel expected red, got
+	//    green from the un-flipped source) FAIL post-#81b, once URL
+	//    resolution was fixed and the PNG bytes actually arrived.
+	//    The fix mirrors the ImageBitmap / HTMLImageElement branches
+	//    below (both added by #78): decode into a temp, then
+	//    imageCopyPixels(dst, tmp, dstPremultiply, flipY) does the
+	//    BGRA-byte copy with premul conversion + optional Y-flip.
 	if (image instanceof Blob) {
 		const buf = await image.arrayBuffer();
-		const img = proto($.imageNew(), ImageBitmap);
-		await $.imageDecode(img, buf);
-		return img;
+		const decoded = proto($.imageNew(), ImageBitmap);
+		await $.imageDecode(decoded, buf);
+		if (!opts.flipY && !opts.unpremul) {
+			return decoded;
+		}
+		const w = decoded.width;
+		const h = decoded.height;
+		const bmp = proto($.imageNew(w, h), ImageBitmap);
+		$.imageCopyPixels(bmp, decoded, !opts.unpremul, opts.flipY);
+		return bmp;
 	}
 
 	// 2. Canvas-like source — nx.js OffscreenCanvas / Screen / live-DOM
