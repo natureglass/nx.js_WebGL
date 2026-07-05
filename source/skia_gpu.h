@@ -97,3 +97,12 @@ GrDirectContext *nx_skia_gpu_gr_context(void);
 // present blit) so the FBO content appears on screen alongside the shell.
 // Returns null before init / after exit.
 SkSurface *nx_skia_gpu_canvas_surface(void);
+
+// Release all cached GPU resources held by Skia's GrDirectContext (Ganesh
+// atlas + glyph cache + unlocked textures + shader cache). Used by the WebGL
+// bridge's resetSharedContext() to relieve cumulative Skia heap pressure that
+// otherwise OOMs long-running test loops (the WebGL 1 conformance runner
+// hitting a 217KB paint allocation failure around test #325). Skia lazily
+// re-caches on next paint; no lifecycle side-effects. Idempotent; no-op if
+// the GrContext is null.
+void nx_skia_gpu_free_gpu_resources(void);

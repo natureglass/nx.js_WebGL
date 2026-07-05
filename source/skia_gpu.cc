@@ -308,3 +308,7 @@ EGLSurface nx_skia_gpu_egl_surface(void) { return s_surf; }
 EGLContext nx_skia_gpu_egl_context(void) { return s_ctx; }
 GrDirectContext *nx_skia_gpu_gr_context(void) { return s_gr.get(); }
 SkSurface *nx_skia_gpu_canvas_surface(void) { return s_canvas.get(); }
+
+void nx_skia_gpu_free_gpu_resources(void) {
+	if (s_gr) s_gr->freeGpuResources();
+}
