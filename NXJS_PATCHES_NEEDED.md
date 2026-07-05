@@ -100,6 +100,7 @@ proposal verdict.
 | 76 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #76` + `cube-route-shim.ts: pendingCubeParams` + `cube-route-shim.ts: applyPendingCubeParams` | Tier-A: pre-atlas `texParameteri` / `texParameterf` cache on cube textures. Post-#75 the image_bitmap cube-face tests had the correct sample HUE but were off by 12-28 units on intensity (243 vs 255 full-brightness, 151/156 vs 128 half-brightness) — exceeding the ±10 tolerance. Root cause: WebGL 1 conformance calls `gl.texParameteri(TEXTURE_CUBE_MAP, TEXTURE_MIN_FILTER, NEAREST)` + MAG_FILTER + WRAP_S/T BEFORE the first `texImage2D` upload; at that moment the shim has no `cubeStates` entry for the tex, so the wrap silently drops the call. The atlas then gets the hard-coded LINEAR/CLAMP defaults from the alloc block, and LINEAR filtering across texel centers introduces sub-texel blending that dims full-brightness / brightens half-brightness pixels via the shim's non-integer atlas sample UVs. Fix: stash pre-alloc `texParameteri` / `texParameterf` calls in a per-tex `pendingCubeParams` WeakMap; drain and replay them at all three atlas-alloc sites (the inline `texImage2D` alloc block for image sources + `allocateCubeRTAtlas` for null-source WebGL 1 + `allocateCubeRTAtlasSized` for WebGL 2 `texStorage2D`), AFTER the LINEAR/CLAMP defaults so caller intent wins. WRAP_S/T stay forced to CLAMP_TO_EDGE during replay (REPEAT on a 6×1 strip would bleed adjacent faces). Last-write-wins per pname dedup keeps replay bounded. Sibling to #75; zero engine delta. |
 | 77 | **runtime** | brewser-specific | n/a | `cube-route-shim.ts: Ledger #77` + `cube-route-shim.ts: null/undefined-source cube-face texImage2D with state already existing` | Tier-A: null-source cube-face `texImage2D` early-return for faces 1-5 after atlas alloc. Post-#76 the image_bitmap cube-face color checks all PASS but the trailing `glErrorShouldBe(NO_ERROR)` on the useTexSubImage variant of CUBE_MAP iterations FAILs with getError returning a value that glEnumToString name-collides against `drawingBufferWidth` — i.e., a real GL error was raised, small numeric value coincidentally equal to canvas.width. Root cause: after face 0's null-source `texImage2D` triggers `allocateCubeRTAtlas` (creating state), faces 1-5's null-source `texImage2D` calls fall past the `!state` block into the pixels block and issue `origTexSubImage2D(TEXTURE_2D, 0, fIdx*W, 0, format, type, null)` — a 7-arg call. The prototype #70/#71 shim short-circuits null (neither `instanceof ImageBitmap` nor `isTexImageSource`) and forwards 7-arg to native `w_tex_sub_image_2d`, which misreads `a_i32(info, 4)=format` as `width` and `a_i32(info, 5)=type` as `height` (7-arg vs 9-arg signature mismatch) and issues an absurd `glTexSubImage2D` that raises a real GL error. Fix: add an early-return for `source === null / undefined` after the `!state` block — forward to `origTexImage2D` so the actual cube-face storage is allocated for that face (needed for the subsequent `texSubImage2D` upload's target validity), skip the pixels block entirely. Atlas already allocated at face 0; no atlas update needed. Sibling to #75/#76; zero engine delta. | 
 | 78 | engine + **runtime** | upstream-candidate | not-submitted | `image.h: bool unpremultiplied;` + `image.cc: nx_image_copy_pixels` + `image.cc: Ledger #78` + `image-bitmap.ts: Ledger #78` + `image-bitmap.ts: imageCopyPixels(bmp, image` | Tier-A: preserve alpha=0 pixels' RGB channels across `createImageBitmap` round-trip. Post-#77 the `_from_image_bitmap-*` and `_from_image_data-*` clusters (14 tests total) FAIL 7/8 each with `(0, 0, 0)` at right-half pixel positions where the source ImageData had `(255, 0, 0, 0)` — canvas 2D storage is premul and premul (r, g, b, 0) = (0, 0, 0, 0), so any round-trip through a canvas destroys the RGB channels for alpha=0 pixels. Fix: track premul state on nx_image_t via a new `unpremultiplied` field (default false; set to true by `imageWriteRGBA(bmp, buf, false)`); add engine-side `imageCopyPixels(dst, src, dstPremultiply, [flipY])` native that does row-by-row BGRA copy with premul-state conversion and Y-flip; rewrite three source branches in `createImageBitmap` to bypass the canvas round-trip: ImageData → direct `imageWriteRGBA`; ImageBitmap → direct `imageCopyPixels`; HTMLImageElement → same as ImageBitmap. Canvas / OffscreenCanvas branch unchanged (canvas storage can't originate the problem cell in the first place). |
+| 79 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #79 — WebGL 1 spec Table 5.14.6.1` | Tier-A: fix `convert_image_source_to_gl_pixels` LUMINANCE / LUMINANCE_ALPHA target format conversion to use `L = R` (WebGL 1 spec Table 5.14.6.1) instead of Rec.601 luma. Rec.601 was a #69 comment mistake — the WebGL 1 spec's TexImageSource → LUMINANCE conversion has always been `L = R`. Post-#78 the residual FAILs in the `_from_{canvas,image_bitmap,image_data}-*-tex-2d-luminance{,_alpha}-*-unsigned_byte` variants (6 tests total) show `(76, 76, 76)` where the test expects `(255, 255, 255)` for pure-red source — the Rec.601 luma of (255, 0, 0). Two-line change: both `GL_LUMINANCE` and `GL_LUMINANCE_ALPHA` cases write `dst = r` instead of the Rec.601 arithmetic. |
 
 ## DISPOSITION POLICY
 
@@ -3686,6 +3687,44 @@ The Canvas / OffscreenCanvas branch still routes through `canvasToImageBitmap` �
 - Only `flipY=true` iterations regress = flipY handling regressed. For ImageData: check the JS-side row-reverse copy loop. For ImageBitmap / HTMLImageElement: check `opts.flipY` is the 4th arg to `imageCopyPixels`.
 - `Switch.VideoDecoder` frame delivery breaks = `nx_image_write_rgba`'s default premultiply=true regressed OR the new `unpremultiplied` field is being read incorrectly downstream. Video path is 2-arg call, expects `unpremultiplied=false`.
 - `createImageBitmap(canvas, {premultiplyAlpha: "none"})` on a canvas regresses = the canvas branch was accidentally changed. Should still route through `canvasToImageBitmap` (correct because canvas can't originate the problem cell).
+
+---
+
+## #79 — Tier-A: `LUMINANCE` / `LUMINANCE_ALPHA` conversion uses L = R, not Rec.601 luma — SHIPPED 2026-07-05
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — two-line change inside `convert_image_source_to_gl_pixels`'s `GL_LUMINANCE` and `GL_LUMINANCE_ALPHA` switch cases.
+
+**Motivation.** Post-#78 the `_from_image_bitmap-*` and `_from_image_data-*` clusters flip from 1/8 to 6/8 PASS. The residual FAILs across all three image-source clusters are the LUMINANCE and LUMINANCE_ALPHA texture formats — same signature: red source pixel `(255, 0, 0)` samples as `(76, 76, 76)` when the test expects `(255, 255, 255)`.
+
+Root cause. #69's `convert_image_source_to_gl_pixels` computes LUMINANCE as `L = 0.299R + 0.587G + 0.114B` (Rec.601 luma). For a pure-red source pixel that gives `L=76`, sampled as `(76, 76, 76, 1)` — off by 179 from the expected white, well outside the ±10 tolerance. The WebGL 1 spec Table 5.14.6.1 (TexImageSource → LUMINANCE / LUMINANCE_ALPHA target) actually says `L = R`, not Rec.601 luma. Chrome uses `L = R`; the conformance tests all assume `L = R` — `(255, 0, 0)` uploaded to a LUMINANCE texture and sampled must return `(255, 255, 255, 1)`.
+
+The Rec.601 formula was a #69 comment mistake. The Rec.601-style luma calculation is only correct for a specific YCbCr color-conversion path that WebGL 1 does not expose.
+
+**Fix.** Two-line change in `convert_image_source_to_gl_pixels`:
+
+```cpp
+case GL_LUMINANCE_ALPHA:
+    dst_row[x * 2 + 0] = r;   // was: (r*299 + g*587 + b*114 + 500) / 1000
+    dst_row[x * 2 + 1] = a;
+    break;
+case GL_LUMINANCE:
+    dst_row[x] = r;           // was: (r*299 + g*587 + b*114 + 500) / 1000
+    break;
+```
+
+`GL_ALPHA` case unchanged — that path was already spec-correct (`A = A`).
+
+**Scope.** Fixes the LUMINANCE + LUMINANCE_ALPHA formats across ALL image-source clusters that route through #69's converter — `_from_canvas`, `_from_image_bitmap`, `_from_image_data` = 6 test flips (3 clusters × 2 formats).
+
+**DISPOSITION:** `upstream-candidate`. Spec-compliance fix; upstream nx.js has the same bug.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #79 — WebGL 1 spec Table 5.14.6.1`. Recurrence tells:
+
+- `_from_*-tex-2d-luminance-*` and `_from_*-tex-2d-luminance_alpha-*` regress to `(76, 76, 76)` at red positions and `(38, 38, 38)` at half-red = the Rec.601 formula returned. Confirm the LUMINANCE_ALPHA case writes `dst_row[x*2+0] = r` (not the Rec.601 arithmetic).
+- Only LUMINANCE_ALPHA regresses = the fix landed in LUMINANCE but not LUMINANCE_ALPHA. Both cases must be updated.
+- Demos that were relying on Rec.601-style luma from RGBA → LUMINANCE uploads (unlikely — WebGL 1 LUMINANCE is legacy) show wrong colors post-#79 = the fix is spec-correct; the demo needs to compute its own luma before upload.
 
 ---
 

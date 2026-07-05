@@ -2821,13 +2821,24 @@ static uint8_t *convert_image_source_to_gl_pixels(
 					dst_row[x * 3 + 2] = b;
 					break;
 				case GL_LUMINANCE_ALPHA:
-					// Rec.601 luma; matches WebGL spec §5.14.6 conversion
-					// table for RGBA → LUMINANCE_ALPHA.
-					dst_row[x * 2 + 0] = (uint8_t)((r * 299 + g * 587 + b * 114 + 500) / 1000);
+					// Ledger #79 — WebGL 1 spec Table 5.14.6.1 (RGBA source
+					// → LUMINANCE_ALPHA target) is L = R, A = A. Not
+					// Rec.601 luma. Chrome + conformance both check L=R:
+					// the `_from_*-tex-2d-luminance*` tests upload
+					// (255, 0, 0) and expect a sample of (255, 255, 255).
+					// Rec.601 gives L=76 (fails ±10 tolerance). #69's
+					// original comment claimed Rec.601 was spec-compliant
+					// — it wasn't; the WebGL 1 §5.14.6 table has been L=R
+					// since spec inception, and the ES 2.0 pixel-transfer
+					// rules the comment referenced don't apply to
+					// TexImageSource uploads (only to typed-array uploads
+					// where format must match source).
+					dst_row[x * 2 + 0] = r;
 					dst_row[x * 2 + 1] = a;
 					break;
 				case GL_LUMINANCE:
-					dst_row[x] = (uint8_t)((r * 299 + g * 587 + b * 114 + 500) / 1000);
+					// Ledger #79 — L = R per WebGL 1 spec Table 5.14.6.1.
+					dst_row[x] = r;
 					break;
 				case GL_ALPHA:
 					dst_row[x] = a;

@@ -1287,6 +1287,14 @@ check 78 "\$.ts [tier-a] imageCopyPixels signature" \
     "$NXJS/packages/runtime/src/\$.ts" \
     'imageCopyPixels\('
 
+# #79 — Tier-A: LUMINANCE / LUMINANCE_ALPHA use L=R (spec Table 5.14.6.1).
+check 79 "webgl.cc [tier-a] Ledger #79 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #79 — WebGL 1 spec Table 5.14.6.1'
+check_absent 79 "webgl.cc [tier-a] Rec.601 luma formula removed from convert_image_source_to_gl_pixels" \
+    "$NXJS/source/webgl.cc" \
+    'r \* 299 \+ g \* 587 \+ b \* 114'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
