@@ -157,6 +157,67 @@ static void nx_v8_fatal_cb(const char *location, const char *message) {
 	nx_v8_fatal_exit("error", location, message);
 }
 
+// NXJS_PATCHES_NEEDED.md #74 — Track-A DrumBrake gate: empirical wasm-tier probe.
+//
+// Called after Isolate + primary Context are up but before runtime.js/user
+// code runs. Compiles + instantiates + EXECUTES a minimal 34-byte MVP wasm
+// module (exports `f: () -> i32` returning 42) inside a TryCatch. Every
+// fallible step falls through to `mode=unavailable` — zero abort paths. Any
+// pending exception is cleared before returning so nothing leaks downstream.
+//
+// Truth in labeling: `[wasm] mode=drumbrake` means "wasm EXECUTES under jitless
+// mode", not merely "the validator ran on the magic+version bytes". This is
+// what distinguishes a switch-v8 monolith built with `v8_enable_drumbrake=true`
+// from the shipping one that has no wasm interpreter compiled in.
+static void nx_probe_wasm_tier(Isolate *iso, Local<Context> ctx, bool can_jit) {
+	HandleScope hs(iso);
+	TryCatch tc(iso);
+
+	// 34-byte MVP module (verified end-to-end via Node.js WebAssembly API):
+	// exports `f: () -> i32` that returns i32.const 42.
+	static const char kProbeSrc[] =
+	    "(function(){"
+	    "var b=new Uint8Array(["
+	    "0,97,115,109,1,0,0,0,"      // magic + version
+	    "1,5,1,96,0,1,127,"           // type: ()->i32
+	    "3,2,1,0,"                    // function: 1 fn of type 0
+	    "7,5,1,1,102,0,0,"            // export "f" -> fn 0
+	    "10,6,1,4,0,65,42,11"         // code: i32.const 42; end
+	    "]);"
+	    "var m=new WebAssembly.Module(b);"
+	    "var i=new WebAssembly.Instance(m);"
+	    "return i.exports.f();"
+	    "})()";
+
+	bool executes = false;
+	Local<String> src;
+	if (String::NewFromUtf8(iso, kProbeSrc, NewStringType::kNormal)
+	        .ToLocal(&src)) {
+		Local<Script> scr;
+		if (Script::Compile(ctx, src).ToLocal(&scr)) {
+			Local<Value> res;
+			if (scr->Run(ctx).ToLocal(&res)) {
+				double d = 0.0;
+				if (res->NumberValue(ctx).To(&d) && d == 42.0)
+					executes = true;
+			}
+		}
+	}
+	// Clear any pending exception so nothing leaks into runtime.js / user code.
+	if (tc.HasCaught())
+		tc.Reset();
+
+	const char *mode;
+	if (!executes)
+		mode = "unavailable";
+	else if (can_jit)
+		mode = "jit(liftoff)";
+	else
+		mode = "drumbrake";
+	fprintf(stderr, "[wasm] mode=%s\n", mode);
+	fflush(stderr);
+}
+
 static void nx_v8_oom_cb(const char *location, const v8::OOMDetails &details) {
 	nx_v8_fatal_exit(details.is_heap_oom ? "JS heap OOM" : "process OOM",
 	                 location, details.detail);
@@ -1738,6 +1799,21 @@ int main(int argc, char *argv[]) {
 		V8::SetFlagsFromString("--jitless --single-threaded "
 		                       "--single-threaded-gc "
 		                       "--no-concurrent-recompilation --predictable");
+		// NXJS_PATCHES_NEEDED.md #74 — Track-A DrumBrake gate. Opt-in via
+		// `[v8] wasm_interpreter = on` in nxjs.ini. Appends `--wasm-jitless`
+		// so V8's in-tree DrumBrake interpreter runs WebAssembly (no JIT code
+		// arena required). Inert on the JIT branch (byte-identical flag string
+		// there). No-op today because the shipped switch-v8 monolith is NOT
+		// built with `v8_enable_drumbrake=true`; the `[wasm]` probe below
+		// reports the actual runtime tier. When Track B lands, run
+		// `scripts/verify-drumbrake-monolith.sh` before flipping any default.
+		if (nx_ctx->config.wasm_interpreter_opt_in) {
+			V8::SetFlagsFromString("--wasm-jitless");
+			fprintf(stderr,
+			        "[v8] wasm_interpreter=on -> --wasm-jitless appended "
+			        "(DrumBrake selected iff monolith supports it)\n");
+			fflush(stderr);
+		}
 	}
 	// App-provided V8 flags, applied AFTER the runtime defaults so they take
 	// precedence (V8's later SetFlagsFromString wins). Advanced/at-own-risk:
@@ -1973,6 +2049,13 @@ int main(int argc, char *argv[]) {
 		HandleScope handle_scope(iso);
 		Local<Context> context = Context::New(iso);
 		Context::Scope context_scope(context);
+
+		// NXJS_PATCHES_NEEDED.md #74 — Track-A DrumBrake gate: empirical
+		// wasm-tier probe. Runs before runtime.js so the resulting
+		// `[wasm] mode=…` line orders with the other init-time logs. Fail-soft
+		// (TryCatch + Reset internally); cannot abort or leak a JS exception.
+		nx_probe_wasm_tier(iso, context, can_jit);
+
 		Local<Object> global = context->Global();
 
 		if (user_code == NULL) {
