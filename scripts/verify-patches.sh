@@ -1314,6 +1314,12 @@ check 81 "live-dom.ts [tier-a] activeBase reads globalThis.location.href before 
 check 81 "live-dom.ts [tier-a] activeBase normalized to directory URL (strip filename)" \
     "$RUNTIME/src/scripts/live-dom.ts" \
     'activeBase\.substring\(0, lastSlash \+ 1\)'
+check 81 "live-dom.ts [tier-a] Ledger #81b header comment" \
+    "$RUNTIME/src/scripts/live-dom.ts" \
+    'Ledger #81b'
+check 81 "live-dom.ts [tier-a] new URL() constructor tried before manual walker" \
+    "$RUNTIME/src/scripts/live-dom.ts" \
+    'try \{\s*return new URL\(s, activeBase\)\.toString\(\);'
 
 # #82 — Tier-A: canvasToImageBitmap fast-path fallback on encode/decode
 # failure — raw getImageData + imageWriteRGBA route.
