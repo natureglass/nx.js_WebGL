@@ -1114,6 +1114,23 @@ check 68 "webgl.cc [tier-a] delete_program clears aliased record" \
     "$NXJS/source/webgl.cc" \
     'programs_with_aliased_link\.erase\(id\)'
 
+# #69 — Tier-A: texImage2D / texSubImage2D ImageBitmap / Image source support.
+check 69 "webgl.cc [tier-a] image.h include" \
+    "$NXJS/source/webgl.cc" \
+    '#include "image.h"'
+check 69 "webgl.cc [tier-a] convert_image_source_to_gl_pixels helper" \
+    "$NXJS/source/webgl.cc" \
+    'static uint8_t \*convert_image_source_to_gl_pixels'
+check 69 "webgl.cc [tier-a] Ledger #69 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #69 — texImage2D / texSubImage2D ImageBitmap \+ Image source support'
+check 69 "webgl.cc [tier-a] w_tex_image_2d nx_get_image probe" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #69 — ImageBitmap / Image \(nx_image_t\) source'
+check 69 "webgl.cc [tier-a] w_tex_sub_image_2d image-source path" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #69 — ImageBitmap / Image source path mirrors w_tex_image_2d'
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:

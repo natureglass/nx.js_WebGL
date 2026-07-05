@@ -43,6 +43,7 @@
 #include "skia_gpu.h"
 #include "error.h"
 #include "wrap.h"
+#include "image.h"
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -2722,13 +2723,134 @@ static inline void bucket_e_translate_tex_sub_image(
 	}
 }
 
+// Ledger #69 — texImage2D / texSubImage2D ImageBitmap + Image source support.
+//
+// nx_image_t holds premultiplied BGRA pixels (byte order B,G,R,A, row-major,
+// width*4 stride, top-to-bottom — see image.h / image.cc). Pre-#69, the
+// texImage2D / texSubImage2D bodies handled only ArrayBuffer / ArrayBufferView
+// sources; nx_image_t fell through the null-source branch, so
+// `gl.texImage2D(target, 0, format, format, type, imageBitmap)` uploaded
+// nothing and the destination texture stayed cleared. WebGL 1 conformance
+// hit this across ~40 textures-image_bitmap_from_* tests (all 5 sub-clusters
+// × 8 texture formats) with the signature `shouldBe 255,0,0 was 0,0,0`.
+//
+// This helper converts BGRA → the caller's (format, type) into a scratch
+// buffer. Returns scratch.data() on success (scratch owns lifetime), nullptr
+// on unsupported (format, type). Honors UNPACK_FLIP_Y_WEBGL (row-reverse)
+// and UNPACK_PREMULTIPLY_ALPHA_WEBGL (un-premultiply when the caller asked
+// for false — source is already premultiplied).
+//
+// MVP format matrix (matches the Tier-A conformance iteration):
+//   RGBA/UNSIGNED_BYTE, RGB/UNSIGNED_BYTE,
+//   RGBA/UNSIGNED_SHORT_4_4_4_4, RGBA/UNSIGNED_SHORT_5_5_5_1,
+//   RGB/UNSIGNED_SHORT_5_6_5,
+//   LUMINANCE/UNSIGNED_BYTE, LUMINANCE_ALPHA/UNSIGNED_BYTE,
+//   ALPHA/UNSIGNED_BYTE.
+// Non-MVP (HALF_FLOAT/FLOAT source-uploads, OffscreenCanvas-as-source,
+// PBO offset overload) fall through to nullptr → null upload, matching
+// pre-#69 behavior. See ledger #69 for deferral rationale.
+static uint8_t *convert_image_source_to_gl_pixels(
+    nx_image_t *img, GLenum format, GLenum type,
+    bool flip_y, bool un_premultiply,
+    std::vector<uint8_t> &scratch) {
+	if (!img || !img->data || img->width == 0 || img->height == 0) return nullptr;
+	const uint32_t W = img->width;
+	const uint32_t H = img->height;
+	// Bytes per destination pixel for the supported (format, type) matrix.
+	size_t dst_bpp = 0;
+	if (type == GL_UNSIGNED_BYTE) {
+		switch (format) {
+		case GL_RGBA:            dst_bpp = 4; break;
+		case GL_RGB:             dst_bpp = 3; break;
+		case GL_LUMINANCE_ALPHA: dst_bpp = 2; break;
+		case GL_LUMINANCE:       dst_bpp = 1; break;
+		case GL_ALPHA:           dst_bpp = 1; break;
+		default: return nullptr;
+		}
+	} else if (type == GL_UNSIGNED_SHORT_4_4_4_4 && format == GL_RGBA) {
+		dst_bpp = 2;
+	} else if (type == GL_UNSIGNED_SHORT_5_5_5_1 && format == GL_RGBA) {
+		dst_bpp = 2;
+	} else if (type == GL_UNSIGNED_SHORT_5_6_5 && format == GL_RGB) {
+		dst_bpp = 2;
+	} else {
+		return nullptr;
+	}
+	scratch.assign((size_t)W * (size_t)H * dst_bpp, 0);
+	uint8_t *dst = scratch.data();
+	for (uint32_t y = 0; y < H; ++y) {
+		const uint32_t src_y = flip_y ? (H - 1 - y) : y;
+		const uint8_t *src_row = img->data + (size_t)src_y * (size_t)W * 4;
+		uint8_t *dst_row = dst + (size_t)y * (size_t)W * dst_bpp;
+		for (uint32_t x = 0; x < W; ++x) {
+			// Source is premultiplied BGRA.
+			uint8_t b = src_row[x * 4 + 0];
+			uint8_t g = src_row[x * 4 + 1];
+			uint8_t r = src_row[x * 4 + 2];
+			uint8_t a = src_row[x * 4 + 3];
+			if (un_premultiply && a != 0 && a != 255) {
+				// Divide premultiplied channels back out. `(c*255 + a/2)/a`
+				// rounds to nearest and clamps at 255 (input is guaranteed
+				// c <= a because of premultiplication).
+				r = (uint8_t)std::min(255, (r * 255 + a / 2) / a);
+				g = (uint8_t)std::min(255, (g * 255 + a / 2) / a);
+				b = (uint8_t)std::min(255, (b * 255 + a / 2) / a);
+			}
+			if (type == GL_UNSIGNED_BYTE) {
+				switch (format) {
+				case GL_RGBA:
+					dst_row[x * 4 + 0] = r;
+					dst_row[x * 4 + 1] = g;
+					dst_row[x * 4 + 2] = b;
+					dst_row[x * 4 + 3] = a;
+					break;
+				case GL_RGB:
+					dst_row[x * 3 + 0] = r;
+					dst_row[x * 3 + 1] = g;
+					dst_row[x * 3 + 2] = b;
+					break;
+				case GL_LUMINANCE_ALPHA:
+					// Rec.601 luma; matches WebGL spec §5.14.6 conversion
+					// table for RGBA → LUMINANCE_ALPHA.
+					dst_row[x * 2 + 0] = (uint8_t)((r * 299 + g * 587 + b * 114 + 500) / 1000);
+					dst_row[x * 2 + 1] = a;
+					break;
+				case GL_LUMINANCE:
+					dst_row[x] = (uint8_t)((r * 299 + g * 587 + b * 114 + 500) / 1000);
+					break;
+				case GL_ALPHA:
+					dst_row[x] = a;
+					break;
+				}
+			} else if (type == GL_UNSIGNED_SHORT_4_4_4_4) {
+				// Big-endian in memory per WebGL: (R<<12) | (G<<8) | (B<<4) | A.
+				uint16_t p = (uint16_t)(((r >> 4) << 12) | ((g >> 4) << 8) |
+				                       ((b >> 4) << 4) | (a >> 4));
+				dst_row[x * 2 + 0] = (uint8_t)(p & 0xFF);
+				dst_row[x * 2 + 1] = (uint8_t)(p >> 8);
+			} else if (type == GL_UNSIGNED_SHORT_5_5_5_1) {
+				uint16_t p = (uint16_t)(((r >> 3) << 11) | ((g >> 3) << 6) |
+				                       ((b >> 3) << 1) | (a >> 7));
+				dst_row[x * 2 + 0] = (uint8_t)(p & 0xFF);
+				dst_row[x * 2 + 1] = (uint8_t)(p >> 8);
+			} else if (type == GL_UNSIGNED_SHORT_5_6_5) {
+				uint16_t p = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) |
+				                       (b >> 3));
+				dst_row[x * 2 + 0] = (uint8_t)(p & 0xFF);
+				dst_row[x * 2 + 1] = (uint8_t)(p >> 8);
+			}
+		}
+	}
+	return dst;
+}
+
 FN(w_tex_image_2d) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
 	const GLint level = a_i32(info, 1);
 	GLint internalformat = a_i32(info, 2);
-	const GLsizei width = a_i32(info, 3);
-	const GLsizei height = a_i32(info, 4);
+	GLsizei width = a_i32(info, 3);
+	GLsizei height = a_i32(info, 4);
 	const GLint border = a_i32(info, 5);
 	GLenum format = a_u32(info, 6);
 	GLenum type = a_u32(info, 7);
@@ -2740,9 +2862,39 @@ FN(w_tex_image_2d) {
 		len = ab->ByteLength();
 	}
 	if (info[8]->IsNullOrUndefined()) pixels = nullptr;
+	// Ledger #69 — ImageBitmap / Image (nx_image_t) source. If the JS arg
+	// wraps an nx_image_t, override width/height from the source (WebGL
+	// spec: source dimensions win for TexImageSource overloads) and
+	// convert premultiplied BGRA into the caller's (format, type) via
+	// scratch. Override UNPACK_ALIGNMENT to 1 around the upload so
+	// tightly-packed row layouts (e.g. RGB/UNSIGNED_BYTE with odd width,
+	// LUMINANCE) don't trip the driver's row-stride check; restore after.
+	std::vector<uint8_t> scratch;
+	GLint saved_alignment = 4;
+	bool alignment_overridden = false;
+	if (!pixels) {
+		nx_image_t *img = nx_get_image(info.GetIsolate(), info[8]);
+		if (img) {
+			const bool flip_y = st ? st->unpack_flip_y : false;
+			const bool un_premultiply = st ? !st->unpack_premultiply : false;
+			uint8_t *conv = convert_image_source_to_gl_pixels(
+			    img, format, type, flip_y, un_premultiply, scratch);
+			if (conv) {
+				width = (GLsizei)img->width;
+				height = (GLsizei)img->height;
+				pixels = conv;
+				glGetIntegerv(GL_UNPACK_ALIGNMENT, &saved_alignment);
+				glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+				alignment_overridden = true;
+			}
+		}
+	}
 	bucket_e_translate_tex_image(&internalformat, &format, &type);
 	glTexImage2D(target, level, internalformat, width, height, border, format,
 	             type, pixels);
+	if (alignment_overridden) {
+		glPixelStorei(GL_UNPACK_ALIGNMENT, saved_alignment);
+	}
 }
 FN(w_tex_sub_image_2d) {
 	enter_bracket();
@@ -2750,8 +2902,8 @@ FN(w_tex_sub_image_2d) {
 	const GLint level = a_i32(info, 1);
 	const GLint xoff = a_i32(info, 2);
 	const GLint yoff = a_i32(info, 3);
-	const GLsizei width = a_i32(info, 4);
-	const GLsizei height = a_i32(info, 5);
+	GLsizei width = a_i32(info, 4);
+	GLsizei height = a_i32(info, 5);
 	GLenum format = a_u32(info, 6);
 	GLenum type = a_u32(info, 7);
 	size_t len = 0;
@@ -2761,9 +2913,38 @@ FN(w_tex_sub_image_2d) {
 		pixels = ab->Data();
 		len = ab->ByteLength();
 	}
+	// Ledger #69 — ImageBitmap / Image source path mirrors w_tex_image_2d
+	// (no internalformat here — storage was allocated by a prior
+	// texImage2D/texStorage2D). Sub-uploads still override width/height
+	// from the source: WebGL spec allows either the explicit args or the
+	// source dimensions, and Three.js / conformance both pass the source's
+	// natural dimensions.
+	std::vector<uint8_t> scratch;
+	GLint saved_alignment = 4;
+	bool alignment_overridden = false;
+	if (!pixels) {
+		nx_image_t *img = nx_get_image(info.GetIsolate(), info[8]);
+		if (img) {
+			const bool flip_y = st ? st->unpack_flip_y : false;
+			const bool un_premultiply = st ? !st->unpack_premultiply : false;
+			uint8_t *conv = convert_image_source_to_gl_pixels(
+			    img, format, type, flip_y, un_premultiply, scratch);
+			if (conv) {
+				width = (GLsizei)img->width;
+				height = (GLsizei)img->height;
+				pixels = conv;
+				glGetIntegerv(GL_UNPACK_ALIGNMENT, &saved_alignment);
+				glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+				alignment_overridden = true;
+			}
+		}
+	}
 	bucket_e_translate_tex_sub_image(&format, &type);
 	glTexSubImage2D(target, level, xoff, yoff, width, height, format, type,
 	                pixels);
+	if (alignment_overridden) {
+		glPixelStorei(GL_UNPACK_ALIGNMENT, saved_alignment);
+	}
 }
 
 // Tier 4 (ledger #65) — validation gate for compressed-texture uploads.
@@ -3351,6 +3532,46 @@ FN(w_copy_bridge_to_canvas) {
 	}
 	const bool ok = nx_webgl_bridge_compose_rect(target, sx, sy, sw, sh, dx, dy);
 	info.GetReturnValue().Set(Boolean::New(iso, ok));
+}
+
+// Runner-driven resetSharedContext hook. The full-webgl1-conformance runner
+// (D:/Workspace/brewser-apps/apps/experimental/com.natureglass.webglconformtest/
+// full-webgl1-conformance/assets/runner.js:3340) calls this every 25 test
+// iterations to relieve cumulative Skia + GL pressure that otherwise OOMs the
+// run around test #325 (V8 heap allocation failure inside renderStatus,
+// classically a ~217KB font/glyph-atlas paint alloc). The QuickJS-era
+// resetSharedContext destroyed the WebGL EGL context (see
+// D:/Workspace/nxjs-source/source/webgl.c:14422 + webgl_egl.c:3087) but this
+// bridge shares Skia's EGL context per Phase 2.A, so the QuickJS pattern would
+// take Skia's rendering down with it. Instead, do the three cheap operations
+// that actually recover the failing allocation site:
+//   1. Purge Skia's Ganesh caches (atlas + glyph cache + unlocked GPU
+//      resources). This is the primary recovery — the failing 217KB
+//      allocation is a paint-side Skia alloc.
+//   2. Reset Ganesh's cached GL-state model so it rebinds its program/VAO on
+//      the next paint (WebGL may have left GL state Ganesh still thinks it
+//      owns).
+//   3. glFlush so the driver retires already-submitted work rather than
+//      queueing indefinitely.
+//   4. Bump s_gl_reset_generation as a forward-compat hook for future
+//      per-object staleness checks; nothing currently reads it, but exporting
+//      it via the same mechanism as the QuickJS bridge's context_generation
+//      lets us add stale-handle guards later without changing the JS API.
+// Returns true on success; false only if Skia isn't up yet (call before
+// nx_skia_gpu_screen_init succeeded, or after nx_skia_gpu_screen_exit).
+static uint32_t s_gl_reset_generation = 0;
+FN(w_reset_shared_context) {
+	Isolate *iso = info.GetIsolate();
+	GrDirectContext *gr = nx_skia_gpu_gr_context();
+	if (!gr) {
+		info.GetReturnValue().Set(Boolean::New(iso, false));
+		return;
+	}
+	nx_skia_gpu_free_gpu_resources();
+	gr->resetContext();
+	glFlush();
+	++s_gl_reset_generation;
+	info.GetReturnValue().Set(Boolean::New(iso, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -5336,6 +5557,7 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
 	    {"copyBridgeToCanvas", w_copy_bridge_to_canvas},
+	    {"resetSharedContext", w_reset_shared_context},
 	};
 	Local<Context> ctx = iso->GetCurrentContext();
 	for (const auto &s : FUNCS) {
@@ -5503,6 +5725,7 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"enableGpuBridgePrototype", w_enable_gpu_bridge_prototype},
 	    {"setBridgeAutoFlush", w_set_bridge_auto_flush},
 	    {"copyBridgeToCanvas", w_copy_bridge_to_canvas},
+	    {"resetSharedContext", w_reset_shared_context},
 
 	    // ---- v2-only adds (Phase 2.G.1 cut #2+) ----
 	    // cut #2 (2026-06-30) — texImage3D: Three.js v2 WebGLRenderer init

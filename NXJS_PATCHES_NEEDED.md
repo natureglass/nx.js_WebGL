@@ -90,6 +90,7 @@ proposal verdict.
 | 66 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: tryUnwrapCanvas` + `image-bitmap.ts: canvasToImageBitmap` | Tier-A: `createImageBitmap` source-type expansion. Pre-#66 impl handled ONLY `Blob` and threw for every other spec-defined `ImageBitmapSource`. Adds `HTMLCanvasElement` (nx.js Screen / OffscreenCanvas + brewser-runtime live-DOM `<canvas>` LiveElement via `.offscreen` duck-unwrap), `ImageData` (via scratch OffscreenCanvas + putImageData), `ImageBitmap` (via drawImage round-trip), `HTMLImageElement` (nx.js Image duck-typed on `naturalWidth`/`naturalHeight`). Unlocks up to 40 conformance tests across 5 `textures-image_bitmap_from_*` sub-clusters × 8 texture formats. HTMLVideoElement branch throws a distinct diagnostic (needs canvas.cc video-frame-capture path). |
 | 67 | engine | upstream-candidate | not-submitted | `webgl.cc: enabled_exts` + `webgl.cc: record_ext_enabled` + `webgl.cc: is_ext_enabled` | Tier-A: `getParameter` extension-gated pname enforcement. Per WebGL spec § 5.14.3, extension-gated pnames MUST return null (+ INVALID_ENUM) until `getExtension` has been called for their gating extension. Pre-#67 they returned real values unconditionally, causing 6-8 conformance FAILs. Adds per-context `enabled_exts` set populated at every success branch in `w_get_extension` and consulted by 8 new/modified pname branches in `w_get_parameter`: `CLIP_ORIGIN_EXT` / `CLIP_DEPTH_MODE_EXT` / `DEPTH_CLAMP_EXT` / `POLYGON_OFFSET_CLAMP_EXT` / `MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL` / `FRAGMENT_SHADER_DERIVATIVE_HINT_OES` / `COMPLETION_STATUS_KHR` + gating on the existing `UNMASKED_VENDOR/RENDERER_WEBGL` + `MAX_TEXTURE_MAX_ANISOTROPY_EXT` branches. |
 | 68 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_detect_link_attrib_aliasing` + `webgl.cc: programs_with_aliased_link` | Tier-A: attribute-aliasing link failure detection. WebGL spec §5.14.9: `linkProgram` MUST fail when two active attributes end up bound to the same location via `bindAttribLocation`. Mesa-Nouveau (observed) still succeeds the driver-level link. Post-link scan iterates `glGetActiveAttrib` × `glGetAttribLocation`, detects any two active attribs sharing a location, and marks the program in a per-context set. `w_get_program_parameter` overrides `LINK_STATUS` to false for marked programs. Fixes `attribs-gl-bindAttribLocation-aliasing` (32 aliased-location assertions). |
+| 69 | engine | upstream-candidate | not-submitted | `webgl.cc: convert_image_source_to_gl_pixels` + `webgl.cc: Ledger #69` | Tier-A: `texImage2D` + `texSubImage2D` ImageBitmap / Image (nx_image_t) source support. Pre-#69 both bodies handled only ArrayBuffer / ArrayBufferView sources; nx_image_t fell through the null-source branch, so `gl.texImage2D(target, 0, format, format, type, imageBitmap)` uploaded null and the destination texture stayed cleared. Blocked ~40 `textures-image_bitmap_from_*` conformance tests (all 5 sub-clusters × 8 texture formats) with signature `shouldBe 255,0,0 was 0,0,0`. Shared helper `convert_image_source_to_gl_pixels` converts premultiplied BGRA source into scratch (`std::vector<uint8_t>`) for the 8-format MVP matrix: RGBA/RGB/LUMINANCE_ALPHA/LUMINANCE/ALPHA `UNSIGNED_BYTE` + RGBA `UNSIGNED_SHORT_4_4_4_4` / `UNSIGNED_SHORT_5_5_5_1` + RGB `UNSIGNED_SHORT_5_6_5`. Honors `UNPACK_FLIP_Y_WEBGL` (row-reverse) and `UNPACK_PREMULTIPLY_ALPHA_WEBGL` (un-premultiply when caller asked for false — source is already premultiplied). Overrides `GL_UNPACK_ALIGNMENT` to 1 around the upload (restores after) so tightly-packed row layouts don't trip the driver row-stride check. Unsupported (format, type) combos fall through to null upload (pre-#69 behavior). |
 
 ## DISPOSITION POLICY
 
@@ -3224,6 +3225,62 @@ PVRTC (0x8C00..3) is deliberately absent — Mesa-Nouveau does not expose the IM
 - `attribs-gl-bindAttribLocation-aliasing` regresses to FAIL on ALL 32 assertions = the scan helper is no longer being called from `w_link_program`, or the aliased-set field was removed from WebGLState.
 - Only SOME assertions fail = the loop bailed early (check the `break;` after `aliased = true;` is inside the `for` and not before the location check).
 - The test PASSES the aliased assertions but a legitimate compile-only test that binds two identical names to the same location starts failing = the scan is flagging non-aliased cases (the `!seen_locations.insert(loc).second` should only fire for truly-duplicate locations; verify the set is per-call, not per-context).
+
+---
+
+## #69 — Tier-A: `texImage2D` + `texSubImage2D` ImageBitmap / Image source support — SHIPPED 2026-07-04
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `#include "image.h"` + new static helper `convert_image_source_to_gl_pixels(nx_image_t*, GLenum format, GLenum type, bool flip_y, bool un_premultiply, std::vector<uint8_t>& scratch)` + image-source-detection branch in `w_tex_image_2d` and `w_tex_sub_image_2d` (both call `nx_get_image` after the ArrayBuffer / typed-array branches, override width/height from the source, and wrap the upload in a `GL_UNPACK_ALIGNMENT=1` save/restore).
+
+**Motivation.** #66 taught `createImageBitmap` to produce an `ImageBitmap` backed by `nx_image_t` for every spec-defined `ImageBitmapSource`, but the `texImage2D` / `texSubImage2D` bodies in webgl.cc only understood ArrayBuffer / ArrayBufferView. `nx_image_t` fell through the null-source branch: `gl.texImage2D(target, 0, format, format, type, imageBitmap)` uploaded nothing and the destination texture kept its cleared contents. WebGL 1 conformance surfaced ~40 tests spanning 5 sub-clusters (× 8 texture formats each) with the exact signature `shouldBe 255,0,0 was 0,0,0`:
+- `textures-image_bitmap_from_canvas-*` — 8 tests
+- `textures-image_bitmap_from_image_bitmap-*` — 8 tests
+- `textures-image_bitmap_from_image_data-*` — 8 tests
+- `textures-image_bitmap_from_video-*` — 8 tests (still blocked upstream by #66's deferred Video branch)
+- `textures-image_bitmap_from_blob-*` — 8 tests (also affected by unrelated `Unsupported image format` for BMP)
+
+Also unblocks any demo that passes an `nx.js Image` directly to `gl.texImage2D` — a spec-supported call shape.
+
+**Design.** After the existing ArrayBuffer / view_bytes / NullOrUndefined branches, `nx_get_image(iso, info[8])` probes the JS arg for a wrapped `nx_image_t`. If the probe hits AND `pixels` is still null (i.e. the arg wasn't already read as a buffer), the helper converts and the call takes the image path.
+
+`convert_image_source_to_gl_pixels` allocates a `std::vector<uint8_t>` scratch sized `width * height * dst_bpp` and walks pixels row-by-row, byte-by-byte. Source is `nx_image_t->data` — premultiplied BGRA, row-major, `width*4` stride, top-to-bottom (canvas.cc treats it as `kBGRA_8888_SkColorType, kPremul_SkAlphaType`).
+
+MVP format matrix (matches the 8 texture-format variants each Tier-A sub-cluster iterates over):
+- `RGBA` / `UNSIGNED_BYTE` — swizzle R↔B, keep alpha
+- `RGB` / `UNSIGNED_BYTE` — swizzle R↔B, drop alpha
+- `RGBA` / `UNSIGNED_SHORT_4_4_4_4` — pack 4-bit per channel, big-endian per WebGL 1 §5.14.6
+- `RGBA` / `UNSIGNED_SHORT_5_5_5_1` — pack 5-5-5-1
+- `RGB` / `UNSIGNED_SHORT_5_6_5` — pack 5-6-5
+- `LUMINANCE_ALPHA` / `UNSIGNED_BYTE` — Rec.601 luma from RGB + alpha
+- `LUMINANCE` / `UNSIGNED_BYTE` — Rec.601 luma
+- `ALPHA` / `UNSIGNED_BYTE` — alpha only
+
+Anything outside this set returns nullptr, falling through to the pre-#69 null upload. This is intentional MVP scope; expanding the matrix (HALF_FLOAT / FLOAT source-uploads, PBO offset overload, `OffscreenCanvas`-as-direct-source) is out of scope until conformance surfaces a test requiring it.
+
+`UNPACK_FLIP_Y_WEBGL` — row-reverse by choosing `src_y = flip_y ? (H - 1 - y) : y`. Source is top-to-bottom; flipping produces bottom-to-top which is what the WebGL flag asks for.
+
+`UNPACK_PREMULTIPLY_ALPHA_WEBGL` — source is *always* premultiplied. Flag `true` (the WebGL default) means "upload premultiplied", so we do nothing — the source's premul BGRA becomes premul RGBA after swizzle. Flag `false` means "upload un-premultiplied", so we divide each color channel by the alpha (`c = (c * 255 + a/2) / a` with rounding and `min(255, ...)` clamp). Tests iterate both flag settings and MVP handles both — the Tier-A `premultiplyAlpha=false` variants FAIL without it.
+
+`GL_UNPACK_ALIGNMENT` override: WebGL spec preserves the caller's alignment, but our scratch is always tightly packed. Odd-width `RGB/UNSIGNED_BYTE` and any `LUMINANCE/ALPHA` upload would trip the driver's row-stride check under `alignment=4`. We `glGetIntegerv` the caller's value, force to 1 for the upload, restore after — invisible to the caller.
+
+Width/height override: WebGL 1 §5.14.6 for the `TexImageSource` overload uses the source's dimensions (the explicit `width`/`height` args ARE present in the C++ dispatch but the JS-side polyfill/binding populates them from `img.width`/`img.height` anyway; overriding here is defensive and matches how three.js / conformance both pass source dimensions).
+
+**Non-MVP formats fall through to null upload.** Deferred:
+- `HALF_FLOAT` / `FLOAT` source uploads via ImageBitmap. Not exercised by the Tier-A cluster.
+- Direct `OffscreenCanvas` as `TexImageSource` (bypassing `createImageBitmap`). Spec allows this but Tier-A goes through ImageBitmap. #66's `createImageBitmap` path converts canvas → PNG → `nx_image_t` at BitMap creation.
+- PBO offset overload (`texImage2D(target, level, IF, w, h, border, format, type, offset)`) for `PIXEL_UNPACK_BUFFER`. WebGL 2 only; not in Tier-A.
+- 3D variants (`texImage3D` / `texSubImage3D`) for ImageBitmap. WebGL 2; separate cluster if it surfaces.
+
+**DISPOSITION:** `upstream-candidate`. Pure spec compliance; upstream nx.js has the same gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `convert_image_source_to_gl_pixels`, the `Ledger #69` block header inside `w_tex_image_2d` + `w_tex_sub_image_2d`, and `#include "image.h"`. Recurrence tells:
+- All 40 `textures-image_bitmap_from_*` tests regress to `shouldBe 255,0,0 was 0,0,0` = the `nx_get_image` probe is no longer called, or the fall-through order changed so the ArrayBuffer branch consumes the arg first (nx_image_t doesn't respond to `IsArrayBuffer()`, so ordering matters only if a future refactor merges branches).
+- Only the `premultiplyAlpha=false` variants fail = the un-premultiply path regressed (check the `un_premultiply && a != 0 && a != 255` guard is still there and dividing correctly).
+- Only the `flipY=true` variants fail = the `src_y = flip_y ? (H - 1 - y) : y` expression regressed.
+- Only specific format variants fail (e.g. all `LUMINANCE_ALPHA/UNSIGNED_BYTE`) = a case in the format switch was removed or its bpp computed wrong; check `dst_bpp` computation matches the memory-store shape.
+- Random driver `INVALID_OPERATION` on odd-width `RGB/UNSIGNED_BYTE` = the `GL_UNPACK_ALIGNMENT=1` override/restore regressed.
 
 ---
 
