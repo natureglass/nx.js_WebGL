@@ -633,39 +633,6 @@ function sourceToPixels(src: any): {
 	let id: ImageData;
 	if (src instanceof ImageData) {
 		id = src;
-	} else if (typeof src.getContext === 'function') {
-		// Ledger #85 — canvas-source short-circuit. Brewser-runtime's canvas
-		// element is not a native nx_canvas_t, so the OffscreenCanvas 2D
-		// drawImage() path below rejects it with "Image or Canvas expected"
-		// (thrown at canvas.cc:nx_canvas_context_2d_draw_image). Read pixels
-		// straight from the source's own 2D context — same non-premultiplied
-		// RGBA guarantee, no round-trip. The dims come from ctx.canvas (the
-		// underlying nxjs OffscreenCanvas) rather than src.width/src.height,
-		// because the WebGL 1 canvas conformance tests set `ctx.canvas.width
-		// = 1; ctx.canvas.height = 2` (min-size upload case) which only
-		// updates the native canvas dims — the LiveElement wrapper's
-		// _width/_height stay at the HTML default 300×150. src.width would
-		// mismatch id.data.length (which native clips to the actual canvas
-		// dims), leaving the texture upload reading out of bounds.
-		const ctx2d = src.getContext('2d');
-		if (ctx2d && typeof ctx2d.getImageData === 'function') {
-			const inner = (ctx2d as { canvas?: { width: number; height: number } }).canvas;
-			const w = (inner && typeof inner.width === 'number') ? inner.width : src.width;
-			const h = (inner && typeof inner.height === 'number') ? inner.height : src.height;
-			id = ctx2d.getImageData(0, 0, w, h) as ImageData;
-		} else {
-			// WebGL-typed canvas or unrecognized context — fall through to
-			// the OffscreenCanvas draw path (may throw for non-native sources).
-			const c = new OffscreenCanvas(src.width, src.height);
-			const ctx = c.getContext('2d');
-			ctx.drawImage(src, 0, 0);
-			id = ctx.getImageData(
-				0,
-				0,
-				src.width,
-				src.height,
-			) as ImageData;
-		}
 	} else {
 		// Rasterize through an offscreen 2D canvas; getImageData() returns
 		// non-premultiplied RGBA, which is exactly what GL expects with the
@@ -686,13 +653,77 @@ function sourceToPixels(src: any): {
 	};
 }
 
+// Ledger #85 — canvas-source short-circuit. Brewser-runtime's canvas
+// element (LiveElement or CanvasShim) is not a native nx_image_t /
+// nx_canvas_t, so the OffscreenCanvas 2D drawImage() path in
+// sourceToPixels rejects it with "Image or Canvas expected" (thrown at
+// canvas.cc:nx_canvas_context_2d_draw_image). Wrap the canvas's raw
+// pixels into a fresh nx_image_t ImageBitmap and let the caller route it
+// through the existing #71 ImageBitmap short-circuit — that way native's
+// convert_image_source_to_gl_pixels handles flipY, format conversion
+// (RGBA → LUMINANCE / ALPHA / RGB / packed 16-bit types), premultiply,
+// and colorspace correctly, just as it does for ImageBitmap sources
+// created via createImageBitmap.
+//
+// The dims come from ctx.canvas (the underlying nxjs OffscreenCanvas)
+// rather than src.width / src.height, because the WebGL 1 canvas
+// conformance tests set `ctx.canvas.width = 1; ctx.canvas.height = 2`
+// (min-size upload case) which only updates the native canvas dims —
+// the LiveElement wrapper's _width / _height stay at the HTML default
+// 300×150. src.width would mismatch the native-clipped data length,
+// leaving the texture upload reading out of bounds.
+function canvasToNxImageBitmap(src: any): ImageBitmap | null {
+	const ctx2d = src.getContext('2d');
+	if (!ctx2d || typeof ctx2d.getImageData !== 'function') return null;
+	const inner = (ctx2d as { canvas?: { width: number; height: number } })
+		.canvas;
+	const w = inner && typeof inner.width === 'number' ? inner.width : src.width;
+	const h = inner && typeof inner.height === 'number'
+		? inner.height
+		: src.height;
+	if (!(w > 0 && h > 0)) return null;
+	const id = ctx2d.getImageData(0, 0, w, h) as ImageData;
+	const bmp = proto($.imageNew(w, h), ImageBitmap);
+	// getImageData returns unpremultiplied RGBA; nx_image_t storage is
+	// premultiplied BGRA. imageWriteRGBA(..., premultiply=true) does the
+	// unpremul-RGBA → premul-BGRA byte transform + swizzle in one pass.
+	// Matches ledger #82's canvas → ImageBitmap fallback pattern.
+	$.imageWriteRGBA(bmp, id.data.buffer, true);
+	return bmp;
+}
+
+function isCanvasSource(v: any): boolean {
+	return (
+		v !== null &&
+		typeof v === 'object' &&
+		!(v instanceof ImageBitmap) &&
+		!(v instanceof ImageData) &&
+		!ArrayBuffer.isView(v) &&
+		typeof v.getContext === 'function'
+	);
+}
+
 {
 	const p: any = WebGLRenderingContext.prototype;
 	const nativeTexImage2D = p.texImage2D;
 	const nativeTexSubImage2D = p.texSubImage2D;
 	if (typeof nativeTexImage2D === 'function') {
 		p.texImage2D = function (...args: any[]) {
-			const last = args[args.length - 1];
+			let last = args[args.length - 1];
+			// Ledger #85 — canvas → ImageBitmap conversion. Wraps a canvas
+			// source's raw pixels into a fresh nx_image_t so the #71
+			// short-circuit below handles it via native
+			// convert_image_source_to_gl_pixels (flipY, format conversion,
+			// premul, colorspace — all done natively, same as an
+			// ImageBitmap made via createImageBitmap). Falls through to
+			// the raw-pixel sourceToPixels path if conversion fails.
+			if (isCanvasSource(last)) {
+				const bmp = canvasToNxImageBitmap(last);
+				if (bmp) {
+					last = bmp;
+					args[args.length - 1] = bmp;
+				}
+			}
 			// Ledger #71 — ImageBitmap passthrough. sourceToPixels always
 			// produces 4-byte RGBA per pixel, but the caller may request a
 			// smaller format (RGB, LUMINANCE, ALPHA, LUMINANCE_ALPHA) or
@@ -746,7 +777,16 @@ function sourceToPixels(src: any): {
 			return nativeTexImage2D.apply(this, args);
 		};
 		p.texSubImage2D = function (...args: any[]) {
-			const last = args[args.length - 1];
+			let last = args[args.length - 1];
+			// Ledger #85 — canvas → ImageBitmap conversion. See texImage2D
+			// above for rationale.
+			if (isCanvasSource(last)) {
+				const bmp = canvasToNxImageBitmap(last);
+				if (bmp) {
+					last = bmp;
+					args[args.length - 1] = bmp;
+				}
+			}
 			// Ledger #71 — same short-circuit as texImage2D above. See there
 			// for rationale.
 			if (last instanceof ImageBitmap) {

@@ -3928,39 +3928,46 @@ if (image instanceof Blob) {
 
 ## #85 — Tier-A: canvas-source short-circuit in the WebGL 1 TexImageSource shim — SHIPPED 2026-07-06
 
-**File(s):** [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) — new canvas-source branch in `sourceToPixels` between the `ImageData` fast path and the OffscreenCanvas draw-rasterize fallback.
+**File(s):** [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) — new `canvasToNxImageBitmap` helper + `isCanvasSource` guard called from the head of both `p.texImage2D` and `p.texSubImage2D` wrappers, converting a canvas source into a fresh `nx_image_t` ImageBitmap that falls through to the existing ledger #71 ImageBitmap short-circuit.
 
 **Motivation.** Post-tier-84c the `textures-canvas-tex-2d-*` cluster (8 tests, one per format+type variant) all TIMEOUT at tier-85 with the same signature: an uncaught `"Image or Canvas expected"` thrown at `nxjs:src/canvas/webgl-rendering-context.ts:642:6` inside `sourceToPixels` and surfaced through the `runtime/src/scripts/cube-route-shim.ts` texImage2D interposer. The test provides a `<canvas>` element painted red-green in a 2D context and passes it as the WebGL 1 TexImageSource-form 6-arg `texImage2D(target, level, IF, format, type, source)`.
 
 The `#70` ledger's `sourceToPixels` unconditionally rasterizes via `new OffscreenCanvas(...).getContext('2d').drawImage(src, 0, 0)`. That `drawImage` binding maps to engine-side `nx_canvas_context_2d_draw_image` (canvas.cc:2481), which only accepts `nx_image_t` (native image/ImageBitmap) or `nx_canvas_t` (native OffscreenCanvas). A brewser-runtime canvas element is neither — it's a `CanvasShim` wrapping the runtime's own 2D compositor — and hits the "Image or Canvas expected" throw. The rejection is spec-legitimate for the native — the shim just needs to avoid asking it.
 
-**Fix.** Detect canvas-like sources by the presence of `getContext` and read pixels directly from the source's OWN 2D backing store — but derive the read dims from `ctx.canvas` (the underlying nxjs OffscreenCanvas), NOT from `src.width` / `src.height`:
+**Fix (v3).** Detect canvas-like sources at the head of the `texImage2D` / `texSubImage2D` wrappers and convert them to a fresh `nx_image_t` ImageBitmap via `$.imageWriteRGBA`, then fall through to the existing #71 ImageBitmap short-circuit. That way native's `convert_image_source_to_gl_pixels` handles **flipY**, **format conversion** (RGBA → LUMINANCE / ALPHA / RGB / packed 16-bit types), **premultiply**, and **colorspace** — same code path that already makes `_from_canvas` (via `createImageBitmap`) pass 8/8.
 
 ```ts
-} else if (typeof src.getContext === 'function') {
+function canvasToNxImageBitmap(src: any): ImageBitmap | null {
     const ctx2d = src.getContext('2d');
-    if (ctx2d && typeof ctx2d.getImageData === 'function') {
-        const inner = (ctx2d as any).canvas;
-        const w = inner ? inner.width : src.width;
-        const h = inner ? inner.height : src.height;
-        id = ctx2d.getImageData(0, 0, w, h) as ImageData;
-    } else {
-        // fall through to OffscreenCanvas draw path (WebGL-typed canvas / unknown ctx)
-    }
+    if (!ctx2d || typeof ctx2d.getImageData !== 'function') return null;
+    const inner = ctx2d.canvas;
+    const w = inner ? inner.width : src.width;
+    const h = inner ? inner.height : src.height;
+    if (!(w > 0 && h > 0)) return null;
+    const id = ctx2d.getImageData(0, 0, w, h);
+    const bmp = proto($.imageNew(w, h), ImageBitmap);
+    $.imageWriteRGBA(bmp, id.data.buffer, true); // premul: unpremul-RGBA → premul-BGRA
+    return bmp;
 }
+
+p.texImage2D = function (...args) {
+    let last = args[args.length - 1];
+    if (isCanvasSource(last)) {
+        const bmp = canvasToNxImageBitmap(last);
+        if (bmp) { last = bmp; args[args.length - 1] = bmp; }
+    }
+    if (last instanceof ImageBitmap) { /* #71 short-circuit */ }
+    /* ... */
+};
 ```
 
-**Why the dim-source split matters.** The WebGL 1 canvas conformance tests exercise the min-size upload case via `ctx.canvas.width = 1; ctx.canvas.height = 2` (see `sdk/tests/js/tests/tex-image-and-sub-image-2d-with-canvas.js` `setCanvasToMin`). That assignment hits the **native OffscreenCanvas width/height setter** — the C `canvas->width` / `canvas->height` update to 1 / 2. But brewser-runtime's `LiveElement` (which is what `src` refers to) tracks its `_width` / `_height` separately, and they stay at the HTML default 300 / 150. If the shim reads dims off `src`:
+**Why the dim source matters.** The WebGL 1 canvas conformance tests exercise the min-size upload case via `ctx.canvas.width = 1; ctx.canvas.height = 2` (see `sdk/tests/js/tests/tex-image-and-sub-image-2d-with-canvas.js` `setCanvasToMin`). That assignment hits the **native OffscreenCanvas width/height setter** — the C `canvas->width` / `canvas->height` update to 1 / 2. But brewser-runtime's `LiveElement` (which is what `src` refers to) tracks its `_width` / `_height` separately, and they stay at the HTML default 300 / 150. Reading dims off `src` gives 300 / 150; native's `getImageData` correctly clips to 1 / 2 and returns 8 bytes; the resulting texture upload reads 180 000 bytes from an 8-byte source. Reading dims from `ctx.canvas` (the OffscreenCanvas, whose `width` getter maps to native `canvas->width`) gives the actual backing dims.
 
-1. `ctx2d.getImageData(0, 0, 300, 150)` — native clips `sw` / `sh` to `canvas->width` / `canvas->height` (1 / 2) and returns an 8-byte ArrayBuffer.
-2. The wrapping TS `getImageData` constructs `new ImageData(clamped_8_bytes, 300, 150)` — nxjs doesn't validate the `data.length !== width*height*4` mismatch, so the `ImageData` claims 300×150 but the buffer is 8 bytes.
-3. The shim's returned struct then tells `nativeTexImage2D` it's uploading a 300×150 texture from an 8-byte source. Native reads 180,000 bytes from that source and gets ~179,992 bytes of out-of-bounds memory. Sampled pixels are garbage.
+**Why the ImageBitmap-conversion route matters.** WebGL 1's `UNPACK_FLIP_Y_WEBGL` / `UNPACK_PREMULTIPLY_ALPHA_WEBGL` / `UNPACK_COLORSPACE_CONVERSION_WEBGL` pixelStore params apply ONLY to TexImageSource uploads (canvas / image / video / ImageBitmap), NOT to raw `ArrayBufferView` uploads. The #70-era `sourceToPixels` path converts the source to raw RGBA bytes and hands them to native as an `ArrayBufferView` — at which point native (correctly, per spec) ignores flipY. That kills any test that exercises flipY on a canvas source (all `textures-canvas-tex-2d-*` tests do). Byte-stride mismatch on non-RGBA formats (ALPHA / LUMINANCE / packed 16-bit) is a second problem the raw-bytes path can't solve.
 
-Reading dims from `ctx.canvas` (the OffscreenCanvas, whose `width` getter maps to native `canvas->width`) gives the shim the actual backing dims. `getImageData(0, 0, 1, 2)` returns an 8-byte buffer that matches, and the 1×2 texture uploads correctly.
+Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `convert_image_source_to_gl_pixels` recognizes, unlocking flipY + format-correct conversion + premul + colorspace — all in one branch. `HTMLImageElement`, `HTMLVideoElement`, SVG images, and other non-canvas sources still hit the OffscreenCanvas rasterize path in `sourceToPixels`, because they don't expose `getContext` (`isCanvasSource` returns false).
 
-Non-premultiplied RGBA is guaranteed by the source's own `getImageData` in the same way #70's OffscreenCanvas round-trip did — the shim's contract with the native (post-shim `args[8] = px.data`, `format` / `type` unchanged) is unchanged. `HTMLImageElement`, `HTMLVideoElement`, SVG images, and any other non-canvas source still hit the OffscreenCanvas rasterize path, because those don't expose `getContext`.
-
-**Scope.** Fixes 8 of 8 `textures-canvas-tex-2d-*` tests. Also unblocks any other test that uploads a canvas source whose backing dims were changed via `ctx.canvas.width` / `.height` after `getContext('2d')` (the LiveElement-wrapper-vs-inner-canvas dim divergence isn't specific to WebGL — anywhere a shim reads dims off the wrapper it'll trip the same trap).
+**Scope.** Fixes 8 of 8 `textures-canvas-tex-2d-*` tests. Likely also cleans up any other test that uploads a canvas source through the WebGL 1 shim — the dim-source-divergence trap (LiveElement wrapper vs inner canvas) isn't specific to WebGL, so this same pattern (`ctx.canvas.width` / `.height` for the actual backing dims) is portable to any future shim that reads pixels off a brewser-runtime canvas element.
 
 **DISPOSITION:** `upstream-candidate`. Any nx.js embedder that presents a non-native canvas element as a TexImageSource will hit this. Upstream nx.js's `sourceToPixels` doesn't handle canvas sources at all today.
 
