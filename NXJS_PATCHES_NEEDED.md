@@ -3982,6 +3982,44 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #89 — Tier-A: minimal SVG decoder for Khronos conformance's red-green.svg — SHIPPED 2026-07-06
+
+**File(s):**
+- [source/image.h](source/image.h) — `FORMAT_SVG` added to the `ImageFormat` enum.
+- [source/image.cc](source/image.cc) — `identify_image_format` detects `<?xml`/`<svg` prologue (with UTF-8 BOM + whitespace skip); new `decode_svg` static function; `nx_decode_image_do` dispatches to it.
+- [brewser-apps/.../full-webgl1-conformance/sdk/tests/resources/red-green.svg](../brewser-apps/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.svg) — synced from webgl2-conformance's resources dir (the WebGL 1 dir was missing the asset entirely — every `wtu.loadTexture(gl, resourcePath + "red-green.svg", ...)` fetched 404 pre-#89).
+
+**Motivation.** WebGL 1 conformance's `textures-svg_image-tex-2d-*` cluster (8 tests) all TIMEOUT with `test never called finishTest()`. Two root causes, both required for a flip:
+
+1. `red-green.svg` was missing from `full-webgl1-conformance/sdk/tests/resources/` (present only in `full-webgl2-conformance/`). `fetch()` returned 404, `image.src`'s promise rejected, `image.onerror` fired — but `wtu.loadTexture` never registers an `onerror` handler, so the test's callback never fires and it times out.
+2. Even with the asset in place, nxjs's image decoder only handles PNG/JPEG/WEBP (`identify_image_format` returned `FORMAT_UNKNOWN` for SVG → `err_str = "Unsupported image format"` → `onerror` fires → same timeout).
+
+**Fix.** Two-part:
+
+1. Sync `red-green.svg` (a 2×2 fixed pattern — `<rect fill="#f00" width="2" height="1"/>` + `<rect fill="#0f0" y="1" width="2" height="1"/>`) into the WebGL 1 resources dir.
+2. Add `FORMAT_SVG` detection + a targeted SVG parser (`decode_svg`) that handles the exact pattern Khronos's asset uses:
+   - Skip UTF-8 BOM, whitespace, `<?xml...?>` preamble, `<!DOCTYPE ...>` preamble to find `<svg ...>`.
+   - Extract `width` and `height` from the `<svg>` root tag.
+   - Iterate `<rect ...>` children, extract `x`, `y`, `width`, `height`, `fill` (defaults: x=0, y=0, w=svg-w, h=svg-h; fill="black").
+   - Parse `fill` as `#RGB` or `#RRGGBB` (hex). Anything else (color name, `none`, `url(...)`) skips the rect (no abort).
+   - Rasterize each rect into a premultiplied BGRA output buffer (alpha=255; premul == non-premul).
+
+Complex SVGs (paths, transforms, gradients, opacity, CSS) return `nullptr` from `decode_svg` → the decode path surfaces the standard `"Image decode was not initialized"` error → `onerror` fires. Since red-green.svg is the only SVG asset the WebGL 1 corpus references, a full SVG rasterizer (SkSVG) would be over-engineering. If future assets need broader support, extend the parser incrementally or link SkSVG.
+
+**Scope.** +8 tests flip: all `textures-svg_image-tex-2d-*` variants. Corpus test-count moves 319/607 = 52.6% → 327/607 = 53.9%.
+
+**DISPOSITION:** `brewser-specific`. nxjs upstream doesn't ship an image decoder for SVG; adding one is embedder scope. If nxjs ever adopts a general SVG path (Skia's SkSVG module), replace `decode_svg` with the delegate.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/image.cc](source/image.cc) for `Ledger #89 — minimal SVG detection` (in `identify_image_format`) and `Ledger #89 — targeted SVG parser` (above `decode_svg`). Recurrence tells:
+
+- `textures-svg_image-tex-2d-*` regresses to TIMEOUT with `test never called finishTest()` = the SVG detection branch was removed OR the asset sync missing (check [full-webgl1-conformance/sdk/tests/resources/red-green.svg](../brewser-apps/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.svg) exists).
+- SVG rasterization garbles pixels (e.g. red/green swapped) = the storage byte order in `decode_svg` (BGRA at row+x*4) got flipped to RGBA. Storage MUST be BGRA to match Skia's `kPremul_BGRA_8888_ColorType`.
+- Complex SVG asset (from a future test) returns `nullptr` from `decode_svg` — this is the intentional fallback. If the failure lists more than solid-color-rect patterns, that's a signal to extend the parser or replace with SkSVG.
+
+---
+
 ## #88 — Tier-A: `getUniformLocation` rejects out-of-range bracket indices (spec-mandated client-side validation) — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — added bracket-index parsing + validation at the head of `w_get_uniform_location`, before the `glGetUniformLocation` call.

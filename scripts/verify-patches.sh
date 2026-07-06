@@ -1368,6 +1368,21 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #89 — Tier-A: minimal SVG decoder for Khronos conformance's red-green.svg
+# (WebGL 1 textures-svg_image-tex-2d-* cluster needs both the asset synced
+# from webgl2 resources AND the engine decode path added).
+check 89 "image.h [tier-a] FORMAT_SVG in ImageFormat enum" \
+    "$NXJS/source/image.h" \
+    'FORMAT_SVG'
+check 89 "image.cc [tier-a] Ledger #89 SVG detection in identify_image_format" \
+    "$NXJS/source/image.cc" \
+    'Ledger #89 — minimal SVG detection'
+check 89 "image.cc [tier-a] Ledger #89 decode_svg parser present" \
+    "$NXJS/source/image.cc" \
+    'Ledger #89 — targeted SVG parser'
+check_file_exists 89 "brewser-apps [tier-a] webgl1 red-green.svg synced from webgl2 resources" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.svg"
+
 # #88 — Tier-A: getUniformLocation rejects out-of-range bracket indices
 # (client-side WebGL 1 spec validation for the driver-leniency case where
 # Mesa-Nouveau wraps uint32 index overflow instead of returning null).

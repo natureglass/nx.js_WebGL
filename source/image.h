@@ -3,7 +3,7 @@
 #include <png.h>
 #include <webp/decode.h>
 
-enum ImageFormat { FORMAT_PNG, FORMAT_JPEG, FORMAT_WEBP, FORMAT_UNKNOWN };
+enum ImageFormat { FORMAT_PNG, FORMAT_JPEG, FORMAT_WEBP, FORMAT_SVG, FORMAT_UNKNOWN };
 
 // Decoded image: `data` is premultiplied BGRA (byte order B,G,R,A), width*4
 // stride. canvas.cc wraps `data` in an SkImage at draw time.

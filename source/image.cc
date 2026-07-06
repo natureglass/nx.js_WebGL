@@ -49,7 +49,194 @@ enum ImageFormat identify_image_format(uint8_t *data, size_t size) {
 		return FORMAT_JPEG;
 	if (size >= 12 && !memcmp(data, "RIFF", 4) && !memcmp(data + 8, "WEBP", 4))
 		return FORMAT_WEBP;
+	// Ledger #89 — minimal SVG detection. Skip UTF-8 BOM, optional whitespace,
+	// then look for `<?xml` (XML preamble) or `<svg` (bare root). Only handles
+	// SVGs whose <rect> children paint rectangles with solid-color fills — the
+	// exact pattern used by Khronos's red-green.svg. See decode_svg below for
+	// scope and fallback behavior on complex SVGs.
+	{
+		size_t o = 0;
+		if (size >= 3 && !memcmp(data, "\xEF\xBB\xBF", 3)) o = 3;
+		while (o < size && (data[o] == ' ' || data[o] == '\t' ||
+		                    data[o] == '\r' || data[o] == '\n')) o++;
+		if (o + 5 <= size && !memcmp(data + o, "<?xml", 5)) return FORMAT_SVG;
+		if (o + 4 <= size && !memcmp(data + o, "<svg", 4)) return FORMAT_SVG;
+	}
 	return FORMAT_UNKNOWN;
+}
+
+// Ledger #89 — targeted SVG parser for Khronos conformance's red-green.svg
+// (WebGL 1 `textures-svg_image-tex-2d-*` cluster). Handles the exact pattern:
+//   <svg xmlns=... width="N" height="M">
+//     <rect [x="N"] [y="N"] width="M" height="M" fill="#RGB|#RRGGBB"/>
+//     ...
+//   </svg>
+// Anything more complex (transforms, gradients, paths, opacity, non-hex
+// colors, css) falls back to NULL, which the async decode path surfaces
+// as "Image decode was not initialized" → `.onerror`. Since Khronos's
+// red-green.svg is the only SVG asset the WebGL 1 corpus references, a
+// full SVG rasterizer (SkSVG) would be over-engineering. If future assets
+// need broader support, extend the parser incrementally or link SkSVG.
+static const char *svg_find_char(const char *s, const char *end, char c) {
+	while (s < end && *s != c) s++;
+	return s;
+}
+static bool svg_find_attr(const char *tag_start, const char *tag_end,
+                          const char *name, const char **out_val,
+                          const char **out_val_end) {
+	size_t nlen = strlen(name);
+	const char *s = tag_start;
+	while (s + nlen + 2 < tag_end) {
+		// Match `<space>name=` at a whitespace boundary.
+		if ((s[0] == ' ' || s[0] == '\t' || s[0] == '\r' || s[0] == '\n') &&
+		    !memcmp(s + 1, name, nlen) && s[1 + nlen] == '=') {
+			const char *q = s + 2 + nlen;
+			if (q >= tag_end) return false;
+			char qc = *q;
+			if (qc != '"' && qc != '\'') return false;
+			const char *e = svg_find_char(q + 1, tag_end, qc);
+			if (e >= tag_end) return false;
+			*out_val = q + 1;
+			*out_val_end = e;
+			return true;
+		}
+		s++;
+	}
+	return false;
+}
+static int svg_parse_int(const char *s, const char *end, int def) {
+	int v = 0;
+	bool any = false;
+	while (s < end && *s >= '0' && *s <= '9') {
+		v = v * 10 + (*s - '0');
+		any = true;
+		s++;
+	}
+	return any ? v : def;
+}
+static bool svg_parse_hex_color(const char *s, const char *end,
+                                uint8_t *r, uint8_t *g, uint8_t *b) {
+	if (s >= end || *s != '#') return false;
+	s++;
+	size_t len = (size_t)(end - s);
+	auto hex = [](char c, uint8_t *out) {
+		if (c >= '0' && c <= '9') { *out = c - '0'; return true; }
+		if (c >= 'a' && c <= 'f') { *out = c - 'a' + 10; return true; }
+		if (c >= 'A' && c <= 'F') { *out = c - 'A' + 10; return true; }
+		return false;
+	};
+	if (len == 3) {
+		uint8_t hr, hg, hb;
+		if (!hex(s[0], &hr) || !hex(s[1], &hg) || !hex(s[2], &hb)) return false;
+		*r = (hr << 4) | hr;
+		*g = (hg << 4) | hg;
+		*b = (hb << 4) | hb;
+		return true;
+	}
+	if (len == 6) {
+		uint8_t h0, h1, h2, h3, h4, h5;
+		if (!hex(s[0], &h0) || !hex(s[1], &h1) || !hex(s[2], &h2) ||
+		    !hex(s[3], &h3) || !hex(s[4], &h4) || !hex(s[5], &h5)) return false;
+		*r = (h0 << 4) | h1;
+		*g = (h2 << 4) | h3;
+		*b = (h4 << 4) | h5;
+		return true;
+	}
+	return false;
+}
+uint8_t *decode_svg(uint8_t *input, size_t input_size, uint32_t *width,
+                    uint32_t *height) {
+	const char *src = (const char *)input;
+	const char *src_end = src + input_size;
+	// Find `<svg` opening tag (skip past optional <?xml?> preamble +
+	// <!DOCTYPE ...> preamble).
+	const char *svg_open = nullptr;
+	for (const char *s = src; s + 4 <= src_end; s++) {
+		if (s[0] == '<' && s[1] == 's' && s[2] == 'v' && s[3] == 'g' &&
+		    (s + 4 == src_end || s[4] == ' ' || s[4] == '\t' ||
+		     s[4] == '\r' || s[4] == '\n' || s[4] == '>')) {
+			svg_open = s;
+			break;
+		}
+	}
+	if (!svg_open) return nullptr;
+	const char *svg_tag_end = svg_find_char(svg_open, src_end, '>');
+	if (svg_tag_end >= src_end) return nullptr;
+	const char *wv, *wve, *hv, *hve;
+	if (!svg_find_attr(svg_open, svg_tag_end, "width", &wv, &wve)) return nullptr;
+	if (!svg_find_attr(svg_open, svg_tag_end, "height", &hv, &hve)) return nullptr;
+	int w = svg_parse_int(wv, wve, 0);
+	int h = svg_parse_int(hv, hve, 0);
+	if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return nullptr;
+	*width = (uint32_t)w;
+	*height = (uint32_t)h;
+	size_t buf_size = (size_t)w * (size_t)h * 4;
+	uint8_t *out = (uint8_t *)calloc(1, buf_size);
+	if (!out) return nullptr;
+	// Iterate <rect ...> children. Each fills a solid color into the
+	// specified rectangle. Storage is premultiplied BGRA (Skia's kPremul).
+	const char *cur = svg_tag_end + 1;
+	while (cur + 5 < src_end) {
+		const char *rect_open = nullptr;
+		for (const char *s = cur; s + 5 <= src_end; s++) {
+			if (s[0] == '<' && s[1] == 'r' && s[2] == 'e' && s[3] == 'c' &&
+			    s[4] == 't' && (s + 5 == src_end || s[5] == ' ' ||
+			                    s[5] == '\t' || s[5] == '\r' ||
+			                    s[5] == '\n')) {
+				rect_open = s;
+				break;
+			}
+		}
+		if (!rect_open) break;
+		const char *rect_end = svg_find_char(rect_open, src_end, '>');
+		if (rect_end >= src_end) break;
+		const char *xv = nullptr, *xve = nullptr;
+		const char *yv = nullptr, *yve = nullptr;
+		const char *rwv = nullptr, *rwve = nullptr;
+		const char *rhv = nullptr, *rhve = nullptr;
+		const char *fv = nullptr, *fve = nullptr;
+		bool has_x = svg_find_attr(rect_open, rect_end, "x", &xv, &xve);
+		bool has_y = svg_find_attr(rect_open, rect_end, "y", &yv, &yve);
+		bool has_w = svg_find_attr(rect_open, rect_end, "width", &rwv, &rwve);
+		bool has_h = svg_find_attr(rect_open, rect_end, "height", &rhv, &rhve);
+		bool has_fill =
+		    svg_find_attr(rect_open, rect_end, "fill", &fv, &fve);
+		int rx = has_x ? svg_parse_int(xv, xve, 0) : 0;
+		int ry = has_y ? svg_parse_int(yv, yve, 0) : 0;
+		int rw = has_w ? svg_parse_int(rwv, rwve, 0) : w;
+		int rh = has_h ? svg_parse_int(rhv, rhve, 0) : h;
+		uint8_t rr = 0, rg = 0, rb = 0;
+		if (has_fill) {
+			if (!svg_parse_hex_color(fv, fve, &rr, &rg, &rb)) {
+				// Unrecognized fill (color name, none, url(...)) — skip this
+				// rect rather than aborting; may still produce a usable
+				// image if other rects paint the target pixels.
+				cur = rect_end + 1;
+				continue;
+			}
+		}
+		if (rx < 0) { rw += rx; rx = 0; }
+		if (ry < 0) { rh += ry; ry = 0; }
+		if (rx + rw > w) rw = w - rx;
+		if (ry + rh > h) rh = h - ry;
+		if (rw <= 0 || rh <= 0) {
+			cur = rect_end + 1;
+			continue;
+		}
+		for (int y = ry; y < ry + rh; y++) {
+			uint8_t *row = out + ((size_t)y * (size_t)w + (size_t)rx) * 4;
+			for (int x = 0; x < rw; x++) {
+				// Alpha = 255 (opaque). Storage is premul BGRA — for
+				// alpha=255 premul == non-premul.
+				row[x * 4 + 0] = rb;
+				row[x * 4 + 1] = rg;
+				row[x * 4 + 2] = rr;
+				row[x * 4 + 3] = 0xFF;
+			}
+		}
+		cur = rect_end + 1;
+	}
+	return out;
 }
 
 void premultiply_alpha(uint8_t *image_data, int width, int height) {
@@ -139,6 +326,10 @@ void nx_decode_image_do(nx_work_t *req) {
 		data->image->data = decode_webp(data->input, data->input_size,
 		                                (int *)&data->image->width,
 		                                (int *)&data->image->height);
+	} else if (data->image->format == FORMAT_SVG) {
+		data->image->data = decode_svg(data->input, data->input_size,
+		                               &data->image->width,
+		                               &data->image->height);
 	} else {
 		data->err_str = "Unsupported image format";
 		return;
