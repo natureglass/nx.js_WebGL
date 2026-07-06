@@ -1368,6 +1368,15 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #101 — Tier-A: WEBGL_depth_texture spec §4.1 texImage2D + texSubImage2D
+# constraints (target / level / pixels for DEPTH_COMPONENT / DEPTH_STENCIL).
+check 101 "webgl.cc [tier-a] w_tex_image_2d depth-format gate" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #101 — WEBGL_depth_texture'
+check 101 "webgl.cc [tier-a] w_tex_sub_image_2d depth-format gate present" \
+    "$NXJS/source/webgl.cc" \
+    'Depth textures MUST be uploaded via texImage2D'
+
 # #100 — Tier-A: getRenderbufferParameter native + INVALID_FRAMEBUFFER_
 # OPERATION client-side gate on draw/read/clear over incomplete FBOs.
 check 100 "webgl.cc [tier-a] w_get_renderbuffer_parameter FN present" \

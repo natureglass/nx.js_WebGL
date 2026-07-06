@@ -3312,6 +3312,30 @@ FN(w_tex_image_2d) {
 		len = ab->ByteLength();
 	}
 	if (info[8]->IsNullOrUndefined()) pixels = nullptr;
+	// Ledger #101 — WEBGL_depth_texture (WebGL 1) spec §4.1: texImage2D
+	// with format ∈ {DEPTH_COMPONENT, DEPTH_STENCIL} has three additional
+	// constraints beyond the base spec (Mesa Nouveau's ES3.2 native
+	// accepts all these silently):
+	//   - target MUST be TEXTURE_2D. Cube-face targets → INVALID_OPERATION.
+	//   - level MUST be 0. Non-zero level → INVALID_OPERATION.
+	//   - pixels MUST be null. Non-null pixels → INVALID_OPERATION.
+	// v2 (WebGL 2 / ES3) lifts these; the gate is v1-only.
+	if (!is_v2_context(info) &&
+	    (format == 0x1902 /* DEPTH_COMPONENT */ ||
+	     format == 0x84F9 /* DEPTH_STENCIL */)) {
+		if (target != GL_TEXTURE_2D) {
+			record_error(GL_INVALID_OPERATION);
+			return;
+		}
+		if (level != 0) {
+			record_error(GL_INVALID_OPERATION);
+			return;
+		}
+		if (pixels != nullptr) {
+			record_error(GL_INVALID_OPERATION);
+			return;
+		}
+	}
 	// Ledger #69 — ImageBitmap / Image (nx_image_t) source. If the JS arg
 	// wraps an nx_image_t, override width/height from the source (WebGL
 	// spec: source dimensions win for TexImageSource overloads) and
@@ -3363,6 +3387,17 @@ FN(w_tex_sub_image_2d) {
 	GLsizei height = a_i32(info, 5);
 	GLenum format = a_u32(info, 6);
 	GLenum type = a_u32(info, 7);
+	// Ledger #101 — WEBGL_depth_texture (WebGL 1) spec §4.1: texSubImage2D
+	// with format ∈ {DEPTH_COMPONENT, DEPTH_STENCIL} is INVALID_OPERATION.
+	// Depth textures MUST be uploaded via texImage2D with pixels=null;
+	// the driver renders into them via a depth-attachment FBO. Sub-upload
+	// would require format conversion the driver can't do. v2 unchanged.
+	if (!is_v2_context(info) &&
+	    (format == 0x1902 /* DEPTH_COMPONENT */ ||
+	     format == 0x84F9 /* DEPTH_STENCIL */)) {
+		record_error(GL_INVALID_OPERATION);
+		return;
+	}
 	size_t len = 0;
 	void *pixels = view_bytes(info[8], &len);
 	if (info[8]->IsArrayBuffer()) {

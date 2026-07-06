@@ -4037,6 +4037,55 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #101 — Tier-A: `WEBGL_depth_texture` texImage2D / texSubImage2D constraints (target / level / pixels for depth formats) — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — added gates at the head of `w_tex_image_2d` and `w_tex_sub_image_2d`, active only for `!is_v2_context(info)` and format ∈ {`DEPTH_COMPONENT`, `DEPTH_STENCIL`}.
+
+**Motivation.** `extensions-webgl-depth-texture` (WebGL 1 conformance, p=303 f=110) enables the `WEBGL_depth_texture` extension and probes the spec-mandated validation gates that WebGL 1 requires beyond ES3 core. Mesa Nouveau's ES3.2 native accepts all the "should-be-rejected" cases silently, so the assertions expecting `INVALID_OPERATION` fire NO_ERROR from `getError`:
+
+- `texImage2D(TEXTURE_CUBE_MAP_POSITIVE_X, 0, DEPTH_COMPONENT, ...)` — cube-face target with depth format (12 fails × ~7 sites).
+- `texImage2D(TEXTURE_2D, 1, DEPTH_COMPONENT, ...)` — non-zero level (12 fails).
+- `texImage2D(TEXTURE_2D, 0, DEPTH_COMPONENT, ..., new Uint16Array(1))` — non-null pixels (12 fails).
+- `texSubImage2D(TEXTURE_2D, 0, 0, 0, 1, 1, DEPTH_COMPONENT, ..., new Uint16Array(1))` — subimage on depth format (12 fails).
+
+Per the extension spec §4.1: "Calls to texImage2D with format equal to DEPTH_COMPONENT or DEPTH_STENCIL with data other than null generates the error INVALID_OPERATION. ... The target must be TEXTURE_2D. ... The level must be 0. ... texSubImage2D and copySubImage2D calls to a depth texture generate INVALID_OPERATION."
+
+**Fix.** Client-side gates on `w_tex_image_2d` and `w_tex_sub_image_2d`.
+
+```cpp
+// texImage2D:
+if (!is_v2_context(info) &&
+    (format == 0x1902 /* DEPTH_COMPONENT */ ||
+     format == 0x84F9 /* DEPTH_STENCIL */)) {
+    if (target != GL_TEXTURE_2D) { record_error(GL_INVALID_OPERATION); return; }
+    if (level != 0)               { record_error(GL_INVALID_OPERATION); return; }
+    if (pixels != nullptr)        { record_error(GL_INVALID_OPERATION); return; }
+}
+
+// texSubImage2D:
+if (!is_v2_context(info) &&
+    (format == 0x1902 || format == 0x84F9)) {
+    record_error(GL_INVALID_OPERATION);
+    return;
+}
+```
+
+Both gates are v1-only — WebGL 2 (ES3 core) removes these restrictions.
+
+**Scope.** Expected +48 assertion flips (12 × 4 gate variants) on the target test. Corresponding `copyTexSubImage2D` fails against depth textures NOT covered by this ledger — would require per-texture format tracking to know when the destination is a depth texture. Deferred as follow-up.
+
+**DISPOSITION:** `upstream-candidate`. Pure WebGL 1 spec conformance. Upstream nx.js has the same gap on WEBGL_depth_texture constraints.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #101 — WEBGL_depth_texture`. Recurrence tells:
+
+- `extensions-webgl-depth-texture` regresses to `getError expected: INVALID_OPERATION. Was NO_ERROR : after evaluating: gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.DEPTH_COMPONENT, ...)` = the `target != GL_TEXTURE_2D` branch was removed. Grep the head of `w_tex_image_2d` for the `format == 0x1902 || format == 0x84F9` gate.
+- Same test regresses on `texSubImage2D(TEXTURE_2D, ...)` calls = the `w_tex_sub_image_2d` gate was removed.
+- An app legitimately calls `texImage2D(TEXTURE_2D, 0, DEPTH_COMPONENT, ...)` with pixels=null and gets `INVALID_OPERATION` = my `pixels != nullptr` check has an off-by-one and treats `null` as non-null. Verify `pixels` starts as `nullptr` from `view_bytes(info[8], ...)` when info[8] is null.
+
+---
+
 ## #100 — Tier-A: `getRenderbufferParameter` native + `INVALID_FRAMEBUFFER_OPERATION` client-side gate on draw/read/clear over incomplete FBOs — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `w_get_renderbuffer_parameter` FN + registration in v1 and v2 method tables; new `nx_fbo_complete_or_record_error()` helper (calls `glCheckFramebufferStatus(GL_FRAMEBUFFER)` when `bound_fbo_js != 0` and records `INVALID_FRAMEBUFFER_OPERATION` on non-`FRAMEBUFFER_COMPLETE`); gate inserted at the head of `w_clear`, `w_draw_arrays`, `w_draw_elements`, `w_read_pixels`.
