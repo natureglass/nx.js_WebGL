@@ -1368,6 +1368,15 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #87 — Tier-A: gate WEBGL_multi_draw advertisement on GL_ANGLE_multi_draw
+# (gl_DrawID capability) so we don't advertise a spec-incomplete extension.
+check 87 "webgl.cc [tier-a] Ledger #87 header comment" \
+    "$NXJS/source/webgl.cc" \
+    "Ledger #87 — WEBGL_multi_draw's Khronos spec REQUIRES gl_DrawID"
+check 87 "webgl.cc [tier-a] gate requires GL_ANGLE_multi_draw" \
+    "$NXJS/source/webgl.cc" \
+    'has_native_ext\("GL_ANGLE_multi_draw"\)'
+
 # #86 — Tier-A: page scripts share ONE AsyncFunction scope so cross-script
 # eval() sees top-level var / const / let. Runtime-side ledger (canvas-runner.ts
 # in brewser-runtime-v8) — MOVED pointer in NXJS_PATCHES_NEEDED.md.

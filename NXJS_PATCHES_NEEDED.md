@@ -3982,6 +3982,30 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #87 — Tier-A: gate `WEBGL_multi_draw` advertisement on `GL_ANGLE_multi_draw` (gl_DrawID capability) — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — two-site change: `getExtension('WEBGL_multi_draw')` and `getSupportedExtensions` now BOTH require `has_native_ext("GL_ANGLE_multi_draw")` in addition to `has_native_ext("GL_EXT_multi_draw_arrays")`.
+
+**Motivation.** WebGL 1 conformance's `extensions-webgl-multi-draw` test alone contributed **7,728 failing assertions** to the corpus at tier-88 (out of 15,776 total assertions in the test). Root cause: WEBGL_multi_draw's Khronos extension spec MUST provide `gl_DrawID` as a built-in `int` in the vertex shader. Mesa Nouveau on Tegra exposes `GL_EXT_multi_draw_arrays` (which gives glMultiDrawArraysEXT etc., fine for the C-side loop shims) but NOT `GL_ANGLE_multi_draw` — the extension where `gl_DrawID` is actually declared for shaders.
+
+Pre-#87 the engine advertised `WEBGL_multi_draw` on `GL_EXT_multi_draw_arrays` alone. Every conformance shader with `#extension GL_ANGLE_multi_draw : require` (four vshaders in the test: `vshaderIllegalDrawID`, `vshaderDrawIDZero`, `vshaderWithDrawID`, plus one via `require`) failed to compile — `error: gl_DrawID undeclared`. Program link cascaded; every subsequent draw produced garbage; the ~7,600 `multiDrawElementsInstancedWithNonzeroOffsets instanced (X,Y)` pixel-check assertions all FAILed.
+
+**Fix.** Add `&& has_native_ext("GL_ANGLE_multi_draw")` to both gates. On drivers without gl_DrawID support (Mesa Nouveau, most non-Angle backends), `WEBGL_multi_draw` is now absent from both `getExtension` and `getSupportedExtensions`. The test's `runSupportedTest` sees "not listed as supported AND getExtension failed" → `testPassed(extensionName + ' not listed as supported and getExtension failed -- this is legal')` → early `return` → `finishTest()` → PASS. On Angle-backed drivers (Chrome's ANGLE, WebKit's Metal path) that DO expose GL_ANGLE_multi_draw, the extension stays advertised and the four `w_multi_draw_*` loop shims continue to work as before.
+
+**Scope.** +1 test flip (extensions-webgl-multi-draw: FAIL → PASS). Corpus assertion counts drop by 87 pass + 7,728 fail (the test no longer runs its full body). Test-level pass rate moves 301/607 = 49.6% → 302/607 = 49.8%; assertion pass rate moves noticeably in the tracker's overall summary. Un-advertising is spec-correct: the WEBGL_multi_draw spec forbids advertisement without gl_DrawID.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder running on a driver without GL_ANGLE_multi_draw would hit the same spurious-advertisement bug. Upstream nx.js has the same gate.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #87 — WEBGL_multi_draw's Khronos spec REQUIRES gl_DrawID`. Recurrence tells:
+
+- `extensions-webgl-multi-draw` regresses to FAIL with ~7,700 failing assertions and `error: gl_DrawID undeclared` in the shader-compile section = the `&& has_native_ext("GL_ANGLE_multi_draw")` gate was removed at either the `getExtension` site or the `getSupportedExtensions` site (both must be gated in lockstep).
+- `extensions-webgl-multi-draw` PASSes with p=1 f=0 (only the "not supported... legal" assertion) — this is the expected post-#87 outcome. Do NOT interpret this as the extension being fully implemented; it just means we correctly don't advertise it.
+- App that uses WEBGL_multi_draw *without* gl_DrawID silently loses functionality — expected trade-off. If the app doesn't need gl_DrawID and the driver has EXT_multi_draw_arrays, an app-side polyfill via a `for` loop of `gl.drawArrays` is a one-liner.
+
+---
+
 ## #86 — MOVED → RUNTIME_SHIMS.md
 
 Page scripts share ONE AsyncFunction scope so cross-script `eval()` sees top-level `var` / `const` / `let`. Refactors `runPageScripts.execAll` in `canvas-runner.ts` to concatenate all `<script>` bodies (inline + `src`-fetched) into a single AsyncFunction body separated by `\n;__b();\n`, where `__b` is a between-scripts hook parameter that runs the GL reset + WebGL readback the OLD per-script loop did between iterations. Matches the browser's realm-Script scope semantics for classic `<script>` tags — required for Khronos WebGL conformance harnesses whose shared helpers `eval(...)` strings referencing test-scope vars. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#86).

@@ -1737,8 +1737,18 @@ FN(w_get_extension) {
 		record_ext_enabled(name);
 		return;
 	}
+	// Ledger #87 — WEBGL_multi_draw's Khronos spec REQUIRES gl_DrawID in
+	// the vertex shader. Mesa Nouveau on Tegra exposes GL_EXT_multi_draw_
+	// arrays (fine for the C-side loop shims below) but NOT
+	// GL_ANGLE_multi_draw (which is where gl_DrawID actually lives). Gating
+	// on both keeps our advertisement honest: only expose the extension
+	// when the driver can back it end-to-end. Pre-#87, we advertised on
+	// EXT alone and any test with `#extension GL_ANGLE_multi_draw :
+	// require` failed shader compile → 7,728 downstream pixel-check FAILs
+	// in the conformance corpus.
 	if (strcmp(name, "WEBGL_multi_draw") == 0 &&
-	    has_native_ext("GL_EXT_multi_draw_arrays")) {
+	    has_native_ext("GL_EXT_multi_draw_arrays") &&
+	    has_native_ext("GL_ANGLE_multi_draw")) {
 		Local<Object> o = Object::New(iso);
 		auto FN_ = [&](const char *n, FunctionCallback fn) {
 			o->Set(c, String::NewFromUtf8(iso, n).ToLocalChecked(),
@@ -1935,7 +1945,10 @@ FN(w_get_supported_extensions) {
 		out.push_back("EXT_polygon_offset_clamp");
 	if (has_native_ext("GL_KHR_parallel_shader_compile"))
 		out.push_back("KHR_parallel_shader_compile");
-	if (has_native_ext("GL_EXT_multi_draw_arrays"))
+	// Ledger #87 — WEBGL_multi_draw requires gl_DrawID via GL_ANGLE_multi_draw;
+	// GL_EXT_multi_draw_arrays alone is not spec-conforming.
+	if (has_native_ext("GL_EXT_multi_draw_arrays") &&
+	    has_native_ext("GL_ANGLE_multi_draw"))
 		out.push_back("WEBGL_multi_draw");
 	if (has_native_ext("GL_EXT_blend_func_extended"))
 		out.push_back("WEBGL_blend_func_extended");
