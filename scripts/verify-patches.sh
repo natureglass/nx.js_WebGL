@@ -1368,6 +1368,19 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #86 — Tier-A: page scripts share ONE AsyncFunction scope so cross-script
+# eval() sees top-level var / const / let. Runtime-side ledger (canvas-runner.ts
+# in brewser-runtime-v8) — MOVED pointer in NXJS_PATCHES_NEEDED.md.
+check 86 "canvas-runner.ts [tier-a] Ledger #86 header comment" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    'Ledger #86 — run all page scripts in one shared AsyncFunction'
+check 86 "canvas-runner.ts [tier-a] scripts concatenated with __b() separator" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    "bodies\\.join\\(.\\\\n;__b\\(\\);\\\\n."
+check 86 "canvas-runner.ts [tier-a] AsyncFunctionCtor called with __b parameter" \
+    "$RUNTIME/src/scripts/canvas-runner.ts" \
+    "new AsyncFunctionCtor\\("
+
 # #85 — Tier-A: canvas-source short-circuit in the WebGL 1 TexImageSource shim
 # (canvasToNxImageBitmap wraps a canvas source's raw pixels into a fresh
 # nx_image_t, then falls through to the existing #71 ImageBitmap short-circuit

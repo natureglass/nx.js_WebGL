@@ -3982,6 +3982,12 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #86 — MOVED → RUNTIME_SHIMS.md
+
+Page scripts share ONE AsyncFunction scope so cross-script `eval()` sees top-level `var` / `const` / `let`. Refactors `runPageScripts.execAll` in `canvas-runner.ts` to concatenate all `<script>` bodies (inline + `src`-fetched) into a single AsyncFunction body separated by `\n;__b();\n`, where `__b` is a between-scripts hook parameter that runs the GL reset + WebGL readback the OLD per-script loop did between iterations. Matches the browser's realm-Script scope semantics for classic `<script>` tags — required for Khronos WebGL conformance harnesses whose shared helpers `eval(...)` strings referencing test-scope vars. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#86).
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches
