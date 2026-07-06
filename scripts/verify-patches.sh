@@ -1368,6 +1368,22 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #92 — Tier-A: per-context WebGL object wrapper cache (identity
+# preservation). new_gl_obj cache-first + delete_* erasures +
+# object-returning w_get_parameter cases.
+check 92 "webgl.cc [tier-a] Ledger #92 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #92 — per-context wrapper cache'
+check 92 "webgl.cc [tier-a] wrapper_cache field on WebGLState" \
+    "$NXJS/source/webgl.cc" \
+    'std::unordered_map<uint64_t, Global<Object>> wrapper_cache'
+check 92 "webgl.cc [tier-a] erase_wrapper_cache helper defined" \
+    "$NXJS/source/webgl.cc" \
+    'inline void erase_wrapper_cache'
+check 92 "webgl.cc [tier-a] w_get_parameter has ARRAY_BUFFER_BINDING case" \
+    "$NXJS/source/webgl.cc" \
+    "case 0x8894 /\\* GL_ARRAY_BUFFER_BINDING \\*/"
+
 # #91 — Tier-A: WebGL 1 NPOT texture restrictions (generateMipmap /
 # texImage2D level>0 / copyTexImage2D level>0) per §5.14.8.
 check 91 "webgl.cc [tier-a] Ledger #91 header comment" \

@@ -183,6 +183,24 @@ struct WebGLState {
 	int height = 360;
 	// Prototypes for the WebGL object classes (set by $.webglInitClass).
 	Global<Object> protos[K_COUNT];
+	// Ledger #92 — per-context wrapper cache. WebGL spec requires that
+	// querying an object binding (e.g. `gl.getParameter(ELEMENT_ARRAY_
+	// BUFFER_BINDING)`, `gl.getVertexAttrib(n, VERTEX_ATTRIB_ARRAY_BUFFER_
+	// BINDING)`, `gl.getParameter(CURRENT_PROGRAM)`, etc.) return the SAME
+	// JS wrapper object that was originally handed out by
+	// `gl.createBuffer()` / `gl.createProgram()` / etc. Pre-#92 the engine
+	// created a FRESH wrapper on every call, so `getX() == originalX`
+	// returned false even when the GL names matched — this failed
+	// `extensions-oes-vertex-array-object`'s state-preservation checks and
+	// any other test that identity-compares WebGL objects. Key packs the
+	// object kind (K_BUFFER etc.) into the high 32 bits and the GLuint
+	// name into the low 32; storage is a strong Global so the wrapper
+	// survives until an explicit `delete<X>` (which erases the entry) or
+	// the context tears down. Uniform locations, active-info, and shader-
+	// precision-format objects don't cache — they're transient / not
+	// name-identified. Sync objects use pointers not GLuints; excluded
+	// too (would need a separate map keyed on the pointer).
+	std::unordered_map<uint64_t, Global<Object>> wrapper_cache;
 	// Ledger #67 — set of extension names for which `getExtension(name)` has
 	// been called with a non-null return, i.e. the extension is enabled on
 	// this context. Extension-gated getParameter pnames MUST return null
@@ -358,8 +376,38 @@ static bool is_v2_context(const FunctionCallbackInfo<Value> &info) {
 
 void free_gl_obj(GLObj *o) { delete o; }
 
+// Ledger #92 — wrapper cache key/lookup helpers. `cache_key` packs kind
+// into high 32 + id into low 32. `is_cacheable_kind` gates out kinds
+// that shouldn't be cached (uniform-locations use `loc` not `id`; active-
+// info / shader-precision-format are transient value objects; sync
+// objects use pointers not GLuint names).
+static inline uint64_t cache_key(uint8_t kind, GLuint id) {
+	return ((uint64_t)kind << 32) | (uint64_t)id;
+}
+static inline bool is_cacheable_kind(uint8_t kind) {
+	return kind != K_UNIFORM_LOCATION && kind != K_ACTIVE_INFO &&
+	       kind != K_SHADER_PRECISION_FORMAT && kind != K_SYNC;
+}
+// Erase a `(kind, id)` entry from the wrapper cache. Called from every
+// gl.delete<X>() natives so the JS wrapper reference stops keeping the
+// (now-deleted) GL name alive on the JS side. If a subsequent
+// gl.createBuffer() happens to reuse the same GL name (spec-legal), the
+// re-created wrapper populates a fresh cache entry.
+static inline void erase_wrapper_cache(uint8_t kind, GLuint id) {
+	if (st && id != 0 && is_cacheable_kind(kind))
+		st->wrapper_cache.erase(cache_key(kind, id));
+}
 Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
                          GLint loc = -1) {
+	// Ledger #92 — cache-first lookup for identity preservation. Same
+	// (kind, id) always returns the same JS wrapper across gl.getParameter
+	// / gl.getVertexAttrib / gl.getFramebufferAttachmentParameter / etc.
+	if (st && id != 0 && is_cacheable_kind(kind)) {
+		auto it = st->wrapper_cache.find(cache_key(kind, id));
+		if (it != st->wrapper_cache.end() && !it->second.IsEmpty()) {
+			return it->second.Get(iso);
+		}
+	}
 	Local<Object> obj = nx::NewWrapped(iso);
 	if (st && !st->protos[kind].IsEmpty()) {
 		obj->SetPrototype(iso->GetCurrentContext(), st->protos[kind].Get(iso))
@@ -367,6 +415,9 @@ Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
 	}
 	GLObj *o = new GLObj{id, loc, kind};
 	nx::Wrap<GLObj>(iso, obj, o, free_gl_obj);
+	if (st && id != 0 && is_cacheable_kind(kind)) {
+		st->wrapper_cache.emplace(cache_key(kind, id), Global<Object>(iso, obj));
+	}
 	return obj;
 }
 
@@ -1043,6 +1094,62 @@ FN(w_get_parameter) {
 		GLint v = 0;
 		glGetIntegerv(pname, &v);
 		info.GetReturnValue().Set(Int32::New(iso, v));
+		return;
+	}
+	// Ledger #92 — object-returning pnames. WebGL spec: these queries
+	// return a WebGLBuffer / WebGLProgram / WebGLTexture / WebGLFramebuffer
+	// / WebGLRenderbuffer / WebGLVertexArrayObject wrapper (or `null`
+	// when nothing is bound). Pre-#92 they fell through to the default
+	// integer branch and callers got raw GLuint numbers — every
+	// `bindingObj == originalObj` identity check in the corpus failed.
+	// The wrapper cache in `new_gl_obj` ensures returned wrappers are the
+	// SAME JS object handed out by the original `gl.create<X>()` call.
+	case 0x8894 /* GL_ARRAY_BUFFER_BINDING */:
+	case 0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(new_gl_obj(iso, K_BUFFER, (GLuint)v));
+		return;
+	}
+	case 0x8B8D /* GL_CURRENT_PROGRAM */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(new_gl_obj(iso, K_PROGRAM, (GLuint)v));
+		return;
+	}
+	case 0x8069 /* GL_TEXTURE_BINDING_2D */:
+	case 0x8514 /* GL_TEXTURE_BINDING_CUBE_MAP */:
+	case 0x8C1D /* GL_TEXTURE_BINDING_2D_ARRAY (v2) */:
+	case 0x806A /* GL_TEXTURE_BINDING_3D (v2) */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(new_gl_obj(iso, K_TEXTURE, (GLuint)v));
+		return;
+	}
+	case 0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING == GL_FRAMEBUFFER_BINDING */:
+	case 0x8CAA /* GL_READ_FRAMEBUFFER_BINDING (v2) */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(new_gl_obj(iso, K_FRAMEBUFFER, (GLuint)v));
+		return;
+	}
+	case 0x8CA7 /* GL_RENDERBUFFER_BINDING */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(new_gl_obj(iso, K_RENDERBUFFER, (GLuint)v));
+		return;
+	}
+	case 0x85B5 /* GL_VERTEX_ARRAY_BINDING (also VERTEX_ARRAY_BINDING_OES) */: {
+		GLint v = 0;
+		glGetIntegerv(pname, &v);
+		if (v == 0) info.GetReturnValue().SetNull();
+		else info.GetReturnValue().Set(
+		    new_gl_obj(iso, K_VERTEX_ARRAY_OBJECT, (GLuint)v));
 		return;
 	}
 	default: {
@@ -2066,7 +2173,10 @@ FN(w_create_shader) {
 }
 FN(w_delete_shader) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteShader(id);
+	if (id) {
+		glDeleteShader(id);
+		erase_wrapper_cache(K_SHADER, id);
+	}
 }
 FN(w_is_shader) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -2322,6 +2432,7 @@ FN(w_delete_program) {
 		// inherit the stale aliased state (glGenProgram reuse is spec-legal
 		// after delete).
 		if (st) st->programs_with_aliased_link.erase(id);
+		erase_wrapper_cache(K_PROGRAM, id);
 	}
 }
 FN(w_is_program) {
@@ -2551,7 +2662,10 @@ FN(w_create_buffer) {
 }
 FN(w_delete_buffer) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteBuffers(1, &id);
+	if (id) {
+		glDeleteBuffers(1, &id);
+		erase_wrapper_cache(K_BUFFER, id);
+	}
 }
 FN(w_is_buffer) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -2682,7 +2796,10 @@ FN(w_create_texture) {
 }
 FN(w_delete_texture) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteTextures(1, &id);
+	if (id) {
+		glDeleteTextures(1, &id);
+		erase_wrapper_cache(K_TEXTURE, id);
+	}
 }
 FN(w_is_texture) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -3310,7 +3427,10 @@ FN(w_create_vertex_array) {
 }
 FN(w_delete_vertex_array) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteVertexArrays(1, &id);
+	if (id) {
+		glDeleteVertexArrays(1, &id);
+		erase_wrapper_cache(K_VERTEX_ARRAY_OBJECT, id);
+	}
 }
 FN(w_is_vertex_array) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -3509,7 +3629,10 @@ FN(w_create_framebuffer) {
 }
 FN(w_delete_framebuffer) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteFramebuffers(1, &id);
+	if (id) {
+		glDeleteFramebuffers(1, &id);
+		erase_wrapper_cache(K_FRAMEBUFFER, id);
+	}
 }
 FN(w_is_framebuffer) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -3559,7 +3682,10 @@ FN(w_create_renderbuffer) {
 }
 FN(w_delete_renderbuffer) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteRenderbuffers(1, &id);
+	if (id) {
+		glDeleteRenderbuffers(1, &id);
+		erase_wrapper_cache(K_RENDERBUFFER, id);
+	}
 }
 FN(w_is_renderbuffer) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -4426,7 +4552,10 @@ FN(w_create_sampler) {
 }
 FN(w_delete_sampler) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteSamplers(1, &id);
+	if (id) {
+		glDeleteSamplers(1, &id);
+		erase_wrapper_cache(K_SAMPLER, id);
+	}
 }
 FN(w_is_sampler) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -4535,7 +4664,10 @@ FN(w_create_query) {
 }
 FN(w_delete_query) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteQueries(1, &id);
+	if (id) {
+		glDeleteQueries(1, &id);
+		erase_wrapper_cache(K_QUERY, id);
+	}
 }
 FN(w_is_query) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),
@@ -4750,7 +4882,10 @@ FN(w_create_transform_feedback) {
 }
 FN(w_delete_transform_feedback) {
 	GLuint id = obj_id(info[0]);
-	if (id) glDeleteTransformFeedbacks(1, &id);
+	if (id) {
+		glDeleteTransformFeedbacks(1, &id);
+		erase_wrapper_cache(K_TRANSFORM_FEEDBACK, id);
+	}
 }
 FN(w_is_transform_feedback) {
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(),

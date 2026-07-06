@@ -3982,6 +3982,53 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #92 — Tier-A: per-context WebGL object wrapper cache (identity preservation) — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `wrapper_cache` field on `WebGLState`; `cache_key` + `is_cacheable_kind` + `erase_wrapper_cache` helpers; `new_gl_obj` refactored to cache-first-lookup; every `w_delete_<X>` FN plumbs `erase_wrapper_cache`; `w_get_parameter` extended with 7 object-returning pname cases.
+
+**Motivation.** Khronos's `extensions-oes-vertex-array-object` and `extensions-angle-instanced-arrays` (32 + 75 failing assertions across the two tests at tier-93) all bottom out on the same class of pattern:
+
+```js
+var buffer = gl.getVertexAttrib(n, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+if (buffer == state.buffer) { /* ok */ }
+else testFailed("VERTEX_ATTRIB_ARRAY_BUFFER_BINDING not preserved");
+
+var elbuffer = gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING);
+if (elbuffer == state.elbuffer) { /* ok */ }
+else testFailed("ELEMENT_ARRAY_BUFFER_BINDING not preserved");
+```
+
+Pre-#92 `new_gl_obj` created a fresh JS wrapper every time the engine needed to hand back a WebGL object — so `buffer` (a new wrapper wrapping GL id 42) and `state.buffer` (the original wrapper from `gl.createBuffer()` also wrapping GL id 42) were DIFFERENT JS objects. `==` returned false even though they referred to the same underlying GL resource. WebGL spec requires identity preservation across queries: the same GL name → the same JS wrapper.
+
+Also affected: `gl.getParameter(GL_ELEMENT_ARRAY_BUFFER_BINDING)` (and all other object-returning pnames) fell through to the default integer branch and returned raw GLuint numbers instead of WebGLBuffer wrappers, guaranteeing the identity check would fail.
+
+**Fix.**
+
+1. Add `std::unordered_map<uint64_t, Global<Object>> wrapper_cache` to `WebGLState`. Key packs kind into the high 32 bits and GLuint name into the low 32.
+2. `new_gl_obj(iso, kind, id, loc)` checks the cache first for cacheable kinds; on hit returns the cached wrapper. On miss, creates the wrapper and stores a strong `Global<Object>` in the cache. Uniform locations, active-info, shader-precision-format, and sync objects are excluded (they're transient / not name-identified / use pointers).
+3. Every `w_delete_<X>` FN (buffer / framebuffer / program / renderbuffer / shader / texture / vertex_array / sampler / query / transform_feedback) calls `erase_wrapper_cache(kind, id)` after the native `glDelete<X>` — the JS wrapper stops keeping the GL name alive across a re-create with the same reused name.
+4. `w_get_parameter` grows 7 explicit cases for object-returning pnames (`ARRAY_BUFFER_BINDING`, `ELEMENT_ARRAY_BUFFER_BINDING`, `CURRENT_PROGRAM`, `TEXTURE_BINDING_2D`, `TEXTURE_BINDING_CUBE_MAP`, `TEXTURE_BINDING_2D_ARRAY` v2, `TEXTURE_BINDING_3D` v2, `DRAW_FRAMEBUFFER_BINDING` / `FRAMEBUFFER_BINDING`, `READ_FRAMEBUFFER_BINDING` v2, `RENDERBUFFER_BINDING`, `VERTEX_ARRAY_BINDING`). Each queries the native `glGetIntegerv`, returns `null` on 0, otherwise wraps the GL name via `new_gl_obj` (which cache-hits and returns the original wrapper).
+
+**Scope.**
+
+- `extensions-oes-vertex-array-object`: 24 failing assertions → 0 (test-level flip).
+- `extensions-angle-instanced-arrays`: some subset of 32 failing assertions (only those in the same identity-comparison class).
+- Any other test that identity-compares WebGL objects across engine queries. Likely picks up test-level flips in `misc-object-deletion-behaviour`, `misc-instanceof-test`, and similar suites.
+
+Corpus test-count expected to move 328 → 336+ (+8 conservative estimate; could go higher if adjacent tests also depend on this).
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder exposing the WebGL API needs identity-preserving wrappers per spec.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #92 — per-context wrapper cache`. Recurrence tells:
+
+- `extensions-oes-vertex-array-object` regresses to FAIL with 24+ "not preserved" assertions = the cache-first branch in `new_gl_obj` was removed, OR the object-returning `w_get_parameter` cases fell back to the default integer branch.
+- A test creates a buffer, deletes it, creates a new buffer that reuses the same GL name, and treats them as the SAME wrapper = `erase_wrapper_cache` was removed from `w_delete_<X>` and the stale wrapper's cache entry survived into the re-create path.
+- Memory grows unbounded during long-running WebGL demos = the wrapper cache never sheds entries. Currently OK because `Global<Object>` is strong-tied to the wrapper's lifetime and delete_<X> erases entries; if a future change relies on wrappers dying via GC, add a weak-reference GC callback per entry.
+
+---
+
 ## #91 — Tier-A: WebGL 1 NPOT `texImage2D` / `copyTexImage2D` level>0 rejection — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `is_pot` inline helper + WebGL-1-gated NPOT guards at the head of `w_tex_image_2d` and `w_copy_tex_image_2d`. (`w_generate_mipmap` NPOT check DEFERRED — requires per-texture dimension tracking that GLES 2's headers don't expose via `glGetTexLevelParameteriv`; would need nx-side state.)
