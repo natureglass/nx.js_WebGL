@@ -884,8 +884,28 @@ FN(w_sample_coverage) {
 FN(w_line_width) { enter_bracket(); glLineWidth(a_f32(info, 0)); }
 FN(w_hint) { enter_bracket(); glHint(a_u32(info, 0), a_u32(info, 1)); }
 
+// Ledger #100 — WebGL 1 spec §5.14.10 / GLES 2 §4.4.4: drawArrays,
+// drawElements, readPixels, copyTexImage2D, copyTexSubImage2D, and
+// clear all must generate INVALID_FRAMEBUFFER_OPERATION when the
+// currently-bound framebuffer is not FRAMEBUFFER_COMPLETE. Mesa
+// Nouveau's native emits the error for clear correctly, but skips it
+// for readPixels (observed via `renderbuffers-framebuffer-object-
+// attachment` — clear PASSes the getError check, subsequent readPixels
+// FAILs). Add a client-side gate for the miss-set. Gate is scoped to
+// user-bound FBOs (`bound_fbo_js != 0`); the tenant FBO is always
+// complete by construction and doesn't need the check.
+static inline bool nx_fbo_complete_or_record_error() {
+	if (!st || st->bound_fbo_js == 0) return true;
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		record_error(GL_INVALID_FRAMEBUFFER_OPERATION);
+		return false;
+	}
+	return true;
+}
 FN(w_clear) {
 	enter_bracket();
+	if (!nx_fbo_complete_or_record_error()) return;
 	glClear(a_u32(info, 0));
 	touch_fbo();
 }
@@ -3920,16 +3940,34 @@ FN(w_renderbuffer_storage) {
 	glRenderbufferStorage(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2),
 	                      a_i32(info, 3));
 }
+// Ledger #100 — WebGL 1 spec §5.14.7: `getRenderbufferParameter(target,
+// pname)` returns an integer for every supported pname (WIDTH, HEIGHT,
+// INTERNAL_FORMAT, RED/GREEN/BLUE/ALPHA/DEPTH/STENCIL_SIZE, SAMPLES,
+// STENCIL). No object-returning cases on WebGL 1. Wraps
+// glGetRenderbufferParameteriv unchanged; error handling is via the
+// driver's own pname validation (INVALID_ENUM for bad pname, INVALID_
+// OPERATION when no renderbuffer bound to target).
+FN(w_get_renderbuffer_parameter) {
+	enter_bracket();
+	const GLenum target = a_u32(info, 0);
+	const GLenum pname = a_u32(info, 1);
+	GLint value = 0;
+	glGetRenderbufferParameteriv(target, pname, &value);
+	info.GetReturnValue().Set(Int32::New(info.GetIsolate(), value));
+}
 
 // ----- Draw -----
 
 FN(w_draw_arrays) {
 	enter_bracket();
+	// Ledger #100 — see nx_fbo_complete_or_record_error.
+	if (!nx_fbo_complete_or_record_error()) return;
 	glDrawArrays(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2));
 	touch_fbo();
 }
 FN(w_draw_elements) {
 	enter_bracket();
+	if (!nx_fbo_complete_or_record_error()) return;
 	glDrawElements(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
 	               (const void *)(intptr_t)a_i64(info, 3));
 	touch_fbo();
@@ -3938,6 +3976,11 @@ FN(w_draw_elements) {
 // ----- Readback -----
 FN(w_read_pixels) {
 	enter_bracket();
+	// Ledger #100 — see nx_fbo_complete_or_record_error. Mesa Nouveau
+	// does NOT emit INVALID_FRAMEBUFFER_OPERATION for readPixels on an
+	// incomplete FBO (unlike its behavior for `clear`), so the client-
+	// side gate is load-bearing here specifically.
+	if (!nx_fbo_complete_or_record_error()) return;
 	const GLint x = a_i32(info, 0);
 	const GLint y = a_i32(info, 1);
 	const GLsizei width = a_i32(info, 2);
@@ -6024,6 +6067,8 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"isRenderbuffer", w_is_renderbuffer},
 	    {"bindRenderbuffer", w_bind_renderbuffer},
 	    {"renderbufferStorage", w_renderbuffer_storage},
+	    // Ledger #100 — getRenderbufferParameter (WebGL 1 §5.14.7).
+	    {"getRenderbufferParameter", w_get_renderbuffer_parameter},
 	    {"drawArrays", w_draw_arrays},
 	    {"drawElements", w_draw_elements},
 	    {"readPixels", w_read_pixels},
@@ -6244,6 +6289,8 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"isRenderbuffer", w_is_renderbuffer},
 	    {"bindRenderbuffer", w_bind_renderbuffer},
 	    {"renderbufferStorage", w_renderbuffer_storage},
+	    // Ledger #100 — getRenderbufferParameter (WebGL 1 §5.14.7).
+	    {"getRenderbufferParameter", w_get_renderbuffer_parameter},
 	    {"drawArrays", w_draw_arrays},
 	    {"drawElements", w_draw_elements},
 	    {"readPixels", w_read_pixels},

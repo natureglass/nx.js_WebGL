@@ -4037,6 +4037,40 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #100 — Tier-A: `getRenderbufferParameter` native + `INVALID_FRAMEBUFFER_OPERATION` client-side gate on draw/read/clear over incomplete FBOs — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `w_get_renderbuffer_parameter` FN + registration in v1 and v2 method tables; new `nx_fbo_complete_or_record_error()` helper (calls `glCheckFramebufferStatus(GL_FRAMEBUFFER)` when `bound_fbo_js != 0` and records `INVALID_FRAMEBUFFER_OPERATION` on non-`FRAMEBUFFER_COMPLETE`); gate inserted at the head of `w_clear`, `w_draw_arrays`, `w_draw_elements`, `w_read_pixels`.
+
+**Motivation.** `renderbuffers-framebuffer-object-attachment` (WebGL 1 conformance, p=442 f=127) had two independent WebGL 1 spec gaps:
+
+1. **`gl.getRenderbufferParameter` not defined**. WebGL 1 spec §5.14.7 requires this method with pnames `WIDTH`, `HEIGHT`, `INTERNAL_FORMAT`, `RED/GREEN/BLUE/ALPHA/DEPTH/STENCIL_SIZE`. Pre-#100 the runtime prototype had no such method — the test's `gl.getRenderbufferParameter(RENDERBUFFER, RENDERBUFFER_RED_SIZE)` calls threw `TypeError: gl.getRenderbufferParameter is not a function`. 20 assertion fails (5 pnames × 4 test sites).
+
+2. **`INVALID_FRAMEBUFFER_OPERATION` not emitted on `readPixels` / `draw*` against incomplete FBOs**. WebGL 1 spec §5.14.10 / GLES 2 §4.4.4: `drawArrays`, `drawElements`, `readPixels`, `copyTexImage2D`, `copyTexSubImage2D`, and `clear` all must generate `INVALID_FRAMEBUFFER_OPERATION` when the currently-bound framebuffer is not `FRAMEBUFFER_COMPLETE`. Mesa Nouveau's ES3.2 native emits it for `clear` correctly (log shows the first `glErrorShouldBe(INVALID_FRAMEBUFFER_OPERATION)` after a bad-attach `clear` PASSes), but silently succeeds for `readPixels` — 41 assertion fails at the follow-up "second `getError` expected INVALID_FRAMEBUFFER_OPERATION, was NO_ERROR" checks.
+
+**Fix.**
+
+1. `w_get_renderbuffer_parameter` wraps `glGetRenderbufferParameteriv` unchanged — all supported pnames are integer-valued on WebGL 1 (no object-returning cases). Register in both v1 and v2 method tables.
+2. `nx_fbo_complete_or_record_error()` helper is a scoped check: skips the tenant FBO (`bound_fbo_js == 0`) because it's always complete by construction and doesn't need per-call polling; on user-bound FBOs, calls `glCheckFramebufferStatus(GL_FRAMEBUFFER)` and returns `false` after `record_error(GL_INVALID_FRAMEBUFFER_OPERATION)` if incomplete. Callers `if (!nx_fbo_complete_or_record_error()) return;` to short-circuit the operation. Applied to `w_clear`, `w_draw_arrays`, `w_draw_elements`, `w_read_pixels`. Not applied to `w_copy_tex_*` — the test allows either `INVALID_FRAMEBUFFER_OPERATION` or `INVALID_OPERATION` there, and Mesa emits one of them.
+
+**Scope.** Expected ~61 assertion flips on `renderbuffers-framebuffer-object-attachment` (20 from getRenderbufferParameter + 41 from INVALID_FRAMEBUFFER_OPERATION). Test may still fail on residual clusters (`checkFramebufferStatus INCOMPLETE_DIMENSIONS`, `should be green`, etc.) that need separate investigation. Cross-cluster reach: any other test that calls `gl.getRenderbufferParameter(...)` flips via #100 alone.
+
+**Trade-offs.**
+
+- **`glCheckFramebufferStatus` cost per draw/read/clear.** Modern driver-cached status is O(1); measured cost negligible in the conformance context. If a perf-sensitive demo surfaces regressions, an FBO-dirty-tracking cache is a straightforward optimization (invalidate on framebufferTexture2D / framebufferRenderbuffer / bindFramebuffer, otherwise reuse). Not implemented in this ledger — spec-correctness first.
+- **Tenant FBO skipped.** The check only fires when `bound_fbo_js != 0`. The tenant FBO IS always complete (we allocate its attachments together in `nx_webgl_bridge_init`), but a future bug that leaves tenant incomplete would silently pass this gate. Trade-off is worth it: polling `glCheckFramebufferStatus` on every draw over the tenant would blow the WebGL frame-cost budget.
+
+**DISPOSITION:** `upstream-candidate`. Both fixes are pure WebGL 1 spec conformance. Upstream nx.js has the same `getRenderbufferParameter` gap and the same missing `INVALID_FRAMEBUFFER_OPERATION` client-side gate on non-clear operations.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #100 — WebGL 1 spec §5.14.7` (getRenderbufferParameter FN) and `Ledger #100 — WebGL 1 spec §5.14.10` (nx_fbo_complete_or_record_error helper). Recurrence tells:
+
+- `renderbuffers-framebuffer-object-attachment` regresses to `gl.getRenderbufferParameter is not a function` FAILs = the `{"getRenderbufferParameter", w_get_renderbuffer_parameter}` row was removed from one or both of the v1/v2 method tables.
+- Same test regresses to `getError expected: INVALID_FRAMEBUFFER_OPERATION. Was NO_ERROR` on the `readPixels` follow-up check = the `if (!nx_fbo_complete_or_record_error()) return;` gate was removed from `w_read_pixels`.
+- A previously-passing draw / clear demo regresses to no output / stuck state = the FBO check is firing spuriously on the tenant FBO (or a user FBO that's actually complete but glCheckFramebufferStatus says otherwise on Mesa Nouveau). Check the `bound_fbo_js != 0` gate is still in `nx_fbo_complete_or_record_error`.
+
+---
+
 ## #99 — MOVED → RUNTIME_SHIMS.md
 
 Cube-route-shim atlas-ifies typed-array cube-face uploads (previously only null-source uploads got atlases). Fixes `textures-misc-texture-size-cube-maps` (WebGL 1 conformance, p=1 f=360) which uploads solid-color faces via `Uint8Array` and samples via `samplerCube` — post-shader-rewrite `sampler2D` reads black without an atlas. Includes an explicit `_emptyCubeTexture` exclusion (Three.js's 1×1 `[255,255,255,255]` placeholder) to preserve the #94-era regression fix against MeshStandardMaterial cubeUV envMap clobbering. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#99).

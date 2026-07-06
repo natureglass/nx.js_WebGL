@@ -1248,7 +1248,7 @@ check 76 "cube-route-shim.ts [tier-a] applyPendingCubeParams helper" \
     'function applyPendingCubeParams'
 check 76 "cube-route-shim.ts [tier-a] stash call from texParameteri wrap" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
-    "stashPendingCubeParam\(tex, pname, param, 'i'\)"
+    "stashPendingCubeParam\(tex, pname, effectiveParam, 'i'\)"
 check 76 "cube-route-shim.ts [tier-a] stash call from texParameterf wrap" \
     "$RUNTIME/src/scripts/cube-route-shim.ts" \
     "stashPendingCubeParam\(tex, pname, param, 'f'\)"
@@ -1367,6 +1367,18 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.webmvp8.webm"
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
+
+# #100 — Tier-A: getRenderbufferParameter native + INVALID_FRAMEBUFFER_
+# OPERATION client-side gate on draw/read/clear over incomplete FBOs.
+check 100 "webgl.cc [tier-a] w_get_renderbuffer_parameter FN present" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_renderbuffer_parameter\)'
+check 100 "webgl.cc [tier-a] getRenderbufferParameter registered in method table" \
+    "$NXJS/source/webgl.cc" \
+    '"getRenderbufferParameter", w_get_renderbuffer_parameter'
+check 100 "webgl.cc [tier-a] nx_fbo_complete_or_record_error helper" \
+    "$NXJS/source/webgl.cc" \
+    'nx_fbo_complete_or_record_error'
 
 # #99 — Tier-A: cube-route-shim atlas-ifies typed-array cube uploads (with
 # _emptyCubeTexture exclusion). Runtime-side ledger (cube-route-shim.ts in
