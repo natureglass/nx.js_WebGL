@@ -1368,6 +1368,18 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #94 — Tier-A: cube-route-shim atlas-alloc gate lowered from w>=8 to w>=1
+# so small null-source cube-face texImage2D uploads allocate an atlas —
+# fixes the WebGL 1 textures-{svg_image,image}-tex-2d-* cluster's cube+
+# texSubImage+flipY=true stale-atlas bug. Runtime-side ledger (cube-route-
+# shim.ts in brewser-runtime-v8) — MOVED pointer in NXJS_PATCHES_NEEDED.md.
+check 94 "cube-route-shim.ts [tier-a] Ledger #94 header comment" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #94 — gate lowered from'
+check 94 "cube-route-shim.ts [tier-a] gate is (source === null && w >= 1 && h >= 1)" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'source === null && w >= 1 && h >= 1'
+
 # #93 — Tier-A: getVertexAttribOffset + extension gate on VERTEX_ARRAY_BINDING_OES.
 check 93 "webgl.cc [tier-a] w_get_vertex_attrib_offset FN defined" \
     "$NXJS/source/webgl.cc" \

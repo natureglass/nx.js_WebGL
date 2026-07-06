@@ -3982,6 +3982,12 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #94 — MOVED → RUNTIME_SHIMS.md
+
+Cube-route-shim atlas-alloc gate lowered from `w >= 8 && h >= 8` to `w >= 1 && h >= 1` for small null-source cube-face `texImage2D` uploads. WebGL 1 conformance's `textures-{svg_image,image}-tex-2d-*` cluster (14 tests) allocates cube face storage via `texImage2D(POSITIVE_X+i, ..., null)` at the SVG/image's natural 2×2 dims, then uploads image content via `texSubImage2D(POSITIVE_X+i, ..., image)`. Pre-#94 the atlas was skipped (`w=2 < 8`), and the shader-rewrite branch of cube-route-shim (which unconditionally converts `samplerCube tex` → `sampler2D tex` + `textureCube(tex, dir)` → `cubeUVSample(tex, dir)`) then sampled TEXTURE_2D[TU0] — which held the *previous* iteration's atlas — producing the `cube+texSubImage+flipY=true` combo's "unflipped colors observed" 12-FAILs-per-test signature. Widened gate atlas-ifies these uploads so `sampler2D` reads the CURRENT cube's atlas. Three.js's `_emptyCubeTexture` placeholder is unaffected (uploads typed-array, not null). Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#94).
+
+---
+
 ## #93 — Tier-A: `getVertexAttribOffset` + extension-gate on `VERTEX_ARRAY_BINDING_OES` — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `w_get_vertex_attrib_offset` FN + registration in v1 and v2 method tables (aliased); extension-gate added to #92's `GL_VERTEX_ARRAY_BINDING` case in `w_get_parameter`.
