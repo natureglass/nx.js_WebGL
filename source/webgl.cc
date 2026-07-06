@@ -3937,8 +3937,22 @@ FN(w_bind_renderbuffer) {
 }
 FN(w_renderbuffer_storage) {
 	enter_bracket();
-	glRenderbufferStorage(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2),
-	                      a_i32(info, 3));
+	const GLenum target = a_u32(info, 0);
+	GLenum internalformat = a_u32(info, 1);
+	const GLsizei width = a_i32(info, 2);
+	const GLsizei height = a_i32(info, 3);
+	// Ledger #100 — WebGL 1's `DEPTH_STENCIL` (0x84F9) is an unsized
+	// enum that GLES 2 native rejects with INVALID_ENUM (packed depth-
+	// stencil is only available via GL_OES_packed_depth_stencil which
+	// uses `DEPTH24_STENCIL8_OES` = 0x88F0). Translate the unsized
+	// WebGL 1 token to the OES/ES3-sized one so Mesa Nouveau (ES3.2)
+	// accepts it. Same class as #10's SRGB / HALF_FLOAT translations
+	// for texImage2D — WebGL 1's unsized enums silently rewritten to
+	// their ES3-core sized equivalents.
+	if (internalformat == 0x84F9 /* GL_DEPTH_STENCIL */) {
+		internalformat = 0x88F0; /* GL_DEPTH24_STENCIL8 */
+	}
+	glRenderbufferStorage(target, internalformat, width, height);
 }
 // Ledger #100 — WebGL 1 spec §5.14.7: `getRenderbufferParameter(target,
 // pname)` returns an integer for every supported pname (WIDTH, HEIGHT,
@@ -3953,6 +3967,16 @@ FN(w_get_renderbuffer_parameter) {
 	const GLenum pname = a_u32(info, 1);
 	GLint value = 0;
 	glGetRenderbufferParameteriv(target, pname, &value);
+	// Ledger #100 — round-trip translation for RENDERBUFFER_INTERNAL_
+	// FORMAT: w_renderbuffer_storage translates WebGL 1's `DEPTH_STENCIL`
+	// (0x84F9) → GLES 2 native's `DEPTH24_STENCIL8` (0x88F0). The query
+	// side has to reverse the mapping so WebGL 1 apps see the token they
+	// originally passed. The v1 spec §5.14.7 example expects the storage
+	// query to return the WebGL 1 token, not the ES3-sized one.
+	if (pname == 0x8D44 /* GL_RENDERBUFFER_INTERNAL_FORMAT */ &&
+	    value == 0x88F0 /* GL_DEPTH24_STENCIL8 */) {
+		value = 0x84F9; /* GL_DEPTH_STENCIL */
+	}
 	info.GetReturnValue().Set(Int32::New(info.GetIsolate(), value));
 }
 
