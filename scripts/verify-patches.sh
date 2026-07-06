@@ -1368,6 +1368,16 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #88 — Tier-A: getUniformLocation rejects out-of-range bracket indices
+# (client-side WebGL 1 spec validation for the driver-leniency case where
+# Mesa-Nouveau wraps uint32 index overflow instead of returning null).
+check 88 "webgl.cc [tier-a] Ledger #88 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #88 — WebGL 1 spec 5\.14'
+check 88 "webgl.cc [tier-a] bracket-index validation loop" \
+    "$NXJS/source/webgl.cc" \
+    'idx > \(uint64_t\)0x7FFFFFFF'
+
 # #87 — Tier-A: gate WEBGL_multi_draw advertisement on GL_ANGLE_multi_draw
 # (gl_DrawID capability) so we don't advertise a spec-incomplete extension.
 check 87 "webgl.cc [tier-a] Ledger #87 header comment" \

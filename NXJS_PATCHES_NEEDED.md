@@ -3982,6 +3982,56 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #88 — Tier-A: `getUniformLocation` rejects out-of-range bracket indices (spec-mandated client-side validation) — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — added bracket-index parsing + validation at the head of `w_get_uniform_location`, before the `glGetUniformLocation` call.
+
+**Motivation.** WebGL 1 conformance's `uniforms-no-over-optimization-on-uniform-array-{00..17}` cluster (18 tests) all FAIL with the same single-assertion signature:
+
+> `FAIL: Requesting colora[4294967296] uniform should return a null uniform location`
+
+(other tests use `4294967518`, `4294967519` — all near or above uint32 max). Per WebGL 1 spec §5.14 / §3.7.16, an out-of-range array index in the uniform name must yield `null`. Mesa-Nouveau's native `glGetUniformLocation` is lenient — it parses `4294967296` (=2^32) as a wrapped `uint32_t` (which truncates to 0) and returns the location for `colora[0]`, a valid non-null value. Every one of the 18 tests fails only that one assertion.
+
+Prior QuickJS-era session diagnosed the same cluster; documented the fix at [nxjs-source/source/webgl.c:7591-7618](../nxjs-source/source/webgl.c#L7591); the fix never got ported to nxjs-source-v8 during Phase 2's method-forwarding migration. Memory [[feedback_test_cluster_names_misleading]] captures the diagnosis history.
+
+**Fix.** Client-side parse the bracket contents (if any) before native. Reject if:
+
+- no `]` after `[` (malformed);
+- `[]` empty;
+- non-digit character between brackets;
+- integer value exceeds `0x7FFFFFFF` (`INT32_MAX`).
+
+Rejection returns `null` immediately without dispatching to native `glGetUniformLocation`. All other cases fall through unchanged.
+
+```cpp
+const char *lbracket = strchr(name, '[');
+if (lbracket) {
+    const char *rbracket = strchr(lbracket + 1, ']');
+    if (!rbracket || rbracket == lbracket + 1) { /* null */ }
+    uint64_t idx = 0; bool valid = true;
+    for (const char *q = lbracket + 1; q < rbracket; q++) {
+        if (*q < '0' || *q > '9') { valid = false; break; }
+        idx = idx * 10u + (uint32_t)(*q - '0');
+        if (idx > (uint64_t)0x7FFFFFFF) { valid = false; break; }
+    }
+    if (!valid) { /* null */ }
+}
+```
+
+**Scope.** +18 tests flip: entire `uniforms-no-over-optimization-on-uniform-array-*` cluster (all previously p=4 f=1 → now p=5 f=0). Corpus test-count moves 301/607 = 49.6% → 319/607 = 52.6% assuming clean ship.
+
+**DISPOSITION:** `upstream-candidate`. WebGL 1 spec-conformance fix. Upstream nx.js's WebGL 1 path has the same driver-leniency gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #88 — WebGL 1 spec 5.14`. Recurrence tells:
+
+- All 18 `uniforms-no-over-optimization-on-uniform-array-*` regress to FAIL with the `Requesting colora[BIG] uniform should return a null` assertion = the bracket-validation block was removed or misplaced (must precede the `glGetUniformLocation` call).
+- Any test that legitimately uses a valid array-index uniform (e.g. `foo[7]` where the array has ≥8 elements) FAILs with "uniform not found" = the accept-list is over-restrictive; verify the parser handles `foo[7]` as `valid=true, idx=7` and reaches native.
+- `getUniformLocation("foo[]")` returns non-null = the empty-brackets branch is misordered or removed. Empty `[]` must return null unconditionally.
+
+---
+
 ## #87 — Tier-A: gate `WEBGL_multi_draw` advertisement on `GL_ANGLE_multi_draw` (gl_DrawID capability) — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — two-site change: `getExtension('WEBGL_multi_draw')` and `getSupportedExtensions` now BOTH require `has_native_ext("GL_ANGLE_multi_draw")` in addition to `has_native_ext("GL_EXT_multi_draw_arrays")`.

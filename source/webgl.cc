@@ -2412,6 +2412,42 @@ FN(w_get_attrib_location) {
 FN(w_get_uniform_location) {
 	GLuint p = obj_id(info[0]);
 	char *name = take_string(info.GetIsolate(), info[1]);
+	// Ledger #88 — WebGL 1 spec 5.14 / 3.7.16: array indices in the
+	// uniform name (e.g. "colora[N]") must parse as a non-negative
+	// decimal integer that fits in int32_t. Out-of-range indices return
+	// null. The Khronos test
+	// `uniforms-no-over-optimization-on-uniform-array-{00..17}` exercises
+	// this with indices near uint32 max (4294967296 = 2^32, plus 4294967518
+	// and 4294967519). Mesa-Nouveau's native glGetUniformLocation returns
+	// a non-null location for those names (driver leniency — the parser
+	// wraps or clamps), so without this client-side validation all 18
+	// tests FAIL the single assertion "Requesting colora[BIG] uniform
+	// should return a null uniform location". Ported verbatim from the
+	// QuickJS-era engine at ../nxjs-source/source/webgl.c:7591-7618.
+	const char *lbracket = strchr(name, '[');
+	if (lbracket) {
+		const char *rbracket = strchr(lbracket + 1, ']');
+		if (!rbracket || rbracket == lbracket + 1) {
+			delete[] name;
+			info.GetReturnValue().SetNull();
+			return;
+		}
+		uint64_t idx = 0;
+		bool valid = true;
+		for (const char *q = lbracket + 1; q < rbracket; q++) {
+			if (*q < '0' || *q > '9') { valid = false; break; }
+			idx = idx * 10u + (uint32_t)(*q - '0');
+			if (idx > (uint64_t)0x7FFFFFFF /*INT32_MAX*/) {
+				valid = false;
+				break;
+			}
+		}
+		if (!valid) {
+			delete[] name;
+			info.GetReturnValue().SetNull();
+			return;
+		}
+	}
 	GLint loc = glGetUniformLocation(p, name);
 	delete[] name;
 	if (loc < 0) {
