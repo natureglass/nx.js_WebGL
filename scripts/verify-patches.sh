@@ -1368,6 +1368,19 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #99 — Tier-A: cube-route-shim atlas-ifies typed-array cube uploads (with
+# _emptyCubeTexture exclusion). Runtime-side ledger (cube-route-shim.ts in
+# brewser-runtime-v8) — MOVED pointer in NXJS_PATCHES_NEEDED.md.
+check 99 "cube-route-shim.ts [tier-a] Ledger #99 header (detect Three.js)" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'Ledger #99 — detect Three.js'
+check 99 "cube-route-shim.ts [tier-a] isEmptyCubePlaceholder predicate" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'isEmptyCubePlaceholder'
+check 99 "cube-route-shim.ts [tier-a] wantAtlas gate includes typed-array" \
+    "$RUNTIME/src/scripts/cube-route-shim.ts" \
+    'isTypedArrayLike\(source\) && w >= 1 && h >= 1 &&'
+
 # #98 — Tier-A: WebGL constants installed enumerable: true + vertexAttrib
 # Pointer type validation (INT/UNSIGNED_INT/FIXED reject) on WebGL 1.
 check 98 "webgl-rendering-context.ts [tier-a] descs enumerable: true (v1)" \

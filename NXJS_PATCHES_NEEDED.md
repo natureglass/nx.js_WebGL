@@ -4037,6 +4037,12 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #99 — MOVED → RUNTIME_SHIMS.md
+
+Cube-route-shim atlas-ifies typed-array cube-face uploads (previously only null-source uploads got atlases). Fixes `textures-misc-texture-size-cube-maps` (WebGL 1 conformance, p=1 f=360) which uploads solid-color faces via `Uint8Array` and samples via `samplerCube` — post-shader-rewrite `sampler2D` reads black without an atlas. Includes an explicit `_emptyCubeTexture` exclusion (Three.js's 1×1 `[255,255,255,255]` placeholder) to preserve the #94-era regression fix against MeshStandardMaterial cubeUV envMap clobbering. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#99).
+
+---
+
 ## #98 — Tier-A: WebGL constants installed `enumerable: true` + `vertexAttribPointer` type validation (INT/UNSIGNED_INT/FIXED reject) — SHIPPED 2026-07-06
 
 **File(s):**
