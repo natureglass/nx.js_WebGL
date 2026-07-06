@@ -3320,6 +3320,14 @@ FN(w_tex_image_2d) {
 	//   - level MUST be 0. Non-zero level → INVALID_OPERATION.
 	//   - pixels MUST be null. Non-null pixels → INVALID_OPERATION.
 	// v2 (WebGL 2 / ES3) lifts these; the gate is v1-only.
+	//
+	// Note the "null" check uses `info[8]->IsNullOrUndefined()`, not the
+	// C++ `pixels != nullptr` — canvas / ImageBitmap / Image sources go
+	// through the image-conversion path further down in this FN which
+	// derives `pixels` from `nx_get_image` after the gate. At gate time
+	// the local `pixels` is still nullptr from `view_bytes` (returns null
+	// for non-ArrayBufferView). Checking the raw JS arg's null-ness
+	// catches typed arrays AND image sources uniformly.
 	if (!is_v2_context(info) &&
 	    (format == 0x1902 /* DEPTH_COMPONENT */ ||
 	     format == 0x84F9 /* DEPTH_STENCIL */)) {
@@ -3331,7 +3339,7 @@ FN(w_tex_image_2d) {
 			record_error(GL_INVALID_OPERATION);
 			return;
 		}
-		if (pixels != nullptr) {
+		if (!info[8]->IsNullOrUndefined()) {
 			record_error(GL_INVALID_OPERATION);
 			return;
 		}
