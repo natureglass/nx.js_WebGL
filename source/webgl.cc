@@ -2793,6 +2793,9 @@ FN(w_vertex_attrib_pointer) {
 	const GLuint index = a_u32(info, 0);
 	const GLint size = a_i32(info, 1);
 	const GLenum type = a_u32(info, 2);
+	const GLboolean normalized = a_bool(info, 3) ? GL_TRUE : GL_FALSE;
+	const GLsizei stride = a_i32(info, 4);
+	const int64_t offset = a_i64(info, 5);
 	// Ledger #98 — WebGL 1 spec §5.14.10: vertexAttribPointer's `type`
 	// arg only accepts BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, FLOAT.
 	// INT / UNSIGNED_INT / FIXED are all invalid on WebGL 1 (they're
@@ -2803,23 +2806,57 @@ FN(w_vertex_attrib_pointer) {
 	// OES_vertex_type_2_10_10_10_REV / OES_vertex_half_float would extend
 	// this list at extension-enable time; not implemented in this ledger
 	// because the conformance test doesn't exercise them on WebGL 1.
+	int bytes_per_component = 0;
 	if (!is_v2_context(info)) {
 		switch (type) {
-		case GL_BYTE:
-		case GL_UNSIGNED_BYTE:
-		case GL_SHORT:
-		case GL_UNSIGNED_SHORT:
-		case GL_FLOAT:
-			break;
+		case GL_BYTE:           bytes_per_component = 1; break;
+		case GL_UNSIGNED_BYTE:  bytes_per_component = 1; break;
+		case GL_SHORT:          bytes_per_component = 2; break;
+		case GL_UNSIGNED_SHORT: bytes_per_component = 2; break;
+		case GL_FLOAT:          bytes_per_component = 4; break;
 		default:
 			record_error(GL_INVALID_ENUM);
 			return;
 		}
+		// Ledger #98 — WebGL 1 spec §5.14.10 additional validation the
+		// native driver doesn't enforce:
+		//   - `stride` must be in [0, 255]. GLES ES3 relaxes this to
+		//     INT_MAX for driver-side memory reasons; WebGL 1 keeps the
+		//     original ES2 range. `> 255` → INVALID_VALUE.
+		//   - `stride % bytesPerComponent != 0` → INVALID_OPERATION
+		//     (misaligned inter-vertex step for the primitive size).
+		//   - `offset % bytesPerComponent != 0` → INVALID_OPERATION
+		//     (misaligned per-attribute base).
+		//   - `size` must be in [1, 4] (already partially enforced by
+		//     driver via INVALID_VALUE).
+		//   - `offset < 0` → INVALID_VALUE. (Never triggered by JS
+		//     numeric coercion since a_i64 caps at int64 min, but the
+		//     check is cheap and spec-mandated.)
+		if (stride < 0 || stride > 255) {
+			record_error(GL_INVALID_VALUE);
+			return;
+		}
+		if (size < 1 || size > 4) {
+			record_error(GL_INVALID_VALUE);
+			return;
+		}
+		if (offset < 0) {
+			record_error(GL_INVALID_VALUE);
+			return;
+		}
+		if (bytes_per_component > 1) {
+			if ((stride % bytes_per_component) != 0) {
+				record_error(GL_INVALID_OPERATION);
+				return;
+			}
+			if ((offset % bytes_per_component) != 0) {
+				record_error(GL_INVALID_OPERATION);
+				return;
+			}
+		}
 	}
-	glVertexAttribPointer(index, size, type,
-	                      a_bool(info, 3) ? GL_TRUE : GL_FALSE,
-	                      a_i32(info, 4),
-	                      (const void *)(intptr_t)a_i64(info, 5));
+	glVertexAttribPointer(index, size, type, normalized, stride,
+	                      (const void *)(intptr_t)offset);
 }
 FN(w_vertex_attrib_1f) { enter_bracket(); glVertexAttrib1f(a_u32(info, 0), a_f32(info, 1)); }
 FN(w_vertex_attrib_2f) { enter_bracket(); glVertexAttrib2f(a_u32(info, 0), a_f32(info, 1), a_f32(info, 2)); }

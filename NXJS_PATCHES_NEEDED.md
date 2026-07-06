@@ -4053,8 +4053,15 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 - Add `enumerable: true` to every descriptor in the two `Object.defineProperties` sites (v1 + v2). Same install SHAPE as #8's crash-fix (bulk defineProperties, not per-key), just widening the flag.
 - In `w_vertex_attrib_pointer`, gate on `is_v2_context(info)`; when v1, `switch` on the incoming type and `record_error(GL_INVALID_ENUM); return;` if it's not one of the five spec-allowed values.
+- **v2 (tier-98b amendment)**: WebGL 1 spec §5.14.10 also mandates additional client-side validation the driver doesn't enforce:
+  - `stride < 0 || stride > 255` → `INVALID_VALUE` (ES3 relaxes to `INT_MAX`; WebGL 1 keeps the ES2 range).
+  - `size < 1 || size > 4` → `INVALID_VALUE`.
+  - `offset < 0` → `INVALID_VALUE`.
+  - `stride % bytesPerComponent != 0` → `INVALID_OPERATION` (misaligned inter-vertex step).
+  - `offset % bytesPerComponent != 0` → `INVALID_OPERATION` (misaligned base). Only checked when `bytesPerComponent > 1` (BYTE / UBYTE are always aligned).
+  Same v1-only gate — v2 continues to defer to native for these (ES3 spec is more permissive).
 
-**Scope.** Expected massive flip on `attribs-gl-vertexattribpointer` — the ~720 iterations each carry ~1-2 assertion fails from the hex-name issue, plus the 3 type-rejection fails at the top. Predicted p=1700 f=1203 → p in the ~2500-2900 range with f dropping to double digits. Cross-cluster reach: any other Khronos test that uses `wtu.glEnumToString` inside a `shouldBe` or `assertMsg` was affected pre-#98 — expect other tests to flip via the enumerable fix alone. `attribs-gl-vertexattribpointer-offsets` (companion test) is another likely beneficiary.
+**Scope.** Expected massive flip on `attribs-gl-vertexattribpointer` — the ~720 iterations each carry ~1-2 assertion fails from the hex-name issue, plus the 3 type-rejection fails at the top. tier-98 measured p=1700 f=1203 → p=2551 f=352 (851 assertion flips from the enumerable fix + type gate). tier-98b's stride/offset/size/alignment validation targets the remaining 352 fails — predicted p=2903 f=0 (test-level PASS). Cross-cluster reach: any other Khronos test that uses `wtu.glEnumToString` inside a `shouldBe` or `assertMsg` was affected pre-#98 — expect other tests to flip via the enumerable fix alone. `attribs-gl-vertexattribpointer-offsets` (companion test) is another likely beneficiary.
 
 **Trade-offs.**
 
