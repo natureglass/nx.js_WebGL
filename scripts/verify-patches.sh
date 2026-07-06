@@ -1368,6 +1368,17 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #93 — Tier-A: getVertexAttribOffset + extension gate on VERTEX_ARRAY_BINDING_OES.
+check 93 "webgl.cc [tier-a] w_get_vertex_attrib_offset FN defined" \
+    "$NXJS/source/webgl.cc" \
+    'FN\(w_get_vertex_attrib_offset\)'
+check 93 "webgl.cc [tier-a] getVertexAttribOffset registered in method table" \
+    "$NXJS/source/webgl.cc" \
+    '"getVertexAttribOffset", w_get_vertex_attrib_offset'
+check 93 "webgl.cc [tier-a] Ledger #93 extension-gate on 0x85B5" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #93 — extension-gated on v1'
+
 # #92 — Tier-A: per-context WebGL object wrapper cache (identity
 # preservation). new_gl_obj cache-first + delete_* erasures +
 # object-returning w_get_parameter cases.

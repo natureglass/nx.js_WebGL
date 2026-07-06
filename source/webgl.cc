@@ -1145,6 +1145,17 @@ FN(w_get_parameter) {
 		return;
 	}
 	case 0x85B5 /* GL_VERTEX_ARRAY_BINDING (also VERTEX_ARRAY_BINDING_OES) */: {
+		// Ledger #93 — extension-gated on v1: WebGL 1 conformance requires
+		// this pname to return null + INVALID_ENUM until getExtension(
+		// 'OES_vertex_array_object') has been called (same class as #67's
+		// extension-gated pnames). v2 core exposes VERTEX_ARRAY_BINDING
+		// unconditionally.
+		if (!is_v2_context(info) &&
+		    !is_ext_enabled("OES_vertex_array_object")) {
+			record_error(GL_INVALID_ENUM);
+			info.GetReturnValue().SetNull();
+			return;
+		}
 		GLint v = 0;
 		glGetIntegerv(pname, &v);
 		if (v == 0) info.GetReturnValue().SetNull();
@@ -5444,6 +5455,22 @@ FN(w_get_uniform) {
 	}
 }
 
+// Ledger #93 — WebGL 1 `getVertexAttribOffset(index, pname)`. Returns the
+// offset (as a GLintptr) of the vertex-attribute-array pointer for the
+// given attribute index. Only pname is `GL_VERTEX_ATTRIB_ARRAY_POINTER`
+// (0x8645). Missing pre-#93 → conformance's `extensions-oes-vertex-array-
+// object` and `attribs-gl-vertexattribpointer-offsets` FAIL with
+// `TypeError: gl.getVertexAttribOffset is not a function`.
+FN(w_get_vertex_attrib_offset) {
+	enter_bracket();
+	const GLuint index = a_u32(info, 0);
+	const GLenum pname = a_u32(info, 1);
+	void *ptr = nullptr;
+	glGetVertexAttribPointerv(index, pname, &ptr);
+	info.GetReturnValue().Set(Number::New(info.GetIsolate(),
+	                                       (double)(intptr_t)ptr));
+}
+
 // #59 — copyTexImage2D(target, level, internalformat, x, y, w, h, border).
 // Thin glCopyTexImage2D wrapper. Reads from the current READ_FRAMEBUFFER
 // (ES3) or FRAMEBUFFER (ES2) at (x, y) w×h and allocates fresh mipmap-level
@@ -5826,6 +5853,7 @@ static void install_methods(Isolate *iso, Local<Object> proto) {
 	    {"getUniform", w_get_uniform},
 	    {"copyTexImage2D", w_copy_tex_image_2d},
 	    {"getVertexAttrib", w_get_vertex_attrib},
+	    {"getVertexAttribOffset", w_get_vertex_attrib_offset},
 	    {"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter},
 	    {"getAttachedShaders", w_get_attached_shaders},
 	    {"vertexAttrib1fv", w_vertex_attrib_1fv},
@@ -6200,6 +6228,7 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 	    {"getUniform", w_get_uniform},
 	    {"copyTexImage2D", w_copy_tex_image_2d},
 	    {"getVertexAttrib", w_get_vertex_attrib},
+	    {"getVertexAttribOffset", w_get_vertex_attrib_offset},
 	    {"getFramebufferAttachmentParameter", w_get_framebuffer_attachment_parameter},
 	    {"getAttachedShaders", w_get_attached_shaders},
 	    {"vertexAttrib1fv", w_vertex_attrib_1fv},

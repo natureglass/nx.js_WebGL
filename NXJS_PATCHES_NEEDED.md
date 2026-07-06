@@ -3982,6 +3982,47 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #93 — Tier-A: `getVertexAttribOffset` + extension-gate on `VERTEX_ARRAY_BINDING_OES` — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `w_get_vertex_attrib_offset` FN + registration in v1 and v2 method tables (aliased); extension-gate added to #92's `GL_VERTEX_ARRAY_BINDING` case in `w_get_parameter`.
+
+**Motivation.** Closing out the 2 residual FAILs in `extensions-oes-vertex-array-object` after #92:
+
+1. `FAIL: VERTEX_ARRAY_BINDING_OES should not be queryable if extension is disabled` — #92 added the `0x85B5` case to `w_get_parameter` unconditionally. Same class as #67's extension-gated pnames: WebGL 1 spec requires this pname to return `null` + `INVALID_ENUM` UNTIL `getExtension('OES_vertex_array_object')` has been called. Adding `is_ext_enabled("OES_vertex_array_object")` gate on v1 (v2 core exposes it unconditionally).
+2. `FAIL: uncaught: gl.getVertexAttribOffset is not a function` — WebGL 1 spec method that returns the offset (as a GLintptr) of the vertex-attribute-array pointer. Missing pre-#93. Wraps `glGetVertexAttribPointerv` and returns the pointer cast to a number.
+
+**Fix.**
+
+```c
+FN(w_get_vertex_attrib_offset) {
+    const GLuint index = a_u32(info, 0);
+    const GLenum pname = a_u32(info, 1);
+    void *ptr = nullptr;
+    glGetVertexAttribPointerv(index, pname, &ptr);
+    info.GetReturnValue().Set(Number::New(iso, (double)(intptr_t)ptr));
+}
+
+// In w_get_parameter's 0x85B5 case:
+if (!is_v2_context(info) && !is_ext_enabled("OES_vertex_array_object")) {
+    record_error(GL_INVALID_ENUM);
+    info.GetReturnValue().SetNull();
+    return;
+}
+```
+
+**Scope.** Expected: `extensions-oes-vertex-array-object` flips (2 remaining fails → 0). Also unblocks `attribs-gl-vertexattribpointer-offsets` which uses `getVertexAttribOffset` for its own checks.
+
+**DISPOSITION:** `upstream-candidate`. Standard WebGL 1 spec method that any nx.js embedder needs.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #93 — WebGL 1 \`getVertexAttribOffset\`` and `Ledger #93 — extension-gated on v1`. Recurrence tells:
+
+- `extensions-oes-vertex-array-object` regresses to `getVertexAttribOffset is not a function` = the method registration in the v1/v2 tables was removed.
+- Test that queries `VERTEX_ARRAY_BINDING` on v1 without ever calling `getExtension('OES_vertex_array_object')` gets a valid GL name back = the extension gate was removed.
+
+---
+
 ## #92 — Tier-A: per-context WebGL object wrapper cache (identity preservation) — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `wrapper_cache` field on `WebGLState`; `cache_key` + `is_cacheable_kind` + `erase_wrapper_cache` helpers; `new_gl_obj` refactored to cache-first-lookup; every `w_delete_<X>` FN plumbs `erase_wrapper_cache`; `w_get_parameter` extended with 7 object-returning pname cases.
