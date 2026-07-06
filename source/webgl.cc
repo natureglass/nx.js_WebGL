@@ -2900,13 +2900,57 @@ FN(w_active_texture) {
 	if (st) st->user_snap.active_tex = (GLint)unit;
 }
 
+// Ledger #95b — WebGL 1 spec §5.14.8: texParameter{i,f} on a target with no
+// currently-bound texture generates INVALID_OPERATION. GLES 2 native is
+// permissive here (glTexParameter{i,f} silently no-ops when nothing is bound),
+// so a client-side guard is needed to match the spec assertion the
+// misc-object-deletion-behaviour test relies on: after `deleteTexture(t)` on
+// t bound to TEXTURE_2D, WebGL 1 §5.14.5 auto-unbinds t to null; #95's
+// bindTexture(deleted t) then also refuses without re-binding; the resulting
+// "no texture bound" state must reject subsequent texParameteri with 0x502.
+// Query the binding via glGetIntegerv(TEXTURE_BINDING_<target>). Only guards
+// TEXTURE_2D and TEXTURE_CUBE_MAP (WebGL 1); WebGL 2's 3D / 2D_ARRAY targets
+// fall through unchanged for now — their misc-object-deletion equivalents
+// aren't in this test's scope.
+static inline bool nx_binding_pname_for_tex_target(GLenum target, GLenum *out) {
+	switch (target) {
+	case GL_TEXTURE_2D:
+		*out = 0x8069; /* GL_TEXTURE_BINDING_2D */
+		return true;
+	case GL_TEXTURE_CUBE_MAP:
+		*out = 0x8514; /* GL_TEXTURE_BINDING_CUBE_MAP */
+		return true;
+	default:
+		return false;
+	}
+}
 FN(w_tex_parameteri) {
 	enter_bracket();
-	glTexParameteri(a_u32(info, 0), a_u32(info, 1), a_i32(info, 2));
+	const GLenum target = a_u32(info, 0);
+	GLenum bpname;
+	if (nx_binding_pname_for_tex_target(target, &bpname)) {
+		GLint bound = 0;
+		glGetIntegerv(bpname, &bound);
+		if (bound == 0) {
+			record_error(GL_INVALID_OPERATION);
+			return;
+		}
+	}
+	glTexParameteri(target, a_u32(info, 1), a_i32(info, 2));
 }
 FN(w_tex_parameterf) {
 	enter_bracket();
-	glTexParameterf(a_u32(info, 0), a_u32(info, 1), a_f32(info, 2));
+	const GLenum target = a_u32(info, 0);
+	GLenum bpname;
+	if (nx_binding_pname_for_tex_target(target, &bpname)) {
+		GLint bound = 0;
+		glGetIntegerv(bpname, &bound);
+		if (bound == 0) {
+			record_error(GL_INVALID_OPERATION);
+			return;
+		}
+	}
+	glTexParameterf(target, a_u32(info, 1), a_f32(info, 2));
 }
 // Ledger #91 — WebGL 1 spec §5.14.8: non-power-of-two textures have
 // restrictions. `is_pot` is the canonical "n is a positive power of two"

@@ -1368,6 +1368,18 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #97 — Tier-A: texParameter{i,f} on target with no bound texture generates
+# INVALID_OPERATION per WebGL 1 spec §5.14.8.
+check 97 "webgl.cc [tier-a] nx_binding_pname_for_tex_target helper" \
+    "$NXJS/source/webgl.cc" \
+    'nx_binding_pname_for_tex_target'
+check 97 "webgl.cc [tier-a] TEXTURE_BINDING_2D bpname 0x8069" \
+    "$NXJS/source/webgl.cc" \
+    '\*out = 0x8069'
+check 97 "webgl.cc [tier-a] texParameteri record_error on unbound target" \
+    "$NXJS/source/webgl.cc" \
+    'w_tex_parameteri'
+
 # #96 — Tier-A: sync XMLHttpRequest via Switch.readFileSync. Runtime-side
 # ledger (xhr.ts in brewser-runtime-v8) — MOVED pointer in
 # NXJS_PATCHES_NEEDED.md.

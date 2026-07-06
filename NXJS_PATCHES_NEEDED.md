@@ -3982,6 +3982,42 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #97 — Tier-A: `texParameter{i,f}` on a target with no bound texture → INVALID_OPERATION (WebGL 1 spec §5.14.8) — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `nx_binding_pname_for_tex_target` helper + `bound == 0` guard at the head of `w_tex_parameteri` and `w_tex_parameterf` that queries the current binding (`GL_TEXTURE_BINDING_2D` / `GL_TEXTURE_BINDING_CUBE_MAP`) and records `INVALID_OPERATION` before dispatching to native.
+
+**Motivation.** `misc-object-deletion-behaviour` (WebGL 1 conformance) does:
+
+```js
+gl.bindTexture(TEXTURE_2D, t);
+gl.texParameteri(TEXTURE_2D, TEXTURE_WRAP_S, CLAMP_TO_EDGE); // NO_ERROR
+gl.deleteTexture(t); // implicit unbind → BINDING_2D = null
+gl.bindTexture(TEXTURE_2D, t); // #95: INVALID_OPERATION, binding stays null
+gl.texParameteri(TEXTURE_2D, TEXTURE_WRAP_S, CLAMP_TO_EDGE); // spec: 0x502 (no bound texture)
+```
+
+Post-#95 the second `bindTexture` correctly refuses to rebind the deleted texture, leaving `BINDING_2D` at null. But `w_tex_parameteri` dispatched straight to `glTexParameteri` — GLES 2's driver-level check for "target has no bound texture" is permissive on Mesa Nouveau (silent no-op, NO_ERROR), so the WebGL spec assertion failed with "expected 0x502. Was NO_ERROR".
+
+**Fix.** Client-side guard: query `GL_TEXTURE_BINDING_<target>` before dispatching. If zero, record `INVALID_OPERATION` and skip the native call. Applied to both integer and float variants.
+
+**Scope.** +1 assertion flip on `misc-object-deletion-behaviour` (p=287 f=7 → p=288 f=6 predicted). Other tests that hit this exact "delete-then-bind-then-texParameter" sequence would also flip — likely rare in practice.
+
+**Trade-offs.**
+
+- **WebGL 2 3D / 2D_ARRAY targets** fall through to native unchanged. The spec applies to those too, but this ledger only covers the WebGL 1 targets exercised by the test in scope. WebGL 2 extension is a straightforward `case` addition when a test needs it.
+- **`glGetIntegerv` cost per call.** Fast (single driver-cached query), unmeasurable in profiling.
+
+**DISPOSITION:** `upstream-candidate`. WebGL 1 spec-conformance closure. Upstream nx.js has the same gap.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #95b — WebGL 1 spec` (in the `w_tex_parameteri` block) — the ledger comment was written pre-numbering when this was expected to fold into #95, but the check was carved out as #97 in ship-time. Recurrence tells:
+
+- `misc-object-deletion-behaviour` regresses to `texParameteri` FAIL "expected 0x502. Was NO_ERROR" = the `bound == 0` guard was removed from `w_tex_parameteri` head.
+- Any WebGL 1 test that calls `texParameteri(TEXTURE_2D, ...)` before ever calling `bindTexture(TEXTURE_2D, tex)` regresses = same site.
+
+---
+
 ## #96 — MOVED → RUNTIME_SHIMS.md
 
 Synchronous `XMLHttpRequest` support via `Switch.readFileSync`. Pre-#96 our XHR polyfill dispatched every `open()` via `fetch(url).then(...)` regardless of the `async` arg — so `xhr.open(url, "GET", false)` returned from `send()` before the response was materialized and `xhr.responseText` stayed `''`. Khronos WebGL conformance's `wtu.loadStandard{Vertex,Fragment}Shader` uses exactly this sync-XHR shape → shader source came back empty → `glCompileShader` returned "unexpected end of file" → every `wtu.setupProgram`-using test cascaded through 12+ downstream assertion failures. The final missing piece of the misc-object-deletion-behaviour / #95 fix chain. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#96).
