@@ -1368,6 +1368,19 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #96 — Tier-A: sync XMLHttpRequest via Switch.readFileSync. Runtime-side
+# ledger (xhr.ts in brewser-runtime-v8) — MOVED pointer in
+# NXJS_PATCHES_NEEDED.md.
+check 96 "xhr.ts [tier-a] Ledger #95b (sync-XHR) header comment" \
+    "$RUNTIME/src/polyfills/xhr.ts" \
+    'Ledger #95b — sync-XHR support'
+check 96 "xhr.ts [tier-a] _sync flag captured in open()" \
+    "$RUNTIME/src/polyfills/xhr.ts" \
+    'this\._sync = _async === false'
+check 96 "xhr.ts [tier-a] send() sync branch dispatches Switch.readFileSync" \
+    "$RUNTIME/src/polyfills/xhr.ts" \
+    'if \(this\._sync\)'
+
 # #95 — Tier-A: WebGL wrapper `deleted` flag + wrapper-cache retention on
 # delete + bindX(deletedX) INVALID_OPERATION + getFramebufferAttachment-
 # Parameter(NONE, OBJECT_NAME) INVALID_ENUM on WebGL 1 + shader asset sync

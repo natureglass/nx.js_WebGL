@@ -3982,6 +3982,12 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #96 — MOVED → RUNTIME_SHIMS.md
+
+Synchronous `XMLHttpRequest` support via `Switch.readFileSync`. Pre-#96 our XHR polyfill dispatched every `open()` via `fetch(url).then(...)` regardless of the `async` arg — so `xhr.open(url, "GET", false)` returned from `send()` before the response was materialized and `xhr.responseText` stayed `''`. Khronos WebGL conformance's `wtu.loadStandard{Vertex,Fragment}Shader` uses exactly this sync-XHR shape → shader source came back empty → `glCompileShader` returned "unexpected end of file" → every `wtu.setupProgram`-using test cascaded through 12+ downstream assertion failures. The final missing piece of the misc-object-deletion-behaviour / #95 fix chain. Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#96).
+
+---
+
 ## #95 — Tier-A: WebGL wrapper `deleted` mark + wrapper-cache retention on delete + bindX(deletedX) → INVALID_OPERATION + WebGL 1 getFramebufferAttachmentParameter(NONE, OBJECT_NAME) → INVALID_ENUM + shader asset sync + FBO delete-of-bound fallback — SHIPPED 2026-07-06
 
 **File(s):**
