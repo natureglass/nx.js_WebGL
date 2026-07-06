@@ -2714,6 +2714,19 @@ FN(w_tex_parameterf) {
 	enter_bracket();
 	glTexParameterf(a_u32(info, 0), a_u32(info, 1), a_f32(info, 2));
 }
+// Ledger #91 — WebGL 1 spec §5.14.8: non-power-of-two textures have
+// restrictions. `is_pot` is the canonical "n is a positive power of two"
+// check; `n == 0` returns false so a zero-dim texture (never uploaded)
+// doesn't accidentally accept a NPOT-guarded call.
+//
+// generateMipmap-side NPOT check needs the currently-bound texture's
+// dimensions, which GLES 2 doesn't expose via glGetTexLevelParameteriv
+// (a GLES 3.1+ / desktop-GL primitive). Would require per-texture
+// dimension tracking in nx-side state; deferred as a follow-up. This
+// ledger only tackles the `w_tex_image_2d` and `w_copy_tex_image_2d`
+// level>0-and-NPOT paths — those get width/height from call args
+// directly and don't need any state lookup.
+static inline bool is_pot(GLint n) { return n > 0 && (n & (n - 1)) == 0; }
 FN(w_generate_mipmap) {
 	enter_bracket();
 	glGenerateMipmap(a_u32(info, 0));
@@ -2961,6 +2974,15 @@ FN(w_tex_image_2d) {
 	const GLint border = a_i32(info, 5);
 	GLenum format = a_u32(info, 6);
 	GLenum type = a_u32(info, 7);
+	// Ledger #91 — WebGL 1 spec §5.14.8: texImage2D at level > 0 with
+	// NPOT dimensions must return INVALID_VALUE. WebGL 2 accepts NPOT at
+	// any level. Guard emits the error + short-circuits before any pixel
+	// conversion, avoiding wasted work on a call that will fail.
+	if (!is_v2_context(info) && level > 0 &&
+	    (!is_pot(width) || !is_pot(height))) {
+		record_error(GL_INVALID_VALUE);
+		return;
+	}
 	size_t len = 0;
 	void *pixels = view_bytes(info[8], &len);
 	if (info[8]->IsArrayBuffer()) {
@@ -5306,6 +5328,14 @@ FN(w_copy_tex_image_2d) {
 	const GLsizei width = a_i32(info, 5);
 	const GLsizei height = a_i32(info, 6);
 	const GLint border = a_i32(info, 7);
+	// Ledger #91 — WebGL 1 spec §5.14.8: copyTexImage2D at level > 0 with
+	// NPOT dimensions must return INVALID_VALUE. See w_tex_image_2d
+	// above for rationale.
+	if (!is_v2_context(info) && level > 0 &&
+	    (!is_pot(width) || !is_pot(height))) {
+		record_error(GL_INVALID_VALUE);
+		return;
+	}
 	glCopyTexImage2D(target, level, internalformat, x, y, width, height,
 	                 border);
 }

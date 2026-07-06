@@ -1368,6 +1368,15 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #91 — Tier-A: WebGL 1 NPOT texture restrictions (generateMipmap /
+# texImage2D level>0 / copyTexImage2D level>0) per §5.14.8.
+check 91 "webgl.cc [tier-a] Ledger #91 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #91 — WebGL 1 spec .5\.14\.8'
+check 91 "webgl.cc [tier-a] is_pot helper defined" \
+    "$NXJS/source/webgl.cc" \
+    'static inline bool is_pot\(GLint n\)'
+
 # #90 — Tier-A: shaderSource rejects _webgl_/webgl_ reserved-prefix
 # identifiers per WebGL 1 spec §5 (driver leniency workaround).
 check 90 "webgl.cc [tier-a] Ledger #90 header comment" \

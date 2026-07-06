@@ -3982,6 +3982,44 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #91 — Tier-A: WebGL 1 NPOT `texImage2D` / `copyTexImage2D` level>0 rejection — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `is_pot` inline helper + WebGL-1-gated NPOT guards at the head of `w_tex_image_2d` and `w_copy_tex_image_2d`. (`w_generate_mipmap` NPOT check DEFERRED — requires per-texture dimension tracking that GLES 2's headers don't expose via `glGetTexLevelParameteriv`; would need nx-side state.)
+
+**Motivation.** WebGL 1 spec §5.14.8 says non-power-of-two textures MUST NOT support mipmaps (`generateMipmap` → INVALID_OPERATION; `texImage2D`/`copyTexImage2D` at `level > 0` → INVALID_VALUE). Mesa Nouveau accepts all three silently. Khronos's `textures-misc-texture-npot` test (33 failing assertions at tier-92) exercises each case explicitly:
+
+- `getError expected: 0x501. Was NO_ERROR : gl.texImage2D with NPOT texture with level > 0 should return INVALID_VALUE` × 7 (this ledger)
+- `getError expected: 0x501. Was NO_ERROR : copyTexImage2D with NPOT texture with level > 0 should return INVALID_VALUE.` × 5 (this ledger)
+- `getError expected: 0x502. Was NO_ERROR : gl.generateMipmap with NPOT texture should return INVALID_OPERATION` × 7 (DEFERRED, see file notes)
+- Additional 14 assertions: "NPOT texture with X should draw with 0,0,0,255" — requires deeper texture-completeness tracking (NPOT samples as black under REPEAT wrap or non-NEAREST-or-LINEAR filter). Separate ledger if worthwhile.
+
+**Total spec-validation assertions flippable in #91's scope: 12.**
+
+**Fix.**
+
+```c
+static inline bool is_pot(GLint n) { return n > 0 && (n & (n - 1)) == 0; }
+```
+
+- `w_tex_image_2d`: after arg extraction, if v1 context AND `level > 0` AND NPOT dims → `record_error(GL_INVALID_VALUE)` + `return`. Guard runs BEFORE pixel conversion, avoiding wasted work.
+- `w_copy_tex_image_2d`: same guard.
+
+Both guards are gated on `!is_v2_context(info)` so WebGL 2 (which explicitly allows NPOT at any level) is unaffected.
+
+**Scope.** Expected ~19 assertion flips in `textures-misc-texture-npot` alone. Test-level flip depends on whether the remaining 14 assertions (texture-completeness / draw-color validation) also happen to become correct as a side effect, which is unlikely — most likely `textures-misc-texture-npot` moves from f=33 to f=~14 but stays FAIL at the test level. Adjacent tests (`textures-misc-texture-mips` f=9, `textures-misc-tex-input-validation` f=9, `textures-misc-tex-image-with-invalid-data` f=8) may pick up flips if their fails include validation-class assertions.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder on a driver that doesn't enforce WebGL 1 NPOT restrictions would hit the same tests.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #91 — WebGL 1 spec §5.14.8`. Recurrence tells:
+
+- `textures-misc-texture-npot` regresses to `f=33+` including the three `getError expected: 0x501/0x502` classes = the guards were removed.
+- WebGL 2 demos (Three.js webgl2-*, gpgpu-*) start returning INVALID_VALUE on mipmap uploads = the `!is_v2_context(info)` gate regressed and is now applying to v2.
+- Some POT texture's `generateMipmap` starts returning INVALID_OPERATION = the `is_pot` check regressed (double-check: `n > 0 && (n & (n - 1)) == 0` — n=0 must return false).
+
+---
+
 ## #90 — Tier-A: `shaderSource` rejects `_webgl_` / `webgl_` reserved-prefix identifiers per WebGL 1 spec §5 — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `has_reserved_webgl_identifier` static + guard in `w_shader_source`.
