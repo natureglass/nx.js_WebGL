@@ -3926,6 +3926,43 @@ if (image instanceof Blob) {
 
 ---
 
+## #85 — Tier-A: canvas-source short-circuit in the WebGL 1 TexImageSource shim — SHIPPED 2026-07-06
+
+**File(s):** [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) — new canvas-source branch in `sourceToPixels` between the `ImageData` fast path and the OffscreenCanvas draw-rasterize fallback.
+
+**Motivation.** Post-tier-84c the `textures-canvas-tex-2d-*` cluster (8 tests, one per format+type variant) all TIMEOUT at tier-85 with the same signature: an uncaught `"Image or Canvas expected"` thrown at `nxjs:src/canvas/webgl-rendering-context.ts:642:6` inside `sourceToPixels` and surfaced through the `runtime/src/scripts/cube-route-shim.ts` texImage2D interposer. The test provides a `<canvas>` element painted red-green in a 2D context and passes it as the WebGL 1 TexImageSource-form 6-arg `texImage2D(target, level, IF, format, type, source)`.
+
+The `#70` ledger's `sourceToPixels` unconditionally rasterizes via `new OffscreenCanvas(...).getContext('2d').drawImage(src, 0, 0)`. That `drawImage` binding maps to engine-side `nx_canvas_context_2d_draw_image` (canvas.cc:2481), which only accepts `nx_image_t` (native image/ImageBitmap) or `nx_canvas_t` (native OffscreenCanvas). A brewser-runtime canvas element is neither — it's a `CanvasShim` wrapping the runtime's own 2D compositor — and hits the "Image or Canvas expected" throw. The rejection is spec-legitimate for the native — the shim just needs to avoid asking it.
+
+**Fix.** Detect canvas-like sources by the presence of `getContext` and read pixels directly from the source's OWN 2D backing store:
+
+```ts
+} else if (typeof src.getContext === 'function') {
+    const ctx2d = src.getContext('2d');
+    if (ctx2d && typeof ctx2d.getImageData === 'function') {
+        id = ctx2d.getImageData(0, 0, src.width, src.height) as ImageData;
+    } else {
+        // fall through to OffscreenCanvas draw path (WebGL-typed canvas / unknown ctx)
+    }
+}
+```
+
+Non-premultiplied RGBA is guaranteed by the source's own `getImageData` in the same way #70's OffscreenCanvas round-trip did — the shim's contract with the native (post-shim `args[8] = px.data`, `format`/`type` unchanged) is unchanged. `HTMLImageElement`, `HTMLVideoElement`, SVG images, and any other non-canvas source still hit the OffscreenCanvas rasterize path, because those don't expose `getContext`.
+
+**Scope.** Fixes 8 of 8 `textures-canvas-tex-2d-*` tests. The 8th (ALPHA/UNSIGNED_BYTE) was previously counted as TIMEOUT along with the others — none was passing at tier-84c. Likely also unlocks the `textures-webgl_canvas-tex-2d-*` cluster (which uses a WebGL-typed source canvas) via the fallback branch, though those tests exercise a different failure surface (currently f=1 or f=3 with mixed pass counts, distinct from the pure timeout signature) and are not asserted here.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder that presents a non-native canvas element as a TexImageSource will hit this. Upstream nx.js's `sourceToPixels` doesn't handle canvas sources at all today.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) for `Ledger #85 — canvas-source short-circuit`. Recurrence tells:
+
+- `textures-canvas-tex-2d-*` TIMEOUT with `"Image or Canvas expected"` at `sourceToPixels` = the `typeof src.getContext === 'function'` branch was removed OR the source's own `getContext('2d')` returns null (in which case the shim silently falls back to the throwing OffscreenCanvas path).
+- `textures-canvas-tex-2d-alpha-alpha-unsigned_byte` PASS but the other 7 FAIL with pixel-diff (not TIMEOUT) = the short-circuit fires but the shim's 4-bpp-RGBA-into-non-RGBA-format bytes-through pattern (see #71 caveat) needs the same `convert_image_source_to_gl_pixels`-style JS-side conversion the ImageBitmap route gets from the native. That's a follow-up ledger, not a regression of #85.
+- `textures-image-tex-2d-*` regress from `_from_video` and other clusters starting to time out on canvas-shaped sources = broader `sourceToPixels` regression, not #85-specific — check both the ImageBitmap short-circuit (#71) and the isTexImageSource fallback.
+
+---
+
 ## Expected growth during Step 2
 
 Step 2 (WebGL semantics to TS) is expected to surface more fork-patches

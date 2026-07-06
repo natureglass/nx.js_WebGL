@@ -633,6 +633,34 @@ function sourceToPixels(src: any): {
 	let id: ImageData;
 	if (src instanceof ImageData) {
 		id = src;
+	} else if (typeof src.getContext === 'function') {
+		// Ledger #85 — canvas-source short-circuit. Brewser-runtime's canvas
+		// element is not a native nx_canvas_t, so the OffscreenCanvas 2D
+		// drawImage() path below rejects it with "Image or Canvas expected"
+		// (thrown at canvas.cc:nx_canvas_context_2d_draw_image). Read pixels
+		// straight from the source's own 2D context — same non-premultiplied
+		// RGBA guarantee, no round-trip.
+		const ctx2d = src.getContext('2d');
+		if (ctx2d && typeof ctx2d.getImageData === 'function') {
+			id = ctx2d.getImageData(
+				0,
+				0,
+				src.width,
+				src.height,
+			) as ImageData;
+		} else {
+			// WebGL-typed canvas or unrecognized context — fall through to
+			// the OffscreenCanvas draw path (may throw for non-native sources).
+			const c = new OffscreenCanvas(src.width, src.height);
+			const ctx = c.getContext('2d');
+			ctx.drawImage(src, 0, 0);
+			id = ctx.getImageData(
+				0,
+				0,
+				src.width,
+				src.height,
+			) as ImageData;
+		}
 	} else {
 		// Rasterize through an offscreen 2D canvas; getImageData() returns
 		// non-premultiplied RGBA, which is exactly what GL expects with the

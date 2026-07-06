@@ -1368,6 +1368,17 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #85 — Tier-A: canvas-source short-circuit in the WebGL 1 TexImageSource shim
+# (sourceToPixels reads the source's own 2D getImageData when src is a canvas
+# element, bypassing the OffscreenCanvas drawImage() path that only accepts
+# native nx_image_t / nx_canvas_t sources).
+check 85 "webgl-rendering-context.ts [tier-a] Ledger #85 header comment" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'Ledger #85 — canvas-source short-circuit'
+check 85 "webgl-rendering-context.ts [tier-a] canvas-source branch reads src.getContext('\''2d'\'').getImageData directly" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'ctx2d\.getImageData\('
+
 echo
 echo "=== meta-check: ledger vs script coverage ==="
 # Non-fatal warnings. Detects:
