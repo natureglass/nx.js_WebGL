@@ -3616,6 +3616,61 @@ Fail-soft contract holds: both boots reach normal browsing state (log continues 
 
 **Size neutrality (measured off-branch, 2026-07-05).** Baseline `nxjs.nro` built at `v8-migration` tip (commit 4584588) = 56,652,621 bytes; post-#74 `nxjs.nro` built at `wasm-drumbrake-track-a` tip = 56,652,621 bytes. **NRO delta = 0 bytes** — the ~520-byte `.text` growth (baseline 54,399,835 → post-#74 54,400,355 bytes, +0.001% of engine text) is absorbed by NRO's page-alignment padding. `.data` and `.bss` unchanged. Confirms the "no visible size cost" expectation for the config gate + probe on the current monolith.
 
+**Track-B outcome (2026-07-06): DEFERRED — Citron-scoped boot hang inside `Isolate::New` under the DrumBrake-enabled monolith.**
+
+Track B (rebuilding `switch-v8` with `v8_enable_drumbrake=true`) was executed end-to-end (see reproducibility appendix below). The resulting `switch-v8 15.0.243-10` monolith installs cleanly, `scripts/verify-drumbrake-monolith.sh` reports PRESENT (3592 matches, exit 0), and the engine builds without additional warnings (only the pre-existing `webgl.cc:2661` sign-compare). **However, under Citron the engine does not survive `Isolate::New`.** Under the shipped `-9` monolith (DrumBrake absent) the engine boots normally at the same source revision on the same emulator — the single-variable difference is decisive.
+
+Localization was via four temporary `[v8-trace]` `fprintf(stderr, ...)` calls around `V8::Initialize()` and `Isolate::New()` in `source/main.cc` (uncommitted; reverted after the diagnosis). Boot log under `-10`, gate off, Citron nightly `0237a9b88` (latest at time of test), CPU emulation `Auto`, multicore emulation `On`:
+
+```
+[detect] target=citron (auto: A=1 B=1 C=1 score=3/3) -> mode=jitless
+[v8] mem_total=3285 MiB free=3 MiB regime=application -> mode=jitless (Ignition only)
+[v8-trace] before V8::Initialize
+[v8-trace] after V8::Initialize
+[v8] max_heap=512 MiB (arena=1024 MiB free=3 MiB)
+[v8-trace] before Isolate::New
+```
+
+`[v8-trace] after Isolate::New` never fires; `[wasm] mode=…` never fires; the shell chain (`[webgl2] init_class`, `[button-router]`, `[fb]`, …) never starts. Gate state was not the variable — appending `--wasm-jitless` at runtime made no difference to the hang position. Two cheap Citron-side discriminators were tried:
+
+- **CPU accuracy = Accurate** (Auto → Accurate): Citron itself crashed. No log created — the engine's very first `fprintf(stderr, ...)` never reached disk. Worse failure mode than the baseline hang.
+- **Multicore emulation = Off** (default On → Off): byte-identical baseline hang (same 6 lines, same last-line signature). `mem_total` differs (Citron reports different guest RAM under the config), but the hang position does not.
+
+Newer Citron builds were not available at test time — Citron nightly `0237a9b88` was the latest.
+
+**Root cause not localized past this point.** Static audit against V8 15.0.243 core files (`src/execution/isolate.cc`, `src/wasm/wasm-engine.cc`) found no explicit `V8_ENABLE_DRUMBRAKE` fork on the `Isolate::New` path:
+
+- Every `#if V8_ENABLE_DRUMBRAKE` block in `isolate.cc` is in stack-trace-building utilities (`CallSiteBuilder::Visit`, `AppendWasmInterpretedFrame`, `VisitStack_ForCallSiteBuilder`) that run *after* isolate creation.
+- `WasmEngine::InitializeOncePerProcess`'s `WasmInterpreter::InitializeOncePerProcess()` call is guarded by both `#ifdef V8_ENABLE_DRUMBRAKE` AND `if (v8_flags.wasm_jitless)`. Under gate-off the runtime flag is false, so this branch does not run.
+- The DrumBrake `InitInstructionTableOnce(Isolate*)` function at `src/wasm/interpreter/wasm-interpreter.cc:703` is guarded by `!V8_DRUMBRAKE_BOUNDS_CHECKS`. Under our build (`!(is_win || is_linux || is_mac || is_ios)` is true for `target_os = "horizon"`) `V8_DRUMBRAKE_BOUNDS_CHECKS` is set, so this init function is not compiled at all.
+
+The hang is therefore triggered by an *implicit* effect of the `V8_ENABLE_DRUMBRAKE` compile-time define — plausible mechanisms include changed mksnapshot output (additional DrumBrake wasm-interpreter builtins carried in the snapshot with arm64 relocations that don't resolve under our `switch-v8` `ExternalReferenceTable` set), a broader `ExternalReferenceTable` layout, or Isolate builtin-deserialization corner cases specific to the Horizon target-OS branch. Confirming any of these requires either a full V8 core deep dive (many files, hours) or a `V8::Initialize` / `Isolate::Init` internal-trace rebuild through the fork CI (each iteration ~30–60 min). Neither meets the "cheap discriminators first" gate the diagnosis has been running under.
+
+**Explicit scope: Citron-only.** No hardware evidence was collected — jitless WASM on hardware is not a goal for this project (JIT + Liftoff already covers the hardware WASM path). This ledger records a Citron observation, not a Horizon-platform verdict.
+
+**Deferred pending any of:**
+
+1. V8 upstream widening DrumBrake's support matrix (currently `win | linux | mac | ios` with `v8_enable_pointer_compression=true`; both conjuncts fail for us).
+2. A Citron-side release whose arm64 emulation surfaces the hang differently (any config that reaches `[v8-trace] after Isolate::New` under the archived `-10` monolith is enough to reopen).
+3. Renewed interest to invest in either (a) a V8-core deep-dive investigation, (b) pointer-compression migration across the engine embedder ABI (rejected as weeks of work mid-Unity-phase per Phase T-B0), or (c) further V8 trace instrumentation via a fork CI cycle.
+
+**Reproducibility appendix.**
+
+- Fork: `https://github.com/<user>/pacman-packages` (Alex Daskalakis) — branch `drumbrake-enable`, commits `12972a2 switch-v8: enable DrumBrake wasm interpreter (pkgrel=10, EXPERIMENTAL)` + `1c7f08a switch-v8: 0011 revised — s2s_RefArrayFill FATAL under PC-off (Amendment 5)`. Based on `TooTallNate/pacman-packages@switch-v8` tip `f0633f4` (with one empty commit for the CI control-run trigger — see Phase T-B0 command list).
+- Two source patches added:
+  - `switch/v8/patches/0010-drumbrake-horizon-whitelist.patch` — extends `is_drumbrake_supported` in `gni/v8.gni` to include `target_os == "horizon"` and drops the `v8_enable_pointer_compression &&` conjunct. EXPERIMENTAL, upstream-unblessed.
+  - `switch/v8/patches/0011-drumbrake-refarrayfill-pc-off-gate.patch` — guards the sole compile-time PC assertion in `Handlers<false>::s2s_RefArrayFill` (wasm-gc `array.fill` on ref arrays) under `#ifdef V8_COMPRESS_POINTERS`; under PC-off replaces the body with `FATAL("DrumBrake: wasm-GC ref array.fill unsupported under PC-off (switch-v8 #74)")`. Loud-fail policy — matches upstream's own `CHECK(false); // Not supported` pattern in `wasm-interpreter-runtime.cc:2418` for the ref-return marshalling path.
+- PKGBUILD: `pkgrel` bumped 9 → 10; adds `v8_enable_drumbrake = true` to the GN args in `_gn_args_jit`; `_apply` calls for 0010 + 0011 following the existing 0001–0009 pattern; Horizon patches 0001–0009 untouched.
+- CI: `.github/workflows/docker-image.yml` triggers on `push`; the fork's first-run (control push of `switch-v8` with one empty commit) seeded the `buildcache` registry tag; the `drumbrake-enable` push produced `ghcr.io/<user-lowercased>/pacman-packages:drumbrake-enable` with the switch-v8 package under `/packages/v8/`.
+- Artifact archived: `d:/tmp/drumbrake-artifact/switch-v8-15.0.243-10-any.pkg.tar.zst`, size 18,041,038 B, SHA256 `27a37df93b489b1485808b483ee47e691144cb4485fb8c67894145711f1b422d`. Companion `-9` archive kept alongside: `switch-v8-15.0.243-9-any.pkg.tar.zst`, size 17,600,338 B, SHA256 `dd8a36966d3565f30e353d7c08e54be5915974228f822c4efcc0b61fe80b7d26` (sourced from `ghcr.io/tootallnate/pacman-packages@sha256:92880d77878639768fe3696800104d68de1dfec65802bf7915689dd7bd718e53`, the pre-Track-B pinned image referenced by `nxjs-source-v8/.github/workflows/ci.yml`).
+- Engine footprint under `-10` monolith at `wasm-drumbrake-track-a` tip `43be7fae` (#84): `nxjs.nro` = 57,612,789 B (delta over the `-9` build at the same tip = +960,168 B = +937.7 KiB); `.text` +923,696 B; `.data` +34,760 B; `.bss` unchanged. Well within the Phase 0 forecast (1–3 MB).
+- To reopen: reinstall `-10` (`dkp-pacman -U d:/tmp/drumbrake-artifact/switch-v8-15.0.243-10-any.pkg.tar.zst`), rebuild engine + brewser (no source changes needed — the gate + probe are already wired), mirror to Citron SDMC, boot. If any lever produces `[v8-trace] after Isolate::New` or `[wasm] mode=drumbrake`, Track B is un-blocked at that config. Trace instrumentation to re-apply: 4 `fprintf(stderr, "[v8-trace] …\n"); fflush(stderr);` pairs around `V8::Initialize()` (main.cc line ~1841) and `Isolate::New(create_params)` (main.cc line ~1995).
+
+**Watch items.**
+
+1. V8 upstream `gni/v8.gni:is_drumbrake_supported` at each future V8 tag bump — if the OS whitelist widens to include a non-desktop platform or the `v8_enable_pointer_compression` conjunct is relaxed, revisit Track B. Verify against a fresh audit of `src/wasm/interpreter/wasm-interpreter.cc` for new PC-off compile gates (the sole one at `s2s_RefArrayFill:6788` at v15.0.243 may be joined by others as DrumBrake evolves).
+2. Citron release notes for arm64 / dynarmic changes — any note mentioning isolate-init-time deadlocks, external-reference handling under jitless V8, or specific improvements to arm64 emulation accuracy for large statically-linked binaries is worth a re-test cycle. Retest is one `dkp-pacman -U <-10 artifact>` + rebuild + boot — everything else stays archived.
+
 **Upstream posture.** Marked `fork-only (upstream-candidate later)` — the gate + empirical probe benefit any nx.js embedder in emulator / no-JIT environments (iOS, Cobalt/Starboard-like sandboxes, etc.). PR queued behind the existing PR-A/-C/-D/-F backlog; do NOT foreclose upstream by leaving fork-specific baggage in the change. The one Horizon-specific piece is the `nx_ctx->config` field name, easy to lift.
 
 **Known non-goals.**
