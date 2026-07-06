@@ -23,6 +23,7 @@ import { $ } from '../$';
 import { def, proto, createInternal } from '../utils';
 import { ImageBitmap } from './image-bitmap';
 import { ImageData } from './image-data';
+import { Image } from '../image';
 import { OffscreenCanvas } from './offscreen-canvas';
 import {
 	WebGLBuffer,
@@ -735,7 +736,18 @@ function isCanvasSource(v: any): boolean {
 			// pixels` in webgl.cc does the byte-stride-correct conversion
 			// via `nx_get_image`. ImageBitmap is nx_image_t under the hood
 			// (per #66's construction).
-			if (last instanceof ImageBitmap) {
+			//
+			// Ledger #89 v2 — extend the short-circuit to nxjs's `Image`
+			// class (HTMLImageElement equivalent). Image also wraps an
+			// `nx_image_t` (per image.ts:74 `proto($.imageNew(), Image)`),
+			// so native's `convert_image_source_to_gl_pixels` handles it
+			// the same way — including flipY / premultiply / colorspace,
+			// which the sourceToPixels raw-bytes route silently skips (per
+			// WebGL 1 spec, those pixelStore params apply to TexImageSource
+			// uploads only, NOT raw ArrayBufferView). Textures-svg_image
+			// tests exercise this because the SVG decode (#89) produces an
+			// nx.js `Image`, not an ImageBitmap.
+			if (last instanceof ImageBitmap || last instanceof Image) {
 				if (args.length === 6) {
 					// (target, level, internalformat, format, type, source)
 					// → (target, level, IF, w, h, 0, format, type, source)
@@ -788,8 +800,9 @@ function isCanvasSource(v: any): boolean {
 				}
 			}
 			// Ledger #71 — same short-circuit as texImage2D above. See there
-			// for rationale.
-			if (last instanceof ImageBitmap) {
+			// for rationale. Ledger #89 v2 extends this to nxjs's `Image`
+			// class (HTMLImageElement equivalent) for the same reason.
+			if (last instanceof ImageBitmap || last instanceof Image) {
 				if (args.length === 7) {
 					// (target, level, xoff, yoff, format, type, source)
 					// → (target, level, xoff, yoff, w, h, format, type, source)

@@ -3982,11 +3982,12 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
-## #89 — Tier-A: minimal SVG decoder for Khronos conformance's red-green.svg — SHIPPED 2026-07-06
+## #89 — Tier-A: minimal SVG decoder + route `Image` sources through the #71 short-circuit — SHIPPED 2026-07-06
 
 **File(s):**
 - [source/image.h](source/image.h) — `FORMAT_SVG` added to the `ImageFormat` enum.
 - [source/image.cc](source/image.cc) — `identify_image_format` detects `<?xml`/`<svg` prologue (with UTF-8 BOM + whitespace skip); new `decode_svg` static function; `nx_decode_image_do` dispatches to it.
+- [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) — v2 addition: import `Image` from `../image`; extend the ImageBitmap short-circuit in both `texImage2D` and `texSubImage2D` to also accept `Image` instances (`last instanceof ImageBitmap || last instanceof Image`).
 - [brewser-apps/.../full-webgl1-conformance/sdk/tests/resources/red-green.svg](../brewser-apps/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.svg) — synced from webgl2-conformance's resources dir (the WebGL 1 dir was missing the asset entirely — every `wtu.loadTexture(gl, resourcePath + "red-green.svg", ...)` fetched 404 pre-#89).
 
 **Motivation.** WebGL 1 conformance's `textures-svg_image-tex-2d-*` cluster (8 tests) all TIMEOUT with `test never called finishTest()`. Two root causes, both required for a flip:
@@ -4006,7 +4007,9 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 Complex SVGs (paths, transforms, gradients, opacity, CSS) return `nullptr` from `decode_svg` → the decode path surfaces the standard `"Image decode was not initialized"` error → `onerror` fires. Since red-green.svg is the only SVG asset the WebGL 1 corpus references, a full SVG rasterizer (SkSVG) would be over-engineering. If future assets need broader support, extend the parser incrementally or link SkSVG.
 
-**Scope.** +8 tests flip: all `textures-svg_image-tex-2d-*` variants. Corpus test-count moves 319/607 = 52.6% → 327/607 = 53.9%.
+**v2 addendum (same session, 2026-07-06).** v1 shipped the SVG decoder + asset sync. Verify run showed 1/8 PASS (ALPHA/UBYTE) + 7/8 FAIL with flipY-swapped-pixels and pixel-diff cascades. Root cause: nxjs's Image (HTMLImageElement equivalent) went through the shim's `sourceToPixels` fallback rather than the ImageBitmap short-circuit, so flipY / premultiply / colorspace pixelStore params (which per WebGL 1 spec apply only to TexImageSource uploads, NOT raw ArrayBufferView) were silently dropped. Image wraps an `nx_image_t` under the hood exactly like ImageBitmap does; extending the `last instanceof ImageBitmap` check to `last instanceof ImageBitmap || last instanceof Image` in both `texImage2D` and `texSubImage2D` routes Image sources through native's `convert_image_source_to_gl_pixels`, which handles flipY etc. correctly. Same class of fix as ledger #85 v3 did for canvas sources.
+
+**Scope.** +8 tests flip: all `textures-svg_image-tex-2d-*` variants. Likely also flips 7 of 8 `textures-image-tex-2d-*` (same PNG/JPEG/etc. Image code path); verified separately. Corpus test-count moves 319/607 = 52.6% → 327/607 = 53.9% (SVG-only) or higher if image-tex also flips.
 
 **DISPOSITION:** `brewser-specific`. nxjs upstream doesn't ship an image decoder for SVG; adding one is embedder scope. If nxjs ever adopts a general SVG path (Skia's SkSVG module), replace `decode_svg` with the delegate.
 

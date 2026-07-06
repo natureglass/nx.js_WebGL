@@ -1382,6 +1382,9 @@ check 89 "image.cc [tier-a] Ledger #89 decode_svg parser present" \
     'Ledger #89 — targeted SVG parser'
 check_file_exists 89 "brewser-apps [tier-a] webgl1 red-green.svg synced from webgl2 resources" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.svg"
+check 89 "webgl-rendering-context.ts [tier-a] Image sources route through the #71 short-circuit (v2)" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'last instanceof ImageBitmap \|\| last instanceof Image'
 
 # #88 — Tier-A: getUniformLocation rejects out-of-range bracket indices
 # (client-side WebGL 1 spec validation for the driver-leniency case where
