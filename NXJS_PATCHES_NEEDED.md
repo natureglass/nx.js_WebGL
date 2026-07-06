@@ -3982,6 +3982,71 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #95 — Tier-A: WebGL wrapper `deleted` mark + wrapper-cache retention on delete + bindX(deletedX) → INVALID_OPERATION + WebGL 1 getFramebufferAttachmentParameter(NONE, OBJECT_NAME) → INVALID_ENUM + shader asset sync + FBO delete-of-bound fallback — SHIPPED 2026-07-06
+
+**File(s):**
+- [source/webgl.cc](source/webgl.cc) — `GLObj` gets a `bool deleted = false;` flag; new `obj_deleted()` and `new_gl_obj_create()` helpers; each `w_delete_{buffer,texture,renderbuffer,framebuffer}` marks the wrapper deleted + KEEPS it in the #92 cache (was: `erase_wrapper_cache`); each `w_create_{buffer,texture,renderbuffer,framebuffer}` routes through `new_gl_obj_create` so gen-after-delete of a reused GL name yields a fresh JS wrapper; each `w_bind_{buffer,texture,renderbuffer,framebuffer}` checks `obj_deleted(info[1])` at the head and records `INVALID_OPERATION` on hit; `w_get_framebuffer_attachment_parameter` records `INVALID_ENUM` on WebGL 1 when the OBJECT_NAME query hits a NONE-typed attachment; `w_delete_framebuffer` falls the shadow FBO binding back to the tenant FBO if the deleted FBO was currently bound.
+- [brewser-apps/.../full-webgl1-conformance/sdk/tests/resources/vertexShader.vert](../brewser-apps/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/vertexShader.vert), [fragmentShader.frag](../brewser-apps/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/fragmentShader.frag) — synced from `full-webgl2-conformance/`'s resources dir (same class of asset gap as #89's `red-green.svg`; the WebGL 1 dir was missing them entirely — `wtu.loadStandardVertexShader` / `loadStandardFragmentShader` fetched empty strings, glCompileShader emitted "unexpected end of file", every downstream test using `wtu.setupProgram` etc. cascaded shader-null-related INVALID_VALUE fails).
+
+**Motivation.** `misc-object-deletion-behaviour` (WebGL 1 conformance) failed with p=249 f=45 — six distinct failure clusters, mostly rooted in three WebGL spec semantics we hadn't implemented, plus one runtime-side ordering bug and one missing-asset issue:
+
+- **Cluster A (shader load: 2 fails)** + **Cluster F cascade (~14 fails)**: `wtu.loadStandardVertexShader(gl)` fetches `resources/vertexShader.vert` — which didn't exist in the WebGL 1 resources dir (present only in WebGL 2). Empty string → compile fail → `assertMsg(vertexShader, "vertex shader loaded")` FAIL, and every downstream `attachShader(program, null)`, `linkProgram`, `useProgram`, `deleteShader(null)`, `isShader(null)`, `getShaderParameter(null, DELETE_STATUS)` etc. cascaded either INVALID_VALUE returns or "was false" mismatches.
+- **Cluster B (11 fails)**: `gl.bind{Buffer,Texture,Renderbuffer,Framebuffer}(deletedX)` — WebGL 1 spec §5.13–5.17 requires INVALID_OPERATION with NO change to current binding. Pre-#95 our shim called `glBindX(target, name)` unconditionally; Mesa-Nouveau's `glBindX` happily accepts the deleted GL name (some drivers even resurrect a fresh empty object under it), so no error was emitted and the binding silently pointed at the deleted-and-freed object.
+- **Cluster C (7 fails)**: `getParameter(BINDING) should be null` — auto-resolves once Cluster B is fixed (the failed bind now doesn't change the binding, which stays at null per the earlier PASS'd `deleteX`-implicit-unbind).
+- **Cluster D (4 fails)**: `getFramebufferAttachmentParameter(FRAMEBUFFER, COLOR_ATTACHMENT0, OBJECT_NAME)` when the attachment type is NONE — WebGL 1 spec §5.14.3 requires INVALID_ENUM + null return. WebGL 2 §3.7.3 relaxes this to null-without-error. Pre-#95 we returned null unconditionally.
+- **Cluster E (2 fails)**: `shouldBe(gl.getFramebufferAttachmentParameter(..., OBJECT_NAME), rbo)` after `deleteRenderbuffer(rbo)` — the renderbuffer is still attached to a *different* framebuffer (spec permits this: deletion detaches only from the *currently bound* FBO). The test expects the returned wrapper to be `===` the original `rbo` JS reference. Pre-#95 `w_delete_renderbuffer` called `erase_wrapper_cache(K_RENDERBUFFER, id)`; the subsequent OBJECT_NAME query then re-created a fresh wrapper via `new_gl_obj(K_RENDERBUFFER, name)` — same class + id but a different JS identity.
+- **Cluster H (subset, ~2 fails)**: after `deleteFramebuffer(currentlyBoundFbo)`, the WebGL 1 spec says the binding falls back to the default framebuffer (name 0). Our shim redirects "JS null / 0" to the tenant FBO in `enter_bracket` via the `st->bound_fbo_js == 0` gate; without resetting the shadow on delete-of-bound, subsequent enter_brackets would `glBindFramebuffer(deletedName)` and Mesa-Nouveau conjures a fresh empty FBO under that name — every downstream clear / readPixels lands in an incomplete FBO, producing e.g. the "backbuffer should be red" → "was 11,18,32" (Skia backdrop leaking through) and "fbo should be green" → "was 255,0,0" (stale backbuffer color) mismatches.
+
+**Fix.**
+
+1. **Shader asset sync** (source `full-webgl2-conformance/sdk/tests/resources/` → dest `full-webgl1-conformance/sdk/tests/resources/`) for `vertexShader.vert` (1507 B) and `fragmentShader.frag` (1456 B). Same class as #89's `red-green.svg` sync.
+
+2. **`GLObj.deleted` flag + wrapper-cache retention.** Add `bool deleted = false;` field. Each `w_delete_{buffer,texture,renderbuffer,framebuffer}` marks the wrapper deleted BUT stops calling `erase_wrapper_cache`. The wrapper survives in `st->wrapper_cache` so subsequent `getFramebufferAttachmentParameter(..., OBJECT_NAME)` / `getVertexAttrib(..., BUFFER_BINDING)` etc. return the SAME JS wrapper (identity preserved). Shader / program / VAO / query / sampler continue to `erase_wrapper_cache` — their delete semantics (esp. `isShader` after `deleteShader-while-attached`) differ from container objects and don't benefit from the retention.
+
+3. **`new_gl_obj_create` for create paths.** With cache retention on delete, a driver-side `glGenX` that reuses a freed name would silently return the marked-deleted wrapper via `new_gl_obj`'s cache-first lookup. `new_gl_obj_create` erases any stale `(kind, id)` entry BEFORE creating, so create always yields a fresh JS wrapper. All four `w_create_{buffer,texture,renderbuffer,framebuffer}` route through it.
+
+4. **`obj_deleted()` guard at bind head.**
+
+```cpp
+FN(w_bind_buffer) {
+    enter_bracket();
+    const GLenum target = a_u32(info, 0);
+    if (obj_deleted(info[1])) {
+        record_error(GL_INVALID_OPERATION);
+        return;
+    }
+    ...
+}
+```
+
+Same shape in `w_bind_texture`, `w_bind_renderbuffer`, `w_bind_framebuffer`. Rejection is early-return: no `glBindX` call, no shadow-state update. The pre-existing binding (typically `null` post-`deleteX`-implicit-unbind) stays intact. Downstream ops like `bufferData` and `texParameteri` that check current binding now correctly get GL's INVALID_OPERATION on "no target bound".
+
+5. **WebGL 1 INVALID_ENUM on NONE-typed OBJECT_NAME query.** Inside `w_get_framebuffer_attachment_parameter`, when `pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME` AND `obj_type == 0 (GL_NONE)`, record `GL_INVALID_ENUM` (WebGL 1 only) before returning null. WebGL 2 gets null-without-error via the `is_v2_context(info)` gate.
+
+6. **FBO delete-of-bound fallback.** `w_delete_framebuffer` now checks `st->bound_fbo_js == o->id` and resets to `bound_fbo_js = 0`, `draw_into_default = true`, and `user_snap.fbo / user_snap.read_fbo = tenant_fbo_id` so the next enter_bracket re-emits the tenant FBO binding (which is the semantic of "default framebuffer" in the brewser embedder).
+
+**Scope.** Expected +40 assertion flips (of 45 total) on `misc-object-deletion-behaviour`. Test-level PASS/FAIL depends on whether the residual ~5 "fbo should be blue" / "backbuffer should be red" fails in the deleted-texture-still-attached-to-non-bound-FBO cluster resolve. Those are a driver-side Mesa-Nouveau issue (texture storage freed on `glDeleteTextures` regardless of pending attachments to non-bound FBOs) that would require attachment-tracking + deferred delete in the shim; deferred as a follow-up. If the residual cluster stays, the test stays FAIL but assertion count drops dramatically. Cross-cluster reach: any WebGL 1 conformance test that hit the "wtu.setupProgram" / `loadStandard{Vertex,Fragment}Shader` path pre-#95 was blocked by the missing asset — expect several other tests to flip via the shader-sync alone.
+
+**Trade-offs.**
+
+- **Deleted wrappers linger in `wrapper_cache` until context teardown.** Memory cost: one Global<Object> per deleted-but-attached object. WebGL apps typically don't churn objects hard enough for this to matter (the `webgl1-perf` demos allocate O(100) buffers total, not O(1e6)); if a future workload needs eviction, the marker + a periodic sweep is a straightforward add.
+- **`new_gl_obj_create` semantics differ from `new_gl_obj` at the create site.** The two-function split is a slight cognitive cost. Alternative — a `bool for_create` param — was rejected: static discipline (which functions call which helper) is easier to grep than a runtime flag.
+- **Shader/program/VAO/query/sampler still `erase_wrapper_cache` on delete.** For consistency they could also switch to retention, but their delete semantics don't require identity survival (no analog of `getFramebufferAttachmentParameter` for these kinds) and `isShader` / `isProgram` semantics rely on the driver's own name-tracking. Leaving them alone minimizes surface area for this ledger.
+
+**DISPOSITION:** `upstream-candidate`. All fixes are WebGL 1 spec-conformance closures except the FBO delete-of-bound fallback, which is brewser-specific (the tenant-FBO redirect is our embedder architecture). Upstream nx.js's WebGL 1 path has the same wrapper-lifecycle + bind-of-deleted + OBJECT_NAME-INVALID_ENUM gaps.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #95 — WebGL 1 spec §5.14: bindBuffer` (bind-side reject) and `Ledger #95 — WebGL 1 spec §5.14.3` (getFramebufferAttachmentParameter INVALID_ENUM) and `Ledger #95 — DO NOT erase_wrapper_cache` (delete-side retention). Recurrence tells:
+
+- `misc-object-deletion-behaviour` regresses to Cluster B assertions (`FAIL: getError expected: 0x502. Was NO_ERROR : after evaluating: gl.bindBuffer(gl.ARRAY_BUFFER, buffer)`) = the `obj_deleted()` guard was dropped from one or more `w_bind_*` heads. Grep the four `w_bind_{buffer,texture,renderbuffer,framebuffer}` for `obj_deleted(info[1])`.
+- `textures-*-tex-2d-*` tests that use `wtu.setupTexturedQuad` regress to "vertex shader loaded" / "fragment shader loaded" FAIL = the standard-shader assets in `full-webgl1-conformance/sdk/tests/resources/` were removed. Re-copy from `full-webgl2-conformance/`.
+- `misc-object-deletion-behaviour` regresses to Cluster E ("should be [WebGLRenderbuffer]. Was [WebGLRenderbuffer]" identity mismatch) = an `erase_wrapper_cache(K_{TEXTURE,RENDERBUFFER,FRAMEBUFFER,BUFFER}, ...)` call was reintroduced into one of the four container `w_delete_*` FNs. Retention is required; the wrapper must survive delete.
+- A `createBuffer` / `createTexture` etc. returns a wrapper `w` whose `w.deleted === true` before the app ever called `deleteX(w)` = `new_gl_obj_create` isn't evicting stale cache on the driver-reused GL name. Grep `w_create_{buffer,texture,renderbuffer,framebuffer}` for `new_gl_obj_create`.
+- `misc-object-deletion-behaviour`'s framebuffer-deletion block regresses to "backbuffer should be red" → "was 11,18,32" or similar Skia-backdrop leak = `w_delete_framebuffer`'s `bound_fbo_js == o->id` check was removed. The shadow must fall back to `bound_fbo_js = 0` + `user_snap.fbo = tenant_fbo_id` on delete-of-bound.
+
+---
+
 ## #94 — MOVED → RUNTIME_SHIMS.md
 
 Cube-route-shim atlas-alloc gate lowered from `w >= 8 && h >= 8` to `w >= 1 && h >= 1` for small null-source cube-face `texImage2D` uploads. WebGL 1 conformance's `textures-{svg_image,image}-tex-2d-*` cluster (14 tests) allocates cube face storage via `texImage2D(POSITIVE_X+i, ..., null)` at the SVG/image's natural 2×2 dims, then uploads image content via `texSubImage2D(POSITIVE_X+i, ..., image)`. Pre-#94 the atlas was skipped (`w=2 < 8`), and the shader-rewrite branch of cube-route-shim (which unconditionally converts `samplerCube tex` → `sampler2D tex` + `textureCube(tex, dir)` → `cubeUVSample(tex, dir)`) then sampled TEXTURE_2D[TU0] — which held the *previous* iteration's atlas — producing the `cube+texSubImage+flipY=true` combo's "unflipped colors observed" 12-FAILs-per-test signature. Widened gate atlas-ifies these uploads so `sampler2D` reads the CURRENT cube's atlas. Three.js's `_emptyCubeTexture` placeholder is unaffected (uploads typed-array, not null). Zero engine delta. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#94).

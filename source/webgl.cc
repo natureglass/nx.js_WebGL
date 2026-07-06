@@ -121,6 +121,18 @@ struct GLObj {
 	uint32_t id;
 	int32_t loc; // uniform location for K_UNIFORM_LOCATION
 	uint8_t kind;
+	// Ledger #95 — WebGL "deletion" is a JS-wrapper concept, not a GL
+	// name-freeing one. After `gl.delete<X>(w)`, the JS wrapper `w` stays
+	// alive (the app may still hold references), but any subsequent
+	// `gl.bind<X>(w)` etc. must generate INVALID_OPERATION per WebGL 1
+	// spec §5.13–5.17. Set true by each `w_delete_*` FN; checked at the
+	// head of each `w_bind_*` (buffer / texture / renderbuffer /
+	// framebuffer) via `obj_deleted()`. Wrapper stays in the #92 cache
+	// so `getFramebufferAttachmentParameter(...OBJECT_NAME)` and other
+	// queries continue to return the same JS wrapper for identity
+	// comparisons (WebGL objects surviving deletion is a spec property,
+	// not a leak).
+	bool deleted = false;
 	// K_SYNC uses a GLsync (opaque pointer), not a GLuint name. Held in
 	// its own field to avoid punning `id`+`loc` bits into a 64-bit
 	// pointer (which introduces sign-extension traps on the loc int32).
@@ -421,6 +433,23 @@ Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
 	return obj;
 }
 
+// Ledger #95 — create-path variant of new_gl_obj. Post-#95 the delete
+// natives for buffer/texture/renderbuffer/framebuffer keep the JS
+// wrapper in the wrapper_cache (to preserve identity for subsequent
+// getFramebufferAttachmentParameter etc.); if a driver-side glGenX
+// then reuses the freed GL name, `new_gl_obj`'s cache-first lookup
+// would silently hand back the DELETED wrapper as the "new" one. Evict
+// any stale cache entry with the same (kind, id) FIRST so createX
+// always returns a fresh JS object. Called from every w_create_* FN
+// so gen-then-reuse-of-freed-name is spec-safe even for kinds that
+// don't (yet) use the .deleted mark.
+Local<Object> new_gl_obj_create(Isolate *iso, uint8_t kind, GLuint id) {
+	if (st && id != 0 && is_cacheable_kind(kind)) {
+		st->wrapper_cache.erase(cache_key(kind, id));
+	}
+	return new_gl_obj(iso, kind, id);
+}
+
 GLObj *get_gl_obj(Local<Value> v) {
 	if (v.IsEmpty() || !v->IsObject())
 		return nullptr;
@@ -430,6 +459,16 @@ GLObj *get_gl_obj(Local<Value> v) {
 GLuint obj_id(Local<Value> v) {
 	GLObj *o = get_gl_obj(v);
 	return o ? o->id : 0;
+}
+
+// Ledger #95 — was this WebGL wrapper deleted via `gl.delete<X>()`?
+// Callers use this at the head of `w_bind_*` / other consumer natives
+// to reject deleted-object references with INVALID_OPERATION (WebGL 1
+// spec §5.13–5.17). Null / undefined / non-GLObj arguments return
+// false — bindX(null) is a valid "unbind" and must not be rejected.
+inline bool obj_deleted(Local<Value> v) {
+	GLObj *o = get_gl_obj(v);
+	return o && o->deleted;
 }
 
 GLint uniform_loc(Local<Value> v) {
@@ -2669,13 +2708,23 @@ FN(w_get_active_uniform) {
 FN(w_create_buffer) {
 	GLuint b = 0;
 	glGenBuffers(1, &b);
-	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_BUFFER, b));
+	// Ledger #95 — new_gl_obj_create evicts any stale (deleted-but-cached)
+	// wrapper with the same GL name before creating so a driver-side gen-
+	// after-delete reuse of the same name doesn't hand back the marked-
+	// deleted wrapper.
+	info.GetReturnValue().Set(
+	    new_gl_obj_create(info.GetIsolate(), K_BUFFER, b));
 }
 FN(w_delete_buffer) {
-	GLuint id = obj_id(info[0]);
-	if (id) {
-		glDeleteBuffers(1, &id);
-		erase_wrapper_cache(K_BUFFER, id);
+	// Ledger #95 — keep the wrapper in the #92 cache; mark deleted so
+	// bindBuffer / bufferData etc. can reject with INVALID_OPERATION.
+	// Identity of the wrapper survives into subsequent
+	// getFramebufferAttachmentParameter / getVertexAttrib queries per
+	// WebGL 1 spec §5.14.
+	GLObj *o = get_gl_obj(info[0]);
+	if (o && o->id) {
+		glDeleteBuffers(1, &o->id);
+		o->deleted = true;
 	}
 }
 FN(w_is_buffer) {
@@ -2685,6 +2734,14 @@ FN(w_is_buffer) {
 FN(w_bind_buffer) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
+	// Ledger #95 — WebGL 1 spec §5.14: bindBuffer on a deleted buffer
+	// generates INVALID_OPERATION and MUST NOT change the current
+	// binding. glDeleteBuffers already ran on the underlying GL name;
+	// the reject-here contract is a WebGL-layer promise, not a GL one.
+	if (obj_deleted(info[1])) {
+		record_error(GL_INVALID_OPERATION);
+		return;
+	}
 	const GLuint buf = obj_id(info[1]);
 	glBindBuffer(target, buf);
 	if (st && target == GL_ARRAY_BUFFER) st->user_snap.array_buffer = (GLint)buf;
@@ -2803,13 +2860,17 @@ UNI_MAT_FV(4)
 FN(w_create_texture) {
 	GLuint t = 0;
 	glGenTextures(1, &t);
-	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_TEXTURE, t));
+	// Ledger #95 — see w_create_buffer for the create-path eviction
+	// rationale.
+	info.GetReturnValue().Set(
+	    new_gl_obj_create(info.GetIsolate(), K_TEXTURE, t));
 }
 FN(w_delete_texture) {
-	GLuint id = obj_id(info[0]);
-	if (id) {
-		glDeleteTextures(1, &id);
-		erase_wrapper_cache(K_TEXTURE, id);
+	// Ledger #95 — see w_delete_buffer.
+	GLObj *o = get_gl_obj(info[0]);
+	if (o && o->id) {
+		glDeleteTextures(1, &o->id);
+		o->deleted = true;
 	}
 }
 FN(w_is_texture) {
@@ -2819,6 +2880,11 @@ FN(w_is_texture) {
 FN(w_bind_texture) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
+	// Ledger #95 — see w_bind_buffer.
+	if (obj_deleted(info[1])) {
+		record_error(GL_INVALID_OPERATION);
+		return;
+	}
 	const GLuint tex = obj_id(info[1]);
 	glBindTexture(target, tex);
 	// Track TU0 TEXTURE_2D binding to match nx_gl_state_snap_t coverage.
@@ -3636,13 +3702,36 @@ FN(w_tex_sub_image_3d) {
 FN(w_create_framebuffer) {
 	GLuint f = 0;
 	glGenFramebuffers(1, &f);
-	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_FRAMEBUFFER, f));
+	// Ledger #95 — see w_create_buffer.
+	info.GetReturnValue().Set(
+	    new_gl_obj_create(info.GetIsolate(), K_FRAMEBUFFER, f));
 }
 FN(w_delete_framebuffer) {
-	GLuint id = obj_id(info[0]);
-	if (id) {
-		glDeleteFramebuffers(1, &id);
-		erase_wrapper_cache(K_FRAMEBUFFER, id);
+	// Ledger #95 — see w_delete_buffer for the wrapper-lifecycle rationale.
+	// Also: WebGL 1 spec §5.14.2 (mirroring GLES 2 §4.4.4) — if the deleted
+	// framebuffer was currently bound, the binding falls back to the
+	// default framebuffer (name 0). Our shim redirects "JS-null / 0" to
+	// the tenant FBO via `bound_fbo_js == 0` in enter_bracket; without
+	// resetting the shadow here, subsequent JS calls' enter_bracket would
+	// glBindFramebuffer(deletedName) and Mesa-Nouveau re-conjures a fresh
+	// empty FBO under that name — every draw / clear / readPixels then
+	// hits an incomplete FBO and the observable state (colors on the
+	// tenant surface, `getFramebufferAttachmentParameter` etc.) diverges
+	// from spec. Fix: fall the shadow back to default on delete-of-bound.
+	GLObj *o = get_gl_obj(info[0]);
+	if (o && o->id) {
+		if (st && st->bound_fbo_js == o->id) {
+			st->bound_fbo_js = 0;
+			st->draw_into_default = true;
+			// user_snap.fbo is the GL-side actual (post-redirect) name we
+			// re-emit at every enter_bracket. Steer it back to the tenant
+			// FBO id so the next bracket doesn't glBindFramebuffer(0)
+			// (native default, ≠ tenant) and lose the redirect.
+			st->user_snap.fbo = (GLint)nx_webgl_bridge_fbo_id();
+			st->user_snap.read_fbo = (GLint)nx_webgl_bridge_fbo_id();
+		}
+		glDeleteFramebuffers(1, &o->id);
+		o->deleted = true;
 	}
 }
 FN(w_is_framebuffer) {
@@ -3652,6 +3741,11 @@ FN(w_is_framebuffer) {
 FN(w_bind_framebuffer) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
+	// Ledger #95 — see w_bind_buffer.
+	if (obj_deleted(info[1])) {
+		record_error(GL_INVALID_OPERATION);
+		return;
+	}
 	GLuint fbo = obj_id(info[1]);
 	if (st) {
 		st->bound_fbo_js = fbo;
@@ -3689,13 +3783,16 @@ FN(w_check_framebuffer_status) {
 FN(w_create_renderbuffer) {
 	GLuint r = 0;
 	glGenRenderbuffers(1, &r);
-	info.GetReturnValue().Set(new_gl_obj(info.GetIsolate(), K_RENDERBUFFER, r));
+	// Ledger #95 — see w_create_buffer.
+	info.GetReturnValue().Set(
+	    new_gl_obj_create(info.GetIsolate(), K_RENDERBUFFER, r));
 }
 FN(w_delete_renderbuffer) {
-	GLuint id = obj_id(info[0]);
-	if (id) {
-		glDeleteRenderbuffers(1, &id);
-		erase_wrapper_cache(K_RENDERBUFFER, id);
+	// Ledger #95 — see w_delete_buffer.
+	GLObj *o = get_gl_obj(info[0]);
+	if (o && o->id) {
+		glDeleteRenderbuffers(1, &o->id);
+		o->deleted = true;
 	}
 }
 FN(w_is_renderbuffer) {
@@ -3704,6 +3801,11 @@ FN(w_is_renderbuffer) {
 }
 FN(w_bind_renderbuffer) {
 	enter_bracket();
+	// Ledger #95 — see w_bind_buffer.
+	if (obj_deleted(info[1])) {
+		record_error(GL_INVALID_OPERATION);
+		return;
+	}
 	glBindRenderbuffer(a_u32(info, 0), obj_id(info[1]));
 }
 FN(w_renderbuffer_storage) {
@@ -5587,6 +5689,16 @@ FN(w_get_framebuffer_attachment_parameter) {
 		glGetFramebufferAttachmentParameteriv(target, attachment, pname,
 		                                       &name);
 		if (obj_type == 0 /* GL_NONE */ || name == 0) {
+			// Ledger #95 — WebGL 1 spec §5.14.3: if the framebuffer
+			// attachment type is NONE, querying OBJECT_NAME generates
+			// INVALID_ENUM and the return value is null. WebGL 2 §3.7.3
+			// widens this: OBJECT_NAME with NONE attachment returns null
+			// WITHOUT generating an error. The distinction is spec-
+			// mandated and load-bearing for the `misc-object-deletion-
+			// behaviour` test's WebGL 1 assertion arm.
+			if (!is_v2_context(info)) {
+				record_error(GL_INVALID_ENUM);
+			}
 			info.GetReturnValue().SetNull();
 			return;
 		}

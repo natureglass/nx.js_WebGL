@@ -1368,6 +1368,33 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #95 — Tier-A: WebGL wrapper `deleted` flag + wrapper-cache retention on
+# delete + bindX(deletedX) INVALID_OPERATION + getFramebufferAttachment-
+# Parameter(NONE, OBJECT_NAME) INVALID_ENUM on WebGL 1 + shader asset sync
+# + FBO delete-of-bound fallback.
+check 95 "webgl.cc [tier-a] GLObj deleted flag defined" \
+    "$NXJS/source/webgl.cc" \
+    'bool deleted = false;'
+check 95 "webgl.cc [tier-a] obj_deleted() helper defined" \
+    "$NXJS/source/webgl.cc" \
+    'inline bool obj_deleted'
+check 95 "webgl.cc [tier-a] new_gl_obj_create() helper defined" \
+    "$NXJS/source/webgl.cc" \
+    'new_gl_obj_create\(Isolate'
+check 95 "webgl.cc [tier-a] w_bind_buffer rejects deleted (Ledger #95 header)" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #95 — WebGL 1 spec'
+check 95 "webgl.cc [tier-a] w_get_framebuffer_attachment_parameter INVALID_ENUM on WebGL 1 NONE" \
+    "$NXJS/source/webgl.cc" \
+    'querying OBJECT_NAME generates'
+check 95 "webgl.cc [tier-a] w_delete_framebuffer falls back to tenant on delete-of-bound" \
+    "$NXJS/source/webgl.cc" \
+    'if \(st && st->bound_fbo_js == o->id\)'
+check_file_exists 95 "brewser-apps [tier-a] webgl1 vertexShader.vert synced from webgl2 resources" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/vertexShader.vert"
+check_file_exists 95 "brewser-apps [tier-a] webgl1 fragmentShader.frag synced from webgl2 resources" \
+    "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/fragmentShader.frag"
+
 # #94 — Tier-A: cube-route-shim atlas-alloc gate lowered from w>=8 to w>=1
 # so small null-source cube-face texImage2D uploads allocate an atlas —
 # fixes the WebGL 1 textures-{svg_image,image}-tex-2d-* cluster's cube+
