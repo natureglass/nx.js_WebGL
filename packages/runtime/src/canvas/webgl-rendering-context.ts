@@ -582,7 +582,18 @@ export interface WebGLRenderingContext extends Readonly<typeof GL_CONSTANTS> {}
 	const descs: PropertyDescriptorMap = {};
 	for (let i = 0; i < keys.length; i++) {
 		const k = keys[i];
-		descs[k] = { value: (GL_CONSTANTS as Record<string, number>)[k] };
+		// Ledger #98 — `enumerable: true` so `Object.entries(WebGLRendering
+		// Context)` returns the constants. Khronos WebGL conformance's
+		// `wtu.glEnumToString(gl, val)` iterates via `for (const [k,v] of
+		// Object.entries(WebGL2RenderingContext || WebGLRenderingContext))`
+		// to build the value → name lookup; without enumerable=true the
+		// iteration yields NO entries and every enum stringifies as its
+		// hex form (`"0x1400"` instead of `"BYTE"`). The test then does
+		// `shouldBe('gl.getVertexAttrib(...TYPE)', 'gl.' + name)`, which
+		// becomes `shouldBe(..., 'gl.0x1400')` — a JS syntax error under
+		// eval, so shouldBe FAILs. This flipped ~700 assertions in
+		// `attribs-gl-vertexattribpointer` alone.
+		descs[k] = { value: (GL_CONSTANTS as Record<string, number>)[k], enumerable: true };
 	}
 	Object.defineProperties(WebGLRenderingContext, descs);
 	Object.defineProperties(WebGLRenderingContext.prototype, descs);

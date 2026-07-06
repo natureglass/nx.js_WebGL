@@ -2790,7 +2790,33 @@ FN(w_disable_vertex_attrib_array) {
 }
 FN(w_vertex_attrib_pointer) {
 	enter_bracket();
-	glVertexAttribPointer(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
+	const GLuint index = a_u32(info, 0);
+	const GLint size = a_i32(info, 1);
+	const GLenum type = a_u32(info, 2);
+	// Ledger #98 — WebGL 1 spec §5.14.10: vertexAttribPointer's `type`
+	// arg only accepts BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, FLOAT.
+	// INT / UNSIGNED_INT / FIXED are all invalid on WebGL 1 (they're
+	// added on WebGL 2 by ES3 core, plus INT_2_10_10_10_REV via ES3).
+	// Mesa Nouveau's native glVertexAttribPointer runs an ES3.2 driver so
+	// it accepts INT/UNSIGNED_INT silently (FIXED via GL_OES_fixed_point
+	// / ES1-legacy on some builds). Guard client-side to match spec.
+	// OES_vertex_type_2_10_10_10_REV / OES_vertex_half_float would extend
+	// this list at extension-enable time; not implemented in this ledger
+	// because the conformance test doesn't exercise them on WebGL 1.
+	if (!is_v2_context(info)) {
+		switch (type) {
+		case GL_BYTE:
+		case GL_UNSIGNED_BYTE:
+		case GL_SHORT:
+		case GL_UNSIGNED_SHORT:
+		case GL_FLOAT:
+			break;
+		default:
+			record_error(GL_INVALID_ENUM);
+			return;
+		}
+	}
+	glVertexAttribPointer(index, size, type,
 	                      a_bool(info, 3) ? GL_TRUE : GL_FALSE,
 	                      a_i32(info, 4),
 	                      (const void *)(intptr_t)a_i64(info, 5));

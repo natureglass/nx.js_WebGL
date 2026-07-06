@@ -4037,6 +4037,41 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #98 — Tier-A: WebGL constants installed `enumerable: true` + `vertexAttribPointer` type validation (INT/UNSIGNED_INT/FIXED reject) — SHIPPED 2026-07-06
+
+**File(s):**
+- [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) — the bulk `Object.defineProperties` call (#8's post-crash-fix install shape) now emits descriptors with `enumerable: true`. Same change in [webgl2-rendering-context.ts](packages/runtime/src/canvas/webgl2-rendering-context.ts).
+- [source/webgl.cc](source/webgl.cc) — `w_vertex_attrib_pointer` gates `type` against the WebGL 1 spec-allowed set (`BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, FLOAT`) and records `INVALID_ENUM` on WebGL 1 for everything else. v2 continues to accept the ES3-core additions unchanged.
+
+**Motivation.** Two independent bugs surfacing in a single Khronos test — `attribs-gl-vertexattribpointer` (WebGL 1 conformance, p=1700 f=1203):
+
+1. **`glEnumToString(gl, 0x1400)` returns `"0x1400"` instead of `"BYTE"`.** Khronos's wtu builds a value → name map by iterating `for (const [k,v] of Object.entries(WebGL2RenderingContext || WebGLRenderingContext))`. Post-#8 the constants are installed via `Object.defineProperties(target, { BYTE: {value: 0x1400}, ... })`. Property descriptors passed as objects to `defineProperties` default to `enumerable: false, writable: false, configurable: false` per ES spec §10.5.1 — so `Object.entries(WebGLRenderingContext)` returns an EMPTY array. The map never populates; every subsequent `glEnumToString` call for a numeric enum falls through to the hex fallback (`"0x" + value.toString(16)`). The test then does `shouldBe('gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_TYPE)', 'gl.' + wtu.glEnumToString(gl, type))` — which becomes `shouldBe(..., 'gl.0x1400')`. `shouldBe` `eval()`s the string; `gl.0x1400` is a JS syntax error (identifier can't start with digit after `.`); the eval throws; the assertion FAILs. Every one of the ~720 successful `vertexAttribPointer` iterations trips this trap.
+
+2. **`vertexAttribPointer(0, N, gl.INT / gl.UNSIGNED_INT / gl.FIXED, ...)` silently succeeds.** WebGL 1 spec §5.14.10 restricts `type` to `BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, FLOAT`; WebGL 2 (via ES3 core) adds `INT, UNSIGNED_INT, HALF_FLOAT, INT_2_10_10_10_REV, UNSIGNED_INT_2_10_10_10_REV`. `FIXED` is NEVER valid in WebGL. Mesa Nouveau's native `glVertexAttribPointer` runs an ES3.2 driver, so it accepts INT/UNSIGNED_INT silently; FIXED is accepted via `GL_OES_fixed_point` on some Nouveau builds. Client-side validation is required to match the WebGL 1 spec.
+
+**Fix.**
+
+- Add `enumerable: true` to every descriptor in the two `Object.defineProperties` sites (v1 + v2). Same install SHAPE as #8's crash-fix (bulk defineProperties, not per-key), just widening the flag.
+- In `w_vertex_attrib_pointer`, gate on `is_v2_context(info)`; when v1, `switch` on the incoming type and `record_error(GL_INVALID_ENUM); return;` if it's not one of the five spec-allowed values.
+
+**Scope.** Expected massive flip on `attribs-gl-vertexattribpointer` — the ~720 iterations each carry ~1-2 assertion fails from the hex-name issue, plus the 3 type-rejection fails at the top. Predicted p=1700 f=1203 → p in the ~2500-2900 range with f dropping to double digits. Cross-cluster reach: any other Khronos test that uses `wtu.glEnumToString` inside a `shouldBe` or `assertMsg` was affected pre-#98 — expect other tests to flip via the enumerable fix alone. `attribs-gl-vertexattribpointer-offsets` (companion test) is another likely beneficiary.
+
+**Trade-offs.**
+
+- **Constants become enumerable everywhere.** Any code doing `for-in` / `Object.keys` / `Object.entries` on `gl` or `WebGLRenderingContext` now sees all ~500 constants. This matches Chrome / Firefox behavior (they expose constants as enumerable own properties on the class). No known downside.
+- **v1 vertexAttribPointer restricted to 5 types even under OES extension.** `OES_vertex_type_2_10_10_10_REV` and `OES_vertex_half_float` extend the accepted set at `getExtension()`-time; not implemented here (Mesa Nouveau's driver support for those extensions isn't verified, and the test doesn't require them). If a future test needs them, gate the widened accept-list on `is_ext_enabled("OES_vertex_...")`.
+
+**DISPOSITION:** `upstream-candidate`. Both fixes are pure WebGL 1 spec conformance. Upstream nx.js has the same non-enumerable-constants gap and the same missing `vertexAttribPointer` type gate.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) for `Ledger #98 — \`enumerable: true\``. Grep [source/webgl.cc](source/webgl.cc) for `Ledger #98 — WebGL 1 spec §5.14.10`. Recurrence tells:
+
+- `attribs-gl-vertexattribpointer` regresses to `FAIL: gl.0x1400 threw: Invalid or unexpected token` per iteration = an `enumerable: true` was removed from one of the two `descs[k]` assignments. Both v1 and v2 sites must set it (v1 for WebGL 1 tests, v2 for the many WebGL 2 tests that ALSO use wtu.glEnumToString).
+- `attribs-gl-vertexattribpointer` regresses to `FAIL: getError expected: 0x500 (INVALID_ENUM). Was NO_ERROR : vertexAttribPointer should not support INT` = the `!is_v2_context(info) + switch(type)` block was removed from `w_vertex_attrib_pointer`. Grep for `Ledger #98 — WebGL 1 spec §5.14.10` at the head of the FN.
+
+---
+
 ## #97 — Tier-A: `texParameter{i,f}` on a target with no bound texture → INVALID_OPERATION (WebGL 1 spec §5.14.8) — SHIPPED 2026-07-06
 
 **File(s):** [source/webgl.cc](source/webgl.cc) — new `nx_binding_pname_for_tex_target` helper + `bound == 0` guard at the head of `w_tex_parameteri` and `w_tex_parameterf` that queries the current binding (`GL_TEXTURE_BINDING_2D` / `GL_TEXTURE_BINDING_CUBE_MAP`) and records `INVALID_OPERATION` before dispatching to native.

@@ -1368,6 +1368,18 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #98 — Tier-A: WebGL constants installed enumerable: true + vertexAttrib
+# Pointer type validation (INT/UNSIGNED_INT/FIXED reject) on WebGL 1.
+check 98 "webgl-rendering-context.ts [tier-a] descs enumerable: true (v1)" \
+    "$NXJS/packages/runtime/src/canvas/webgl-rendering-context.ts" \
+    'enumerable: true'
+check 98 "webgl2-rendering-context.ts [tier-a] descs enumerable: true (v2)" \
+    "$NXJS/packages/runtime/src/canvas/webgl2-rendering-context.ts" \
+    'enumerable: true'
+check 98 "webgl.cc [tier-a] w_vertex_attrib_pointer type gate INVALID_ENUM" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #98 — WebGL 1 spec'
+
 # #97 — Tier-A: texParameter{i,f} on target with no bound texture generates
 # INVALID_OPERATION per WebGL 1 spec §5.14.8.
 check 97 "webgl.cc [tier-a] nx_binding_pname_for_tex_target helper" \

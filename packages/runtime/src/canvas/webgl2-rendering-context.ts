@@ -1121,7 +1121,11 @@ export interface WebGL2RenderingContext extends Readonly<typeof GL_CONSTANTS> {}
 	const descs: PropertyDescriptorMap = {};
 	for (let i = 0; i < keys.length; i++) {
 		const k = keys[i];
-		descs[k] = { value: (GL_CONSTANTS as Record<string, number>)[k] };
+		// Ledger #98 — see webgl-rendering-context.ts for the
+		// `enumerable: true` rationale. Same fix applied on v2 so
+		// `Object.entries(WebGL2RenderingContext)` yields the constant
+		// list for `wtu.glEnumToString`'s reverse-lookup population.
+		descs[k] = { value: (GL_CONSTANTS as Record<string, number>)[k], enumerable: true };
 	}
 	Object.defineProperties(WebGL2RenderingContext, descs);
 	Object.defineProperties(WebGL2RenderingContext.prototype, descs);
