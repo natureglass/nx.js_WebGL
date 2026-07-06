@@ -2226,9 +2226,45 @@ static char *maybe_replace_pmrem_fs(GLuint shader, const char *src) {
 	return built;
 }
 
+// Ledger #90 — WebGL 1 spec §5 GLSL identifier reservation. `_webgl_` and
+// `webgl_` are reserved prefixes; shaders using them for any identifier
+// (variable, function, struct, struct field, etc.) MUST fail compilation.
+// Mesa Nouveau's GLSL compiler doesn't enforce this, so the Khronos
+// glsl-reserved-{_,}webgl_{field,function,struct,variable} cluster (8
+// tests) all FAIL the "[unexpected link status] (expected: false)" check.
+// Detect at boundary (start-of-string OR preceded by non-identifier char)
+// to avoid false-positives on legit identifiers that happen to contain
+// "webgl_" as a substring (e.g. "myapp_webgl_foo" is legal per spec —
+// only the LEADING prefix is reserved).
+static bool has_reserved_webgl_identifier(const char *src) {
+	if (!src) return false;
+	for (const char *p = src; *p; p++) {
+		char prev = (p == src) ? '\0' : p[-1];
+		bool at_boundary =
+		    !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+		      (prev >= '0' && prev <= '9') || prev == '_');
+		if (!at_boundary) continue;
+		if (p[0] == '_' && !strncmp(p + 1, "webgl_", 6)) return true;
+		if (!strncmp(p, "webgl_", 6)) return true;
+	}
+	return false;
+}
 FN(w_shader_source) {
 	GLuint s = obj_id(info[0]);
 	char *src = take_string(info.GetIsolate(), info[1]);
+	// Ledger #90 — replace source with a #error directive that halts the
+	// GLSL preprocessor. glCompileShader then reports COMPILE_STATUS=false;
+	// attachShader + linkProgram propagate that to LINK_STATUS=false,
+	// which is what the glsl-reserved cluster's info.linkSuccess=false
+	// expectation requires.
+	if (has_reserved_webgl_identifier(src)) {
+		const char *err_src =
+		    "#error nxjs: WebGL 1 spec \xC2\xA75 reserves _webgl_/webgl_ "
+		    "prefix\nvoid main(){gl_Position=vec4(0);}\n";
+		glShaderSource(s, 1, &err_src, nullptr);
+		delete[] src;
+		return;
+	}
 	char *pmrem_repl = maybe_replace_pmrem_fs(s, src);
 	const char *p = pmrem_repl ? pmrem_repl : src;
 	glShaderSource(s, 1, &p, nullptr);

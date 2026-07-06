@@ -1368,6 +1368,15 @@ check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-gree
 check_file_exists 84 "brewser-apps [tier-a] webgl1 video assets synced (red-green.bt601.vp9.webm)" \
     "$APPS/apps/experimental/com.natureglass.webglconformtest/full-webgl1-conformance/sdk/tests/resources/red-green.bt601.vp9.webm"
 
+# #90 — Tier-A: shaderSource rejects _webgl_/webgl_ reserved-prefix
+# identifiers per WebGL 1 spec §5 (driver leniency workaround).
+check 90 "webgl.cc [tier-a] Ledger #90 header comment" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #90 — WebGL 1 spec .5 GLSL identifier reservation'
+check 90 "webgl.cc [tier-a] has_reserved_webgl_identifier function present" \
+    "$NXJS/source/webgl.cc" \
+    'has_reserved_webgl_identifier'
+
 # #89 — Tier-A: minimal SVG decoder for Khronos conformance's red-green.svg
 # (WebGL 1 textures-svg_image-tex-2d-* cluster needs both the asset synced
 # from webgl2 resources AND the engine decode path added).

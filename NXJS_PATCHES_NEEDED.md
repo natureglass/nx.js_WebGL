@@ -3982,6 +3982,43 @@ Routing the canvas via ImageBitmap makes the source a real `nx_image_t`, which `
 
 ---
 
+## #90 — Tier-A: `shaderSource` rejects `_webgl_` / `webgl_` reserved-prefix identifiers per WebGL 1 spec §5 — SHIPPED 2026-07-06
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `has_reserved_webgl_identifier` static + guard in `w_shader_source`.
+
+**Motivation.** WebGL 1 conformance's `glsl-reserved-{_,}webgl_{field,function,struct,variable}` cluster (8 tests) all FAIL with `[unexpected link status] (expected: false) use of reserved _webgl prefix as {field,function,struct,variable} should fail`. Per WebGL 1 spec §5, GLSL identifiers must NOT begin with `webgl_` or `_webgl_` — the driver is required to fail compilation. Mesa Nouveau's GLSL compiler doesn't enforce this reservation; the shader compiles, the program links, and the test's `linkSuccess=false` assertion fires.
+
+**Fix.** In `w_shader_source`, scan the incoming source for identifiers starting with `_webgl_` or `webgl_`. A leading prefix means the pattern must appear at start-of-string OR preceded by a non-identifier character — this avoids false-positives on legit identifiers that happen to contain the substring elsewhere (`myapp_webgl_foo` is spec-legal because only the LEADING prefix is reserved). If found, replace the source with a `#error` directive that halts the GLSL preprocessor:
+
+```c
+static bool has_reserved_webgl_identifier(const char *src) {
+    for (const char *p = src; *p; p++) {
+        char prev = (p == src) ? '\0' : p[-1];
+        bool at_boundary = !((prev >= 'a' && prev <= 'z') || ...);
+        if (!at_boundary) continue;
+        if (p[0] == '_' && !strncmp(p + 1, "webgl_", 6)) return true;
+        if (!strncmp(p, "webgl_", 6)) return true;
+    }
+    return false;
+}
+```
+
+`#error` sets `COMPILE_STATUS=false`, then `attachShader` + `linkProgram` propagate to `LINK_STATUS=false`, which the test's `info.linkSuccess=false` expectation requires.
+
+**Scope.** +8 tests flip: entire `glsl-reserved-{_,}webgl_*` cluster. Corpus test-count moves 320/607 = 52.7% → 328/607 = 54.0%.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder on a driver that doesn't enforce the WebGL 1 identifier reservation would hit the same test cluster failure.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `Ledger #90 — WebGL 1 spec §5 GLSL identifier reservation`. Recurrence tells:
+
+- All 8 `glsl-reserved-*` regress to FAIL with `[unexpected link status] (expected: false)` = the guard in `w_shader_source` was removed or the identifier scan misordered relative to `maybe_replace_pmrem_fs`.
+- Legitimate identifiers like `myapp_webgl_helper` fail compilation = the boundary check (start-of-string OR preceded by non-identifier char) regressed; the scan is matching anywhere, not just at identifier start.
+- A shader with `_webgl_` inside a comment fails compilation = we're not stripping comments before the scan. GLSL ES 1.0 comments are `// ...` or `/* ... */` — extend the parser to skip them if this becomes a real problem. Current behavior is conservative (over-reject) rather than under-reject.
+
+---
+
 ## #89 — Tier-A: minimal SVG decoder + route `Image` sources through the #71 short-circuit — SHIPPED 2026-07-06
 
 **File(s):**
