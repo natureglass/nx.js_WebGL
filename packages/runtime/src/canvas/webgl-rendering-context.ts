@@ -639,15 +639,20 @@ function sourceToPixels(src: any): {
 		// drawImage() path below rejects it with "Image or Canvas expected"
 		// (thrown at canvas.cc:nx_canvas_context_2d_draw_image). Read pixels
 		// straight from the source's own 2D context — same non-premultiplied
-		// RGBA guarantee, no round-trip.
+		// RGBA guarantee, no round-trip. The dims come from ctx.canvas (the
+		// underlying nxjs OffscreenCanvas) rather than src.width/src.height,
+		// because the WebGL 1 canvas conformance tests set `ctx.canvas.width
+		// = 1; ctx.canvas.height = 2` (min-size upload case) which only
+		// updates the native canvas dims — the LiveElement wrapper's
+		// _width/_height stay at the HTML default 300×150. src.width would
+		// mismatch id.data.length (which native clips to the actual canvas
+		// dims), leaving the texture upload reading out of bounds.
 		const ctx2d = src.getContext('2d');
 		if (ctx2d && typeof ctx2d.getImageData === 'function') {
-			id = ctx2d.getImageData(
-				0,
-				0,
-				src.width,
-				src.height,
-			) as ImageData;
+			const inner = (ctx2d as { canvas?: { width: number; height: number } }).canvas;
+			const w = (inner && typeof inner.width === 'number') ? inner.width : src.width;
+			const h = (inner && typeof inner.height === 'number') ? inner.height : src.height;
+			id = ctx2d.getImageData(0, 0, w, h) as ImageData;
 		} else {
 			// WebGL-typed canvas or unrecognized context — fall through to
 			// the OffscreenCanvas draw path (may throw for non-native sources).

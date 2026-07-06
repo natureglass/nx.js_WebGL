@@ -3934,22 +3934,33 @@ if (image instanceof Blob) {
 
 The `#70` ledger's `sourceToPixels` unconditionally rasterizes via `new OffscreenCanvas(...).getContext('2d').drawImage(src, 0, 0)`. That `drawImage` binding maps to engine-side `nx_canvas_context_2d_draw_image` (canvas.cc:2481), which only accepts `nx_image_t` (native image/ImageBitmap) or `nx_canvas_t` (native OffscreenCanvas). A brewser-runtime canvas element is neither — it's a `CanvasShim` wrapping the runtime's own 2D compositor — and hits the "Image or Canvas expected" throw. The rejection is spec-legitimate for the native — the shim just needs to avoid asking it.
 
-**Fix.** Detect canvas-like sources by the presence of `getContext` and read pixels directly from the source's OWN 2D backing store:
+**Fix.** Detect canvas-like sources by the presence of `getContext` and read pixels directly from the source's OWN 2D backing store — but derive the read dims from `ctx.canvas` (the underlying nxjs OffscreenCanvas), NOT from `src.width` / `src.height`:
 
 ```ts
 } else if (typeof src.getContext === 'function') {
     const ctx2d = src.getContext('2d');
     if (ctx2d && typeof ctx2d.getImageData === 'function') {
-        id = ctx2d.getImageData(0, 0, src.width, src.height) as ImageData;
+        const inner = (ctx2d as any).canvas;
+        const w = inner ? inner.width : src.width;
+        const h = inner ? inner.height : src.height;
+        id = ctx2d.getImageData(0, 0, w, h) as ImageData;
     } else {
         // fall through to OffscreenCanvas draw path (WebGL-typed canvas / unknown ctx)
     }
 }
 ```
 
-Non-premultiplied RGBA is guaranteed by the source's own `getImageData` in the same way #70's OffscreenCanvas round-trip did — the shim's contract with the native (post-shim `args[8] = px.data`, `format`/`type` unchanged) is unchanged. `HTMLImageElement`, `HTMLVideoElement`, SVG images, and any other non-canvas source still hit the OffscreenCanvas rasterize path, because those don't expose `getContext`.
+**Why the dim-source split matters.** The WebGL 1 canvas conformance tests exercise the min-size upload case via `ctx.canvas.width = 1; ctx.canvas.height = 2` (see `sdk/tests/js/tests/tex-image-and-sub-image-2d-with-canvas.js` `setCanvasToMin`). That assignment hits the **native OffscreenCanvas width/height setter** — the C `canvas->width` / `canvas->height` update to 1 / 2. But brewser-runtime's `LiveElement` (which is what `src` refers to) tracks its `_width` / `_height` separately, and they stay at the HTML default 300 / 150. If the shim reads dims off `src`:
 
-**Scope.** Fixes 8 of 8 `textures-canvas-tex-2d-*` tests. The 8th (ALPHA/UNSIGNED_BYTE) was previously counted as TIMEOUT along with the others — none was passing at tier-84c. Likely also unlocks the `textures-webgl_canvas-tex-2d-*` cluster (which uses a WebGL-typed source canvas) via the fallback branch, though those tests exercise a different failure surface (currently f=1 or f=3 with mixed pass counts, distinct from the pure timeout signature) and are not asserted here.
+1. `ctx2d.getImageData(0, 0, 300, 150)` — native clips `sw` / `sh` to `canvas->width` / `canvas->height` (1 / 2) and returns an 8-byte ArrayBuffer.
+2. The wrapping TS `getImageData` constructs `new ImageData(clamped_8_bytes, 300, 150)` — nxjs doesn't validate the `data.length !== width*height*4` mismatch, so the `ImageData` claims 300×150 but the buffer is 8 bytes.
+3. The shim's returned struct then tells `nativeTexImage2D` it's uploading a 300×150 texture from an 8-byte source. Native reads 180,000 bytes from that source and gets ~179,992 bytes of out-of-bounds memory. Sampled pixels are garbage.
+
+Reading dims from `ctx.canvas` (the OffscreenCanvas, whose `width` getter maps to native `canvas->width`) gives the shim the actual backing dims. `getImageData(0, 0, 1, 2)` returns an 8-byte buffer that matches, and the 1×2 texture uploads correctly.
+
+Non-premultiplied RGBA is guaranteed by the source's own `getImageData` in the same way #70's OffscreenCanvas round-trip did — the shim's contract with the native (post-shim `args[8] = px.data`, `format` / `type` unchanged) is unchanged. `HTMLImageElement`, `HTMLVideoElement`, SVG images, and any other non-canvas source still hit the OffscreenCanvas rasterize path, because those don't expose `getContext`.
+
+**Scope.** Fixes 8 of 8 `textures-canvas-tex-2d-*` tests. Also unblocks any other test that uploads a canvas source whose backing dims were changed via `ctx.canvas.width` / `.height` after `getContext('2d')` (the LiveElement-wrapper-vs-inner-canvas dim divergence isn't specific to WebGL — anywhere a shim reads dims off the wrapper it'll trip the same trap).
 
 **DISPOSITION:** `upstream-candidate`. Any nx.js embedder that presents a non-native canvas element as a TexImageSource will hit this. Upstream nx.js's `sourceToPixels` doesn't handle canvas sources at all today.
 
@@ -3958,7 +3969,8 @@ Non-premultiplied RGBA is guaranteed by the source's own `getImageData` in the s
 **RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/canvas/webgl-rendering-context.ts](packages/runtime/src/canvas/webgl-rendering-context.ts) for `Ledger #85 — canvas-source short-circuit`. Recurrence tells:
 
 - `textures-canvas-tex-2d-*` TIMEOUT with `"Image or Canvas expected"` at `sourceToPixels` = the `typeof src.getContext === 'function'` branch was removed OR the source's own `getContext('2d')` returns null (in which case the shim silently falls back to the throwing OffscreenCanvas path).
-- `textures-canvas-tex-2d-alpha-alpha-unsigned_byte` PASS but the other 7 FAIL with pixel-diff (not TIMEOUT) = the short-circuit fires but the shim's 4-bpp-RGBA-into-non-RGBA-format bytes-through pattern (see #71 caveat) needs the same `convert_image_source_to_gl_pixels`-style JS-side conversion the ImageBitmap route gets from the native. That's a follow-up ledger, not a regression of #85.
+- `textures-canvas-tex-2d-*` FAIL with all-random-looking pixel colors, top pixel `(0, 17, 0, 25)` or similar out-of-bounds noise = the dim-source split regressed — the shim is reading `src.width` / `src.height` (LiveElement's stale wrapper dims) instead of `ctx.canvas.width` / `.height` (actual backing dims after the test's `ctx.canvas.width = 1` min-size assignment).
+- `textures-canvas-tex-2d-alpha-alpha-unsigned_byte` PASS but the other 7 FAIL with pixel-diff = the short-circuit fires with correct dims, but the shim's 4-bpp-RGBA-into-non-RGBA-format bytes-through pattern (see #71 caveat) needs the same `convert_image_source_to_gl_pixels`-style JS-side conversion the ImageBitmap route gets from the native. That's a follow-up ledger, not a regression of #85.
 - `textures-image-tex-2d-*` regress from `_from_video` and other clusters starting to time out on canvas-shaped sources = broader `sourceToPixels` regression, not #85-specific — check both the ImageBitmap short-circuit (#71) and the isTexImageSource fallback.
 
 ---
