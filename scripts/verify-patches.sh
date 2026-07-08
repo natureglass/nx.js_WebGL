@@ -22,6 +22,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NXJS="${NXJS:-$(cd "$here/.." && pwd)}"
 RUNTIME="${RUNTIME:-$(cd "$here/../../brewser-runtime-v8" 2>/dev/null && pwd || echo "$here/../../brewser-runtime-v8")}"
 APPS="${APPS:-$(cd "$here/../../brewser-apps" 2>/dev/null && pwd || echo "$here/../../brewser-apps")}"
+BREWSER_V8="${BREWSER_V8:-$(cd "$here/../../brewser-v8" 2>/dev/null && pwd || echo "$here/../../brewser-v8")}"
 
 fail=0
 have_check=0
@@ -308,6 +309,31 @@ check 42 "webgl.cc OES ext exposes createVertexArrayOES/bindVertexArrayOES" \
 
 echo
 echo "=== runtime ledger: brewser-runtime-v8/RUNTIME_SHIMS.md (in $RUNTIME) ==="
+
+# #102 — brewser-auth-bridge (SDMC → localStorage['brewser_auth'] + __brewserPlatform)
+check 102 "brewser-auth-bridge module exports installBrewserAuthBridge" \
+    "$RUNTIME/src/auth/brewser-auth-bridge.ts" \
+    'export function installBrewserAuthBridge'
+check 102 "install-polyfills.ts wires installBrewserAuthBridge after installLocalStorage" \
+    "$RUNTIME/src/install-polyfills.ts" \
+    'installBrewserAuthBridge\(\)'
+
+# #102 (writer half) — google-auth.js tail POSTs to /auth/device-mint, not /userinfo
+check 102 "google-auth.js MINT_URL constant points at /auth/device-mint" \
+    "$BREWSER_V8/romfs/shell/scripts/google-auth.js" \
+    "var MINT_URL\s*=\s*'https://brewser\.tech/wp-json/brewser/v1/auth/device-mint'"
+check 102 "google-auth.js startDeviceFlow calls mintEnvelope" \
+    "$BREWSER_V8/romfs/shell/scripts/google-auth.js" \
+    'mint\s*=\s*await mintEnvelope\('
+check_absent 102 "google-auth.js does NOT call fetchUserIdentity (identity is envelope-only)" \
+    "$BREWSER_V8/romfs/shell/scripts/google-auth.js" \
+    'async function fetchUserIdentity\('
+check 102 "local-storage.ts defines SHARED_AUTH_KEY = 'brewser_auth' constant" \
+    "$RUNTIME/src/storage/local-storage.ts" \
+    "const SHARED_AUTH_KEY\s*=\s*'brewser_auth'"
+check 102 "local-storage.ts getItem() bypasses storage permission for SHARED_AUTH_KEY" \
+    "$RUNTIME/src/storage/local-storage.ts" \
+    'k !== SHARED_AUTH_KEY && !storageAllowed\(\)'
 
 # #12 — cube-route-shim samplerCube→sampler2D
 check 12 "cube-route-shim installed (cubeUVSample helper)" \
@@ -1388,6 +1414,37 @@ check 100 "webgl.cc [tier-a] getRenderbufferParameter registered in method table
 check 100 "webgl.cc [tier-a] nx_fbo_complete_or_record_error helper" \
     "$NXJS/source/webgl.cc" \
     'nx_fbo_complete_or_record_error'
+
+# #103 — Restore Mozilla CA bundle in TLS handshake (V8-migration regression fix).
+check_file_exists 103 "data/cacert.bin present (Mozilla PEM bundle)" \
+    "$NXJS/data/cacert.bin"
+check 103 "tls.cc includes cacert_bin.h" \
+    "$NXJS/source/tls.cc" \
+    '#include "cacert_bin\.h"'
+check 103 "tls.cc allocates pem_buf sized to cacert_bin_size + 1 for NUL-terminated parse" \
+    "$NXJS/source/tls.cc" \
+    'malloc\(cacert_bin_size \+ 1\)'
+check 103 "tls.cc calls mbedtls_x509_crt_parse on pem_buf" \
+    "$NXJS/source/tls.cc" \
+    'mbedtls_x509_crt_parse\(&nx_ctx->ca_chain, pem_buf'
+check 103 "tls.cc uses sslInitialize(3) for concurrent HTTPS video sessions" \
+    "$NXJS/source/tls.cc" \
+    'sslInitialize\(3\)'
+check 103 "tls.cc emits '(system + bundled)' log line" \
+    "$NXJS/source/tls.cc" \
+    'CA certificates in chain \(system \+ bundled\)'
+check_absent 103 "tls.cc does NOT call sslExit() at end of nx_tls_load_ca_certs (breaks libavformat HTTPS video)" \
+    "$NXJS/source/tls.cc" \
+    '^\s*sslExit\(\);'
+
+# #104 — fetch: set Content-Length for string / URLSearchParams bodies so
+# POSTs don't go out chunked (which OAuth device-code endpoints reject).
+check 104 "body.ts string branch sets contentLength = encoded.byteLength" \
+    "$NXJS/packages/runtime/src/fetch/body.ts" \
+    'contentLength = encoded\.byteLength'
+check 104 "body.ts advertises Content-Length for string / URLSearchParams" \
+    "$NXJS/packages/runtime/src/fetch/body.ts" \
+    'advertise Content-Length'
 
 # #99 — Tier-A: cube-route-shim atlas-ifies typed-array cube uploads (with
 # _emptyCubeTexture exclusion). Runtime-side ledger (cube-route-shim.ts in

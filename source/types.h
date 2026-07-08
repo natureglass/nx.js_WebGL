@@ -182,9 +182,12 @@ typedef struct nx_context_s {
 	mbedtls_entropy_context entropy;
 	mbedtls_ctr_drbg_context ctr_drbg;
 
-	// System CA certificate chain (loaded lazily from Switch SSL service)
+	// CA certificate chain, loaded lazily. Populated from two sources:
+	// the Switch's built-in ssl service (via sslGetCertificates on ids
+	// 1-3 + 1000-1059) plus the bundled Mozilla cacert.bin. Merging both
+	// covers general HTTPS roots the Nintendo curated set doesn't expose.
 	bool ca_certs_loaded;
-	int ca_cert_count; // number of system CA certs parsed into ca_chain
+	int ca_cert_count; // total certs in ca_chain (system + bundled)
 	mbedtls_x509_crt ca_chain;
 
 	bool spl_initialized;

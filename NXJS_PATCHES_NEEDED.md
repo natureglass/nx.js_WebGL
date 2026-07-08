@@ -136,6 +136,84 @@ UPSTREAM STATUS values:
 
 ---
 
+## #104 — fetch: set Content-Length for string and URLSearchParams bodies (avoid chunked POST, which OAuth servers reject) — SHIPPED 2026-07-08
+
+**File(s):** [packages/runtime/src/fetch/body.ts](packages/runtime/src/fetch/body.ts).
+
+**Motivation.** Symptom on real Nintendo Switch hardware after the CA chain fix (#103) landed: `POST https://oauth2.googleapis.com/device/code` and `POST https://github.com/login/device/code` still hang — POST is written to the socket, but no response ever arrives; no throw, no timeout, no log line beyond the initial POST. Cursor keeps ticking; the JS event loop is fine; the fetch promise just never resolves. Chain verification is confirmed good (`TLS: 175 CA certificates in chain (system + bundled)` at boot).
+
+Root cause: [packages/runtime/src/fetch/body.ts:103-105](packages/runtime/src/fetch/body.ts) constructs a `Body` from a string via `stringIterator(init)` and sets `contentType` but **never sets `contentLength`**. Same at [packages/runtime/src/fetch/body.ts:110-112](packages/runtime/src/fetch/body.ts) for `URLSearchParams`. Downstream in [packages/runtime/src/fetch/fetch.ts:209-214](packages/runtime/src/fetch/fetch.ts):
+
+```ts
+if (!req.body || hasContentLength) {
+    req.headers.set('connection', 'close');
+} else {
+    req.headers.set('connection', 'keep-alive');
+    req.headers.set('transfer-encoding', 'chunked');
+}
+```
+
+Without a `Content-Length`, fetch takes the else branch and sends the POST body **chunked** (`transfer-encoding: chunked` with the body in `<hex>\r\n<bytes>\r\n0\r\n\r\n` framing). Google's OAuth device-code endpoint and GitHub's OAuth endpoints — like a lot of production HTTP servers — do NOT parse chunked request bodies for POST. They hang waiting for a `Content-Length` header they can trust and never respond, never close. The fetch promise sits pending forever.
+
+Only affects bodies whose length is knowable at construction time but which the runtime forgot to measure. Blob and ArrayBuffer/typed-array bodies already correctly set `contentLength` (lines 108-109 and 122-124). ReadableStream and FormData bodies genuinely have unknown lengths and correctly stay chunked. String and URLSearchParams are the two known-length shapes that were silently going out chunked.
+
+This is a longstanding upstream nx.js bug, not a V8-migration regression — pre-migration `nxjs-source/packages/runtime/src/fetch/body.ts:143-145` has the same shape. It stayed hidden because Brewser's default boot-fetch surface (GitHub raw, brewser.tech) was hit with GET requests where the issue doesn't manifest. First POST with a string body (device-code auth) exposed it.
+
+**Exact change.** For the string and URLSearchParams branches, encode once at construction time via `encoder.encode(...)`, set `contentLength = encoded.byteLength`, and feed the encoded bytes to the existing `arrayBufferIterator`. `TextEncoder.prototype.encode` returns a fresh Uint8Array whose backing buffer is exactly the encoded byte range, so `.buffer` is safe to hand off without a slice. `contentLength` propagates to `this.headers.set('content-length', ...)` at [body.ts:133-134](packages/runtime/src/fetch/body.ts), which is the same headers object `Request` inherits (Request extends Body — see [packages/runtime/src/fetch/request.ts:124,164](packages/runtime/src/fetch/request.ts)). fetch.ts's `hasContentLength` check then sees the header and takes the non-chunked path.
+
+Symptom side effect: `stringIterator` is no longer called for these branches. The function stays in the file — other code paths may use it — but it's unreachable via the Body constructor for string / URLSearchParams inputs now.
+
+**Scope.** Any nx.js embedder that POSTs a string or URLSearchParams body to a Content-Length-strict HTTP server. Confirmed hangs pre-fix: Google's and GitHub's OAuth device-code endpoints. Also expected to affect any REST API consumer that POSTs form-encoded credentials, JSON strings via `body: JSON.stringify(...)`, or `body: new URLSearchParams(...)` — none of which worked from Switch pre-fix.
+
+**DISPOSITION:** `upstream-candidate`. Longstanding bug in nx.js's fetch — every embedder that uses `fetch` with a string body hits it against a strict server.
+
+**UPSTREAM STATUS:** `not-submitted` — PR to be prepared in [upstream-prs/](upstream-prs/) alongside #103.
+
+**RE-APPLY / VERIFY NOTE.** Grep [packages/runtime/src/fetch/body.ts](packages/runtime/src/fetch/body.ts) for `advertise Content-Length so`. Recurrence tells:
+
+- Any POST with `body: "…"` or `body: new URLSearchParams(...)` hangs against a strict server → the `contentLength = encoded.byteLength` assignment was reverted, or the `arrayBufferIterator(encoded.buffer)` call was reverted to `stringIterator(init)`, causing fetch to fall through to chunked encoding again.
+- Regenerated bundle sends `transfer-encoding: chunked` on POSTs it shouldn't → check that both string and URLSearchParams branches were changed in lockstep. Reverting only one leaves the other still hanging.
+- Body arrives at the server as UTF-16 or corrupted → `encoded.buffer` was replaced with a manual `new ArrayBuffer(...)` that skipped the encoder. `encoder.encode(init)` handles UTF-8 correctly; do not open-code it.
+- Streaming or FormData bodies suddenly get a `Content-Length` and truncate mid-stream → the fix leaked into the wrong branches. Only string and URLSearchParams should have known length; ReadableStream and FormData MUST stay chunked.
+- After an upstream nx.js pull the fix is missing → re-apply. Consider whether the upstream PR has landed and this ledger entry can be dropped.
+
+---
+
+## #103 — Restore Mozilla CA bundle + supplement in TLS handshake (V8-migration regression fix) — SHIPPED 2026-07-08
+
+**File(s):** [source/tls.cc](source/tls.cc), [source/types.h](source/types.h), NEW [data/cacert.bin](data/cacert.bin) (189,462 B, byte-identical to QuickJS-era `nxjs-source/data/cacert.bin`).
+
+**Motivation.** After the V8 migration, all outbound HTTPS from device flows started failing silently. Symptom on real Nintendo Switch hardware: `google-auth.js` and `github-auth.js` both `POST` to their respective `/device/code` endpoints, and the fetch never resolves — no response line, no throw. Boot log shows `Loaded 54 system CA certificates` — that's whatever Nintendo's `ssl:` service (`sslGetCertificates()` over IDs 1-3 + 1000-1059) chooses to expose. Nintendo curates this set for its own endpoints (eShop, NPNS, etc.) and it does not consistently cover general HTTPS roots (Google Trust Services, ISRG, some Sectigo chains). The QuickJS-era engine supplemented this set with a bundled Mozilla `cacert.bin` (baked in via `bin2s` and parsed via `mbedtls_x509_crt_parse`); the V8 migration dropped both the bundle and the parse from [source/tls.cc](source/tls.cc). Since nothing in `runtime-defaults.ts`'s boot fetch surface hits Google or Sectigo-signed hosts (all defaults are `api.github.com`/`raw.githubusercontent.com`/`brewser.tech` — Digicert/Let's Encrypt), the regression sat undiscovered until device-auth flow was actually exercised end-to-end.
+
+**Exact change.**
+
+1. **Copy** [data/cacert.bin](data/cacert.bin) verbatim from the QuickJS-era `nxjs-source/data/cacert.bin` — 189,462 B Mozilla PEM bundle. The V8-fork `Makefile` already declares `DATA := data` at line 55 and auto-picks `BINFILES` via `wildcard $(dir)/*.*` at line 150, so `bin2s` compiles `cacert.bin` → `build/cacert.bin.o` and generates `build/cacert_bin.h` with symbols `cacert_bin` (unsigned-char pointer) and `cacert_bin_size` (u32). No `Makefile` edit needed.
+2. **[source/tls.cc](source/tls.cc)** — add `#include "cacert_bin.h"` at the top-of-file include block with a comment explaining the supplement's role.
+3. **[source/tls.cc](source/tls.cc)** — restructure `nx_tls_load_ca_certs()`:
+   - `sslInitialize(1)` → `sslInitialize(3)`. Three sessions: one for the CA-loading pass, two spare so libavformat's `tls_libnx.c` backend (used by `<video src="https://…">`) can open concurrent HTTPS video streams without `0xFA801` at `sslContextCreateConnection`. libnx caps this at 4. This restores QuickJS-era behavior lost in migration.
+   - On `R_FAILED(sslInitialize)`, do NOT return `-1`. Log the failure and **fall through** to the Mozilla bundle so HTTPS still works when the SSL service is unavailable.
+   - After the `sslGetCertificates` loop, **remove `sslExit()`**. Rationale: libavformat's HTTPS backend calls `sslCreateContext` later in the runtime's lifetime; releasing the SSL service here breaks `<video src="https://…">` playback with `0xFA801`. The OS reclaims the handle on process exit.
+   - After the loop, **`memcpy` `cacert_bin` onto a NUL-padded heap buffer and call `mbedtls_x509_crt_parse(&nx_ctx->ca_chain, pem_buf, cacert_bin_size + 1)`**. The mbedtls PEM parser requires NUL termination.
+   - Replace the `Loaded %d system CA certificates` log line with `TLS: %d CA certificates in chain (system + bundled)`, where the count is a chain-walk over `ca_chain->next` — `raw.len > 0` filters the zero-init head node. This is the honest count of what the mbedtls verifier will actually consult.
+   - Return `chain_len > 0 ? 0 : -1` so a fully-empty chain surfaces to the caller instead of guaranteeing every subsequent handshake fails.
+4. **[source/types.h](source/types.h)** — update `nx_context_t::ca_cert_count` comment from "number of system CA certs parsed into ca_chain" to "total certs in ca_chain (system + bundled)", and expand the preceding block comment to note the two-source loading model.
+
+**Scope.** All outbound HTTPS from the runtime that terminates at a Mozilla-trusted root that isn't in Nintendo's curated 54-cert set. Confirmed pre-fix failure: Google's `/device/code` (GTS chain) and GitHub's `/login/device/code` (Sectigo chain) both hang at POST. Confirmed pre-migration working state: QuickJS-era engine with identical bundle.
+
+**DISPOSITION:** `upstream-candidate`. Any nx.js embedder that runs on real Nintendo Switch hardware and expects general HTTPS to work benefits from this. The Nintendo curated cert set's insufficiency for general HTTPS is a hardware/firmware quirk, not brewser-specific.
+
+**UPSTREAM STATUS:** `not-submitted` — PR to be prepared in [upstream-prs/](upstream-prs/) after hardware verification lands.
+
+**RE-APPLY / VERIFY NOTE.** Grep [source/tls.cc](source/tls.cc) for `Mozilla CA bundle baked in via`. Recurrence tells:
+
+- Boot log shows `Loaded N system CA certificates` (with the old wording) instead of `TLS: N CA certificates in chain (system + bundled)` → the log-line + chain-walk swap was reverted; the Mozilla parse may have been reverted with it.
+- Boot log shows `TLS: N CA certificates in chain (system + bundled)` but N is close to 54 (not ~200) → the Mozilla parse block is present but not landing certs; check that `data/cacert.bin` exists and non-empty, and that `bin2s` produced `build/cacert_bin.h` (it's auto-generated during the engine build).
+- `<video src="https://…">` starts 0xFA801-failing on `sslContextCreateConnection` → `sslExit()` was re-added at end of `nx_tls_load_ca_certs`, or `sslInitialize(3)` was narrowed to `sslInitialize(1)`.
+- Google / GitHub / Twitch device-code POST fetches hang with no response and no throw on real hardware → this patch was silently regressed, most likely by dropping `data/cacert.bin` during a repo-restructure or by re-adding the `return -1` short-circuit on the `sslInitialize` failure path.
+- Fresh install on a Switch whose firmware is old enough that `sslInitialize` fails outright → the fall-through-to-bundle branch was removed; check that `R_FAILED(rc)` no longer `return`s early.
+
+---
+
 ## #1 — image.ts: call-time globalThis.fetch deferral
 
 **File(s):** [packages/runtime/src/image.ts](packages/runtime/src/image.ts)

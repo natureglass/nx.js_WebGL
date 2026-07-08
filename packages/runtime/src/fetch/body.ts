@@ -101,14 +101,28 @@ export abstract class Body implements globalThis.Body {
 
 		if (init) {
 			if (typeof init === 'string') {
-				this.body = asyncIteratorToStream(stringIterator(init));
+				// Encode once so we can advertise Content-Length. Without a known
+				// length, fetch.ts falls through to chunked transfer-encoding for
+				// the request body, which many production HTTP servers (including
+				// Google's OAuth device-code endpoint and GitHub's OAuth) refuse to
+				// parse for POST — they hang waiting for a Content-Length header
+				// they can trust. `encoder.encode` returns a fresh Uint8Array whose
+				// backing buffer is exactly the encoded byte range, so `.buffer` is
+				// safe to hand to `arrayBufferIterator` without a slice.
+				const encoded = encoder.encode(init);
+				this.body = asyncIteratorToStream(arrayBufferIterator(encoded.buffer));
+				contentLength = encoded.byteLength;
 				contentType = 'text/plain;charset=UTF-8';
 			} else if (init instanceof Blob) {
 				this.body = init.stream();
 				contentType = init.type;
 				contentLength = init.size;
 			} else if (init instanceof URLSearchParams) {
-				this.body = asyncIteratorToStream(stringIterator(String(init)));
+				// Same rationale as the string branch — advertise Content-Length so
+				// the wire path stays non-chunked, which OAuth endpoints require.
+				const encoded = encoder.encode(String(init));
+				this.body = asyncIteratorToStream(arrayBufferIterator(encoded.buffer));
+				contentLength = encoded.byteLength;
 				contentType = 'application/x-www-form-urlencoded;charset=UTF-8';
 			} else if (init instanceof ReadableStream) {
 				if (init.locked) {
