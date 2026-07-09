@@ -1446,6 +1446,31 @@ check 104 "body.ts advertises Content-Length for string / URLSearchParams" \
     "$NXJS/packages/runtime/src/fetch/body.ts" \
     'advertise Content-Length'
 
+# #105 — Snapshot toolbar avatar SDMC read at navigation, off the per-rAF-tick
+# renderChrome path. Shell-only, browser-shell.ts. Positive checks: the
+# cached field + refresh method + boot init + per-navigation refresh site
+# all exist. Anti-pattern check: pushToolbarState's avatar-slot branch
+# reads the cached field and does NOT call resolveActiveSessionAvatarPath
+# (which would put the SDMC read back on the paint path).
+check 105 "browser-shell.ts declares private cachedToolbarAvatarSrc field" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    'private cachedToolbarAvatarSrc: string'
+check 105 "browser-shell.ts defines refreshCachedToolbarAvatarSrc method" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    'private refreshCachedToolbarAvatarSrc\(\): void'
+check 105 "browser-shell.ts refresh method sets cachedToolbarAvatarSrc from resolveActiveSessionAvatarPath" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    'this\.cachedToolbarAvatarSrc = resolveActiveSessionAvatarPath\(\) \?\? DEFAULT_TOOLBAR_AVATAR_SRC'
+check 105 "browser-shell.ts pushToolbarState avatar branch reads cachedToolbarAvatarSrc" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    'const nextSrc = this\.cachedToolbarAvatarSrc'
+check_absent 105 "browser-shell.ts pushToolbarState avatar branch does NOT call resolveActiveSessionAvatarPath directly (would regress the per-frame flood)" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    'const nextSrc = resolveActiveSessionAvatarPath\('
+check 105 "browser-shell.ts handleHtmlResponseLive per-nav refresh is shell-context-gated by currentAppId() === null (refresh method never runs under a restrictive app policy)" \
+    "$BREWSER_V8/src/browser-shell.ts" \
+    '^\s*if \(this\.policy\.currentAppId\(\) === null\) \{$'
+
 # #99 — Tier-A: cube-route-shim atlas-ifies typed-array cube uploads (with
 # _emptyCubeTexture exclusion). Runtime-side ledger (cube-route-shim.ts in
 # brewser-runtime-v8) — MOVED pointer in NXJS_PATCHES_NEEDED.md.
