@@ -107,10 +107,15 @@ proposal verdict.
 | 83 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #83` + `image-bitmap.ts: imageCopyPixels(bmp, decoded` | Tier-A: `createImageBitmap(Blob, opts)` honors `opts.imageOrientation` and `opts.premultiplyAlpha` via a post-decode `imageCopyPixels` step. Pre-#83 the Blob branch decoded the PNG/JPEG/WebP straight into an ImageBitmap and returned it — options ignored — so `_from_blob` variants with `premultiplyAlpha: "none"` had their alpha=0.5 red pixel sample as `128,0,0` (premultiplied) instead of the expected `255,0,0` (raw), and `imageOrientation: "flipY"` iterations sampled top/bottom in un-flipped positions. Fast path (no options) returns the decoded bitmap unchanged. Options path allocates a sized destination ImageBitmap and calls `$.imageCopyPixels(dst, src, !opts.unpremul, opts.flipY)` — same primitive #78 uses for ImageBitmap / HTMLImageElement branches. Fixes 7 of 8 `_from_blob-tex-2d-*` variants (the 8th, ALPHA, was already passing because all expected values are `[0,0,0]` regardless of premul state). |
 | 84 | **runtime** (MOVED) | brewser-specific | n/a | `live-video.ts: Ledger #84` + `live-video.ts: installVideoImageBitmapShim` + `canvas-runner.ts: installVideoImageBitmapShim` | Tier-A: `createImageBitmap(<video>)` runtime shim. Wraps `globalThis.createImageBitmap` so `<video>` LiveElements are captured through the live-video decoder pipeline — waits for `state.hasFirstFrame` bounded by a 3-second timeout, converts the RGBA `frameBytes` via a scratch OffscreenCanvas + `putImageData`, delegates to the original `createImageBitmap(oc, ...opts)` which takes the OffscreenCanvas branch already added by #66. Zero engine delta (engine's HTMLVideoElement branch stays the "not supported" throw; the shim runs first and never reaches it). Also syncs the three video assets to the webgl1 conformance resources dir. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#84). |
 | 105 | engine | upstream-candidate | PR-drafted(PR-modules) | `module.cc: nx_module_bindings` + `module.cc: g_importmaps` + `module.cc: resolve_specifier_with_map` + `module.h: nx_module_bindings` + `main.cc: nx_module_bindings(iso, init_obj)` | Page-level ES modules: importmap-aware resolver + prefetched-source registry + JS-callable `moduleSetImportmap`/`moduleSetSource`/`moduleRun`/`moduleClearPage`. Extends the existing filesystem-only module system so an embedder can execute an HTML `<script type="module">` under V8's real module semantics — no SystemJS, no userland module loader, no bundling — while sourcing bodies from URL schemes the engine has no fopen access to (e.g. `brewser://`, `http(s)://`). Foundation for stock (unmodified) Three.js demo support in Brewser and for any nx.js embedder that renders in-browser-shaped ES module pages. |
+| 107 | engine | upstream-candidate | not-submitted | `media-decoder.cc: audio_consumed_last` + `media-decoder.cc: Cut #22c` | Switch.VideoDecoder post-seek deadlock fix: only slave `clock_now()` wall time to the audio clock when the audio consumer has actually advanced since the last poll. Prevents a video-ring-full / audio-underrun feedback loop that pins the media clock permanently after any seek on webgl_materials_video (and any other decoder-audio-attached path). |
 | 108 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_gl_flip_pixels_y` + `webgl.cc: Ledger #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array pixel data` | Honor UNPACK_FLIP_Y_WEBGL for typed-array pixel uploads in `texImage2D` / `texSubImage2D` (WebGL 1 §6.10 + WebGL 2 §5.30). Pre-#108 only the nx_image_t branch (`convert_image_source_to_gl_pixels`) flipped; the raw-pixels path emitted `glTexImage2D` unflipped. Made Three.js's VideoTexture render upside-down through the WebGL2 shim's ImageBitmap-rasterization path. |
 | 109 | engine | fork-only | n/a | `webgl.cc: Ledger #109 (2026-07-10) — translate ` + `webgl.cc: bufs_scratch[i] = ((GLenum)p[i] == GL_BACK)` | `drawBuffers` GL_BACK→GL_COLOR_ATTACHMENT0 translation when JS-null is bound (tenant redirect). Fixes Three.js EffectComposer post-processing rendering black — OutputPass's `setRenderTarget(null)` emitted `drawBuffers([BACK])` which is INVALID_OPERATION on the tenant (a user FBO). Fork-only because this is a nx.js tenant-model artifact — real WebGL contexts have BACK=default backbuffer, so no upstream fix applies. |
 | 110 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #110 (2026-07-10) — ` + `webgl.cc: OES_texture_half_float_linear.` | Un-prune `OES_texture_half_float_linear` on WebGL 2. Patch #49 (rider 2) incorrectly listed it as WebGL-1-only "promoted to WebGL 2 core"; WebGL 2 §5.30.1 still requires this extension for LINEAR filtering on HALF_FLOAT textures, and both Chrome / Firefox advertise it on their WebGL 2 contexts. Without it, sampling any HALF_FLOAT texture with LINEAR filter is "sampler-incomplete" → returns (0, 0, 0, 1) → Three.js EffectComposer's RGBA16F ping-pong RTs render pure black. |
 | 111 | **runtime** (MOVED) | brewser-specific | n/a | `module-loader.ts: _self.setRenderTarget(_savedRT` | `maybePatchThreeSource`'s `renderer.render` wrap must save + restore the render target across `resetState()`. Fixes Three.js EffectComposer post-processing rendering fully black (RenderPass's `setRenderTarget(readBuffer)` gets nullified by the wrap's `resetState()`, all scene draws land on tenant instead of readBuffer). Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#111). |
+| 112 | engine | fork-only (diagnostic) | n/a | `media-decoder.cc: MEDIA_DIAG_112` + `media-decoder.cc: [md-diag:enq]` + `media-decoder.cc: [md-diag:snap]` + `media-decoder.cc: [md-diag:prs]` | Ledger #112 (2026-07-10) — diagnostic probes for the ~1 s periodic video stutter reported on `webgl_materials_video`. Three stderr tags: `[md-diag:enq]` per-frame sws_scale timing + ring depth (I-frame decode burst check), `[md-diag:snap]` per audio-clock resync event with drift + interval (candidate #2), `[md-diag:prs]` per-second aggregate present() ring occupancy + no_frame / skip counts. Gated by `#define MEDIA_DIAG_112 1`; flip to 0 to silence. NOT a fix — diag-only, remove or gate at 0 before shipping. **Post-#113 status**: `[md-diag:snap]` now fires never (snap path removed by #113 Fix B); `[md-diag:prs]` `no_frame` should drop to ~0 with the fix in place — used to verify. |
+| 113 | engine | upstream-candidate (SHIPPED CITRON VERIFIED 2026-07-10) | not-submitted | `media-decoder.cc: Ledger #113 (2026-07-10) — Fix B` + `media-decoder.cc: video-follows-audio` | Video-follows-audio sync: `clock_now` returns `at` directly when audio is advancing; drops the pre-#113 `AV_RESYNC_THRESHOLD=50ms` hard-snap-on-drift design. Cures the ~1-2 Hz periodic video stutter on `webgl_materials_video` (and any decoder-audio-attached path) on Citron / CPU-slow paths where the decode pipeline can't keep up with realtime. Cut #22c stall-fallback contract preserved: audio-stall detection (`audio_advancing`) still falls through to wall-clock so nx_media_present drains the video ring and unblocks enqueue_video. Fork history: originally Cut #22c (#107) preserved wall+snap; #113 supersedes the whole snap design. **Ships as a coupled pair with #115** — Fix B alone cured the wall-snap stutter but exposed the audio-underrun stutter; #115 layered a monotonic clock gate + wall-extrapolation cap + larger video ring on top. |
+| 114 | engine | fork-only (diagnostic extension) | n/a | `audio-graph.h: nx_audio_stream_pending` + `audio-graph.h: nx_audio_stream_underrun_count` + `audio-graph.cc: stream_underrun_count.fetch_add` | Ledger #114 (2026-07-10) — diagnostic extension: audio ring level (`nx_audio_stream_pending`) + render-quantum underrun counter (`nx_audio_stream_underrun_count`) accessors on stream nodes, plus a `stream_underrun_count` field incremented in `process_stream_source` when `avail < Q`. Feeds two new fields into `[md-diag:prs]` output — `aur_pending_min/max` and `aur_underruns` — which pinned #115's audio-underrun root cause. Retained as passive diagnostic; kept live so any future decoder-audio-attached bug surfaces the same fingerprint. |
+| 115 | engine | upstream-candidate (SHIPPED CITRON VERIFIED 2026-07-10) | not-submitted | `media-decoder.cc: Ledger #115 (2026-07-10)` + `media-decoder.cc: RING_SLOTS = 12` + `media-decoder.cc: last_clock` + `media-decoder.cc: ring_newest_pts` | Three-part follow-up cure for the residual periodic stutter that survived Fix B (#113). (a) RING_SLOTS 3 → 12: bigger video buffer prevents the decode thread from constantly blocking in `enqueue_video`, which was starving the shared decoder of time to process audio packets — audio ring was draining to 0 every ~1 s (708 underruns in 3 s on Citron). (b) Monotonic clock gate: `clock_now` clamps its return to `>= m->last_clock`; a small forward pause replaces every visible backward jump when audio resumes below wall-extrapolated `t`. (c) Wall-extrapolation cap during stall: wall time can't exceed `ring_newest_pts + vframe_dur`, so the resume-catch-up gap stays small. Cut #22c deadlock avoidance still works — present() drains ring at capped-wall rate. Post-fix telemetry: `aur_underruns` 708/3s → 0/3s (steady state); `aur_pending_min` 0 → 1077-9125; no_frame 18-24 → 0-6; `t` strictly monotonic. |
 
 ## DISPOSITION POLICY
 
@@ -138,6 +143,170 @@ UPSTREAM STATUS values:
 - `merged-in(vX)` — landed in upstream at version X; check whether the
   next pull obsoletes this entry.
 - `n/a` — not applicable (brewser-specific / fork-only disposition).
+
+---
+
+## #115 — Bigger video ring + monotonic clock gate + wall-extrapolation cap — SHIPPED CITRON VERIFIED 2026-07-10
+
+**File(s):** [source/media-decoder.cc](source/media-decoder.cc) — three coordinated changes:
+- Line 35: `RING_SLOTS = 12` (was 3). Bigger video buffer.
+- Line ~124: new `double last_clock = 0` field on `nx_media`. Monotonic clock gate state.
+- `clock_now` (line ~534): monotonic gate `computed = max(computed, m->last_clock)` at exit; during stall, wall-extrapolation is capped at `ring_newest_pts + m->vframe_dur`.
+- `do_seek` (line ~455): resets `m->last_clock = target` so post-seek clock returns to the target.
+- `nx_media_seek` (line ~787): resets `m->last_clock = seconds` (main-thread mirror) so `nx_media_current_time` between the seek() call and the decode thread's do_seek pickup returns sane values.
+
+**Motivation.** Fix B (#113) cured the pre-fix wall-clock-drift-and-snap stutter but exposed a deeper stutter driven by periodic audio ring underruns. Post-#113 Citron telemetry:
+- `[md-diag:prs] no_frame=18-24/60 aur_pending_min=0 aur_underruns=708 per 3 s window`
+- `[md-diag:vpr]` per-call trace showed the smoking gun — `t` regressing by 70-150 ms every ~1 s as audio resumed with a lower `at` than the wall-extrapolated position during the underrun.
+
+The 3-slot video ring was the trigger: it kept the shared decode thread constantly blocked in `enqueue_video` waiting for a video pop. During each block, the thread could not process audio packets (single-threaded decoder reads packets in mux order via `av_read_frame`). Audio ring drained to 0 → `consumed` frozen → `at` frozen → Fix B's stall-fallback extrapolated wall-clock forward → when audio resumed and `at` caught up, returning `at` yielded a visible frame regression.
+
+**Design.**
+1. **RING_SLOTS 3 → 12** — 12 slots × 42 ms = ~500 ms of video buffer. With 4× the headroom, the decoder blocks less often, spends more time processing audio packets, and the audio ring stays comfortably above 0. Empirically: `aur_pending_min` went from 0 to 1077-9125; `aur_underruns` dropped from 708/3s to 0/3s (steady state).
+
+2. **Monotonic clock gate.** `clock_now` maintains `m->last_clock` and returns `max(computed, m->last_clock)`. Whatever the computed value is (audio `at`, wall extrapolation, whatever), the returned `t` can never regress. Any residual audio underrun turns a *visible backward jump* into a much less perceptible *forward pause* — video freezes on the last displayed frame until the audio-driven `t` catches up. The pause is at most one frame duration in practice.
+
+3. **Wall-extrapolation cap during stall.** During audio stall (`audio_advancing == false`), the wall clock's computed value is bounded above by `ring_newest_pts + m->vframe_dur`. Present() still finds a valid candidate (drains the ring at the ring's natural rate), preserving cut #22c's deadlock avoidance. But wall never races far past what the decoder has actually produced — so when audio does resume, the catch-up gap is small (one frame at most, not 150 ms).
+
+**Cross-checks:**
+- Seek behavior: `do_seek` runs on the decode thread; `nx_media_seek` runs on the main thread. Both reset `last_clock` (main-thread ASAP, decode-thread on pickup) so the gate doesn't retain pre-seek high-water marks.
+- Deadlock avoidance: cut #22c's `audio_advancing == false → wall leads → ring drains → decoder unblocks` cycle still fires, just capped in extent.
+- Video-only sources: unchanged (wall-only fallback path).
+
+**Verification.** Post-#115 Citron log grep of `[md-diag:prs]`:
+
+```
+n=60 depth_min=11 max=12 avg=11.98 no_frame=0 skip=22 aur_pending_min=1077 max=26373 aur_underruns=48 ...
+n=60 depth_min=12 max=12 avg=12.00 no_frame=1 skip=19 aur_pending_min=9111 max=27899 aur_underruns=0 ...
+n=60 depth_min=12 max=12 avg=12.00 no_frame=0 skip=24 aur_pending_min=7955 max=31228 aur_underruns=0 ...
+n=60 depth_min=12 max=12 avg=12.00 no_frame=6 skip=20 aur_pending_min=9125 max=41893 aur_underruns=0 ...
+```
+
+- `aur_underruns` = 48 in first window (startup transient) then **0** throughout playback.
+- `aur_pending_min` never drops below 1077 (fills to 27000-42000 in bursts).
+- `no_frame` = 0-6/60 (was 18-24/60 pre-#115).
+- Video ring depth = 11-12/12 (saturated but not thrashing).
+
+`[md-diag:vpr]` per-call trace shows `t` strictly monotonic: 1.0816 → 1.1040 → 1.1894 → 1.2747 → 1.3174 → 1.3814 → 1.4240 → 1.4880 → ... with no regressions. User confirmed: "Now is playing perfectly."
+
+**Blast radius.** Any decoder-audio-attached playback path benefits. Video-only sources unchanged. Memory cost: 12 × width × height × 4 bytes per decoder instance (~4.7 MB for 480×204 Sintel; ~35 MB for 1280×544 HD). Acceptable for typical single-decoder demos; multi-decoder apps may want a smaller ring or a per-instance override.
+
+**DISPOSITION:** `upstream-candidate` — the three-part fix is a standard AV player design (video-follows-audio + monotonic media clock + bounded stall extrapolation). Any nx.js embedder with `Switch.VideoDecoder` audio-attached benefits.
+
+**UPSTREAM STATUS:** `not-submitted`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: grep `source/media-decoder.cc` for `RING_SLOTS = 12`, `last_clock`, and `ring_newest_pts`. All three MUST be present. Verify `do_seek` AND `nx_media_seek` both reset `last_clock`. Verify the `computed = max(computed, m->last_clock)` gate at the exit of `clock_now`. *To re-apply after upstream pull*: apply the bump, add the field, add both reset sites, and add the gate + wall-cap.
+
+**Recurrence tell.** Periodic video stutter on `Switch.VideoDecoder` playback where `[md-diag:vpr]` (re-enable via ledger #112's `MEDIA_DIAG_112` gate) shows `t` regressing across successive present() calls → this ledger's monotonic gate regressed. Alternative tell: `[md-diag:prs] aur_underruns` climbing steadily → RING_SLOTS was reverted or set too low for the workload.
+
+---
+
+## #114 — Audio ring level + underrun counter diagnostic — DIAG-ONLY 2026-07-10
+
+**File(s):** [source/audio-graph.h](source/audio-graph.h) + [source/audio-graph.cc](source/audio-graph.cc).
+
+**Motivation.** Post-#113 Citron playback still stuttered periodically. #112's probes ruled out I-frame decode and rAF cost but pinned the residual pattern to `[md-diag:prs] no_frame=18-24/60` — video present() was returning false ~33% of the time, meaning `t` was routinely behind the video ring's oldest slot. Needed audio-side visibility to determine whether `at` was truly stalling (audio underrun) or bouncing (chunky consumer advance).
+
+**Design.**
+- New field `std::atomic<uint64_t> stream_underrun_count{0}` on `nx_audio_node`. Incremented by `process_stream_source` whenever `avail < Q` (a render quantum where the ring didn't have a full quantum of samples ready).
+- Reset in `nx_audio_stream_flush` so seeks don't leave stale counts.
+- Two accessor functions:
+  - `nx_audio_stream_pending(node)` — current ring depth in frames (`write - read`).
+  - `nx_audio_stream_underrun_count(node)` — monotonic underrun event counter since last flush.
+
+`media-decoder.cc`'s `[md-diag:prs]` probe consumes both to extend its per-second aggregate with `aur_pending_min/max` and `aur_underruns`. That data pinned #115's root cause: 708 underruns per 3-second window with `aur_pending_min = 0` in every window = audio ring was cycling to 0 constantly.
+
+**DISPOSITION:** `fork-only (diagnostic extension)` — retained live even after #115 shipped. Provides ongoing observability for any decoder-audio bug; cost is one atomic add per render quantum + two O(1) reads.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: grep `source/audio-graph.h` for `nx_audio_stream_underrun_count`; grep `source/audio-graph.cc` for `stream_underrun_count.fetch_add`.
+
+---
+
+## #113 — Video-follows-audio sync (Fix B) — SHIPPED CITRON VERIFIED 2026-07-10 (companion to #115)
+
+**File(s):** [source/media-decoder.cc](source/media-decoder.cc) — `clock_now` (line ~532) rewritten to return `at` directly when audio is advancing; removes the pre-#113 `AV_RESYNC_THRESHOLD = 0.05 s` constant (unused after this change). Wall-clock fallback retained for video-only sources, pre-first-audio-frame startup, and cut #22c's audio-stall contract.
+
+**Motivation.** The user reported a periodic ~1 s stutter during `webgl_materials_video` playback after ledgers #107-#111 shipped. Ledger #112 instrumented three engine probes (`[md-diag:enq]`, `[md-diag:snap]`, `[md-diag:prs]`) plus two demo probes (`[demo-diag:raf]`, `[demo-diag:tex]`) and captured a 14-second Citron playback. The log ruled out I-frame decode burst (`sws_ms` 0.27-0.70 ms typical, ring depth constantly 3) and GC / upload spikes (per-second tex upload total 65-73 ms = 7% of frame time), and confirmed candidate #2 (clock resync snap) as the direct cause — with a deeper root beneath it.
+
+Snap trace summary (steady state after startup):
+
+```
+[md-diag:snap] t=1.905 at=1.847 delta=-0.0577 gap_ms=365.3
+[md-diag:snap] t=2.058 at=1.911 delta=-0.1474 gap_ms=211.4
+[md-diag:snap] t=2.278 at=2.219 delta=-0.0597 gap_ms=367.3
+[md-diag:snap] t=2.888 at=2.701 delta=-0.1874 gap_ms=626.7
+[md-diag:snap] t=3.263 at=3.074 delta=-0.1889 gap_ms=562.3
+...
+```
+
+Every snap has `delta` negative (wall time `t` ahead of audio `at` by 130-200 ms). Snap yanks wall back → every yank = a visible video frame regression = stutter.
+
+Working back through consecutive snaps: `at` advanced 0.284 s while wall advanced 0.347 s (real time between snaps) → **audio clock progressing at ~82% of realtime**. Cross-check: 221 video frames enqueued reaching `pts=9.792` over ~14 s wall = decoder producing content at ~70% realtime. The decode pipeline on Citron / emulator paths is CPU-limited to ~70-82% of realtime throughput; wall clock (`steady_clock`) runs at true 100%; the ~18-30% divergence per second is what feeds the snap loop. On real Switch hardware the decoder keeps up with realtime and this drift never accumulates — that's why the bug is emulator-visible and hardware-invisible.
+
+**Design.** The pre-#113 design ran wall clock as authoritative and hard-snapped to audio when drift crossed 50 ms. Every snap on Citron was a visible frame regression by 130-200 ms — the exact stutter the user reported. The correct fix is the standard video-follows-audio sync model used by VLC, FFmpeg (`sync=audio`), and every mainstream AV player: video presentation time IS the audio clock. Wall clock has no independent authority when audio is playing.
+
+Post-#113 `clock_now` logic:
+
+```
+if (audio playing && audio_advancing) {
+    // Video presentation pinned exactly to audio clock.
+    at = audio_pts_base + (consumed - base) / rate;
+    clock_base = at;                          // keep anchor coherent
+    clock_anchor = steady_clock::now();       // for stall fallback
+    return at;
+}
+// Wall-clock fallback: no audio, or audio stalled (cut #22c contract).
+return clock_base + (steady_clock::now() - clock_anchor);
+```
+
+Three fallback cases stay on the wall path:
+1. **No audio track** (`audio_node == null` or `audio_clock_valid == false`) — video-only source. Pure wall clock, unchanged.
+2. **Pre-first-audio-frame startup** — `consumed == base`. Wall runs until audio kicks in, then transitions to `at`. One-time transition, not periodic.
+3. **Audio consumer stalled** (cut #22c) — `audio_advancing == false` because the audio ring underran (decoder blocked in enqueue_video on a full video ring). Wall time must lead so nx_media_present drains the video ring and unblocks the decoder. Every successful audio branch first updates `clock_base = at` + `clock_anchor = now`, so the fallback picks up from the last observed `at` and advances at real rate from there — no discontinuity at the stall boundary.
+
+**Blast radius.** All decoder-audio-attached playback paths benefit: `webgl_materials_video`, `spectraplay`, any `Switch.VideoDecoder` consumer with audio. Video-only sources unchanged (wall fallback). On real hardware where the decode pipeline runs at 100% realtime, `at` advances at 100% realtime and the semantic is identical to pre-#113 (no snap ever fired because drift stayed under 50 ms). On Citron / emulator paths, video and audio now play at whatever the pipeline can sustain (~70-82% realtime on the observed run) — smoothly, in perfect sync, at consistent slow-motion — instead of stuttering at ~2 Hz as wall time repeatedly overshot and snapped back.
+
+**Verification.** Same probes from #112 stay in place. After #113: `[md-diag:snap]` fires **never** (snap path removed). `[md-diag:prs]` `no_frame` count should drop to ~0 (was 18-21/60 per second pre-fix — every no_frame was wall clock racing ahead of the ring's future-PTS frames after a snap). `[md-diag:enq]` unchanged (decode-side behavior). `[demo-diag:raf]` unchanged (rAF cadence is composer-render-bound at ~20 fps on Citron, orthogonal to sync).
+
+**DISPOSITION:** `upstream-candidate` — video-follows-audio is a standard AV-player sync design; any nx.js embedder with `Switch.VideoDecoder` benefits. The pre-#113 wall-plus-snap design is unusual and produces the observed stutter on any CPU-slow decode path.
+
+**UPSTREAM STATUS:** `not-submitted` — pending Citron verification.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: grep `source/media-decoder.cc` for `Ledger #113 (2026-07-10) — Fix B`. The `clock_now` body should NOT reference `AV_RESYNC_THRESHOLD` (constant is deleted) and MUST have the "return `at` directly" early return in the audio-advancing branch. *To re-apply after upstream pull*: replace whatever `clock_now` upstream ships with the audio-pinned early-return design above; preserve cut #22c's stall detection via `audio_advancing`.
+
+**Recurrence tell.** A user reports periodic video stutter on `Switch.VideoDecoder` playback on emulator or CPU-slow paths and the log shows `[md-diag:snap]` firing repeatedly (before #113 is applied) — this fix regressed. Alternate tell: any diff that reintroduces a `fabs(at - t) > threshold` clause to `clock_now` — that's the pre-#113 design coming back.
+
+---
+
+## #112 — Diagnostic probes for the ~1 s periodic video stutter — DIAG-ONLY 2026-07-10
+
+**File(s):** [source/media-decoder.cc](source/media-decoder.cc) — `#define MEDIA_DIAG_112 1` gate near the resync-threshold constant; `[md-diag:enq]` in `enqueue_video` (line ~250, times `sws_scale` and reports ring depth after push); `[md-diag:snap]` in `clock_now` (line ~527, one line per audio-clock resync event with `t`, `at`, `delta`, `gap_ms` since last snap); `[md-diag:prs]` in `nx_media_present` (line ~731, per-second aggregate over 60 present() calls: `depth_min/max/avg`, `no_frame` count where candidate<0, `skip` count where candidate advanced >1 slot from vread).
+
+**Companion demo probes:** [`webgl_materials_video.html` sdmc copy](../brewser-apps/apps/featured/com.natureglass.webgl2threejsdemos/examples/webgl_materials_video.html) (SDMC only — source not touched) — `[demo-diag:raf]` per-second rAF interval histogram (`n`, `min`, `max`, `avg`, `stalls25`), `[demo-diag:tex]` per-second `texImage2D`+`texSubImage2D` timing (`n`, `total_ms`, `max_ms`, `avg_ms`).
+
+**Motivation.** The demo works end-to-end after ledgers #107-#111, but plays with a visible ~1 second periodic stutter. Three structural candidates could explain a 1 s cadence:
+
+1. **H.264 GOP burst.** Sintel MP4 is 24 fps H.264 with the standard x264 `keyint=24` default — one I-frame per second. I-frames take 5-10× the decode time of P-frames. The video ring is only 3 slots (`RING_SLOTS = 3` ≈ 125 ms at 24 fps); an I-frame decode spike can drain most of it. If the ring empties, `nx_media_present` returns false → screen shows STALE frame → visible ~1 Hz stutter. `[md-diag:enq]` sws_scale times + ring-depth trace directly measures this.
+2. **Audio-clock resync snap.** `clock_now` hard-snaps wall time to the audio clock when `|at - t| > 0.05 s`. If steady_clock and audren callback drift accumulate at ~50 ms/s (plausible on Citron), snaps fire at ~1 Hz. Every snap either skips or repeats a video frame. `[md-diag:snap]` reports every snap with `delta` and `gap_ms`.
+3. **`sourceToPixels` per-frame OffscreenCanvas + getImageData allocation → V8 major GC.** Every `VideoTexture` upload rasterizes through OffscreenCanvas + drawImage + getImageData at 60 fps (~46 MB/s alloc churn). Major GC at sustained rates could land on a ~1 s cadence with 100-300 ms pause. `[demo-diag:raf]` catches this via `stalls25` (rAF intervals > 25 ms).
+
+**Log volume.** Trivial: ~2 KB/s for a 480x204 24fps stream. `enq` ≈ 24/s, `snap` on-demand (expected < 1/s), `prs` = 1/s, `raf` = 1/s, `tex` = 1/s.
+
+**How to read the log after a ~10 s playback.** Grep prefixes:
+- `[md-diag:enq]` → look for periodic `sws_ms` spikes (I-frames) and correlate with `depth` dropping toward 0.
+- `[md-diag:snap]` → check `gap_ms` cadence. If ~1000 ms, candidate #2 is confirmed.
+- `[md-diag:prs]` → `no_frame > 0` in the same second as `depth_min = 0` and an I-frame spike = candidate #1 confirmed.
+- `[demo-diag:raf]` → `stalls25 > 0` + high `max` = a rAF-side stall (GC or engine work) in that second; correlate with `[demo-diag:tex]` `max_ms` spike for candidate #3.
+
+**DISPOSITION:** `fork-only (diagnostic)` — remove or gate at 0 before shipping. Diagnostic entry, not a code fix; will be superseded by whatever fix ledger this session ships.
+
+**UPSTREAM STATUS:** `n/a`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify probes are live*: grep `source/media-decoder.cc` for `MEDIA_DIAG_112` and confirm value is 1. Grep sdmc `webgl_materials_video.html` for `DEMO_DIAG_112 = true`. *To silence*: flip `MEDIA_DIAG_112` to 0 and `DEMO_DIAG_112` to false; rebuild.
+
+**Recurrence tell.** Any nx.js user reports "video plays smoothly but stutters at ~1 s cadence" on `Switch.VideoDecoder` playback — re-enable this ledger's probes as the first diagnostic. Also useful for any audio/video sync bug — the three tags directly reveal whether the media clock is drift-snapping or the video ring is exhausted.
 
 ---
 
@@ -258,6 +427,54 @@ Both `w_tex_image_2d` and `w_tex_sub_image_2d` grow one identical branch: **afte
 **RE-APPLY / VERIFY NOTE.** *To verify the fix is still in place*: grep `source/webgl.cc` for `nx_gl_flip_pixels_y`. If the helper is gone, ANY Three.js `VideoTexture` (or any raw-typed-array texImage2D upload that sets `UNPACK_FLIP_Y_WEBGL`) will render upside-down. *To re-apply*: add the two helpers above `w_tex_image_2d`, wire the branch into both texImage2D and texSubImage2D after the nx_image_t path.
 
 **Recurrence tell.** A demo user reports "my `<video>` texture / raw RGBA texture is upside-down" AND `pixelStorei(UNPACK_FLIP_Y_WEBGL, 1)` is called before texImage2D — first diagnosis: grep webgl.cc for `nx_gl_flip_pixels_y`. If the raw-pixels branch doesn't call it, the fix regressed. Repro: `gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1); gl.texImage2D(tgt, 0, RGBA, w, h, 0, RGBA, UNSIGNED_BYTE, rgba_bytes);` — sample the top-left corner: bytes there should read what was at the SOURCE's bottom-left. Pre-fix reads the source's top-left (unflipped upload).
+
+---
+
+## #107 — Switch.VideoDecoder post-seek deadlock: don't slave wall clock to a stalled audio consumer — SHIPPED 2026-07-10
+
+**File(s):** [source/media-decoder.cc](source/media-decoder.cc) — `clock_now()` at ~line 486, `nx_media` struct field `audio_consumed_last`, `do_seek()` audio-tracker reset.
+
+**Motivation.** `nx_media`'s `clock_now()` slaves wall time to an audio-derived `at = audio_pts_base + (consumed - audio_base) / rate` when `|at - t| > AV_RESYNC_THRESHOLD` (50 ms). The clock re-anchors to `at` in both directions — audio ahead OR audio behind wall — to keep A/V drift bounded.
+
+That is spec-adjacent for actively-flowing audio, but it creates a hard deadlock cycle when audio underruns:
+
+1. Post-seek: decode thread produces both video and audio; video ring (3 slots) fills after ~3 frames.
+2. `enqueue_video` blocks in a spin-wait for a free ring slot.
+3. Because the decode thread is blocked, no new audio arrives after the initial burst.
+4. Audio consumer (`process_stream_source` in [source/audio-graph.cc](source/audio-graph.cc)) drains the ring, then stalls with `stream_read_pos == stream_write_pos` (spec-correct underrun — the render thread does NOT advance `consumed` on silent output).
+5. `consumed` freezes at some value V. `at` freezes at `audio_pts_base + (V - audio_base) / rate`.
+6. Every subsequent `clock_now()` call sees wall clock advance past `at` by more than 50 ms, snaps `clock_base = at, anchor = now`, and pins `t = at` forever.
+7. All buffered frames in the video ring have `pts > at`, so `nx_media_present` finds no due candidate, `vread` never advances, ring stays full, `enqueue_video` never unblocks → **permanent deadlock**.
+
+Recreated on webgl_materials_video (Three.js's 200-cube video-texture demo) with a `seek(20)` at 2.5 s wall: video advances ~10 frames from PTS 19.81 → 20.125, then freezes. Confirmed via [stall-diag] instrumentation: `slot_r_pts=20.167` sitting in front of `clk=20.098` for hundreds of consecutive ticks; `consumed=50748` frozen; `[decode-thread]` heartbeat stops after iter 1 (decode thread blocked in `enqueue_video`); zero `[enqueue_audio] BLOCKED` events (consistent — decode is blocked BEFORE the next audio packet). Same cycle exists pre-seek but has been hard to hit because the initial audio-anchor arrives before the video ring fills; a full ring on a clock with `at=0` snaps back to 0 which the first-frame `present_force` sentinel just barely covers.
+
+**Fix.** Track the previous `consumed` value across `clock_now()` calls in a new plain `uint64_t nx_media::audio_consumed_last` (main-thread-only, no atomic needed — every caller of `clock_now` is main-thread per the media-decoder.h contract). Gate the snap on `consumed != audio_consumed_last` — audio must have actually advanced since the last poll to be treated as a valid reference:
+
+```cpp
+bool audio_advancing = consumed != m->audio_consumed_last;
+m->audio_consumed_last = consumed;
+if (audio_advancing && fabs(at - t) > AV_RESYNC_THRESHOLD) {
+    m->clock_base = at;
+    m->clock_anchor = std::chrono::steady_clock::now();
+    t = at;
+}
+```
+
+Reset `audio_consumed_last = 0` in `do_seek()` immediately after `nx_audio_stream_flush()` so the first post-anchor poll always sees an "advanced" delta and re-engages the slave immediately.
+
+Steady-state behavior is unchanged: audio actively playing → `consumed` advances every rAF tick by ~800 samples → snap runs as before. Underrun behavior: audio stalls → snap paused → wall clock leads → `nx_media_present` drains ring → `enqueue_video` unblocks → decode thread produces fresh audio → `consumed` starts advancing again → snap re-engages next tick and re-anchors clock to audio (via existing `|at - t| > threshold` fallback).
+
+**Blast radius.** Small. The change affects the single snap-condition line in `clock_now()`. Fast-play + steady audio remains bit-identical. Real-underrun A/V desync bound: however much wall time we let free-run before audio flowing again — realistically < 100 ms per event, resnapped forward on next `consumed` advance.
+
+**DISPOSITION:** `upstream-candidate` — this is a general engine-correctness fix. Any nx.js embedder that plays audio-bearing video (particularly seeking video) benefits. QuickJS-era `video.c` had a different audrv wave-buffer bookkeeping model and did not exhibit the same deadlock, but the underlying "don't snap to a frozen audio clock" invariant is model-independent.
+
+**UPSTREAM STATUS:** `not-submitted` — trivial diff (single struct field + one condition + one reset).
+
+**RE-APPLY / VERIFY NOTE.** *To verify the fix is still in place*: grep `source/media-decoder.cc` for `audio_consumed_last`. If the field is gone, seek-driven playback on any audio-bearing video will deadlock. *To re-apply*: add the `uint64_t audio_consumed_last = 0;` field to `nx_media`, gate the snap in `clock_now`, and add the reset in `do_seek`. Rebuild engine (no runtime change needed).
+
+**Recurrence tell.** A user reports "video plays a few frames after seek then freezes silently — no error, no ended, `readyState=2`, `paused=false`." First diagnosis: check `[stall-diag:present]` (if instrumentation is still in) or add temp `fprintf(stderr, "[dbg] present r=%llu w=%llu clk=%.3f slot=%.3f\n", ...)` in `nx_media_present` — if the ring has frames (`w > r`) but `slot[r%3].pts > clk` for hundreds of consecutive calls, this is the same clock-audio deadlock resurfacing. Diff `clock_now()` against the shipping code — someone dropped the `audio_advancing` gate.
+
+Repro: `<video src="…" muted></video>`, `video.play()`, `video.seek(20)`. Video advances 5-20 frames then stops indefinitely. Log signature (with #107 stall-diag): `clk`, `base`, `slot_r_pts` all frozen; `consumed`, `audio_base` frozen too. Without the fix, `clock_now`'s snap logic pins `t` to `at` on every call, `pts <= t + epsilon` fails, ring never drains.
 
 ---
 

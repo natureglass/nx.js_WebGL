@@ -32,7 +32,14 @@ struct av_log_quiet {
 	av_log_quiet() { av_log_set_level(AV_LOG_ERROR); }
 } av_log_quiet_init;
 
-constexpr int RING_SLOTS = 3;
+// Ledger #115 (2026-07-10): bumped from 3 to 12. The 3-slot ring kept
+// producer constantly blocked in enqueue_video (post-#113 diag showed
+// depth=3 constantly), which starved the shared decode thread of time to
+// process audio packets — audio ring drained to 0 every ~1 s, triggering
+// Fix B's wall-extrapolation-then-resume-jump-back cycle. 12 slots
+// (~500 ms of video buffer at 24 fps) gives the decoder headroom to keep
+// audio flowing evenly.
+constexpr int RING_SLOTS = 12;
 // Cut #22b Stage 2: audio-tap window size for the visualizer readers.
 // Must be a power of two (masked with TAP_LEN - 1 in the writer). 1024
 // samples ≈ 21.3 ms at 48 kHz — matches the pre-migration (QuickJS-era)
@@ -49,8 +56,19 @@ constexpr double TAP_PI = 3.14159265358979323846;
 // Present a frame when its PTS is within this much of the clock (one frame of
 // slack at 24 fps is ~41 ms; this is just sub-frame jitter tolerance).
 constexpr double PRESENT_EPSILON = 0.001;
-// Snap the wall clock to the audio clock when they drift further than this.
-constexpr double AV_RESYNC_THRESHOLD = 0.05;
+// ---------------------------------------------------------------------------
+// Ledger #112 (2026-07-10) — diagnostic probes for the ~1s periodic video
+// stutter reported on webgl_materials_video. Toggled by MEDIA_DIAG_112. Logs
+// three signals to stderr (routed to nxjs-debug.log):
+//   [md-diag:enq]  per-video-frame sws_scale ms + video-ring depth
+//   [md-diag:snap] per audio-clock resync event with delta + interval
+//   [md-diag:prs]  per 60 nx_media_present calls: min/max/avg ring depth,
+//                  no-frame count (candidate<0), skip count (>1 slot behind)
+// All three tag prefixes are unique so `grep '\[md-diag:' log` returns the
+// full record. Rate: enq ≈ 24/s, snap on-demand (expected ≤1/s), prs ≈ 1/s.
+// Total log volume: ~2 KB/s for a 480x204 24fps stream — trivial.
+// ---------------------------------------------------------------------------
+#define MEDIA_DIAG_112 0
 
 struct video_slot {
 	uint8_t *bgra = nullptr;
@@ -105,6 +123,23 @@ struct nx_media {
 	double clock_base = 0;
 	std::chrono::steady_clock::time_point clock_anchor;
 	bool clock_running = false;
+	// Ledger #115: monotonic gate on clock_now returns. `at` itself is
+	// monotonic (consumed only increases), but Fix B's wall-extrapolation
+	// during audio stall can outrun `at`; when audio resumes, returning
+	// the fresh `at` causes a visible frame regression (~150 ms every
+	// ~1 s under Citron's audio-underrun cycle). `last_clock` gates
+	// clock_now to `max(computed, last_clock)` — no regression, ever.
+	// Reset to seek target in do_seek so seeks work.
+	double last_clock = 0;
+	// Cut #22c (2026-07-10): last audio `consumed` sample count observed by
+	// clock_now(). When this matches the current value on a fresh call,
+	// the audio consumer has NOT advanced since — treat the audio clock as
+	// stalled and let wall time free-run rather than snap wall back to a
+	// frozen `at`. Prevents the video-ring-full / audio-underrun deadlock
+	// that stalls webgl_materials_video after a seek (see #109). Reset to 0
+	// whenever `audio_clock_valid` transitions false → true so a fresh seek
+	// anchor's first main-thread poll doesn't false-positive.
+	uint64_t audio_consumed_last = 0;
 
 	// ---- presentation quality counters (main thread only) ----
 	uint64_t presented_frames = 0;
@@ -237,8 +272,26 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	}
 	uint8_t *dst[4] = {slot->bgra, NULL, NULL, NULL};
 	int dst_stride[4] = {m->width * 4, 0, 0, 0};
+#if MEDIA_DIAG_112
+	auto _sws_t0 = std::chrono::steady_clock::now();
+#endif
 	sws_scale(m->sws, frame->data, frame->linesize, 0, frame->height, dst,
 	          dst_stride);
+#if MEDIA_DIAG_112
+	double _sws_ms = std::chrono::duration<double, std::milli>(
+	                     std::chrono::steady_clock::now() - _sws_t0)
+	                     .count();
+	static uint64_t _diag_enq_idx = 0;
+	uint64_t _diag_idx = _diag_enq_idx++;
+	uint64_t _diag_depth = w + 1 - m->vread.load(std::memory_order_relaxed);
+	// One line per decoded video frame: sws_ms is the H.264 → BGRA scale
+	// cost (I-frames spike vs P-frames), depth is the ring occupancy after
+	// this push. Correlate periodic depth==RING_SLOTS just-before-a-drop
+	// with big sws_ms values to confirm the GOP-burst hypothesis.
+	fprintf(stderr, "[md-diag:enq] fi=%llu pts=%.3f sws_ms=%.2f depth=%llu\n",
+	        (unsigned long long)_diag_idx, pts, _sws_ms,
+	        (unsigned long long)_diag_depth);
+#endif
 	slot->pts = pts;
 	m->vwrite.store(w + 1, std::memory_order_release);
 	return true;
@@ -402,6 +455,15 @@ void do_seek(nx_media *m, double *seek_drop_until) {
 	}
 	*seek_drop_until = target;
 	m->present_force.store(true);
+	// Cut #22c (2026-07-10): reset the audio-stall tracker so the first
+	// post-anchor clock_now() call sees `consumed != audio_consumed_last`
+	// and re-engages the audio-slave clock immediately (rather than
+	// starting one tick in "stalled" mode).
+	m->audio_consumed_last = 0;
+	// Ledger #115: reset the monotonic gate to the seek target so the
+	// first post-seek clock_now can validly return audio-anchored PTS
+	// values around the target (which are lower than pre-seek `t`).
+	m->last_clock = target;
 	if (m->vstream < 0) {
 		// No video track: nothing will flip `seeking` in receive_frames.
 		m->seeking.store(false);
@@ -484,28 +546,72 @@ void decode_thread_main(nx_media *m) {
 // ---------------------------------------------------------------------------
 
 double clock_now(nx_media *m) {
-	double t = m->clock_base;
-	if (m->clock_running) {
-		t += std::chrono::duration<double>(
-		         std::chrono::steady_clock::now() - m->clock_anchor)
-		         .count();
-	}
-	// Slave to the audio clock when audio is flowing.
+	// Ledger #113 (Fix B, 2026-07-10): video-follows-audio when audio is
+	// advancing.
+	// Ledger #115 (2026-07-10): + monotonic gate + wall-cap during stall.
+	// Diagnostic runs on Citron post-#113 showed periodic audio ring
+	// underruns (~1 Hz) — during each ~150 ms underrun, `consumed` was
+	// frozen, wall-fallback extrapolated `t` forward, then on resume the
+	// fresh `at` was ~150 ms behind the extrapolated `t` → visible
+	// frame regression. Two-part cure:
+	//   (a) Monotonic gate: `t` is clamped to `>= last_clock`; when audio
+	//       resumes below the wall-extrapolated position, video PAUSES on
+	//       the last shown frame instead of regressing. Pauses are much
+	//       less perceptible than backward jumps.
+	//   (b) Wall-cap during stall: extrapolation is bounded by
+	//       `ring_newest_pts + vframe_dur`. Present() still drains the
+	//       ring (cut #22c deadlock contract preserved), but wall can't
+	//       race far past what's actually decoded — so the resume-catch-up
+	//       gap stays small.
+	// Companion #115 fix: RING_SLOTS 3 → 12 (bigger video buffer prevents
+	// the underrun from happening as often in the first place).
+	double computed;
 	if (m->clock_running && m->audio_node &&
 	    m->audio_clock_valid.load(std::memory_order_acquire)) {
 		uint64_t consumed = nx_audio_stream_consumed(m->audio_node);
 		uint64_t base = m->audio_base.load(std::memory_order_relaxed);
-		if (consumed > base) {
+		bool audio_advancing = consumed != m->audio_consumed_last;
+		m->audio_consumed_last = consumed;
+		if (consumed > base && audio_advancing) {
 			double at = m->audio_pts_base.load(std::memory_order_relaxed) +
 			            (double)(consumed - base) / m->audio_out_rate;
-			if (fabs(at - t) > AV_RESYNC_THRESHOLD) {
-				m->clock_base = at;
-				m->clock_anchor = std::chrono::steady_clock::now();
-				t = at;
+			m->clock_base = at;
+			m->clock_anchor = std::chrono::steady_clock::now();
+			computed = at;
+		} else {
+			// Stall path: wall-extrapolate from last `at` but cap at
+			// ring_newest_pts + one frame so we don't race far ahead.
+			double t_wall = m->clock_base +
+			                std::chrono::duration<double>(
+			                    std::chrono::steady_clock::now() -
+			                    m->clock_anchor)
+			                    .count();
+			uint64_t w = m->vwrite.load(std::memory_order_acquire);
+			uint64_t r = m->vread.load(std::memory_order_relaxed);
+			if (w > r) {
+				double newest_pts =
+				    m->slots[(w - 1) % RING_SLOTS].pts;
+				double cap = newest_pts + m->vframe_dur;
+				if (t_wall > cap) t_wall = cap;
 			}
+			computed = t_wall;
+		}
+	} else {
+		// Pure wall clock: no audio, video-only, or pre-first-audio-frame.
+		computed = m->clock_base;
+		if (m->clock_running) {
+			computed += std::chrono::duration<double>(
+			                std::chrono::steady_clock::now() -
+			                m->clock_anchor)
+			                .count();
 		}
 	}
-	return t;
+	// Monotonic gate: never regress. Even a small backward step causes a
+	// visible frame regression; a small forward pause is much less
+	// perceptible.
+	if (computed < m->last_clock) computed = m->last_clock;
+	m->last_clock = computed;
+	return computed;
 }
 
 } // namespace
@@ -675,6 +781,11 @@ void nx_media_seek(nx_media_t *m, double seconds) {
 		seconds = 0;
 	if (m->duration > 0 && seconds > m->duration)
 		seconds = m->duration;
+	// Ledger #115: reset monotonic gate to the seek target immediately
+	// (main thread) so between seek() and do_seek() (decode thread)
+	// nx_media_current_time queries return sane values. do_seek also
+	// updates last_clock, redundant but idempotent.
+	m->last_clock = seconds;
 	// Stop presentation/clock reads of the ring first.
 	m->seeking.store(true, std::memory_order_release);
 	m->clock_base = seconds;
@@ -702,6 +813,100 @@ bool nx_media_present(nx_media_t *m, uint8_t **buffer_inout) {
 		else
 			break;
 	}
+#if MEDIA_DIAG_112
+	// Aggregate over 60 present() calls (~3 s at 20 fps rAF). Extended
+	// (ledger #114) with audio-side snapshots to pin the residual jitter
+	// after Fix B (#113):
+	//   depth_min/max/avg  — video ring occupancy
+	//   no_frame / skip    — as before
+	//   aur_pending_min/max — audio ring depth (frames of buffered audio)
+	//                         over the window
+	//   aur_underruns      — count of render-quantum underrun events since
+	//                         last window (audio ring emptied → consumer
+	//                         emits silence → `consumed` stalls)
+	//   t_min/max          — clock_now returns over the window
+	//   ring_pts_min/max   — video ring PTS range at present() calls
+	static uint32_t _diag_prs_calls = 0;
+	static uint64_t _diag_prs_depth_sum = 0;
+	static uint32_t _diag_prs_depth_min = 0xFFFFFFFFu;
+	static uint32_t _diag_prs_depth_max = 0;
+	static uint32_t _diag_prs_no_frame = 0;
+	static uint32_t _diag_prs_skip = 0;
+	static uint32_t _diag_aur_pending_min = 0xFFFFFFFFu;
+	static uint32_t _diag_aur_pending_max = 0;
+	static uint64_t _diag_aur_underrun_prev = 0;
+	static double _diag_t_min = 1e18;
+	static double _diag_t_max = -1e18;
+	static double _diag_ring_oldest_min = 1e18;
+	static double _diag_ring_newest_max = -1e18;
+	uint32_t _diag_depth = (uint32_t)(w - r);
+	_diag_prs_calls++;
+	_diag_prs_depth_sum += _diag_depth;
+	if (_diag_depth < _diag_prs_depth_min) _diag_prs_depth_min = _diag_depth;
+	if (_diag_depth > _diag_prs_depth_max) _diag_prs_depth_max = _diag_depth;
+	if (candidate < 0) _diag_prs_no_frame++;
+	else if (candidate > (int64_t)r) _diag_prs_skip++;
+	if (t < _diag_t_min) _diag_t_min = t;
+	if (t > _diag_t_max) _diag_t_max = t;
+	if (_diag_depth > 0) {
+		double _rop = m->slots[r % RING_SLOTS].pts;
+		double _rnp = m->slots[(w - 1) % RING_SLOTS].pts;
+		if (_rop < _diag_ring_oldest_min) _diag_ring_oldest_min = _rop;
+		if (_rnp > _diag_ring_newest_max) _diag_ring_newest_max = _rnp;
+	}
+	if (m->audio_node) {
+		uint32_t _pending = nx_audio_stream_pending(m->audio_node);
+		if (_pending < _diag_aur_pending_min) _diag_aur_pending_min = _pending;
+		if (_pending > _diag_aur_pending_max) _diag_aur_pending_max = _pending;
+	}
+	if (_diag_prs_calls >= 60) {
+		double _avg = (double)_diag_prs_depth_sum / _diag_prs_calls;
+		uint64_t _aur_underrun_now =
+		    m->audio_node ? nx_audio_stream_underrun_count(m->audio_node) : 0;
+		uint64_t _aur_underrun_delta = _aur_underrun_now - _diag_aur_underrun_prev;
+		_diag_aur_underrun_prev = _aur_underrun_now;
+		fprintf(stderr,
+		        "[md-diag:prs] n=%u depth_min=%u max=%u avg=%.2f "
+		        "no_frame=%u skip=%u aur_pending_min=%u max=%u "
+		        "aur_underruns=%llu t_min=%.3f t_max=%.3f "
+		        "ring_oldest_min=%.3f ring_newest_max=%.3f\n",
+		        _diag_prs_calls, _diag_prs_depth_min, _diag_prs_depth_max,
+		        _avg, _diag_prs_no_frame, _diag_prs_skip,
+		        _diag_aur_pending_min, _diag_aur_pending_max,
+		        (unsigned long long)_aur_underrun_delta,
+		        _diag_t_min, _diag_t_max,
+		        _diag_ring_oldest_min, _diag_ring_newest_max);
+		_diag_prs_calls = 0;
+		_diag_prs_depth_sum = 0;
+		_diag_prs_depth_min = 0xFFFFFFFFu;
+		_diag_prs_depth_max = 0;
+		_diag_prs_no_frame = 0;
+		_diag_prs_skip = 0;
+		_diag_aur_pending_min = 0xFFFFFFFFu;
+		_diag_aur_pending_max = 0;
+		_diag_t_min = 1e18;
+		_diag_t_max = -1e18;
+		_diag_ring_oldest_min = 1e18;
+		_diag_ring_newest_max = -1e18;
+	}
+	// Per-call verbose trace for the first 100 present() calls (~5s at
+	// 20fps rAF). Lets us see the per-tick relationship of t / ring PTS /
+	// candidate / audio ring level during startup.
+	static uint32_t _diag_vpr_left = 100;
+	if (_diag_vpr_left > 0) {
+		_diag_vpr_left--;
+		double _rop = _diag_depth > 0 ? m->slots[r % RING_SLOTS].pts : -1.0;
+		double _rnp = _diag_depth > 0 ? m->slots[(w - 1) % RING_SLOTS].pts
+		                              : -1.0;
+		uint32_t _apend = m->audio_node
+		                      ? nx_audio_stream_pending(m->audio_node)
+		                      : 0;
+		fprintf(stderr,
+		        "[md-diag:vpr] t=%.4f dep=%u rop=%.3f rnp=%.3f cand=%lld "
+		        "apend=%u\n",
+		        t, _diag_depth, _rop, _rnp, (long long)candidate, _apend);
+	}
+#endif
 	if (candidate < 0 && w > r &&
 	    m->present_force.exchange(false, std::memory_order_acq_rel)) {
 		// First frame after a seek: show it even if its PTS is just past

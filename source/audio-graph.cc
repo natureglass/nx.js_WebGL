@@ -348,6 +348,8 @@ void process_stream_source(nx_audio_graph *g, nx_audio_node *n) {
 	}
 	// Underrun: the remainder of the bus stays silent and is NOT counted as
 	// consumed, so the media clock only advances for real audio.
+	if (avail < (uint32_t)Q)
+		n->stream_underrun_count.fetch_add(1, std::memory_order_relaxed);
 	n->stream_read_pos.store(read + frames, std::memory_order_release);
 	(void)g;
 }
@@ -753,6 +755,18 @@ uint64_t nx_audio_stream_consumed(nx_audio_node *n) {
 	return n->stream_read_pos.load(std::memory_order_acquire);
 }
 
+uint32_t nx_audio_stream_pending(nx_audio_node *n) {
+	if (!n->stream_ring)
+		return 0;
+	uint64_t read = n->stream_read_pos.load(std::memory_order_acquire);
+	uint64_t write = n->stream_write_pos.load(std::memory_order_relaxed);
+	return (uint32_t)(write - read);
+}
+
+uint64_t nx_audio_stream_underrun_count(nx_audio_node *n) {
+	return n->stream_underrun_count.load(std::memory_order_relaxed);
+}
+
 void nx_audio_stream_flush(nx_audio_node *n) {
 	// Producer is parked (decoder contract); empty the ring by advancing the
 	// read position to the write position. Take the graph mutex so this
@@ -761,6 +775,9 @@ void nx_audio_stream_flush(nx_audio_node *n) {
 	n->stream_read_pos.store(
 	    n->stream_write_pos.load(std::memory_order_relaxed),
 	    std::memory_order_release);
+	// Ledger #114 diag — reset underrun counter on flush so per-play stats
+	// are meaningful (avoid seek events polluting the underrun window).
+	n->stream_underrun_count.store(0, std::memory_order_relaxed);
 }
 
 void nx_audio_graph_render_s16(nx_audio_graph *g, int16_t *out,

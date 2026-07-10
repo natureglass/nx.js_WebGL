@@ -139,6 +139,8 @@ struct nx_audio_node {
 	std::atomic<uint64_t> stream_read_pos{0};
 	// When false the node outputs silence and consumes nothing (pause).
 	std::atomic<bool> stream_playing{false};
+	// Ledger #114 diag — counts render quanta where avail < Q (underrun).
+	std::atomic<uint64_t> stream_underrun_count{0};
 };
 
 struct nx_audio_graph {
@@ -209,6 +211,11 @@ uint32_t nx_audio_stream_write(nx_audio_node *n, const float *interleaved,
 void nx_audio_stream_set_playing(nx_audio_node *n, bool playing);
 // Total frames consumed by the render thread (the media clock).
 uint64_t nx_audio_stream_consumed(nx_audio_node *n);
+// Ledger #114 diag — frames currently queued in the ring (write - read).
+uint32_t nx_audio_stream_pending(nx_audio_node *n);
+// Ledger #114 diag — count of render quanta where avail < Q (underrun events).
+// Reset on stream_flush. Read-only snapshot; monotonic during playback.
+uint64_t nx_audio_stream_underrun_count(nx_audio_node *n);
 // Discard all buffered frames (seek/flush). The producer thread MUST be
 // parked while this is called.
 void nx_audio_stream_flush(nx_audio_node *n);

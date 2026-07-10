@@ -1446,6 +1446,20 @@ check 104 "body.ts advertises Content-Length for string / URLSearchParams" \
     "$NXJS/packages/runtime/src/fetch/body.ts" \
     'advertise Content-Length'
 
+# #107 — Switch.VideoDecoder post-seek deadlock fix: don't slave the wall
+# clock to a stalled audio consumer in clock_now(). Positive checks: the
+# per-media tracker field exists; clock_now gates the snap on
+# `audio_advancing`; do_seek resets the tracker on anchor flip.
+check 107 "media-decoder.cc nx_media has audio_consumed_last tracker field" \
+    "$NXJS/source/media-decoder.cc" \
+    'uint64_t audio_consumed_last = 0;'
+check 107 "media-decoder.cc clock_now gates snap on audio_advancing" \
+    "$NXJS/source/media-decoder.cc" \
+    'bool audio_advancing = consumed != m->audio_consumed_last;'
+check 107 "media-decoder.cc do_seek resets audio_consumed_last after flush" \
+    "$NXJS/source/media-decoder.cc" \
+    'm->audio_consumed_last = 0;'
+
 # #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array texImage2D/texSubImage2D
 # uploads. Positive checks: bpp helper + flip helper defined; both native
 # entry points reference the helper in their raw-pixels branch.
