@@ -106,6 +106,7 @@ proposal verdict.
 | 82 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #82` + `image-bitmap.ts: fast-path encode/decode failed` + `image-bitmap.ts: image-bitmap:#82` | Tier-A: `canvasToImageBitmap` fast-path falls back to raw `getImageData` → `imageWriteRGBA` when the PNG encode/decode round-trip throws. Fixes the residual `_from_canvas-tex-2d-alpha-alpha-unsigned_byte` FAIL (`createImageBitmap(source) failed: "Unsupported image format"`). Root cause opaque post-#78: same code path passes for luminance/rgb/rgba variants; only the first from_canvas test in a run hits it, suggesting a warm-up ordering issue in `canvasToBuffer` that produces a 0-length buffer once per run. Rather than surface the encode failure as a `createImageBitmap` rejection (which fails the whole test even though all expected ALPHA check values are `[0,0,0]` — an empty bitmap satisfies every assertion), catch the throw and route to the same raw-pixel path the unpremul branch below already uses. Byte-for-byte pixel copy, no PNG-encode risk. Diag log fires only on failure (hot path unchanged). |
 | 83 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #83` + `image-bitmap.ts: imageCopyPixels(bmp, decoded` | Tier-A: `createImageBitmap(Blob, opts)` honors `opts.imageOrientation` and `opts.premultiplyAlpha` via a post-decode `imageCopyPixels` step. Pre-#83 the Blob branch decoded the PNG/JPEG/WebP straight into an ImageBitmap and returned it — options ignored — so `_from_blob` variants with `premultiplyAlpha: "none"` had their alpha=0.5 red pixel sample as `128,0,0` (premultiplied) instead of the expected `255,0,0` (raw), and `imageOrientation: "flipY"` iterations sampled top/bottom in un-flipped positions. Fast path (no options) returns the decoded bitmap unchanged. Options path allocates a sized destination ImageBitmap and calls `$.imageCopyPixels(dst, src, !opts.unpremul, opts.flipY)` — same primitive #78 uses for ImageBitmap / HTMLImageElement branches. Fixes 7 of 8 `_from_blob-tex-2d-*` variants (the 8th, ALPHA, was already passing because all expected values are `[0,0,0]` regardless of premul state). |
 | 84 | **runtime** (MOVED) | brewser-specific | n/a | `live-video.ts: Ledger #84` + `live-video.ts: installVideoImageBitmapShim` + `canvas-runner.ts: installVideoImageBitmapShim` | Tier-A: `createImageBitmap(<video>)` runtime shim. Wraps `globalThis.createImageBitmap` so `<video>` LiveElements are captured through the live-video decoder pipeline — waits for `state.hasFirstFrame` bounded by a 3-second timeout, converts the RGBA `frameBytes` via a scratch OffscreenCanvas + `putImageData`, delegates to the original `createImageBitmap(oc, ...opts)` which takes the OffscreenCanvas branch already added by #66. Zero engine delta (engine's HTMLVideoElement branch stays the "not supported" throw; the shim runs first and never reaches it). Also syncs the three video assets to the webgl1 conformance resources dir. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#84). |
+| 105 | engine | upstream-candidate | PR-drafted(PR-modules) | `module.cc: nx_module_bindings` + `module.cc: g_importmaps` + `module.cc: resolve_specifier_with_map` + `module.h: nx_module_bindings` + `main.cc: nx_module_bindings(iso, init_obj)` | Page-level ES modules: importmap-aware resolver + prefetched-source registry + JS-callable `moduleSetImportmap`/`moduleSetSource`/`moduleRun`/`moduleClearPage`. Extends the existing filesystem-only module system so an embedder can execute an HTML `<script type="module">` under V8's real module semantics — no SystemJS, no userland module loader, no bundling — while sourcing bodies from URL schemes the engine has no fopen access to (e.g. `brewser://`, `http(s)://`). Foundation for stock (unmodified) Three.js demo support in Brewser and for any nx.js embedder that renders in-browser-shaped ES module pages. |
 
 ## DISPOSITION POLICY
 
@@ -133,6 +134,96 @@ UPSTREAM STATUS values:
 - `merged-in(vX)` — landed in upstream at version X; check whether the
   next pull obsoletes this entry.
 - `n/a` — not applicable (brewser-specific / fork-only disposition).
+
+---
+
+## #105 — Page-level ES modules: importmap-aware resolver + prefetched-source registry + JS-callable bindings — SHIPPED 2026-07-09
+
+**File(s):** [source/module.cc](source/module.cc), [source/module.h](source/module.h), [source/main.cc](source/main.cc).
+
+**Motivation.** nx.js's existing module system in [source/module.cc](source/module.cc) is scoped to a single **entrypoint** module (`nx_run_entry_module`) plus its filesystem-reachable import graph. That's sufficient for the runtime's own bundle (a single `.mjs` loaded via `fopen` against a mounted `romfs:`/`sdmc:`/`nxjs:` devoptab), but it can't execute a page-shaped `<script type="module">` from an embedder's HTML browser because:
+
+1. **Bare specifiers are hard-rejected.** `resolve_specifier` returns false for anything that isn't `./`, `../`, `/`, or `scheme:`. A demo doing `import * as THREE from 'three'` has no way to say what `three` means. The browser answer is `<script type="importmap">{...}</script>`; the engine has no importmap concept.
+2. **Only fopen-able schemes are supported.** `load_module` calls `read_module_file(url_to_fs_path(url))`. An embedder rendering a page at `brewser://apps/foo/index.html`, or fetching over `https://…`, has no devoptab mount that fopen can walk — even though the JS side already has a working `fetch()` that speaks all these schemes.
+3. **No JS-callable module-execution surface.** `nx_run_entry_module` is C-linkage only, one-shot at boot, and installs the module at a URL derived from an argv path. An HTML page's inline `<script type="module">` (no `src`, arbitrary body) cannot reach it.
+
+The workaround embedders have had to reach for is SystemJS or an equivalent userland loader: a ~30 KB bundle injected into every page, doing its own `s.register`-shaped module linking on top of V8's classic-script `eval`. That works but hands userland responsibility for spec semantics V8 already implements natively (top-level await, live bindings, cyclic imports, `import.meta`) — and forfeits the engine's compile cache, its module identity guarantees, and integration with `SetHostImportModuleDynamicallyCallback` which already sits in this file.
+
+The engine has all of V8's module machinery plumbed already: `ScriptCompiler::CompileModule`, `Module::InstantiateModule` with `resolve_module_callback`, `Module::Evaluate`, top-level-await promise chaining, `import.meta.url` population, dynamic `import()` via `SetHostImportModuleDynamicallyCallback`. The delta to make it usable for page-level modules is **surgical**, not architectural: four JS-callable bindings + one resolver extension + one alternate source path.
+
+**Exact change.**
+
+1. **[source/module.cc](source/module.cc) — new state (three unordered_maps, anonymous-namespace-scoped):**
+   - `g_importmaps: pageBase → (specifier → resolved-target-URL)`. Populated by `moduleSetImportmap`; consulted by the resolver for bare specifiers. Values are stored **already resolved** against the pageBase so lookup at resolve time is O(1) and does not re-parse.
+   - `g_prefetch_sources: url → source-text`. Populated by `moduleSetSource` when the embedder has already fetched a body via its own JS `fetch()`. `load_module` checks this map **before** falling through to `fopen`.
+   - `g_module_page_base: url → pageBase`. Threaded through `load_module` so a child module inherits the same page scope as its parent, and `resolve_module_callback` can look up which importmap applies from a referrer's identity.
+
+2. **[source/module.cc](source/module.cc) — new resolver `resolve_specifier_with_map`.** Layered on top of `resolve_specifier`: try direct URL parse first (browser importmap spec: only bare specifiers consult the map), fall through to `g_importmaps[page_base][specifier]`. Returns false only if neither path succeeds. `resolve_module_callback` and `dynamic_import_callback` both switch to this variant, both propagate `page_base` on recursion.
+
+3. **[source/module.cc](source/module.cc) — `load_module` gains an optional `page_base` parameter (default empty).** Existing callers (`nx_run_entry_module`, filesystem `dynamic_import` fallbacks) pass empty and are unaffected. New page-module recursion tags loaded URLs with the page scope. Source-lookup precedence becomes: `g_prefetch_sources[url]` → `fopen(url_to_fs_path(url))`. The prefetch path is byte-identical to the fopen path from V8's perspective — same `ScriptCompiler::Source`, same `ScriptOrigin` (module URL as resource name), same `CompileModule` invocation.
+
+4. **[source/module.cc](source/module.cc) — four new JS-callable functions in a second anonymous namespace, exposed via `nx_module_bindings`:**
+   - `moduleSetImportmap(pageBase: string, mapJson: string): void`. Parses `mapJson` via `v8::JSON::Parse`, iterates `imports`, resolves each target against `pageBase`, merges into `g_importmaps[pageBase]`. Silently ignores malformed JSON (a broken importmap must not abort the page). `scopes` is accepted but ignored for this pass — punt until an embedder actually needs scoped maps.
+   - `moduleSetSource(url: string, source: string): void`. Idempotent map write; last-writer-wins.
+   - `moduleRun(source: string, url: string, pageBase: string): Promise<any>`. Compiles `source` as a module with `url` as its identity and `pageBase` as its page-scope tag, `InstantiateModule` (recursively resolving through the extended resolver + prefetch registry), `Evaluate`. Returns a Promise that mirrors the evaluation promise: fulfilled with the module namespace on success, rejected on any compile/instantiate/evaluate failure, chained through `.then(() => ns)` when the graph uses top-level await. Rejects with `TypeError` on arg-shape violations. Rejects with a descriptive `Error` if `url` was already registered — collisions would either replay stale source or throw a redeclaration; making it loud forces callers to assign unique URLs per inline script / re-run.
+   - `moduleClearPage(pageBase: string): void`. Drops `g_importmaps[pageBase]` and purges every entry in `g_module_cache`, `g_module_urls`, `g_prefetch_sources`, and `g_module_page_base` whose page-scope matches. The runtime entrypoint bundle (loaded via `nx_run_entry_module`, absent from `g_module_page_base`) is untouched.
+
+5. **[source/module.h](source/module.h)** — declares `nx_module_bindings(Isolate *, Local<Object>)` and updates the header block comment to document that page-level modules join the pre-existing filesystem-only entrypoint flow.
+
+6. **[source/main.cc](source/main.cc)** — one line inside `build_init_object`, right after `nx_init_window(iso, init_obj);`, calls `nx_module_bindings(iso, init_obj)` to attach the four `module*` functions onto the `$` bridge object.
+
+7. **[source/module.cc](source/module.cc) — `nx_modules_teardown`** clears the three new maps alongside the existing cache + urls + entrypoint URL, so isolate disposal releases everything.
+
+8. **[source/module.cc](source/module.cc) — `nx_module_bindings` additionally publishes `globalThis.nxjsPageModules`**, a durable namespace object with methods `{ setImportmap, setSource, run, clearPage }`. Rationale: the nx.js runtime captures `$` into a module export and immediately deletes the global at [packages/runtime/src/$.ts](packages/runtime/src/$.ts) init time, so any code loaded AFTER the nx.js runtime bundle (i.e. every downstream embedder — brewser-runtime, third-party session shims, WebViews) cannot reach `$.moduleRun` etc. The runtime never touches `nxjsPageModules`, so it survives for the isolate's lifetime. Attribute flags `DontEnum | DontDelete` keep it out of `for…in`, out of `Object.keys(globalThis)`, and non-deletable, while still writable so an embedder can wrap it (e.g. add telemetry) if it wants. Access from embedder code: `globalThis.nxjsPageModules.run(src, url, base)`.
+
+**Design contract.** The embedder is expected to drive the page-module flow entirely from JS:
+
+```js
+// Once per importmap tag on the page.
+$.moduleSetImportmap(pageBase, mapJson);
+
+// Once per URL in the transitively-imported dep graph. The embedder walks
+// static imports (regex or ESTree scan) on the JS side, fetches each URL via
+// its own fetch(), and hands the body to the engine.
+$.moduleSetSource(url, source);
+
+// Once per `<script type="module">` on the page. Await the returned promise
+// so top-level await settles before the next script.
+await $.moduleRun(inlineSource, syntheticUrl, pageBase);
+
+// On page navigation.
+$.moduleClearPage(pageBase);
+```
+
+The engine does not fetch. The engine does not walk imports pre-instantiate. The engine's contract is only: given an importmap + a source registry + an entry, compile+instantiate+evaluate under V8's spec-conformant semantics. This split keeps the C++ delta minimal, keeps the async I/O boundary on the JS side where `fetch()` already exists and works for every scheme the embedder cares about, and preserves the engine's compile cache + module identity for cross-graph deduplication.
+
+**Interactions and preserved invariants.**
+
+- **Entrypoint module flow is untouched.** `nx_run_entry_module` passes no `page_base`, filesystem loading is the fallback in `load_module`, `resolve_specifier_with_map` degrades to `resolve_specifier` when `page_base` is empty. Existing embedders that only load a single entrypoint module see zero behavioral change.
+- **Dynamic `import()` from a page module inherits the page scope.** `dynamic_import_callback` looks up `g_module_page_base[importing_url]` and threads it through `resolve_specifier_with_map` and `load_module`. So `import('three')` from an inline module works the same as `import * as THREE from 'three'`.
+- **`import.meta.url` is preserved.** Page modules go through `register_module`, which populates `g_module_urls`; `init_import_meta` reads from there unchanged. `import.meta.main` is `false` for page modules (they were not the entrypoint).
+- **Import cycles work.** `register_module` runs before `InstantiateModule`, matching the existing pattern. A cycle at page-module scope resolves to the same `Global<Module>` handle the same way an entrypoint-graph cycle does.
+- **Top-level await surfaces correctly.** `moduleRun` chains the evaluation promise into the returned Promise. A rejection propagates via `.reject(eval_promise->Result())`, not via an unhandled-rejection channel — the JS caller gets a normal Promise rejection.
+
+**Scope.** Any nx.js embedder rendering HTML pages that use standard `<script type="importmap">` + `<script type="module">` boot patterns. Immediately: Brewser's zero-config Three.js demo path (retires the demo-side `three-latest.iife.js` + `r184-nxjs-bridge.js` + hand-edited `main.js` triple stack). Broader: any embedder wanting to run browser-shaped ES module content without shipping SystemJS or writing a userland loader. Also useful for developer tooling — e.g. running an ES module test file loaded from an sdcard path against a runtime-provided fixture stack via `moduleSetSource(fixtureUrl, fixtureSrc)`.
+
+**Not in this ledger (deferred to follow-ups):**
+- `scopes` section of importmaps (parser accepts and ignores). Common demos don't use it; addons scope in Three.js may need it. Adding is `~15 LOC` (nested map).
+- `v8::SyntheticModule` for host-provided modules (e.g. `import { Switch } from 'nx:switch'`). ~50 LOC; not needed for the cube demo. Would slot in as `moduleSetSynthetic(url, exportsObject)`.
+- Async C++→JS fetch callback. Explicitly chose the JS-drives-fetch model instead — it keeps the engine synchronous and side-effect-free, and the runtime already has a working `fetch()`. If a future use case genuinely needs the engine to initiate a load (e.g. dynamic import of a URL the runtime didn't pre-scan for), the alternative is either a JS-side registered fetcher wrapped through `nx_queue_async` or a two-phase Instantiate retry loop. Neither is on the critical path today.
+
+**DISPOSITION:** `upstream-candidate`. The engine already ships a full ES module system for entrypoints; this closes the last capability gap that keeps embedders from using it for the same shape of code they were going to have to write anyway. Zero user-facing behavior change for embedders that don't call the new functions.
+
+**UPSTREAM STATUS:** `PR-drafted(PR-modules)` — see [upstream-prs/PR-modules.md](upstream-prs/PR-modules.md).
+
+**RE-APPLY / VERIFY NOTE.** After an upstream nx.js pull:
+- Grep [source/module.cc](source/module.cc) for `nx_module_bindings`, `g_importmaps`, `resolve_specifier_with_map`, `g_prefetch_sources`, `g_module_page_base`. Missing → re-apply from this ledger.
+- Grep [source/module.h](source/module.h) for `nx_module_bindings`. Missing → header declaration reverted; re-apply.
+- Grep [source/main.cc](source/main.cc) for `nx_module_bindings(iso, init_obj)`. Missing → the wiring at `build_init_object` was reverted; add back right after `nx_init_window`.
+- Recurrence tell #1: an embedder using `<script type="module">` with a bare-specifier importmap page silently regresses to "Cannot find module 'three'" — `resolve_specifier_with_map` fallback was reverted, or the importmap parser dropped the entry, or `g_module_page_base` is not being propagated through `load_module`'s recursive resolve.
+- Recurrence tell #2: page-module fetches from `brewser://`/`http(s)://` schemes fail with `Cannot find module '<url>'` — the `g_prefetch_sources` branch in `load_module` was reverted; the resolver is falling straight to fopen and there's no devoptab match.
+- Recurrence tell #3: two page navigations to demos that share an importmap key (e.g. both name `three` but at different asset paths) render the second demo with the first demo's Three.js — `moduleClearPage` was reverted or the embedder isn't calling it on nav.
+- Consider whether the upstream PR has landed and this ledger entry can be dropped.
 
 ---
 
