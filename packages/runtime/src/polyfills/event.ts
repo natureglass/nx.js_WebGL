@@ -628,10 +628,41 @@ export class GamepadEvent extends Event implements globalThis.GamepadEvent {
 	}
 }
 
+export interface ProgressEventInit extends EventInit {
+	lengthComputable?: boolean;
+	loaded?: number;
+	total?: number;
+}
+
+/**
+ * Ledger #118 (2026-07-10). WHATWG XHR `ProgressEvent`. Not tied to
+ * XMLHttpRequest — Three.js's `FileLoader` dispatches
+ * `new ProgressEvent('progress', {lengthComputable, loaded, total})`
+ * inside its fetch-streaming path (per-chunk callback), and any code
+ * that assumes a browsing-shaped runtime touches this class. Pre-#118
+ * the global was undefined → Three's per-chunk dispatch threw
+ * `ReferenceError`, the fetch promise rejected, and downstream
+ * `.load()` callbacks never fired (visible symptom: stock demos that
+ * use `FileLoader` never render because their loaded-data callback
+ * never runs).
+ */
+export class ProgressEvent extends Event implements globalThis.ProgressEvent {
+	readonly lengthComputable: boolean;
+	readonly loaded: number;
+	readonly total: number;
+	constructor(type: string, options: ProgressEventInit = {}) {
+		super(type, options);
+		this.lengthComputable = options.lengthComputable ?? false;
+		this.loaded = options.loaded ?? 0;
+		this.total = options.total ?? 0;
+	}
+}
+
 def(Event);
 def(CustomEvent);
 def(ErrorEvent);
 def(PromiseRejectionEvent);
+def(ProgressEvent);
 def(UIEvent);
 def(KeyboardEvent);
 def(Touch);

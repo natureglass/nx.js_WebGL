@@ -116,6 +116,7 @@ proposal verdict.
 | 113 | engine | upstream-candidate (SHIPPED CITRON VERIFIED 2026-07-10) | not-submitted | `media-decoder.cc: Ledger #113 (2026-07-10) — Fix B` + `media-decoder.cc: video-follows-audio` | Video-follows-audio sync: `clock_now` returns `at` directly when audio is advancing; drops the pre-#113 `AV_RESYNC_THRESHOLD=50ms` hard-snap-on-drift design. Cures the ~1-2 Hz periodic video stutter on `webgl_materials_video` (and any decoder-audio-attached path) on Citron / CPU-slow paths where the decode pipeline can't keep up with realtime. Cut #22c stall-fallback contract preserved: audio-stall detection (`audio_advancing`) still falls through to wall-clock so nx_media_present drains the video ring and unblocks enqueue_video. Fork history: originally Cut #22c (#107) preserved wall+snap; #113 supersedes the whole snap design. **Ships as a coupled pair with #115** — Fix B alone cured the wall-snap stutter but exposed the audio-underrun stutter; #115 layered a monotonic clock gate + wall-extrapolation cap + larger video ring on top. |
 | 114 | engine | fork-only (diagnostic extension) | n/a | `audio-graph.h: nx_audio_stream_pending` + `audio-graph.h: nx_audio_stream_underrun_count` + `audio-graph.cc: stream_underrun_count.fetch_add` | Ledger #114 (2026-07-10) — diagnostic extension: audio ring level (`nx_audio_stream_pending`) + render-quantum underrun counter (`nx_audio_stream_underrun_count`) accessors on stream nodes, plus a `stream_underrun_count` field incremented in `process_stream_source` when `avail < Q`. Feeds two new fields into `[md-diag:prs]` output — `aur_pending_min/max` and `aur_underruns` — which pinned #115's audio-underrun root cause. Retained as passive diagnostic; kept live so any future decoder-audio-attached bug surfaces the same fingerprint. |
 | 115 | engine | upstream-candidate (SHIPPED CITRON VERIFIED 2026-07-10) | not-submitted | `media-decoder.cc: Ledger #115 (2026-07-10)` + `media-decoder.cc: RING_SLOTS = 12` + `media-decoder.cc: last_clock` + `media-decoder.cc: ring_newest_pts` | Three-part follow-up cure for the residual periodic stutter that survived Fix B (#113). (a) RING_SLOTS 3 → 12: bigger video buffer prevents the decode thread from constantly blocking in `enqueue_video`, which was starving the shared decoder of time to process audio packets — audio ring was draining to 0 every ~1 s (708 underruns in 3 s on Citron). (b) Monotonic clock gate: `clock_now` clamps its return to `>= m->last_clock`; a small forward pause replaces every visible backward jump when audio resumes below wall-extrapolated `t`. (c) Wall-extrapolation cap during stall: wall time can't exceed `ring_newest_pts + vframe_dur`, so the resume-catch-up gap stays small. Cut #22c deadlock avoidance still works — present() drains ring at capped-wall rate. Post-fix telemetry: `aur_underruns` 708/3s → 0/3s (steady state); `aur_pending_min` 0 → 1077-9125; no_frame 18-24 → 0-6; `t` strictly monotonic. |
+| 117 | engine | upstream-candidate | not-submitted | `request.ts: globalThis as { location?: { href?: string } }` | Request-constructor base URL prefers `globalThis.location.href` over `$.entrypoint` when a `location` global is present (browsing-context shape). Fixes stock Three.js `FileLoader.load(rel)` and any `new Request(rel)` in an embedder — pre-#117 the ctor resolved relative URLs against the app's `main.js` (`romfs:/main.js`), sending fetches to `romfs:/...` where restrictive manifests deny them. Matches WHATWG Fetch spec (env settings object base URL = `document.baseURI` in a browsing context). CLI apps unaffected — no `location` global, resolver falls back to `$.entrypoint` unchanged. |
 
 ## DISPOSITION POLICY
 
@@ -143,6 +144,46 @@ UPSTREAM STATUS values:
 - `merged-in(vX)` — landed in upstream at version X; check whether the
   next pull obsoletes this entry.
 - `n/a` — not applicable (brewser-specific / fork-only disposition).
+
+---
+
+## #117 — Request-ctor base URL prefers `globalThis.location.href` over `$.entrypoint` (WHATWG Fetch spec conformance) — SHIPPED 2026-07-10
+
+**File(s):** [packages/runtime/src/fetch/request.ts](packages/runtime/src/fetch/request.ts) — Request constructor's string-input branch (~line 180).
+
+**Motivation.** Stock Three.js `FileLoader.load('textures/3d/head256x256x109.zip')` (used by e.g. the `webgl_texture2darray` demo) internally wraps the URL as `new Request(url, {...})` at [three-latest/src/loaders/FileLoader.js:130](three-latest/src/loaders/FileLoader.js#L130) before calling `fetch()`. Pre-#117 the Request constructor resolved the relative URL against `$.entrypoint` — the app's own `main.js`, which nx.js pins to `romfs:/main.js` under an embedder. Result: the fetch landed at `romfs:/textures/3d/head256x256x109.zip` instead of the page's own scheme, and any app manifest without `filesystem_read` denied the read.
+
+Symptom in brewser (any app that stock-uses `FileLoader`, `TextureLoader`, or any other loader that goes through `FileLoader`): asset load fails with `[switch-web/runtime] perm denied: filesystem_read fetch(romfs:/...)` in the debug log. `pageFetchWrapper` in brewser-runtime's `canvas-runner.ts` only rewrites *string* inputs to `fetch()` via `resolveLiveResourceUrl` — Three's Loader path constructs the Request object BEFORE `fetch()` is called, so the wrapper's Request pass-through comment ("`new Request(rel)` goes through nxjs's own resolver (against $.entrypoint) which we don't override here") was a known load-bearing gap.
+
+**Root cause + fix.** Per WHATWG Fetch, `new Request(rel)` resolves `rel` against "the current settings object's base URL" — in a browsing context that's `document.baseURI` (usually the document URL). nx.js's `Request` ctor unconditionally used `$.entrypoint`. Correct for a CLI-shaped context (no `location`); wrong for browser-shaped ones. Fix: prefer `globalThis.location?.href` when it's a resolvable URL, fall back to `$.entrypoint` on missing / `about:blank` / any URL-ctor throw. CLI apps (no `location` global) are unaffected — the fallback is byte-identical to pre-#117 behavior.
+
+```ts
+// pre-fix
+const url = typeof input === 'string' ? new URL(input, $.entrypoint) : input;
+
+// post-fix
+let url;
+if (typeof input === 'string') {
+    const loc = (globalThis as { location?: { href?: string } }).location?.href;
+    let resolved: URL | null = null;
+    if (typeof loc === 'string' && loc.length > 0) {
+        try { resolved = new URL(input, loc); } catch (_) { /* fall through */ }
+    }
+    url = resolved ?? new URL(input, $.entrypoint);
+} else {
+    url = input;
+}
+```
+
+**Blast radius.** Positive. Every Three.js loader (`FileLoader`, `TextureLoader`, `HDRLoader`, `EXRLoader`, `GLTFLoader`, `RGBELoader`, etc.) now resolves relative URLs against the page URL — matching real browsers. No demo-side workarounds needed. CLI apps that construct `Request(rel)` still resolve against `$.entrypoint` because `globalThis.location` is undefined there. Any brewser page that already had a valid `location.href` (installed by `installPageLocation` on every navigation, per [canvas-runner.ts:2306](../brewser-runtime-v8/src/scripts/canvas-runner.ts#L2306)) now gets spec-correct Request resolution.
+
+**DISPOSITION:** `upstream-candidate` — pure spec-conformance fix. When `globalThis.location` is undefined the behavior is byte-identical to pre-#117; when it's defined the result matches every browser. Any nx.js embedder that wires a `location`-shape (Cocos, GameMaker, and any HTML-shell embedder) benefits.
+
+**UPSTREAM STATUS:** `not-submitted` — file a PR to `TooTallNate/nx.js`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: `grep -n "globalThis as { location" packages/runtime/src/fetch/request.ts` — the location.href branch should live inside the Request constructor. `scripts/verify-patches.sh` gains a `check 117` for the same. *To re-apply*: replace the plain `new URL(input, $.entrypoint)` ternary with the try-with-location-fallback pattern above.
+
+**Recurrence tell.** A stock Three.js demo (or any code that does `new Request(relativeUrl)`) fetches an asset that then 404s / permission-denies. Debug log shows `perm denied: filesystem_read fetch(romfs:/…)` where the leading `romfs:/` should have been the page's scheme (`brewser://`, `http://`, `sdmc:/`, etc.). Grep `packages/runtime/src/fetch/request.ts` for the location.href branch — if it's missing (just `new URL(input, $.entrypoint)` remains), regressed.
 
 ---
 

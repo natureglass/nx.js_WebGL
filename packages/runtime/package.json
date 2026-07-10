@@ -43,5 +43,8 @@
     "to-px": "^1.1.0",
     "vitest": "catalog:",
     "web-streams-polyfill": "^4.0.0"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.10"
   }
 }

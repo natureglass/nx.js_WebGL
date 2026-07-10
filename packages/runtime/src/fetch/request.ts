@@ -176,8 +176,32 @@ export class Request extends Body implements globalThis.Request {
 			this.referrerPolicy = init.referrerPolicy ?? input.referrerPolicy;
 			this.signal = init.signal ?? input.signal;
 		} else {
-			const url =
-				typeof input === 'string' ? new URL(input, $.entrypoint) : input;
+			// Ledger #117 (2026-07-10) — Request-ctor base URL selection.
+			// Per WHATWG Fetch, `new Request(rel)` resolves `rel` against
+			// the current settings object's base URL. In a browsing context
+			// (the shape brewser and any HTML-embedder present) that's
+			// `document.baseURI`, exposed here as `globalThis.location.href`.
+			// In a CLI context (nx.js's original use case) there's no
+			// `location`, so `$.entrypoint` (the app's `main.js`) is the
+			// only sensible fallback. Prefer `location.href` when it's a
+			// resolvable URL; fall back to `$.entrypoint` on
+			// missing / `about:blank` / any URL-ctor throw. Fixes stock
+			// Three.js `FileLoader` usage in an embedder — its
+			// `new Request(url, {...})` wrap on relative asset URLs was
+			// landing at `romfs:/textures/...` (denied by any restrictive
+			// manifest gate) instead of the page's own scheme.
+			let url;
+			if (typeof input === 'string') {
+				const loc = (globalThis as { location?: { href?: string } })
+					.location?.href;
+				let resolved: URL | null = null;
+				if (typeof loc === 'string' && loc.length > 0) {
+					try { resolved = new URL(input, loc); } catch (_) { /* fall through */ }
+				}
+				url = resolved ?? new URL(input, $.entrypoint);
+			} else {
+				url = input;
+			}
 			this.url = url.href;
 			this.cache = init.cache || 'default';
 			this.credentials = init.credentials || 'same-origin';

@@ -791,7 +791,7 @@ importers:
     dependencies:
       kleur:
         specifier: github:TooTallNate/kleur#rgb
-        version: https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
+        version: git+https://git@github.com:TooTallNate/kleur.git#aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
 
   packages/install-title:
     dependencies:
@@ -932,7 +932,7 @@ importers:
     dependencies:
       kleur:
         specifier: github:TooTallNate/kleur#rgb
-        version: https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
+        version: git+https://git@github.com:TooTallNate/kleur.git#aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
       sisteransi:
         specifier: 'catalog:'
         version: 1.0.5
@@ -951,6 +951,10 @@ importers:
         version: 3.2.4(@types/debug@4.1.12)(@types/node@22.19.13)(lightningcss@1.31.1)
 
   packages/runtime:
+    dependencies:
+      '@xmldom/xmldom':
+        specifier: ^0.9.10
+        version: 0.9.10
     devDependencies:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.20
@@ -990,7 +994,7 @@ importers:
         version: 1.7.0(next@16.1.6(react-dom@19.2.4(react@19.2.4))(react@19.2.4))
       kleur:
         specifier: github:TooTallNate/kleur#rgb
-        version: https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
+        version: git+https://git@github.com:TooTallNate/kleur.git#aa22b05da68d29ff6d2ce5eba5895ac654b7f25a
       parse-css-font:
         specifier: ^4.0.0
         version: 4.0.0
@@ -2976,6 +2980,10 @@ packages:
     resolution: {integrity: sha512-cQzWCtO6C8TQiYl1ruKNn2U6Ao4o4WBBcbL61yJl84x+j5sOWWFU9X7DpND8XZG3daDppSsigMdfAIl2upQBRw==}
     engines: {node: '>=10.0.0'}
 
+  '@xmldom/xmldom@0.9.10':
+    resolution: {integrity: sha512-A9gOqLdi6cV4ibazAjcQufGj0B1y/vDqYrcuP6d/6x8P27gRS8643Dj9o1dEKtB6O7fwxb2FgBmJS2mX7gpvdw==}
+    engines: {node: '>=14.6'}
+
   '@xterm/headless@6.0.0':
     resolution: {integrity: sha512-5Yj1QINYCyzrZtf8OFIHi47iQtI+0qYFPHmouEfG8dHNxbZ9Tb9YGSuLcsEwj9Z+OL75GJqPyJbyoFer80a2Hw==}
 
@@ -3828,8 +3836,8 @@ packages:
     resolution: {integrity: sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ==}
     engines: {node: '>=6'}
 
-  kleur@https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a:
-    resolution: {tarball: https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a}
+  kleur@git+https://git@github.com:TooTallNate/kleur.git#aa22b05da68d29ff6d2ce5eba5895ac654b7f25a:
+    resolution: {commit: aa22b05da68d29ff6d2ce5eba5895ac654b7f25a, repo: git@github.com:TooTallNate/kleur.git, type: git}
     version: 4.1.5
     engines: {node: '>=6'}
 
@@ -7055,6 +7063,8 @@ snapshots:
 
   '@xmldom/xmldom@0.8.11': {}
 
+  '@xmldom/xmldom@0.9.10': {}
+
   '@xterm/headless@6.0.0': {}
 
   abort-controller@3.0.0:
@@ -8017,7 +8027,7 @@ snapshots:
 
   kleur@4.1.5: {}
 
-  kleur@https://codeload.github.com/TooTallNate/kleur/tar.gz/aa22b05da68d29ff6d2ce5eba5895ac654b7f25a: {}
+  kleur@git+https://git@github.com:TooTallNate/kleur.git#aa22b05da68d29ff6d2ce5eba5895ac654b7f25a: {}
 
   lightningcss-android-arm64@1.31.1:
     optional: true

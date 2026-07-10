@@ -1491,6 +1491,16 @@ check_absent 110 "webgl.cc v2_rider2 prune must not include OES_texture_half_flo
     "$NXJS/source/webgl.cc" \
     'strcmp\(name, "OES_texture_half_float_linear"\) == 0 \|\|\s*$'
 
+# #117 — Request-ctor base URL prefers globalThis.location.href over
+# $.entrypoint so browser-shaped embedders (brewser) resolve relative
+# fetch URLs against the page URL, matching WHATWG Fetch spec. Positive
+# check: the location.href branch exists in request.ts. Anti-pattern:
+# the plain `new URL(input, $.entrypoint)` pattern must NOT be the only
+# resolver call left (defense against revert).
+check 117 "request.ts Request-ctor consults globalThis.location.href before \$.entrypoint" \
+    "$NXJS/packages/runtime/src/fetch/request.ts" \
+    'globalThis as \{ location\?: \{ href\?: string \} \}'
+
 # #105 — Snapshot toolbar avatar SDMC read at navigation, off the per-rAF-tick
 # renderChrome path. Shell-only, browser-shell.ts. Positive checks: the
 # cached field + refresh method + boot init + per-navigation refresh site
