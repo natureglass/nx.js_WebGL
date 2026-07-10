@@ -116,7 +116,18 @@ export class EventTarget implements globalThis.EventTarget {
 				self.removeEventListener(event.type, cb.cb);
 			}
 			if (typeof cb.cb === 'function') {
-				cb.cb(event);
+				// Per DOM spec (Web IDL "invoke a callback function"), `this`
+				// inside an event listener callback must be the event
+				// target. Three.js's ImageLoader's onImageLoad reads
+				// `this` to get the loaded image; a bare `cb.cb(event)`
+				// leaves `this` as undefined/globalThis (depending on
+				// strict-mode of the caller's function), so
+				// `onLoad(this)` inside Three.js hands the wrong object
+				// (or undefined) to TextureLoader → `texture.image`
+				// becomes garbage → sampler samples empty → materials
+				// render black. `.call(self, event)` binds `this` to the
+				// event target, matching browsers.
+				cb.cb.call(self, event);
 			} else {
 				cb.cb.handleEvent(event);
 			}

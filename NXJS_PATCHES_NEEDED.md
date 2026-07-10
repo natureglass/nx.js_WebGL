@@ -137,6 +137,33 @@ UPSTREAM STATUS values:
 
 ---
 
+## #106 — EventTarget.dispatchEvent must bind `this` to target inside listener callback (DOM / Web IDL spec) — SHIPPED 2026-07-09
+
+**File(s):** [packages/runtime/src/polyfills/event-target.ts](packages/runtime/src/polyfills/event-target.ts) — `EventTarget.prototype.dispatchEvent`, ~line 118.
+
+**Motivation.** Web IDL's "invoke a callback function" step (which `dispatchEvent` runs for each stored listener) requires `thisArg` to be the event target when the callback's and target's realms are same-origin (https://webidl.spec.whatwg.org/#call-a-user-objects-operation). The pre-fix implementation called `cb.cb(event)` as a bare invocation — `this` inside the listener resolves to whatever the caller's function-code strict-mode rules dictate (undefined in a strict function, globalThis in a sloppy one), NEVER the target.
+
+**Symptom manifested by:** Three.js's `ImageLoader.onImageLoad` (three.core.js ~44605): the listener body is `if (onLoad) onLoad(this)` — passes `this` to `TextureLoader`'s inner callback, which does `texture.image = image`. With `this` = globalThis instead of the loaded Image, `texture.image` becomes the global object. `WebGLTextures.setTexture2D` then queues an "upload" that produces an empty texture (`nx_get_image` returns nullptr on globalThis; the engine's texImage2D falls through the ImageBitmap/Image conversion path and uploads nothing). Sampling the empty texture returns (0,0,0,255) → any material with `map: texture` renders opaque black. The stock r184 `webgl_geometry_cube` demo hits this on `MeshBasicMaterial({ map: textureLoader.load('textures/crate.png') })`. Confirmed via a demo-side probe that shows `loaded.image instanceof Image === false`, `Object.getPrototypeOf(loaded.image).constructor.name === 'Object'`, no `width` descriptor anywhere on the proto chain — the exact shape of globalThis.
+
+**Fix.** One line — `cb.cb(event)` → `cb.cb.call(self, event)` where `self` is already resolved as the target (`this || globalThis`) at the top of dispatchEvent.
+
+**Blast radius (why this shipped without gating).** Positive — every existing listener that DIDN'T rely on `this` (arrow-function `onload = () => {}`, `image.onload = function(){}` property syntax where nx.js's `dispatchEvent` special-cases the direct `.onload?.(event)` call with correct `this`) continues to work unchanged. Every listener that DID rely on `this` was already broken and had no way to observe the pre-fix behavior. The fix is spec-compliant AND browser-matching; no runtime code intentionally relies on the pre-fix "this = undefined" behavior.
+
+**DISPOSITION:** `upstream-candidate` (this is a straight spec-conformance fix — belongs in nx.js upstream).
+
+**UPSTREAM STATUS:** `not-submitted` — draft PR against nx.js main welcomed; the diff is trivial. Recommend paired test: `t = new EventTarget(); t.addEventListener('x', function() { assert(this === t); }); t.dispatchEvent(new Event('x'));`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify the fix is still in place*: grep `packages/runtime/src/polyfills/event-target.ts` for `cb.cb.call(self, event)`. If the file reverted to `cb.cb(event)`, ANY DOM `addEventListener` callback that uses `this` (Three.js's TextureLoader, jQuery-style plugins, addEventListener('click', function() { this.classList.toggle(...) }), etc.) breaks silently. *To re-apply*: change line 118 in dispatchEvent, run `node packages/runtime/bundle.mjs`, then `make -C /d/Workspace/brewser-v8` to rebuild the engine and package brewser.nro.
+
+**Recurrence tell.** A user reports "my `addEventListener` handler runs but seems to point at the wrong element" or "Three.js's TextureLoader onLoad callback gets undefined image / globalThis" — first diagnosis: is EventTarget.dispatchEvent binding `this` to `self`? The pre-fix bug reproduces trivially:
+```js
+const t = new EventTarget();
+t.addEventListener('x', function () { console.log(this === t); });  // pre-fix: false; post-fix: true
+t.dispatchEvent(new Event('x'));
+```
+
+---
+
 ## #105 — Page-level ES modules: importmap-aware resolver + prefetched-source registry + JS-callable bindings — SHIPPED 2026-07-09
 
 **File(s):** [source/module.cc](source/module.cc), [source/module.h](source/module.h), [source/main.cc](source/main.cc).
