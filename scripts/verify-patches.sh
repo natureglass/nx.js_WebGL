@@ -1446,6 +1446,37 @@ check 104 "body.ts advertises Content-Length for string / URLSearchParams" \
     "$NXJS/packages/runtime/src/fetch/body.ts" \
     'advertise Content-Length'
 
+# #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array texImage2D/texSubImage2D
+# uploads. Positive checks: bpp helper + flip helper defined; both native
+# entry points reference the helper in their raw-pixels branch.
+check 108 "webgl.cc has nx_gl_pixel_bpp helper" \
+    "$NXJS/source/webgl.cc" \
+    'static size_t nx_gl_pixel_bpp\('
+check 108 "webgl.cc has nx_gl_flip_pixels_y helper" \
+    "$NXJS/source/webgl.cc" \
+    'static const void \*nx_gl_flip_pixels_y\('
+check 108 "webgl.cc w_tex_image_2d / w_tex_sub_image_2d wire nx_gl_flip_pixels_y" \
+    "$NXJS/source/webgl.cc" \
+    'nx_gl_flip_pixels_y\('
+
+# #109 — drawBuffers([BACK]) → [COLOR_ATTACHMENT0] translation when the JS
+# view is on the default framebuffer (tenant redirect). Fixes Three.js
+# EffectComposer post-processing rendering black. Positive check: the
+# translation branch exists in w_draw_buffers.
+check 109 "webgl.cc w_draw_buffers translates GL_BACK on tenant" \
+    "$NXJS/source/webgl.cc" \
+    'bufs_scratch\[i\] = \(\(GLenum\)p\[i\] == GL_BACK\)'
+
+# #110 — OES_texture_half_float_linear un-pruned on WebGL 2. Positive
+# check: header comment marker is present. Anti-pattern check: the
+# extension name must NOT appear in the rider-2 v2 prune list.
+check 110 "webgl.cc Ledger #110 header (un-prune half-float-linear)" \
+    "$NXJS/source/webgl.cc" \
+    'Ledger #110 \(2026-07-10\) — `OES_texture_half_float_linear`'
+check_absent 110 "webgl.cc v2_rider2 prune must not include OES_texture_half_float_linear" \
+    "$NXJS/source/webgl.cc" \
+    'strcmp\(name, "OES_texture_half_float_linear"\) == 0 \|\|\s*$'
+
 # #105 — Snapshot toolbar avatar SDMC read at navigation, off the per-rAF-tick
 # renderChrome path. Shell-only, browser-shell.ts. Positive checks: the
 # cached field + refresh method + boot init + per-navigation refresh site

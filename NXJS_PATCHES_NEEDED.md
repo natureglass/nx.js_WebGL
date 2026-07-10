@@ -107,6 +107,10 @@ proposal verdict.
 | 83 | engine | upstream-candidate | not-submitted | `image-bitmap.ts: Ledger #83` + `image-bitmap.ts: imageCopyPixels(bmp, decoded` | Tier-A: `createImageBitmap(Blob, opts)` honors `opts.imageOrientation` and `opts.premultiplyAlpha` via a post-decode `imageCopyPixels` step. Pre-#83 the Blob branch decoded the PNG/JPEG/WebP straight into an ImageBitmap and returned it — options ignored — so `_from_blob` variants with `premultiplyAlpha: "none"` had their alpha=0.5 red pixel sample as `128,0,0` (premultiplied) instead of the expected `255,0,0` (raw), and `imageOrientation: "flipY"` iterations sampled top/bottom in un-flipped positions. Fast path (no options) returns the decoded bitmap unchanged. Options path allocates a sized destination ImageBitmap and calls `$.imageCopyPixels(dst, src, !opts.unpremul, opts.flipY)` — same primitive #78 uses for ImageBitmap / HTMLImageElement branches. Fixes 7 of 8 `_from_blob-tex-2d-*` variants (the 8th, ALPHA, was already passing because all expected values are `[0,0,0]` regardless of premul state). |
 | 84 | **runtime** (MOVED) | brewser-specific | n/a | `live-video.ts: Ledger #84` + `live-video.ts: installVideoImageBitmapShim` + `canvas-runner.ts: installVideoImageBitmapShim` | Tier-A: `createImageBitmap(<video>)` runtime shim. Wraps `globalThis.createImageBitmap` so `<video>` LiveElements are captured through the live-video decoder pipeline — waits for `state.hasFirstFrame` bounded by a 3-second timeout, converts the RGBA `frameBytes` via a scratch OffscreenCanvas + `putImageData`, delegates to the original `createImageBitmap(oc, ...opts)` which takes the OffscreenCanvas branch already added by #66. Zero engine delta (engine's HTMLVideoElement branch stays the "not supported" throw; the shim runs first and never reaches it). Also syncs the three video assets to the webgl1 conformance resources dir. Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#84). |
 | 105 | engine | upstream-candidate | PR-drafted(PR-modules) | `module.cc: nx_module_bindings` + `module.cc: g_importmaps` + `module.cc: resolve_specifier_with_map` + `module.h: nx_module_bindings` + `main.cc: nx_module_bindings(iso, init_obj)` | Page-level ES modules: importmap-aware resolver + prefetched-source registry + JS-callable `moduleSetImportmap`/`moduleSetSource`/`moduleRun`/`moduleClearPage`. Extends the existing filesystem-only module system so an embedder can execute an HTML `<script type="module">` under V8's real module semantics — no SystemJS, no userland module loader, no bundling — while sourcing bodies from URL schemes the engine has no fopen access to (e.g. `brewser://`, `http(s)://`). Foundation for stock (unmodified) Three.js demo support in Brewser and for any nx.js embedder that renders in-browser-shaped ES module pages. |
+| 108 | engine | upstream-candidate | not-submitted | `webgl.cc: nx_gl_flip_pixels_y` + `webgl.cc: Ledger #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array pixel data` | Honor UNPACK_FLIP_Y_WEBGL for typed-array pixel uploads in `texImage2D` / `texSubImage2D` (WebGL 1 §6.10 + WebGL 2 §5.30). Pre-#108 only the nx_image_t branch (`convert_image_source_to_gl_pixels`) flipped; the raw-pixels path emitted `glTexImage2D` unflipped. Made Three.js's VideoTexture render upside-down through the WebGL2 shim's ImageBitmap-rasterization path. |
+| 109 | engine | fork-only | n/a | `webgl.cc: Ledger #109 (2026-07-10) — translate ` + `webgl.cc: bufs_scratch[i] = ((GLenum)p[i] == GL_BACK)` | `drawBuffers` GL_BACK→GL_COLOR_ATTACHMENT0 translation when JS-null is bound (tenant redirect). Fixes Three.js EffectComposer post-processing rendering black — OutputPass's `setRenderTarget(null)` emitted `drawBuffers([BACK])` which is INVALID_OPERATION on the tenant (a user FBO). Fork-only because this is a nx.js tenant-model artifact — real WebGL contexts have BACK=default backbuffer, so no upstream fix applies. |
+| 110 | engine | upstream-candidate | not-submitted | `webgl.cc: Ledger #110 (2026-07-10) — ` + `webgl.cc: OES_texture_half_float_linear.` | Un-prune `OES_texture_half_float_linear` on WebGL 2. Patch #49 (rider 2) incorrectly listed it as WebGL-1-only "promoted to WebGL 2 core"; WebGL 2 §5.30.1 still requires this extension for LINEAR filtering on HALF_FLOAT textures, and both Chrome / Firefox advertise it on their WebGL 2 contexts. Without it, sampling any HALF_FLOAT texture with LINEAR filter is "sampler-incomplete" → returns (0, 0, 0, 1) → Three.js EffectComposer's RGBA16F ping-pong RTs render pure black. |
+| 111 | **runtime** (MOVED) | brewser-specific | n/a | `module-loader.ts: _self.setRenderTarget(_savedRT` | `maybePatchThreeSource`'s `renderer.render` wrap must save + restore the render target across `resetState()`. Fixes Three.js EffectComposer post-processing rendering fully black (RenderPass's `setRenderTarget(readBuffer)` gets nullified by the wrap's `resetState()`, all scene draws land on tenant instead of readBuffer). Full entry in [../brewser-runtime-v8/RUNTIME_SHIMS.md](../brewser-runtime-v8/RUNTIME_SHIMS.md#111). |
 
 ## DISPOSITION POLICY
 
@@ -134,6 +138,126 @@ UPSTREAM STATUS values:
 - `merged-in(vX)` — landed in upstream at version X; check whether the
   next pull obsoletes this entry.
 - `n/a` — not applicable (brewser-specific / fork-only disposition).
+
+---
+
+## #110 — `OES_texture_half_float_linear` MUST be advertised on WebGL 2 (WebGL 2 §5.30.1) — SHIPPED 2026-07-10
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `w_get_extension` (~line 1329, remove from the rider-2 v2 prune list), `w_get_supported_extensions` (~line 2020, remove from the v1-only list + add to the always-advertised list).
+
+**Motivation.** Patch #49 (Phase-1 batch 2B "rider 2") pruned five extensions from WebGL 2 contexts on the theory that WebGL 2 promotes their functionality to core. Four of those (`OES_standard_derivatives`, `OES_texture_float`, `OES_texture_half_float`, `WEBGL_depth_texture`) are genuinely WebGL-1-only per the Khronos registry — WebGL 2 core takes over. The fifth, **`OES_texture_half_float_linear`, is not**: it remains a WebGL 2 extension per Khronos, and WebGL 2 spec §5.30.1 explicitly requires it to be enabled via `getExtension` before LINEAR filtering can be used with any HALF_FLOAT texture. Chrome and Firefox both advertise it on their WebGL 2 contexts, matching the registry.
+
+The consequence of the incorrect prune: **any HALF_FLOAT texture with LINEAR filter is sampler-incomplete**. WebGL 2 spec §5.30.1: "if the internalformat contains a floating-point type (RGBA16F, R11F_G11F_B10F, ...) and OES_texture_float_linear or OES_texture_half_float_linear is not enabled, using LINEAR filter mode causes the texture to be incomplete." A sample from an incomplete texture returns `(0, 0, 0, 1)`.
+
+**Symptom the fix cures.** Three.js's `EffectComposer` allocates its ping-pong render targets with `HalfFloatType` + `LinearFilter` by default (r160+). `BloomPass` and `OutputPass` sample those RTs in their fullscreen-quad shaders. Under nx.js's v2 context with the extension pruned, every `texture2D(tDiffuse, vUv)` in the OutputPass shader reads `(0, 0, 0, 1)` → tone-mapping + sRGB transfer of `(0, 0, 0)` = `(0, 0, 0)` → tenant reads `(0, 0, 0, 255)`. Pure-black screen, zero GL errors, all FBOs COMPLETE. `webgl_materials_video` reproduces cleanly.
+
+Empirical confirmation ladder from the diagnostic session:
+1. `[post-fx-diag] extTHFL=false` — engine returns null for `getExtension('OES_texture_half_float_linear')`.
+2. `[post-fx-diag] rt1 checkFramebufferStatus=0x8cd5 complete=true` — RGBA16F FBOs ARE renderable (`EXT_color_buffer_float` is present).
+3. `[post-fx-diag6] drawBuffers([0x8ce0]) fbo=user err=0x0` — post-#109 no drawBuffers errors.
+4. `[post-fx-diag11] frame=30 c=(0,0,0,255)` — all 5 tenant positions read `(0,0,0,255)` on every frame. Not `(0,0,0,0)`: the `A=255` value discriminates "OutputPass ran and wrote `alpha=1`" from "OutputPass didn't run at all". The OutputPass shader outputs `gl_FragColor.a = tex.a` and `tex.a = 1` when the texture is sampler-incomplete — matches the WebGL 2 spec's `(0, 0, 0, 1)` semantics for incomplete-float-sampling.
+
+**Fix.** Two-site removal of `OES_texture_half_float_linear` from the WebGL-1-only branches. The extension is now advertised on both WebGL 1 and WebGL 2 (as an empty object — the "enable the capability" signal is what matters; the driver already treats the texture as filterable natively via `GL_OES_texture_half_float_linear`).
+
+Companion `w_get_extension` change: remove the extension from the rider-2 v2 prune list at line 1329, so `getExtension('OES_texture_half_float_linear')` falls through to the existing `set_empty_obj()` branch at line 1355 on both contexts.
+
+Companion `w_get_supported_extensions` change: remove from the v1-only `if (!v2)` block, add to the always-advertised list next to `OES_texture_float_linear`.
+
+**Blast radius.** Positive across the board. Any WebGL 2 code path using HALF_FLOAT textures with LINEAR filter (Three.js post-processing, tone-mapping pipelines, HDR framebuffers, any float RT ping-pong) now works. No path is regressed — advertising an extension that was already being pruned is a strict addition; existing consumers who didn't check for it either don't care or were already broken.
+
+**DISPOSITION:** `upstream-candidate` — this is a spec-conformance correction. Any nx.js embedder that runs Three.js post-processing (or any WebGL 2 HDR pipeline) benefits. Fix is minimal — two lines removed from prune lists, one line added to the always-advertised list.
+
+**UPSTREAM STATUS:** `not-submitted` — trivial diff, upstream nx.js should also correct the spec mistake if it inherited it.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: grep `source/webgl.cc` for `OES_texture_half_float_linear`. In `w_get_extension`, it should NOT appear in the `v2_rider2` prune list; it SHOULD be reachable at the `set_empty_obj()` line further down. In `w_get_supported_extensions`, it should NOT be in the `if (!v2)` block; it SHOULD be in the unconditional advertising list. *To re-apply*: move both mentions per above.
+
+**Recurrence tell.** A Three.js EffectComposer / post-processing user reports "pure black screen, zero GL errors, all FBOs complete." First diagnosis: `console.debug(gl.getExtension('OES_texture_half_float_linear'))` — if `null` on a WebGL 2 context that has `EXT_color_buffer_float` present, this fix regressed. Repro: any `new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType })` with the default `LinearFilter` — sampling it in a shader will return `(0, 0, 0, 1)` for every texel until this extension is enabled.
+
+---
+
+## #109 — `drawBuffers([BACK])` on the tenant-redirected default framebuffer — translate to `[COLOR_ATTACHMENT0]` — SHIPPED 2026-07-10
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — `w_draw_buffers` (~line 3913).
+
+**Motivation.** nx.js's WebGL tenant model (patch #7) redirects any `gl.bindFramebuffer(target, null)` from JS to the engine's internal tenant FBO — a real user FBO backed by a `COLOR_ATTACHMENT0` texture + `DEPTH24_STENCIL8` renderbuffer. From the user's perspective this looks and behaves like the default framebuffer, and every WebGL-facing call needs to preserve that illusion.
+
+ES3 §16.1.4 (glDrawBuffers): `GL_BACK` is only valid on the true default framebuffer (name 0). For any user FBO — including our tenant — only `COLOR_ATTACHMENT[n]` and `NONE` are accepted; anything else generates `GL_INVALID_OPERATION`.
+
+Three.js's `WebGLState.drawBuffers(renderTarget, framebuffer)` follows the spec view: when `renderTarget === null` (JS wants the default FB), it emits `gl.drawBuffers([BACK])`. In a real browser this succeeds because FBO 0 IS the default backbuffer. Under nx.js, this call reaches the tenant FBO and hits `GL_INVALID_OPERATION`. Confirmed by targeted monkey-patched trace during `composer.render()`:
+
+```
+[post-fx-diag6] #21 drawBuffers([0x8ce0]) lastBindTarget=0x8d40 lastBindFbo=user err=0x0
+[post-fx-diag6] #26 drawBuffers([0x405]) lastBindTarget=0x8d40 lastBindFbo=null(tenant) err=0x502
+[post-fx-diag6] #31 drawBuffers([0x405]) lastBindTarget=0x8d40 lastBindFbo=null(tenant) err=0x502
+```
+
+Symptom the fix cures: Three.js's `EffectComposer` post-processing chain (`RenderPass` + `BloomPass` + `OutputPass` on `webgl_materials_video`) renders a fully black screen. `OutputPass.render()` calls `renderer.setRenderTarget(null)` to write the tone-mapped result to the "default" framebuffer; Three.js's WebGLState follows with `drawBuffers([BACK])` → error → OutputPass's fullscreen quad draw does not land in the tenant. Every subsequent frame runs the same sequence; the tenant stays at the `renderer.clear()` clear color forever.
+
+Pre-composer video texture (from #107 / #108's fix) also hit this — every `renderer.render(scene, camera)` also called `drawBuffers([BACK])` at frame start via the same `setRenderTarget(null)` path — but for the pre-composer path, the ONE error per frame followed by a normal scene-draw sequence to the tenant appeared to render correctly (the errored `drawBuffers` no-op leaves the tenant's `DRAW_BUFFERS[0]` at its default `COLOR_ATTACHMENT0`, and normal scene draws followed OK). Something about the composer chain — likely the interaction with intermediate RTs' `drawBuffers` state that Three.js's `currentDrawbuffers` cache manages — causes the tenant path to no longer recover.
+
+**Fix.** In `w_draw_buffers`, when `bound_fbo_js == 0` (JS view says "default framebuffer" — i.e., we're on the tenant), translate any `GL_BACK` entries in the buffer array to `GL_COLOR_ATTACHMENT0` before dispatching to `glDrawBuffers`. Buffer array is typically 1-4 entries; a 16-element inline `bufs_scratch` avoids heap allocation on the hot path. Fast path (no `BACK` in the array, or bound_fbo_js != 0) passes the caller's array pointer straight through with zero copy.
+
+```cpp
+GLenum bufs_scratch[16];
+const GLenum *out = (const GLenum *)p;
+if (st && st->bound_fbo_js == 0 && n > 0 && n <= 16) {
+    bool needs_translate = false;
+    for (size_t i = 0; i < n; ++i) {
+        if ((GLenum)p[i] == GL_BACK) { needs_translate = true; break; }
+    }
+    if (needs_translate) {
+        for (size_t i = 0; i < n; ++i) {
+            bufs_scratch[i] = ((GLenum)p[i] == GL_BACK)
+                                   ? GL_COLOR_ATTACHMENT0
+                                   : (GLenum)p[i];
+        }
+        out = bufs_scratch;
+    }
+}
+glDrawBuffers((GLsizei)n, out);
+```
+
+**Blast radius.** Small and precise. Only fires when (a) the JS view is "default framebuffer" (`bound_fbo_js == 0`), and (b) the buffer array actually contains `GL_BACK`. Any drawBuffers call to a real user FBO (like a `WebGLRenderTarget`'s framebuffer) is untouched. The translation matches what a real WebGL context would produce semantically: `BACK` on the default FB means "write to the back color buffer" — which for the tenant is `COLOR_ATTACHMENT0`.
+
+**DISPOSITION:** `fork-only` — this is purely a nx.js tenant-model artifact. Upstream nx.js's WebGL delegate model doesn't have a tenant FBO between the JS and the driver's actual default framebuffer, so upstream can't reproduce this bug and doesn't need the translation.
+
+**UPSTREAM STATUS:** `n/a` — fork-only fix; upstream nx.js doesn't share the tenant redirect.
+
+**RE-APPLY / VERIFY NOTE.** *To verify the fix is still in place*: grep `source/webgl.cc` for `Ledger #109` inside `w_draw_buffers`. If the branch is missing, Three.js's `EffectComposer` post-processing (bloom, tone-mapping, ANY `OutputPass`-terminated chain) renders black. *To re-apply*: add the `bufs_scratch` translation branch to `w_draw_buffers` between the buffer-array read and the `glDrawBuffers` call.
+
+**Recurrence tell.** A demo user reports "Three.js post-processing (bloomPass / outputPass / any EffectComposer chain) renders a fully black screen". First diagnosis: monkey-patch `gl.drawBuffers` before `composer.render()` and log the args. If any call has `bufs=[0x405]` (GL_BACK) and raises `err=0x502`, this fix regressed. Grep webgl.cc for `bufs_scratch` in `w_draw_buffers`.
+
+Repro: `const composer = new EffectComposer(renderer); composer.addPass(new RenderPass(scene, camera)); composer.addPass(new BloomPass(1.3)); composer.addPass(new OutputPass()); composer.render();` — screen renders black without the fix.
+
+---
+
+## #108 — Honor `UNPACK_FLIP_Y_WEBGL` for typed-array `texImage2D` / `texSubImage2D` uploads — SHIPPED 2026-07-10
+
+**File(s):** [source/webgl.cc](source/webgl.cc) — new `nx_gl_pixel_bpp` + `nx_gl_flip_pixels_y` helpers just above `w_tex_image_2d`; new branch in both `w_tex_image_2d` and `w_tex_sub_image_2d` after the nx_image_t path declines.
+
+**Motivation.** WebGL 1 spec §6.10 and WebGL 2 spec §5.30 both mandate that `UNPACK_FLIP_Y_WEBGL` applies to *any* pixel data unpacked into a texture — including raw `ArrayBufferView` uploads, not just TexImageSource sources (canvas / Image / ImageBitmap / ImageData / HTMLVideoElement). Chrome and Firefox row-reverse typed-array bytes when the flag is set; the fork's pre-#108 native only flipped inside the `nx_image_t` branch (via `convert_image_source_to_gl_pixels` — added in #69), so any path that funneled to native as bytes silently ignored the flag.
+
+**Symptom.** Three.js's `WebGLRenderer.setTexture2D` always emits `gl.pixelStorei(UNPACK_FLIP_Y_WEBGL, texture.flipY)`. `THREE.VideoTexture` inherits `Texture`'s default `flipY = true`. Under the WebGL 2 pipeline used by `webgl_materials_video` (200 rotating cubes over a video texture), the runtime's TexImageSource normalization shim ([packages/runtime/src/canvas/webgl2-rendering-context.ts](packages/runtime/src/canvas/webgl2-rendering-context.ts)) rasterizes the ImageBitmap wrapper (produced by [brewser-runtime-v8/src/scripts/canvas-runner.ts](../brewser-runtime-v8/src/scripts/canvas-runner.ts)'s texImage2D wrap over the video LiveElement) through an OffscreenCanvas 2D `drawImage` + `getImageData`, then hands the raw RGBA bytes to native as a typed array. Native's raw-pixel branch emitted `glTexImage2D` directly — `UNPACK_FLIP_Y_WEBGL=1` never reached the driver, and the top row of the video ended up at V=0 in texture space (which GL samples at the bottom of the quad). Video renders upside-down. Surfaced immediately after #107's clock-decouple restored playback — pre-#107 the deadlock hid this bug behind a frozen frame.
+
+Symmetry note: the WebGL 1 shim ships #71's ImageBitmap short-circuit which reshapes to a 9-arg call preserving the nx_image_t reference, routing through `convert_image_source_to_gl_pixels` (which does honor flipY). WebGL 2's shim doesn't — it always rasterizes through `sourceToPixels` regardless of source type. Extending #71's short-circuit into the WebGL 2 shim would be an alternate fix, but the engine-side #108 fix is broader (any raw-pixel caller that sets UNPACK_FLIP_Y_WEBGL — not just this specific ImageBitmap-round-trip path — now gets spec-conforming behavior).
+
+**Fix.** Two static helpers above `w_tex_image_2d`:
+
+- `nx_gl_pixel_bpp(format, type)` — bytes per pixel for the (format, type) matrix the engine can compute. Covers RGBA/RGB/LUMINANCE_ALPHA/LUMINANCE/ALPHA/RED × UNSIGNED_BYTE/BYTE/UNSIGNED_SHORT/SHORT/HALF_FLOAT (both OES + core enums)/FLOAT/UNSIGNED_INT/INT, plus the three packed 16-bit types (5_6_5, 4_4_4_4, 5_5_5_1). Returns 0 on any combo we don't recognize; the flip caller then declines to flip and falls back to pre-#108 behavior (spec-nonconformant only for that combo — same as pre-fix, no regression).
+
+- `nx_gl_flip_pixels_y(pixels, len, w, h, format, type, alignment, scratch)` — row-reverses `pixels` into `scratch`, honoring `UNPACK_ALIGNMENT` for the row pitch. Row pitch = `ceil(width * bpp, alignment)`; inter-row padding is preserved so the driver's stride reads keep matching. Bounds-checks `len` against `(H-1) * row_pitch + unaligned_row` — a short buffer declines the flip (rather than reading past the end).
+
+Both `w_tex_image_2d` and `w_tex_sub_image_2d` grow one identical branch: **after** the nx_image_t path has had a chance to run (it flips internally, so we mustn't double-flip — the branch guards on `!scratch.size()`), **if** `pixels` is a typed-array upload AND `st->unpack_flip_y` is set AND `width > 0` AND `height > 0`, call `nx_gl_flip_pixels_y` and swap `pixels` to the scratch buffer. Skip when the caller-supplied length doesn't cover the expected pitched image (would-be OOB read).
+
+**Blast radius.** Small and one-directional. Existing typed-array uploads with `UNPACK_FLIP_Y_WEBGL` default `false` (the common case for typed-array uploads pre-#108 because most WebGL code that sets flipY is uploading TexImageSource sources) are unaffected — the branch skips. Uploads that DID set `UNPACK_FLIP_Y_WEBGL=1` were already broken pre-fix (spec-nonconformant); now they behave like Chrome / Firefox. No path is regressed. All WebGL 1 conformance texture tests kept their prior verdicts (all currently uploading via `nx_image_t` sources go through `convert_image_source_to_gl_pixels` — untouched here).
+
+**DISPOSITION:** `upstream-candidate` — spec-conformance fix that applies to every nx.js embedder.
+
+**UPSTREAM STATUS:** `not-submitted` — bounded diff, self-contained helpers, unit-testable pattern.
+
+**RE-APPLY / VERIFY NOTE.** *To verify the fix is still in place*: grep `source/webgl.cc` for `nx_gl_flip_pixels_y`. If the helper is gone, ANY Three.js `VideoTexture` (or any raw-typed-array texImage2D upload that sets `UNPACK_FLIP_Y_WEBGL`) will render upside-down. *To re-apply*: add the two helpers above `w_tex_image_2d`, wire the branch into both texImage2D and texSubImage2D after the nx_image_t path.
+
+**Recurrence tell.** A demo user reports "my `<video>` texture / raw RGBA texture is upside-down" AND `pixelStorei(UNPACK_FLIP_Y_WEBGL, 1)` is called before texImage2D — first diagnosis: grep webgl.cc for `nx_gl_flip_pixels_y`. If the raw-pixels branch doesn't call it, the fix regressed. Repro: `gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1); gl.texImage2D(tgt, 0, RGBA, w, h, 0, RGBA, UNSIGNED_BYTE, rgba_bytes);` — sample the top-left corner: bytes there should read what was at the SOURCE's bottom-left. Pre-fix reads the source's top-left (unflipped upload).
 
 ---
 

@@ -1330,7 +1330,20 @@ FN(w_get_extension) {
 	    (strcmp(name, "OES_standard_derivatives") == 0 ||
 	     strcmp(name, "OES_texture_float") == 0 ||
 	     strcmp(name, "OES_texture_half_float") == 0 ||
-	     strcmp(name, "OES_texture_half_float_linear") == 0 ||
+	     // Ledger #110 (2026-07-10) — `OES_texture_half_float_linear`
+	     // REMOVED from the WebGL-2 prune list. Rider-2's original claim
+	     // that this extension is "promoted to WebGL 2 core" is
+	     // incorrect: WebGL 2 §5.30.1 still requires this extension to
+	     // be enabled via `getExtension` for LINEAR filtering on any
+	     // HALF_FLOAT texture (Chrome and Firefox both advertise it on
+	     // their WebGL 2 contexts, matching the Khronos registry). When
+	     // the extension is unavailable, sampling a HALF_FLOAT texture
+	     // with LINEAR filter makes it "sampler-incomplete" (spec-
+	     // mandated) and the texture read returns (0, 0, 0, 1) — Three.js's
+	     // EffectComposer post-processing (RGBA16F ping-pong RTs with
+	     // LINEAR filter by default) renders a pure-black tenant, cured
+	     // by ungating this extension. Companion change in
+	     // `w_get_supported_extensions` below.
 	     strcmp(name, "WEBGL_depth_texture") == 0)) {
 		info.GetReturnValue().SetNull();
 		return;
@@ -2021,12 +2034,18 @@ FN(w_get_supported_extensions) {
 		out.push_back("OES_standard_derivatives");
 		out.push_back("OES_texture_float");
 		out.push_back("OES_texture_half_float");
-		out.push_back("OES_texture_half_float_linear");
 		out.push_back("WEBGL_depth_texture");
 	}
 	// KEPT on both: OES_texture_float_linear (registry keeps this as a
 	// v2 ext; FLOAT texture sampling with linear filtering is not core).
 	out.push_back("OES_texture_float_linear");
+	// Ledger #110 (2026-07-10) — KEPT on both: OES_texture_half_float_linear.
+	// Same rationale as OES_texture_float_linear: WebGL 2 §5.30.1 still
+	// requires this extension to be enabled for LINEAR filtering on
+	// HALF_FLOAT textures (rider-2's claim that it was promoted to WebGL 2
+	// core was incorrect). Un-pruned to fix Three.js EffectComposer's
+	// black-output on RGBA16F ping-pong RTs.
+	out.push_back("OES_texture_half_float_linear");
 	out.push_back("WEBGL_debug_renderer_info");  // batch-1
 	// v1-only statics (v2 has them as core).
 	if (!v2) {
@@ -3285,6 +3304,109 @@ static uint8_t *convert_image_source_to_gl_pixels(
 	return dst;
 }
 
+// Ledger #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array pixel uploads.
+//
+// Per WebGL 1 §6.10 and WebGL 2 §5.30, UNPACK_FLIP_Y_WEBGL "applies to any
+// type of unpacked pixel data, including array buffer views" — Chrome and
+// Firefox row-reverse raw pixel bytes when the flag is set, not just
+// TexImageSource inputs. Pre-#108 the fork only flipped inside
+// convert_image_source_to_gl_pixels (the nx_image_t branch), so any path
+// that funneled to native as bytes (WebGL 2's sourceToPixels shim
+// rasterizes ImageBitmap/OffscreenCanvas → getImageData → typed array) got
+// unflipped uploads even when the caller had UNPACK_FLIP_Y_WEBGL=1.
+//
+// Symptom that surfaced this: webgl_materials_video with the fixed post-
+// seek clock (#107) renders 200 THREE.VideoTexture cubes upside-down.
+// Three.js `WebGLTextures.setTexture2D` sets `pixelStorei(UNPACK_FLIP_Y_
+// WEBGL, texture.flipY)` — default `true` for VideoTexture. WebGL2's shim
+// (webgl2-rendering-context.ts) rasterizes the ImageBitmap through an
+// OffscreenCanvas, hands the RGBA bytes to native. Native's raw-pixel
+// path emits glTexImage2D directly with UNPACK_FLIP_Y ignored → V=0 of
+// the texture receives the top row → sampled upside-down.
+//
+// Fix: after the nx_image_t branch declines (pixels came in as a typed
+// array), row-reverse pixels into scratch when UNPACK_FLIP_Y_WEBGL is set.
+// Row pitch honors UNPACK_ALIGNMENT (already stored on WebGLState). Only
+// the (format, type) matrix nx.js can compute is handled — HALF_FLOAT /
+// FLOAT / integer formats + BYTE/RGB/RGBA/L/LA/A × UNSIGNED_BYTE +
+// packed 16-bit; anything else falls through to pre-fix behavior (no
+// flip), matching the pre-fix semantics but not blocking new upload paths.
+static size_t nx_gl_pixel_bpp(GLenum format, GLenum type) {
+	int channels = 0;
+	switch (format) {
+	case GL_RGBA: channels = 4; break;
+	case GL_RGB:  channels = 3; break;
+	case GL_LUMINANCE_ALPHA: channels = 2; break;
+	case GL_LUMINANCE:
+	case GL_ALPHA:
+	case GL_RED:
+		channels = 1;
+		break;
+	default:
+		return 0;
+	}
+	switch (type) {
+	case GL_UNSIGNED_BYTE:
+		return (size_t)channels;
+	case GL_BYTE:
+		return (size_t)channels;
+	case GL_UNSIGNED_SHORT_4_4_4_4:
+	case GL_UNSIGNED_SHORT_5_5_5_1:
+	case GL_UNSIGNED_SHORT_5_6_5:
+		return 2;
+	case GL_UNSIGNED_SHORT:
+	case GL_SHORT:
+	case 0x8D61 /* GL_HALF_FLOAT_OES */:
+	case 0x140B /* GL_HALF_FLOAT */:
+		return (size_t)channels * 2;
+	case GL_FLOAT:
+	case GL_UNSIGNED_INT:
+	case GL_INT:
+		return (size_t)channels * 4;
+	default:
+		return 0;
+	}
+}
+// Row-reverse `pixels` into `scratch`. Returns scratch.data() on success,
+// nullptr when the (format, type) combo isn't in the bpp matrix (caller
+// falls back to pre-fix "no flip" — spec-nonconformant for that combo but
+// no worse than the shipping engine). Row pitch = ceil(width * bpp,
+// alignment); the copy preserves inter-row padding so the driver's row-
+// stride reads keep matching.
+static const void *nx_gl_flip_pixels_y(
+    const void *pixels, size_t len, GLsizei width, GLsizei height,
+    GLenum format, GLenum type, int alignment,
+    std::vector<uint8_t> &scratch) {
+	if (!pixels || width <= 0 || height <= 0) return nullptr;
+	const size_t bpp = nx_gl_pixel_bpp(format, type);
+	if (bpp == 0) return nullptr;
+	if (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8)
+		alignment = 4;
+	const size_t unaligned_row = bpp * (size_t)width;
+	const size_t row_pitch =
+	    (unaligned_row + (size_t)alignment - 1) &
+	    ~((size_t)alignment - 1);
+	// The last row has no trailing pad byte requirement (glTexImage2D only
+	// reads `unaligned_row` bytes on the last line), so the smallest buffer
+	// glTexImage2D would accept is: (H-1) * row_pitch + unaligned_row.
+	const size_t expected =
+	    (size_t)(height - 1) * row_pitch + unaligned_row;
+	if (len < expected) return nullptr;
+	scratch.assign(row_pitch * (size_t)height, 0);
+	const uint8_t *src = (const uint8_t *)pixels;
+	for (int y = 0; y < height; ++y) {
+		const size_t src_row_ofs = (size_t)y * row_pitch;
+		const size_t dst_row_ofs = (size_t)(height - 1 - y) * row_pitch;
+		// The last input row may lack padding bytes; clamp the copy so we
+		// don't read past `len`. Padding bytes on the reversed row stay 0
+		// from the assign — driver never reads them past unaligned_row.
+		size_t copy = row_pitch;
+		if (src_row_ofs + copy > len) copy = len - src_row_ofs;
+		memcpy(scratch.data() + dst_row_ofs, src + src_row_ofs, copy);
+	}
+	return scratch.data();
+}
+
 FN(w_tex_image_2d) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
@@ -3378,6 +3500,21 @@ FN(w_tex_image_2d) {
 			}
 		}
 	}
+	// Ledger #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array pixel data.
+	// Only fires when: (a) pixels came from a real typed array (not the
+	// nx_image_t branch above, which already flipped internally); (b) the
+	// caller set UNPACK_FLIP_Y_WEBGL=1; (c) width/height are known and > 0.
+	// Handles the WebGL2 shim's ImageBitmap-rasterization path used by
+	// Three.js's VideoTexture (webgl_materials_video renders upside-down
+	// without this fix even with `<video>.flipY=true` default).
+	std::vector<uint8_t> flip_scratch;
+	if (pixels && !scratch.size() && st && st->unpack_flip_y &&
+	    width > 0 && height > 0) {
+		const void *flipped = nx_gl_flip_pixels_y(
+		    pixels, len, width, height, format, type,
+		    st ? st->unpack_alignment : 4, flip_scratch);
+		if (flipped) pixels = (void *)flipped;
+	}
 	bucket_e_translate_tex_image(&internalformat, &format, &type);
 	glTexImage2D(target, level, internalformat, width, height, border, format,
 	             type, pixels);
@@ -3438,6 +3575,16 @@ FN(w_tex_sub_image_2d) {
 				alignment_overridden = true;
 			}
 		}
+	}
+	// Ledger #108 — UNPACK_FLIP_Y_WEBGL honor for typed-array pixel data.
+	// Sibling of the w_tex_image_2d branch; see there for rationale.
+	std::vector<uint8_t> flip_scratch;
+	if (pixels && !scratch.size() && st && st->unpack_flip_y &&
+	    width > 0 && height > 0) {
+		const void *flipped = nx_gl_flip_pixels_y(
+		    pixels, len, width, height, format, type,
+		    st ? st->unpack_alignment : 4, flip_scratch);
+		if (flipped) pixels = (void *)flipped;
 	}
 	bucket_e_translate_tex_sub_image(&format, &type);
 	glTexSubImage2D(target, level, xoff, yoff, width, height, format, type,
@@ -3782,13 +3929,50 @@ FN(w_vertex_attrib_divisor) {
 // state.drawBuffers in the frame), no geometry rasterizes, no JS error
 // surfaces because the Three.js try/catch upstream isn't on this path.
 // GLES3 signature: glDrawBuffers(GLsizei n, const GLenum *bufs).
+//
+// Ledger #109 (2026-07-10) — translate `GL_BACK` to `GL_COLOR_ATTACHMENT0`
+// when the JS view says "default framebuffer" (`bound_fbo_js == 0`). Per
+// ES3 §16.1.4, `BACK` is only valid for the true default framebuffer
+// (name 0); on a user FBO — which our tenant is, since we redirect the
+// JS null-bind to a real user FBO with `COLOR_ATTACHMENT0` — passing
+// `BACK` is INVALID_OPERATION. Symptom the fix cures: Three.js's
+// EffectComposer post-processing pipeline (`RenderPass` + `BloomPass` +
+// `OutputPass`) renders black because OutputPass's `setRenderTarget(null)`
+// triggers `state.drawBuffers(null, null)` which emits `[BACK]`. The
+// errored `glDrawBuffers` call combined with the subsequent draw ends
+// up not writing to the tenant (empirically observed even though ES3
+// spec says the state should stay unchanged on error — Mesa Nouveau's
+// behavior in the errored path is what matters here, not the spec).
+// The translation makes the WebGL 2 tenant model spec-conformant from
+// the user's perspective: `[BACK]` on the "default" framebuffer maps to
+// the tenant's `COLOR_ATTACHMENT0`, which IS the tenant's back buffer
+// from the user's POV.
 FN(w_draw_buffers) {
 	enter_bracket();
 	std::vector<int32_t> tmp;
 	const int32_t *p = nullptr;
 	size_t n = 0;
 	if (!i32_list(info.GetIsolate(), info[0], tmp, &p, &n)) return;
-	glDrawBuffers((GLsizei)n, (const GLenum *)p);
+	// Ledger #109 — when JS-null is bound (redirected to tenant), translate
+	// any GL_BACK to GL_COLOR_ATTACHMENT0. Buffer array is small (typically
+	// 1 entry); inline scratch avoids an allocation on the fast path.
+	GLenum bufs_scratch[16];
+	const GLenum *out = (const GLenum *)p;
+	if (st && st->bound_fbo_js == 0 && n > 0 && n <= 16) {
+		bool needs_translate = false;
+		for (size_t i = 0; i < n; ++i) {
+			if ((GLenum)p[i] == GL_BACK) { needs_translate = true; break; }
+		}
+		if (needs_translate) {
+			for (size_t i = 0; i < n; ++i) {
+				bufs_scratch[i] = ((GLenum)p[i] == GL_BACK)
+				                       ? GL_COLOR_ATTACHMENT0
+				                       : (GLenum)p[i];
+			}
+			out = bufs_scratch;
+		}
+	}
+	glDrawBuffers((GLsizei)n, out);
 }
 
 // Phase 2.G.1 cut #2 — texImage3D for WebGL2. Three.js's v2 path calls this
