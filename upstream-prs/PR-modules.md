@@ -38,9 +38,10 @@ lookup path for URL schemes the engine has no fopen access to.
 
 ### The new surface
 
-Attached both to the `$` init object (for `packages/runtime` internal use)
-and to a durable `globalThis.nxjsPageModules` namespace (for downstream
-embedders, since `$` is captured + deleted at nx.js runtime init):
+Attached both to the `$` init object (nx.js house style for engine
+bindings) and to a durable `globalThis.nxjsPageModules` namespace (the
+entry point downstream embedders actually use, since `$` is captured +
+deleted at nx.js runtime init):
 
 ```ts
 // Register an importmap for a page scope. Merges on repeat calls (last
@@ -143,10 +144,10 @@ identity for cross-graph deduplication.
 ## Diff summary
 
 ```
- source/module.cc | ~+290 LOC  (state + resolver ext + 4 bindings + durable global + teardown)
- source/module.h  |    +6 LOC  (declaration + updated header block comment)
- source/main.cc   |    +1 LOC  (nx_module_bindings call in build_init_object)
- 3 files changed
+ source/module.cc | +425 / -24  (state + resolver ext + 4 bindings + durable global + teardown)
+ source/module.h  |  +16 /  -2  (declaration + updated header block comment)
+ source/main.cc   |   +1 /  -0  (nx_module_bindings call in build_init_object)
+ 3 source files changed
 ```
 
 No new source files. No Makefile changes. No new dependencies (`ada` was
