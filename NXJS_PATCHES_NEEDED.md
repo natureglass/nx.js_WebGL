@@ -39,19 +39,19 @@ proposal verdict.
 
 | # | Where | Disposition | Upstream status | Verify grep target | One-line title |
 |---:|---|---|---|---|---|
-| 1 | engine | upstream-candidate | PR-drafted(PR-A) | `image.ts: return globalThis\.fetch\(input, init\)` | image.ts call-time globalThis.fetch deferral |
-| 2 | engine | upstream-candidate | PR-drafted(PR-A) | `audio.ts: return globalThis\.fetch\(input, init\)` | audio.ts call-time globalThis.fetch deferral |
-| 3 | engine | upstream-candidate | PR-drafted(PR-A) | `video.ts: return globalThis\.fetch\(input, init\)` | video.ts call-time globalThis.fetch deferral |
+| 1 | engine | upstream-merged (2026-07-11) | merged(PR-A) | `image.ts: return globalThis\.fetch\(input, init\)` | image.ts call-time globalThis.fetch deferral |
+| 2 | engine | upstream-merged (2026-07-11) | merged(PR-A) | `audio.ts: return globalThis\.fetch\(input, init\)` | audio.ts call-time globalThis.fetch deferral |
+| 3 | engine | upstream-merged (2026-07-11) | merged(PR-A) | `video.ts: return globalThis\.fetch\(input, init\)` | video.ts call-time globalThis.fetch deferral |
 | 4 | engine | fork-only (SHIPPED 2026-06-30) | n/a | `cursor.h: nx_cursor_set_static` + `canvas.cc: js_set_cursor_overlay` + `skia_gpu.cc: cursor composite hook` | Screen.setCursorOverlay native binding |
 | 5 | engine | upstream-candidate | PR-drafted(PR-D) | `skia_gpu.cc: EGL_CONTEXT_CLIENT_VERSION,\s*3` | skia_gpu ES3 shared context + accessors |
 | 6 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl_bridge.h: nx_gl_state_snap_t` | webgl_bridge state save/restore + tenant FBO |
 | 7 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: nx_webgl_compose_if_active` | WebGL1 context via screen.getContext('webgl') |
-| 8 | engine | upstream-candidate (FIXED) | PR-drafted(PR-F) | `webgl*-rendering-context.ts: NO for-of over GL_CONSTANTS` | V8 JIT crash fix — bulk defineProperties |
+| 8 | engine | upstream-merged (2026-07-11) | merged(PR-F) | `webgl*-rendering-context.ts: NO for-of over GL_CONSTANTS` | V8 JIT crash fix — bulk defineProperties |
 | 9 | engine | upstream-candidate | not-submitted | `webgl-rendering-context.ts: SRGB8_ALPHA8:` | v1 ES3 sized internalformat constants |
 | 10 | engine | upstream-candidate | not-submitted | `webgl.cc: bucket_e_translate_tex_image` | WebGL1 EXT_sRGB + HalfFloat translate |
 | 11 | engine | fork-only | n/a | `webgl.cc: maybe_replace_pmrem_fs` | PMREM r184 FS replacement |
 | 12 | **runtime** (MOVED) | fork-only | n/a | `cube-route-shim.ts: cubeUVSample` | samplerCube→sampler2D routing layer |
-| 13 | engine | upstream-candidate | PR-drafted(PR-C) | `canvas.cc: set_font_size(context, context->state->font_size)` | canvas.cc font-size pin |
+| 13 | engine | upstream-merged (2026-07-11) | merged(PR-C) | `canvas.cc: set_font_size(context, context->state->font_size)` | canvas.cc font-size pin |
 | 14 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: webgl2ContextNew` | WebGL2 context factory |
 | 15 | engine | upstream-candidate | PR-drafted(PR-D) | `webgl.cc: install_methods_v2` | v1/v2 FUNCS[] table split |
 | 16 | engine | fork-only (diagnostic) | n/a | `webgl_bridge.cc: nx_webgl_state_probe_log` | passive state-contract probe |
@@ -760,7 +760,7 @@ schemes via `globalThis.fetch` (see `installRuntimeFetch` design in
 brewser-runtime-v8/src/resources/runtime-fetch.ts), so the engine's own
 `Image` should honor that. No reason for upstream not to take it.
 
-**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md). — flag for a TooTallNate PR.
+**UPSTREAM STATUS:** `merged` — PR-A merged into TooTallNate/nx.js 2026-07-11. Fork carries the same change; delete this entry once we sync from upstream.
 
 **RE-APPLY / VERIFY NOTE.**
 
@@ -806,7 +806,7 @@ migration dropped both patches.
 **DISPOSITION:** `upstream-candidate`. Same engine-correctness reason
 as #1; ideally bundle both into a single upstream PR.
 
-**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md)..
+**UPSTREAM STATUS:** `merged` — PR-A merged into TooTallNate/nx.js 2026-07-11.
 
 **RE-APPLY / VERIFY NOTE.** Verify identically to #1 (grep image.ts +
 audio.ts for the local import). Same CALL-TIME gotcha applies. Same
@@ -835,7 +835,7 @@ completeness (the audit grep for `./fetch/fetch` importers caught it).
 **DISPOSITION:** `upstream-candidate`. Bundle into the same upstream
 PR as #1 + #2.
 
-**UPSTREAM STATUS:** `PR-drafted(local)` — PR-A, branch `upstream-pr/A-fetch-deferral`. See [upstream-prs/PR-A.md](upstream-prs/PR-A.md)..
+**UPSTREAM STATUS:** `merged` — PR-A merged into TooTallNate/nx.js 2026-07-11.
 
 **RE-APPLY / VERIFY NOTE.** Verify identically to #1/#2. Same CALL-TIME
 gotcha. Same fix shape.
@@ -1242,7 +1242,7 @@ and idiomatic — millions of programs use `Object.entries` + for-of —
 but at this scale on Tegra's V8 port it crashes the JIT. We've stopped
 triggering it; the underlying V8 codegen bug still exists.
 
-**UPSTREAM STATUS:** `PR-drafted(local)` — PR-F, branch `upstream-pr/F-jit-safe-defineproperties`. See [upstream-prs/PR-F.md](upstream-prs/PR-F.md).. Candidate-3 (V8/switch-v8 minimal
+**UPSTREAM STATUS:** `merged` — PR-F merged into TooTallNate/nx.js 2026-07-11. Candidate-3 (V8/switch-v8 minimal
 repro) remains a worthwhile low-priority follow-up — we've stopped
 triggering the V8 bug, not fixed it. Minimal repro facts: a module-body
 function running `for (const [k, v] of Object.entries(obj))` calling
@@ -1738,11 +1738,7 @@ than sharing the FontFace's instances, but that's a larger refactor
 with allocation-rate + memory implications; the per-text-op
 `set_font_size` re-pin is the minimal, surgical fix.
 
-**UPSTREAM STATUS:** `PR-drafted(local)` — PR-C, branch `upstream-pr/C-fonface-charsize-pin`. See [upstream-prs/PR-C.md](upstream-prs/PR-C.md). (2026-06-30). Worth a PR after a
-minimal repro is reduced — likely "two `OffscreenCanvas` instances,
-both set `ctx.font = '14px system-ui'`, one calls save/font('20px')/
-fillText/restore, the other does fillText and gets text at 10 px."
-Repro is trivial to extract from the user-reported case.
+**UPSTREAM STATUS:** `merged` — PR-C merged into TooTallNate/nx.js 2026-07-11.
 
 **Cost.** One `FT_Set_Char_Size` + one `hb_font_set_scale` per
 `fillText` / `strokeText` / `measureText` call — sub-microsecond on
@@ -2736,7 +2732,7 @@ Symptom re-appeared 2026-07-02 in spectraplay (MP3 Play button "does nothing"). 
 
 **DISPOSITION:** `upstream-candidate`. Method surface expansion — general benefit for any embedder running Three.js r184+ on a v2 context.
 
-**UPSTREAM STATUS:** `not-submitted`. Bundle with PR-D (WebGL2 method surface) or ship as a small standalone PR alongside PR-A/F/C if PR-D lags.
+**UPSTREAM STATUS:** `not-submitted`. Bundle with PR-D (WebGL2 method surface) or ship as a small standalone PR (PR-A/C/F merged 2026-07-11; PR-D still open).
 
 **RE-APPLY / VERIFY NOTE.** Grep [source/webgl.cc](source/webgl.cc) for `w_tex_storage_3d`. Recurrence tell: `webgl2-texture2darray` (or any DataArrayTexture demo) renders black with no error in nxjs-debug.log → this binding regressed.
 
@@ -4249,7 +4245,7 @@ The hang is therefore triggered by an *implicit* effect of the `V8_ENABLE_DRUMBR
 1. V8 upstream `gni/v8.gni:is_drumbrake_supported` at each future V8 tag bump — if the OS whitelist widens to include a non-desktop platform or the `v8_enable_pointer_compression` conjunct is relaxed, revisit Track B. Verify against a fresh audit of `src/wasm/interpreter/wasm-interpreter.cc` for new PC-off compile gates (the sole one at `s2s_RefArrayFill:6788` at v15.0.243 may be joined by others as DrumBrake evolves).
 2. Citron release notes for arm64 / dynarmic changes — any note mentioning isolate-init-time deadlocks, external-reference handling under jitless V8, or specific improvements to arm64 emulation accuracy for large statically-linked binaries is worth a re-test cycle. Retest is one `dkp-pacman -U <-10 artifact>` + rebuild + boot — everything else stays archived.
 
-**Upstream posture.** Marked `fork-only (upstream-candidate later)` — the gate + empirical probe benefit any nx.js embedder in emulator / no-JIT environments (iOS, Cobalt/Starboard-like sandboxes, etc.). PR queued behind the existing PR-A/-C/-D/-F backlog; do NOT foreclose upstream by leaving fork-specific baggage in the change. The one Horizon-specific piece is the `nx_ctx->config` field name, easy to lift.
+**Upstream posture.** Marked `fork-only (upstream-candidate later)` — the gate + empirical probe benefit any nx.js embedder in emulator / no-JIT environments (iOS, Cobalt/Starboard-like sandboxes, etc.). PR queued behind PR-D + PR-modules (PR-A/-C/-F merged 2026-07-11); do NOT foreclose upstream by leaving fork-specific baggage in the change. The one Horizon-specific piece is the `nx_ctx->config` field name, easy to lift.
 
 **Known non-goals.**
 

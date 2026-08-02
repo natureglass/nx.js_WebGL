@@ -784,7 +784,10 @@ This session executed the Post-2.G consolidation task
     generic diffs, no brewser mentions. Descriptions at
     `upstream-prs/PR-A.md` / `PR-F.md` / `PR-C.md`. Ledger
     UPSTREAM STATUS for #1/#2/#3/#8/#13 upgraded to
-    `PR-drafted(local)`.
+    `PR-drafted(local)`. **[UPDATE 2026-07-11: all three
+    merged into TooTallNate/nx.js. PR-*.md drafts + local
+    branches + origin branches removed; ledger re-flagged to
+    `merged`.]**
 
 **Task 1 (ledger closing pass).**
 - Mined `git log --stat` across nxjs-source-v8 v8-migration +
@@ -915,11 +918,13 @@ human user is ready to review.
 ### Files to review
 
 - `nxjs-source-v8/upstream-prs/PR-A.md` — Image/Audio/Video
-  fetch deferral (retires #1/#2/#3).
+  fetch deferral (retires #1/#2/#3). **[merged 2026-07-11;
+  file removed.]**
 - `nxjs-source-v8/upstream-prs/PR-F.md` — JIT-safe
-  defineProperties for GL constants (retires #8).
+  defineProperties for GL constants (retires #8). **[merged
+  2026-07-11; file removed.]**
 - `nxjs-source-v8/upstream-prs/PR-C.md` — canvas.cc font-size
-  pin (retires #13).
+  pin (retires #13). **[merged 2026-07-11; file removed.]**
 - `nxjs-source-v8/upstream-prs/PR-D.md` — Skia/WebGL
   coexistence primitive (retires #5/#6/#7/#14/#15/#17/#35/#36).
 - `nxjs-source-v8/NXJS_PATCHES_NEEDED.md` — engine ledger with

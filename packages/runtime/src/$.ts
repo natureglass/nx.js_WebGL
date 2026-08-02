@@ -595,6 +595,17 @@ export interface Init {
 	nifmInitialize(): () => void;
 	networkInfo(): NetworkInfo;
 
+	// sensors.cc
+	sensorsSixAxisStart(): boolean;
+	sensorsSixAxisRead(): {
+		acceleration: { x: number; y: number; z: number };
+		angularVelocity: { x: number; y: number; z: number };
+		angle: { x: number; y: number; z: number };
+		samplingNumber: bigint;
+		deltaTime: bigint;
+	} | null;
+	sensorsSixAxisStop(): void;
+
 	// ns.c
 	nsInitialize(): () => void;
 	nsAppInit(c: ClassOf<Application>): void;
@@ -850,14 +861,39 @@ export interface Init {
 		interfaceSubclass?: number;
 		interfaceProtocol?: number;
 	}): USBNativeDevice[];
+	/** Returns `true` if a USB hotplug (attach/detach) event fired since the last check. */
+	usbHotplugCheck(): boolean;
 	usbDeviceOpen(device: USBNativeDevice): void;
 	usbDeviceClose(device: USBNativeDevice): void;
 	usbClaimInterface(device: USBNativeDevice, interfaceNumber: number): void;
+	usbReleaseInterface(device: USBNativeDevice, interfaceNumber: number): void;
+	usbSelectAlternateInterface(
+		device: USBNativeDevice,
+		interfaceNumber: number,
+		alternateSetting: number,
+	): void;
+	/** Clear a halted endpoint (CLEAR_FEATURE + host toggle reset). */
+	usbClearHalt(
+		device: USBNativeDevice,
+		directionIn: boolean,
+		endpointNumber: number,
+	): void;
 	usbTransferIn(
 		device: USBNativeDevice,
 		endpointNumber: number,
 		length: number,
 	): ArrayBuffer;
+	/** Post a non-blocking bulk-IN transfer (idempotent per endpoint). */
+	usbReadStart(
+		device: USBNativeDevice,
+		endpointNumber: number,
+		length: number,
+	): void;
+	/** Poll a posted bulk-IN transfer: `ArrayBuffer` when done, `undefined` while pending. */
+	usbReadPoll(
+		device: USBNativeDevice,
+		endpointNumber: number,
+	): ArrayBuffer | undefined;
 	usbTransferOut(
 		device: USBNativeDevice,
 		endpointNumber: number,
@@ -874,6 +910,17 @@ export interface Init {
 		},
 		length: number,
 	): ArrayBuffer;
+	usbControlTransferOut(
+		device: USBNativeDevice,
+		setup: {
+			requestType: string;
+			recipient: string;
+			request: number;
+			value: number;
+			index: number;
+		},
+		data?: BufferSource,
+	): number;
 	usbResetDevice(device: USBNativeDevice): void;
 
 	// video.cc — Video element (ffmpeg media pipeline)

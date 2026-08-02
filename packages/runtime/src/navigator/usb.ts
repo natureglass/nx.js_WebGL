@@ -3,7 +3,9 @@ import { DOMException } from '../dom-exception';
 import { INTERNAL_SYMBOL } from '../internal';
 import type { BufferSource } from '../types';
 import { assertInternalConstructor, def } from '../utils';
-import { setTimeout } from '../timers';
+import { setTimeout, setInterval, clearInterval } from '../timers';
+import { EventTarget } from '../polyfills/event-target';
+import { Event } from '../polyfills/event';
 
 type USBControlTransferType = 'standard' | 'class' | 'vendor';
 type USBRequestType = USBControlTransferType | 'reserved';
@@ -86,6 +88,8 @@ interface USBNativeDescriptor extends USBNativeDevice {
 	manufacturerName?: string;
 	productName?: string;
 	serialNumber?: string;
+	busId: number;
+	deviceId: number;
 	configurations: USBConfigurationDescriptor[];
 }
 
@@ -145,6 +149,11 @@ function validateFilter(filter: USBDeviceFilter) {
 
 function deviceFromNative(native: USBNativeDescriptor): USBDevice {
 	return new USBDevice(INTERNAL, native);
+}
+
+/** Stable per-physical-device identity used by the hotplug diff. */
+function deviceKey(native: USBNativeDescriptor): string {
+	return `${native.busId}:${native.deviceId}`;
 }
 
 /** A USB endpoint descriptor exposed by {@link USBAlternateInterface}. */
@@ -215,7 +224,12 @@ export class USBConfiguration {
 }
 def(USBConfiguration);
 
-/** A USB device returned from {@link USB.requestDevice}. */
+/**
+ * A physical USB device attached to the Switch's USB-C port, with all of its
+ * interfaces exposed under {@link USBDevice.configurations}.
+ *
+ * @see https://developer.mozilla.org/docs/Web/API/USBDevice
+ */
 export class USBDevice {
 	readonly usbVersionMajor: number;
 	readonly usbVersionMinor: number;
@@ -228,9 +242,11 @@ export class USBDevice {
 	readonly deviceVersionMajor: number;
 	readonly deviceVersionMinor: number;
 	readonly deviceVersionSubminor: number;
-	readonly manufacturerName?: string;
-	readonly productName?: string;
-	readonly serialNumber?: string;
+	// Not `readonly`: the engine doesn't populate string descriptors at
+	// enumeration, so `open()` fills these in from GET_DESCRIPTOR reads.
+	manufacturerName?: string;
+	productName?: string;
+	serialNumber?: string;
 	readonly configurations: USBConfiguration[];
 
 	constructor(_internal: symbol, native: USBNativeDescriptor) {
@@ -273,6 +289,41 @@ export class USBDevice {
 			await yieldToLoop();
 			$.usbDeviceOpen(state.native);
 			state.opened = true;
+			// Best-effort: the engine leaves string descriptors empty at
+			// enumeration, so read them now that a control pipe is available.
+			await this.#populateStrings();
+		}
+	}
+
+	async #populateStrings(): Promise<void> {
+		if (this.manufacturerName && this.productName && this.serialNumber) return;
+		try {
+			const dd = await this.controlTransferIn(
+				{ requestType: 'standard', recipient: 'device', request: 0x06, value: 0x0100, index: 0 },
+				18,
+			);
+			const dv = dd.data;
+			if (!dv || dv.byteLength < 18) return;
+			const read = async (index: number): Promise<string | undefined> => {
+				if (!index) return undefined;
+				const r = await this.controlTransferIn(
+					{ requestType: 'standard', recipient: 'device', request: 0x06, value: 0x0300 | index, index: 0x0409 },
+					255,
+				);
+				const v = r.data;
+				if (!v || v.byteLength < 2) return undefined;
+				const len = v.getUint8(0);
+				let out = '';
+				for (let i = 2; i + 1 < len && i + 1 < v.byteLength; i += 2) {
+					out += String.fromCharCode(v.getUint16(i, true));
+				}
+				return out || undefined;
+			};
+			if (!this.manufacturerName) this.manufacturerName = await read(dv.getUint8(14));
+			if (!this.productName) this.productName = await read(dv.getUint8(15));
+			if (!this.serialNumber) this.serialNumber = await read(dv.getUint8(16));
+		} catch {
+			// best-effort; leave any unread strings undefined
 		}
 	}
 
@@ -286,6 +337,11 @@ export class USBDevice {
 				for (const iface of config.interfaces) iface.claimed = false;
 			}
 		}
+	}
+
+	/** No persistent permission store on Switch; `forget()` closes the device. */
+	async forget(): Promise<void> {
+		await this.close();
 	}
 
 	async selectConfiguration(configurationValue: number): Promise<void> {
@@ -304,16 +360,37 @@ export class USBDevice {
 		if (!state.opened) {
 			throw new DOMException('The device must be opened first.', 'InvalidStateError');
 		}
-		await yieldToLoop();
-		$.usbClaimInterface(state.native, interfaceNumber);
-		const iface = state.configuration?.interfaces.find(
-			(i) => i.interfaceNumber === interfaceNumber,
-		);
-		if (iface) iface.claimed = true;
+		// usb:hs releases interfaces asynchronously, so a re-acquire right after a
+		// close (rapid disconnect → reconnect) can transiently fail with the
+		// interface still "in use" — and a data interface with a pending bulk-IN
+		// URB can take a while to release. Retry with frame-yielding backoff
+		// (keeps RAF/input alive) for up to ~1.5s before surfacing the error.
+		// Only the transient acquire race is retried; other failures throw at once.
+		let lastErr: unknown;
+		for (let attempt = 0; attempt < 20; attempt++) {
+			await yieldToLoop();
+			try {
+				$.usbClaimInterface(state.native, interfaceNumber);
+				const iface = state.configuration?.interfaces.find(
+					(i) => i.interfaceNumber === interfaceNumber,
+				);
+				if (iface) iface.claimed = true;
+				return;
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (!msg.includes('usbHsAcquireUsbIf')) throw err;
+				lastErr = err;
+				await new Promise<void>((resolve) => setTimeout(resolve, 75));
+			}
+		}
+		throw lastErr;
 	}
 
 	async releaseInterface(interfaceNumber: number): Promise<void> {
-		const iface = this.configuration?.interfaces.find(
+		const state = _device.get(this)!;
+		await yieldToLoop();
+		$.usbReleaseInterface(state.native, interfaceNumber);
+		const iface = state.configuration?.interfaces.find(
 			(i) => i.interfaceNumber === interfaceNumber,
 		);
 		if (iface) iface.claimed = false;
@@ -323,7 +400,8 @@ export class USBDevice {
 		interfaceNumber: number,
 		alternateSetting: number,
 	): Promise<void> {
-		const iface = this.configuration?.interfaces.find(
+		const state = _device.get(this)!;
+		const iface = state.configuration?.interfaces.find(
 			(i) => i.interfaceNumber === interfaceNumber,
 		);
 		const alternate = iface?.alternates.find(
@@ -332,6 +410,8 @@ export class USBDevice {
 		if (!iface || !alternate) {
 			throw new DOMException('The selected alternate interface does not exist.', 'NotFoundError');
 		}
+		await yieldToLoop();
+		$.usbSelectAlternateInterface(state.native, interfaceNumber, alternateSetting);
 		iface.alternate = alternate;
 	}
 
@@ -342,9 +422,17 @@ export class USBDevice {
 		validateByte('endpointNumber', endpointNumber);
 		validateWord('length', length);
 		const state = _device.get(this)!;
-		await yieldToLoop();
-		const buffer = $.usbTransferIn(state.native, endpointNumber, length);
-		return { data: new DataView(buffer), status: 'ok' };
+		// Non-blocking: post the URB once, then poll it a frame at a time so the
+		// JS event loop (RAF, input, timers) keeps running while data is pending.
+		// `usbReadStart` is idempotent, so re-entry after an earlier yield is safe.
+		$.usbReadStart(state.native, endpointNumber, length);
+		for (;;) {
+			await yieldToLoop();
+			const buffer = $.usbReadPoll(state.native, endpointNumber);
+			if (buffer !== undefined) {
+				return { data: new DataView(buffer), status: 'ok' };
+			}
+		}
 	}
 
 	async transferOut(
@@ -380,6 +468,59 @@ export class USBDevice {
 		return { data: new DataView(buffer), status: 'ok' };
 	}
 
+	async controlTransferOut(
+		setup: USBControlTransferParameters,
+		data?: BufferSource,
+	): Promise<USBOutTransferResult> {
+		if (!['standard', 'class', 'vendor', 'reserved'].includes(setup.requestType)) {
+			throw new TypeError('Invalid USB requestType');
+		}
+		if (!['device', 'interface', 'endpoint', 'other'].includes(setup.recipient)) {
+			throw new TypeError('Invalid USB recipient');
+		}
+		validateByte('request', setup.request);
+		validateWord('value', setup.value);
+		validateWord('index', setup.index);
+		const state = _device.get(this)!;
+		await yieldToLoop();
+		return {
+			bytesWritten: $.usbControlTransferOut(state.native, setup, data),
+			status: 'ok',
+		};
+	}
+
+	/** Clear a halted (stalled) bulk/interrupt endpoint and reset its data toggle. */
+	async clearHalt(direction: USBDirection, endpointNumber: number): Promise<void> {
+		if (direction !== 'in' && direction !== 'out') {
+			throw new TypeError("direction must be 'in' or 'out'");
+		}
+		validateByte('endpointNumber', endpointNumber);
+		const state = _device.get(this)!;
+		await yieldToLoop();
+		$.usbClearHalt(state.native, direction === 'in', endpointNumber);
+	}
+
+	async isochronousTransferIn(
+		_endpointNumber: number,
+		_packetLengths: number[],
+	): Promise<never> {
+		throw new DOMException(
+			'Isochronous transfers are not supported by the nx.js usb:hs backend.',
+			'NotSupportedError',
+		);
+	}
+
+	async isochronousTransferOut(
+		_endpointNumber: number,
+		_data: BufferSource,
+		_packetLengths: number[],
+	): Promise<never> {
+		throw new DOMException(
+			'Isochronous transfers are not supported by the nx.js usb:hs backend.',
+			'NotSupportedError',
+		);
+	}
+
 	async reset(): Promise<void> {
 		const state = _device.get(this)!;
 		await yieldToLoop();
@@ -388,9 +529,34 @@ export class USBDevice {
 }
 def(USBDevice);
 
+/**
+ * Fired at {@link USB} when a device is attached (`connect`) or detached
+ * (`disconnect`).
+ *
+ * @see https://developer.mozilla.org/docs/Web/API/USBConnectionEvent
+ */
+export class USBConnectionEvent extends Event {
+	readonly device: USBDevice;
+
+	constructor(type: string, eventInitDict: { device: USBDevice }) {
+		super(type);
+		this.device = eventInitDict.device;
+	}
+}
+def(USBConnectionEvent);
+
+const HOTPLUG_POLL_MS = 500;
+
 /** Entry point for WebUSB functionality, available as `navigator.usb`. */
-export class USB {
-	constructor() {
+export class USB extends EventTarget {
+	#onconnect: ((this: USB, ev: USBConnectionEvent) => any) | null = null;
+	#ondisconnect: ((this: USB, ev: USBConnectionEvent) => any) | null = null;
+	#hotplugListeners = 0;
+	#pollTimer: number | null = null;
+	#known = new Map<string, USBDevice>();
+
+	constructor(_internal: symbol) {
+		super();
 		assertInternalConstructor(arguments);
 	}
 
@@ -416,9 +582,103 @@ export class USB {
 		}
 		throw new DOMException('No USB devices matching the filters were found.', 'NotFoundError');
 	}
+
+	// ---- hotplug (connect / disconnect) ----------------------------------
+
+	get onconnect() {
+		return this.#onconnect;
+	}
+	set onconnect(cb: ((this: USB, ev: USBConnectionEvent) => any) | null) {
+		if (this.#onconnect) {
+			super.removeEventListener('connect', this.#onconnect as any);
+			this.#hotplugListeners--;
+		}
+		this.#onconnect = cb;
+		if (cb) {
+			super.addEventListener('connect', cb as any);
+			this.#hotplugListeners++;
+			this.#startHotplug();
+		} else {
+			this.#maybeStopHotplug();
+		}
+	}
+
+	get ondisconnect() {
+		return this.#ondisconnect;
+	}
+	set ondisconnect(cb: ((this: USB, ev: USBConnectionEvent) => any) | null) {
+		if (this.#ondisconnect) {
+			super.removeEventListener('disconnect', this.#ondisconnect as any);
+			this.#hotplugListeners--;
+		}
+		this.#ondisconnect = cb;
+		if (cb) {
+			super.addEventListener('disconnect', cb as any);
+			this.#hotplugListeners++;
+			this.#startHotplug();
+		} else {
+			this.#maybeStopHotplug();
+		}
+	}
+
+	addEventListener(type: string, callback: any, options?: any): void {
+		super.addEventListener(type, callback, options);
+		if (type === 'connect' || type === 'disconnect') {
+			this.#hotplugListeners++;
+			this.#startHotplug();
+		}
+	}
+
+	removeEventListener(type: string, callback: any, options?: any): void {
+		super.removeEventListener(type, callback, options);
+		if ((type === 'connect' || type === 'disconnect') && this.#hotplugListeners > 0) {
+			this.#hotplugListeners--;
+			this.#maybeStopHotplug();
+		}
+	}
+
+	#startHotplug() {
+		if (this.#pollTimer !== null) return;
+		ensureInit();
+		// Seed the known-device set silently so pre-existing devices don't fire
+		// a spurious `connect` when listening starts.
+		this.#known = new Map();
+		for (const native of $.usbGetDevices() as USBNativeDescriptor[]) {
+			this.#known.set(deviceKey(native), deviceFromNative(native));
+		}
+		this.#pollTimer = setInterval(() => this.#poll(), HOTPLUG_POLL_MS);
+	}
+
+	#maybeStopHotplug() {
+		if (this.#hotplugListeners > 0 || this.#onconnect || this.#ondisconnect) return;
+		if (this.#pollTimer !== null) {
+			clearInterval(this.#pollTimer);
+			this.#pollTimer = null;
+		}
+	}
+
+	#poll() {
+		// The native check gates re-enumeration on an actual hotplug event.
+		if (!$.usbHotplugCheck()) return;
+		const seen = new Map<string, USBDevice>();
+		for (const native of $.usbGetDevices() as USBNativeDescriptor[]) {
+			const key = deviceKey(native);
+			let dev = this.#known.get(key);
+			if (!dev) {
+				dev = deviceFromNative(native);
+				this.dispatchEvent(new USBConnectionEvent('connect', { device: dev }));
+			}
+			seen.set(key, dev);
+		}
+		for (const [key, dev] of this.#known) {
+			if (!seen.has(key)) {
+				this.dispatchEvent(new USBConnectionEvent('disconnect', { device: dev }));
+			}
+		}
+		this.#known = seen;
+	}
 }
 def(USB);
 
 /** The shared USB instance, also exposed as `navigator.usb`. */
-// @ts-expect-error internal constructor
 export const usb = new USB(INTERNAL);

@@ -71,6 +71,7 @@ NX_MODULE(memory);
 NX_MODULE(nifm);
 NX_MODULE(ns);
 NX_MODULE(path2d);
+NX_MODULE(sensors);
 NX_MODULE(service);
 NX_MODULE(swkbd);
 NX_MODULE(tcp);
@@ -259,6 +260,25 @@ static bool g_romfs_app_mounted = false;
 static bool g_mman_teardown_done = false;
 static bool g_emergency_teardown_started = false;
 static FILE *g_debug_fd = NULL;
+
+// ---------------------------------------------------------------------------
+// Sleep / resume fix.
+//
+// On Switch sleep the bsdsocket layer is torn down, invalidating ALL sockets —
+// including libuv's threadpool self-wakeup pipe, which on this platform is a
+// loopback socketpair (`pipe()` == socket/bind/listen/connect/accept) created
+// once at loop init. After resume, the first `uv_async_send()` from a worker
+// completing an async task (e.g. a DNS `getaddrinfo`) writes to that now-dead
+// fd and libuv aborts / the process faults. Apps that never spawn threadpool
+// work (pure main-thread 2D/WebGL) are unaffected; anything doing `fetch()` or
+// other async I/O crashes on the first request after wake.
+//
+// The fix: on resume, call `uv_loop_fork()` — the public libuv API that
+// recreates the loop's kernel state, including a FRESH async self-pipe
+// (uv__async_fork -> uv__make_pipe). `g_need_loop_fork` is set from the applet
+// resume hook; the main loop performs the fork (it must run on the loop thread).
+static volatile bool g_need_loop_fork = false;
+static AppletHookCookie g_applet_hook_cookie;
 
 static void nx_display_parachute_release(void) {
 	if (g_display_parachute != NULL) {
@@ -1074,6 +1094,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_nifm(iso, init_obj);
 	nx_init_ns(iso, init_obj);
 	nx_init_path2d(iso, init_obj);
+	nx_init_sensors(iso, init_obj);
 	nx_init_service(iso, init_obj);
 	nx_init_swkbd(iso, init_obj);
 	nx_init_tcp(iso, init_obj);
@@ -1477,6 +1498,20 @@ static void resolve_entrypoint(nx_context_t *nx_ctx, int argc, char *argv[],
 // `screen.getContext`) is exactly `[skia] ... ready`'s reported delta.
 // Defined here so skia_gpu.cc can read it via an `extern` declaration.
 uint64_t g_boot_t0_ns = 0;
+
+// Applet lifecycle hook — fires from inside appletMainLoop() when the OS
+// delivers a message. On resume from sleep (or refocus back to the foreground),
+// flag the main loop to recreate libuv's async self-pipe (see the fix note at
+// g_need_loop_fork). Runs on the loop thread; only sets a flag, so it's cheap
+// and the fork itself happens in the loop where uv_loop_fork() is safe to call.
+static void nx_applet_hook_cb(AppletHookType hook, void *param) {
+	(void)param;
+	if (hook == AppletHookType_OnResume ||
+	    (hook == AppletHookType_OnFocusState &&
+	     appletGetFocusState() == AppletFocusState_InFocus)) {
+		g_need_loop_fork = true;
+	}
+}
 
 int main(int argc, char *argv[]) {
 	Result rc;
@@ -2139,8 +2174,29 @@ int main(int argc, char *argv[]) {
 		// loop for applet message processing; its return value is only honored as
 		// an exit signal when NOT driving a GPU surface (legacy framebuffer apps
 		// rely on it to detect an OS-initiated close).
+
+		// Sleep/resume fix: enable the Resume applet message and hook the applet
+		// lifecycle so a wake-from-sleep flags the loop to recreate libuv's async
+		// self-pipe (see nx_applet_hook_cb / g_need_loop_fork). Best-effort.
+		appletSetRestartMessageEnabled(true);
+		appletHook(&g_applet_hook_cookie, nx_applet_hook_cb, nullptr);
+
 		while (is_running) {
 			bool applet_active = appletMainLoop();
+
+			// Sleep/resume fix: recreate libuv's async self-pipe after a wake,
+			// on the loop thread, AFTER appletMainLoop() delivered the resume and
+			// BEFORE uv_run / the frame handler can queue new async work — so the
+			// self-pipe is valid before any threadpool worker uv_async_send()s to
+			// it. Idle workers park in their own condvar (not the loop), no race.
+			if (g_need_loop_fork) {
+				g_need_loop_fork = false;
+				int frk = uv_loop_fork(&loop);
+				if (frk != 0) {
+					fprintf(stderr, "[nx] uv_loop_fork failed: %d\n", frk);
+					fflush(stderr);
+				}
+			}
 			// When the screen is GPU-backed, EGL owns the NWindow and
 			// appletMainLoop() can return false immediately, which would end the
 			// loop at frame 1 before a clean exit (leaking V8's svcMapMemory
