@@ -39,8 +39,8 @@ proves it isn't probe state leakage. Interim `glDrawElements` fallback shipped
 1. Rebuild engine with `NX_52A_DISABLE_FALLBACK=1` to restore the direct
    `glDrawRangeElements` call:
    ```
-   make -C /d/Workspace/nxjs-source-v8 clean
-   CFLAGS_APPEND=-DNX_52A_DISABLE_FALLBACK=1 make -C /d/Workspace/nxjs-source-v8
+   make -C /d/Workspace/nxjs-extended clean
+   CFLAGS_APPEND=-DNX_52A_DISABLE_FALLBACK=1 make -C /d/Workspace/nxjs-extended
    # rebuild brewser-v8 chain
    make -C /d/Workspace/brewser-v8 sdmc
    ```

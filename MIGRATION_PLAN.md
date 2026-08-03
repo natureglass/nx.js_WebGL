@@ -20,7 +20,7 @@ Track upstream by pulling, not by maintaining a divergent monolith.
 
 ## Repo / branch topology
 - nxjs-source @ nxjs-extended  → QuickJS reference, READ-ONLY during migration
-- nxjs-source-v8 @ v8-migration (from upstream v1.0.0-beta.5) → native work
+- nxjs-extended @ v8-migration (from upstream v1.0.0-beta.5) → native work
 - brewser-runtime-v8 @ v8-migration → TS shell + (later) WebGL semantics
 - brewser @ main → consumes the built NRO via Makefile overlay; untouched until cutover
 
@@ -30,11 +30,11 @@ Skia (Canvas 2D); WebGL returns null and does nothing.
 
 Gates (all must pass):
 - [x] 1.1 Worktrees created; nxjs-extended + both mains untouched & clean
-          (nxjs-source-v8 @ v8-migration from v1.0.0-beta.5; brewser-runtime-v8 @
+          (nxjs-extended @ v8-migration from v1.0.0-beta.5; brewser-runtime-v8 @
           v8-migration from main; brewser-v8 @ v8-migration from main — added in
           Step 1 to host the BREWSER_RUNTIME_DIR env-var seam in sync-runtime.mjs
           without touching brewser/main.)
-- [x] 1.2 Stock upstream beta.5 NRO builds in nxjs-source-v8 — nxjs.nro = 56,513,145 B
+- [x] 1.2 Stock upstream beta.5 NRO builds in nxjs-extended — nxjs.nro = 56,513,145 B
 - [x] 1.3 WebGL stub module: webgl.cc replaced with thin no-op preserving
           $.webglContextNew/$.webglInitClass and nx_webgl_active/present/exit
           symbols; no EGL/GLES includes; main.cc init line unchanged (already
@@ -65,12 +65,12 @@ Gates (all must pass):
 ## What stays vs what was reverted (Step 1 outcome)
 
 - KEPT (permanent engine changes):
-  - SetStackLimit fix in nxjs-source-v8/source/main.cc (~1791-1817), deriving
+  - SetStackLimit fix in nxjs-extended/source/main.cc (~1791-1817), deriving
     limit from threadGetSelf()->stack_mem + 256 KiB headroom. Pre-fix bug was
     real — V8's auto-detect StackGuard assumed a desktop-sized stack and never
     threw the catchable RangeError on the Switch's 1 MiB libnx main-thread
     stack. Load-bearing on hardware as well as emulator.
-  - WebGL null stub in nxjs-source-v8/source/webgl.cc (the seam Step 2 grows
+  - WebGL null stub in nxjs-extended/source/webgl.cc (the seam Step 2 grows
     into).
   - Extended_Pictographic codepoint range table in
     brewser-runtime-v8/src/scripts/emoji-atlas.ts. switch-v8 ships without ICU,
@@ -275,7 +275,7 @@ never the regression. See [[reference-brewser-v8-sync-runtime-env-loss]]
 for the recurrence tell.
 
 Build state:
-- `nxjs-source-v8/nxjs.nro` = 56,353,729 B (Step 1 was 56,353,401 B;
+- `nxjs-extended/nxjs.nro` = 56,353,729 B (Step 1 was 56,353,401 B;
   +328 B, expected for the small new logging + accessor symbols).
 - `brewser-v8/brewser.nro` = 66,763,274 B (Step 1 was 66,763,898 B;
   -624 B, within compression-variation noise).
@@ -572,7 +572,7 @@ but at WebGL2 scale.
 
 **The diff (inventory citations).**
 
-| Surface | QuickJS-era (nxjs-source @ nxjs-extended) | V8-migration current (nxjs-source-v8) | Delta |
+| Surface | QuickJS-era (nxjs-source @ nxjs-extended) | V8-migration current (nxjs-extended) | Delta |
 |---------|------------------------------------------|---------------------------------------|-------|
 | Engine WebGL C/C++ | source/webgl.c (18,244 lines) + webgl_egl.c (11,130 lines) | source/webgl.cc (1,701 lines, ~95 v1 methods) + webgl_bridge.cc (565 lines) | **~10×** more surface to re-platform on the engine side |
 | Methods registered | ~190 (full v1 + v2 spec) | 95 (v1 only) | **~95 WebGL2-only methods missing** |
@@ -598,7 +598,7 @@ QuickJS-era reference (nxjs-source @ nxjs-extended, READ-ONLY):
 - WebGL2 constants table: webgl.c:17895-18133 (~240 v2 enums)
 - Tegra/Mesa quirks: webgl.c:5203-5212 (half-float NEAREST), 6504-6638 (cube format widening), 13546-13690 (readPixels Phase 1c widening), webgl_egl.c:1999-2382 (extended H-B probe for sampler3D/2DArray/Cube)
 
-V8 current (nxjs-source-v8, WRITE):
+V8 current (nxjs-extended, WRITE):
 - Method table: webgl.cc:1436-1570 (95 methods, `install_methods()` / `FUNCS[]`)
 - v1 constants: webgl-rendering-context.ts:60-247 (236, includes #9 ES3 adds at 132-144)
 - v2 constants: webgl2-rendering-context.ts:201-752 (387, complete)

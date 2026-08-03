@@ -21,7 +21,7 @@ diagnostics live:
 
 ```sh
 # 1) engine (produces the instrumented ../../nxjs.nro) — devkitPro msys2 bash:
-#    cd /d/Workspace/nxjs-source-v8 && make
+#    cd /d/Workspace/nxjs-extended && make
 # 2) this app (from repo root):
 pnpm --filter sleep-test build
 pnpm --filter sleep-test nro --fat   # self-contained sleep-test.nro

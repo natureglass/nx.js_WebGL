@@ -1,4 +1,4 @@
-# Fork-delta reduction study — nxjs-source-v8 vs upstream nx.js
+# Fork-delta reduction study — nxjs-extended vs upstream nx.js
 
 Read-mostly investigation (Phases 1–4) + mechanical ledger reshuffle
 (Phase 5). The report is the deliverable for Phases 1–4 and the
@@ -790,7 +790,7 @@ This session executed the Post-2.G consolidation task
     `merged`.]**
 
 **Task 1 (ledger closing pass).**
-- Mined `git log --stat` across nxjs-source-v8 v8-migration +
+- Mined `git log --stat` across nxjs-extended v8-migration +
   brewser-runtime-v8 + brewser-apps for commits since 2026-06-30.
 - Added dated ADDENDA to existing entries:
   - **#11** (PMREM r184 FS replacement): STILL-UNVERIFIED post-2.G
@@ -864,7 +864,7 @@ human user is ready to review.
 1. **Review PR-A/F/C branches.** All three are small, tight
    diffs. Suggested review order: PR-A → PR-F → PR-C. Diffs
    in the worktrees; descriptions in
-   `nxjs-source-v8/upstream-prs/PR-{A,F,C}.md`.
+   `nxjs-extended/upstream-prs/PR-{A,F,C}.md`.
 
 2. **File PR-A/F/C to TooTallNate.** These are the highest-ratio
    PRs — if merged, retire 5 ledger entries with ~66 lines of
@@ -917,21 +917,21 @@ human user is ready to review.
 
 ### Files to review
 
-- `nxjs-source-v8/upstream-prs/PR-A.md` — Image/Audio/Video
+- `nxjs-extended/upstream-prs/PR-A.md` — Image/Audio/Video
   fetch deferral (retires #1/#2/#3). **[merged 2026-07-11;
   file removed.]**
-- `nxjs-source-v8/upstream-prs/PR-F.md` — JIT-safe
+- `nxjs-extended/upstream-prs/PR-F.md` — JIT-safe
   defineProperties for GL constants (retires #8). **[merged
   2026-07-11; file removed.]**
-- `nxjs-source-v8/upstream-prs/PR-C.md` — canvas.cc font-size
+- `nxjs-extended/upstream-prs/PR-C.md` — canvas.cc font-size
   pin (retires #13). **[merged 2026-07-11; file removed.]**
-- `nxjs-source-v8/upstream-prs/PR-D.md` — Skia/WebGL
+- `nxjs-extended/upstream-prs/PR-D.md` — Skia/WebGL
   coexistence primitive (retires #5/#6/#7/#14/#15/#17/#35/#36).
-- `nxjs-source-v8/NXJS_PATCHES_NEEDED.md` — engine ledger with
+- `nxjs-extended/NXJS_PATCHES_NEEDED.md` — engine ledger with
   new entries #35/#36/#37 + addenda on #4/#11/#19/#20 + updated
   index table.
-- `nxjs-source-v8/scripts/verify-patches.sh` — 47 checks + meta-
+- `nxjs-extended/scripts/verify-patches.sh` — 47 checks + meta-
   check; clean run.
 - `brewser-runtime-v8/RUNTIME_SHIMS.md` — unchanged (already
   captured all runtime shims in prior session).
-- `nxjs-source-v8/NXJS_PATCHES_ARCHIVE.md` — unchanged.
+- `nxjs-extended/NXJS_PATCHES_ARCHIVE.md` — unchanged.

@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/verify-patches.sh                 # verify against defaults
-#   NXJS=/path/to/nxjs-source-v8 \
+#   NXJS=/path/to/nxjs-extended \
 #     RUNTIME=/path/to/brewser-runtime-v8 \
 #     APPS=/path/to/brewser-apps \
 #     scripts/verify-patches.sh

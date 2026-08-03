@@ -9,7 +9,7 @@ import { URL } from './polyfills/url';
 // supported schemes beyond this package's built-in
 // http/https/blob/data/file/sdmc/romfs handlers. Recapitulates the
 // QuickJS-era patch that the V8 migration dropped — see
-// nxjs-source-v8/MIGRATION_PLAN.md "QuickJS-era engine patches to re-apply
+// nxjs-extended/MIGRATION_PLAN.md "QuickJS-era engine patches to re-apply
 // on V8" catalog.
 //
 // CRITICAL: late-bound. The function body calls `globalThis.fetch` at
