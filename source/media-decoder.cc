@@ -620,6 +620,20 @@ double clock_now(nx_media *m) {
 // Public API
 // ---------------------------------------------------------------------------
 
+// http(s):// sources are opened by libavformat itself — its http/https
+// protocols + hls demuxer fetch the playlist and the rolling media segments
+// over TLS (the libnx backend baked into switch-ffmpeg as tls_libnx), so there
+// is NO fopen and NO custom AVIO wrap. Every other scheme (sdmc:/, romfs:/,
+// disk paths, and in-memory buffers) still goes through fopen/memory +
+// avio_read_cb, because FFmpeg's protocol layer doesn't understand those.
+// Restored from the QuickJS-era video.c network branch that the V8 migration
+// dropped when it adopted upstream nx.js's local-only media pipeline.
+static bool nx_is_network_url(const char *path) {
+	if (!path) return false;
+	return strncmp(path, "http://", 7) == 0 ||
+	       strncmp(path, "https://", 8) == 0;
+}
+
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
                           char *errbuf, size_t errbuf_size) {
@@ -630,43 +644,63 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 	const AVCodec *acodec = NULL;
 	unsigned char *avio_buf = NULL;
 
-	if (path) {
-		m->file = fopen(path, "rb");
-		if (!m->file) {
-			snprintf(errbuf, errbuf_size, "failed to open file");
+	const bool is_network = nx_is_network_url(path);
+
+	if (is_network) {
+		// Network (http/https): libavformat owns the IO and, for HLS, its
+		// hls demuxer fetches the rolling media segments itself. No fopen,
+		// no custom AVIO — pass the URL straight to avformat_open_input.
+		m->fmt = avformat_alloc_context();
+		if (!m->fmt) {
+			snprintf(errbuf, errbuf_size, "out of memory");
 			goto fail;
 		}
-		fseek(m->file, 0, SEEK_END);
-		m->file_size = (int64_t)ftell(m->file);
-		fseek(m->file, 0, SEEK_SET);
+		ret = avformat_open_input(&m->fmt, path, NULL, NULL);
+		if (ret < 0) {
+			// Surface the real AVERROR (DNS / TLS handshake / HTTP 4xx /
+			// "Protocol not found") — network opens fail many distinct ways.
+			av_strerror(ret, errbuf, errbuf_size);
+			goto fail;
+		}
 	} else {
-		m->mem = mem;
-		m->mem_size = mem_size;
-	}
+		if (path) {
+			m->file = fopen(path, "rb");
+			if (!m->file) {
+				snprintf(errbuf, errbuf_size, "failed to open file");
+				goto fail;
+			}
+			fseek(m->file, 0, SEEK_END);
+			m->file_size = (int64_t)ftell(m->file);
+			fseek(m->file, 0, SEEK_SET);
+		} else {
+			m->mem = mem;
+			m->mem_size = mem_size;
+		}
 
-	avio_buf = (unsigned char *)av_malloc(65536);
-	if (!avio_buf) {
-		snprintf(errbuf, errbuf_size, "out of memory");
-		goto fail;
-	}
-	m->avio = avio_alloc_context(avio_buf, 65536, 0, m, avio_read_cb, NULL,
-	                             avio_seek_cb);
-	if (!m->avio) {
-		av_free(avio_buf);
-		snprintf(errbuf, errbuf_size, "out of memory");
-		goto fail;
-	}
-	m->fmt = avformat_alloc_context();
-	if (!m->fmt) {
-		snprintf(errbuf, errbuf_size, "out of memory");
-		goto fail;
-	}
-	m->fmt->pb = m->avio;
+		avio_buf = (unsigned char *)av_malloc(65536);
+		if (!avio_buf) {
+			snprintf(errbuf, errbuf_size, "out of memory");
+			goto fail;
+		}
+		m->avio = avio_alloc_context(avio_buf, 65536, 0, m, avio_read_cb, NULL,
+		                             avio_seek_cb);
+		if (!m->avio) {
+			av_free(avio_buf);
+			snprintf(errbuf, errbuf_size, "out of memory");
+			goto fail;
+		}
+		m->fmt = avformat_alloc_context();
+		if (!m->fmt) {
+			snprintf(errbuf, errbuf_size, "out of memory");
+			goto fail;
+		}
+		m->fmt->pb = m->avio;
 
-	ret = avformat_open_input(&m->fmt, NULL, NULL, NULL);
-	if (ret < 0) {
-		av_strerror(ret, errbuf, errbuf_size);
-		goto fail;
+		ret = avformat_open_input(&m->fmt, NULL, NULL, NULL);
+		if (ret < 0) {
+			av_strerror(ret, errbuf, errbuf_size);
+			goto fail;
+		}
 	}
 	ret = avformat_find_stream_info(m->fmt, NULL);
 	if (ret < 0) {
