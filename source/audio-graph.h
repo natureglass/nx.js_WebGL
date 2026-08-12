@@ -35,6 +35,11 @@ enum nx_audio_node_type {
 	// counter is the A/V sync master clock.
 	NX_AUDIO_NODE_STREAM_SOURCE = 4,
 	NX_AUDIO_NODE_OSCILLATOR = 5,
+	// AnalyserNode — a passthrough node (output == summed input) that also
+	// taps its output into a ring buffer JS can read for time-domain /
+	// frequency visualisation. Unlike other sinks it isn't reachable from the
+	// destination, so `render_quantum` processes it explicitly each quantum.
+	NX_AUDIO_NODE_ANALYSER = 6,
 };
 
 // OscillatorNode wave types (matches OscillatorType wire values in JS).
@@ -141,6 +146,15 @@ struct nx_audio_node {
 	std::atomic<bool> stream_playing{false};
 	// Ledger #114 diag — counts render quanta where avail < Q (underrun).
 	std::atomic<uint64_t> stream_underrun_count{0};
+
+	// ---- analyser state (NX_AUDIO_NODE_ANALYSER) ----
+	// Ring of the most-recent downmixed (mono) output samples. Written by the
+	// render thread under the graph mutex (process_analyser), read by JS
+	// (getFloatTimeDomainData) under the same mutex. Capacity is a power of
+	// two >= the max fftSize (32768) so JS can request any fftSize up to that.
+	std::unique_ptr<float[]> analyser_ring;
+	uint32_t analyser_ring_size = 0;      // capacity in samples (power of two)
+	uint64_t analyser_write_pos = 0;      // absolute samples written (ring idx = pos & (size-1))
 };
 
 struct nx_audio_graph {
@@ -200,6 +214,14 @@ int nx_audio_source_playback_state(nx_audio_node *n);
 
 // ---- oscillator ----
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type);
+
+// ---- analyser (time-domain readback; locks the graph mutex) ----
+// Fills `out` with the most-recent `count` downmixed output samples (newest
+// last), each in [-1, 1]. Samples older than the ring holds (or before any
+// audio was rendered) are 0. Frequency-domain data is computed in JS from
+// this time-domain window.
+void nx_audio_analyser_get_float_time_data(nx_audio_node *n, float *out,
+                                           uint32_t count);
 
 // ---- stream source (producer side; lock-free, single producer thread) ----
 // Number of frames that can currently be written without overwriting.

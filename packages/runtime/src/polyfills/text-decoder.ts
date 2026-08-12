@@ -20,19 +20,70 @@ export class TextDecoder implements globalThis.TextDecoder {
 	fatal: boolean;
 	ignoreBOM: boolean;
 	constructor(
-		encoding?: string,
+		encoding: string = 'utf-8',
 		options?: { fatal?: boolean; ignoreBOM?: boolean },
 	) {
-		if (
-			typeof encoding === 'string' &&
-			encoding !== 'utf-8' &&
-			encoding !== 'utf8'
+		// WHATWG encoding labels are case-insensitive and whitespace-
+		// trimmed. We support UTF-8 (the original nx.js capability) plus
+		// UTF-16LE / UTF-16BE. UTF-16 matters for Emscripten-compiled
+		// runtimes: Unity's IL2CPP marshals C# `System.String` (UTF-16)
+		// back to JS via `new TextDecoder('utf-16le')` in `UTF16ToString`,
+		// so without it a Unity WebGL build throws at framework init
+		// ("Only utf-8 decoding is supported"). Anything else still
+		// throws (RangeError, matching the browser).
+		const label = String(encoding).trim().toLowerCase();
+		if (label === 'utf-8' || label === 'utf8' || label === 'unicode-1-1-utf-8') {
+			this.encoding = 'utf-8';
+		} else if (
+			label === 'utf-16le' || label === 'utf-16' ||
+			label === 'unicode' || label === 'csunicode' || label === 'unicodefeff'
 		) {
-			throw new TypeError('Only "utf-8" decoding is supported');
+			this.encoding = 'utf-16le';
+		} else if (label === 'utf-16be' || label === 'unicodefffe') {
+			this.encoding = 'utf-16be';
+		} else {
+			throw new RangeError(
+				`Failed to construct 'TextDecoder': The encoding label provided ('${encoding}') is invalid.`,
+			);
 		}
-		this.encoding = 'utf-8';
 		this.fatal = options?.fatal ?? false;
 		this.ignoreBOM = options?.ignoreBOM ?? false;
+	}
+
+	/** Decode a UTF-16 byte stream (little- or big-endian). Companion to
+	 * the UTF-8 fast path in `decode()`; kept separate so the UTF-8 code
+	 * is untouched. Strips a leading BOM (U+FEFF) unless `ignoreBOM`, and
+	 * emits U+FFFD for a dangling odd byte (throws when `fatal`). Chunked
+	 * `String.fromCharCode.apply` to stay under the argument-count cap on
+	 * large inputs. */
+	private decodeUtf16(bytes: Uint8Array, bigEndian: boolean): string {
+		const len = bytes.length;
+		let result = '';
+		const CHUNK = 0x8000;
+		const units: number[] = [];
+		let checkBom = !this.ignoreBOM;
+		let i = 0;
+		for (; i + 1 < len; i += 2) {
+			const unit = bigEndian
+				? (bytes[i] << 8) | bytes[i + 1]
+				: bytes[i] | (bytes[i + 1] << 8);
+			if (checkBom) {
+				checkBom = false;
+				if (unit === 0xfeff) continue; // strip BOM
+			}
+			units.push(unit);
+			if (units.length >= CHUNK) {
+				result += String.fromCharCode.apply(null, units);
+				units.length = 0;
+			}
+		}
+		if (i < len) {
+			// Odd trailing byte — incomplete code unit.
+			if (this.fatal) throw new TypeError('Invalid UTF-16 sequence');
+			units.push(0xfffd);
+		}
+		if (units.length) result += String.fromCharCode.apply(null, units);
+		return result;
 	}
 
 	/**
@@ -54,6 +105,13 @@ export class TextDecoder implements globalThis.TextDecoder {
 		} else {
 			bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
 		}
+
+		// UTF-16 takes a dedicated path; the rest of this method is the
+		// original UTF-8 decoder, untouched.
+		if (this.encoding === 'utf-16le' || this.encoding === 'utf-16be') {
+			return this.decodeUtf16(bytes, this.encoding === 'utf-16be');
+		}
+
 		var inputIndex = 0;
 
 		// Create a working buffer for UTF-16 code points, but don't generate one

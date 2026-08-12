@@ -168,12 +168,12 @@ void nx_audio_node_new(const FunctionCallbackInfo<Value> &info) {
 	if (!ctx)
 		return;
 	int type = arg_i32(info, 1);
-	// JS may create GAIN, STEREO_PANNER, BUFFER_SOURCE, and OSCILLATOR
-	// nodes; STREAM_SOURCE (4) is engine-internal (media elements) and is
-	// explicitly rejected.
+	// JS may create GAIN, STEREO_PANNER, BUFFER_SOURCE, OSCILLATOR, and
+	// ANALYSER nodes; STREAM_SOURCE (4) is engine-internal (media elements)
+	// and is explicitly rejected.
 	if (type != NX_AUDIO_NODE_GAIN && type != NX_AUDIO_NODE_STEREO_PANNER &&
 	    type != NX_AUDIO_NODE_BUFFER_SOURCE &&
-	    type != NX_AUDIO_NODE_OSCILLATOR) {
+	    type != NX_AUDIO_NODE_OSCILLATOR && type != NX_AUDIO_NODE_ANALYSER) {
 		nx_throw(iso, "invalid AudioNode type");
 		return;
 	}
@@ -401,6 +401,27 @@ void nx_audio_oscillator_set_type_cb(const FunctionCallbackInfo<Value> &info) {
 	nx_audio_oscillator_set_type(n, type);
 }
 
+// audioAnalyserFloatTimeData(node, out: Float32Array) — fills `out` with the
+// most-recent `out.length` downmixed output samples (newest last, each in
+// [-1, 1]). JS derives byte-time-domain + frequency data from this window.
+void nx_audio_analyser_float_time_data_cb(
+    const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_audio_node *n = get_node(iso, info[0]);
+	if (!n)
+		return;
+	if (!info[1]->IsFloat32Array()) {
+		nx_throw(iso, "expected Float32Array");
+		return;
+	}
+	Local<Float32Array> ta = info[1].As<Float32Array>();
+	uint32_t count = (uint32_t)(ta->ByteLength() / sizeof(float));
+	std::shared_ptr<BackingStore> bs = ta->Buffer()->GetBackingStore();
+	float *out = reinterpret_cast<float *>(
+	    static_cast<uint8_t *>(bs->Data()) + ta->ByteOffset());
+	nx_audio_analyser_get_float_time_data(n, out, count);
+}
+
 // ---------------------------------------------------------------------------
 // decodeAudioData
 // ---------------------------------------------------------------------------
@@ -582,6 +603,8 @@ void nx_init_audio(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "audioSourceStop", nx_audio_source_stop_cb);
 	NX_SET_FUNC(init_obj, "audioSourceSetLoop", nx_audio_source_set_loop_cb);
 	NX_SET_FUNC(init_obj, "audioSourceState", nx_audio_source_state_cb);
+	NX_SET_FUNC(init_obj, "audioAnalyserFloatTimeData",
+	            nx_audio_analyser_float_time_data_cb);
 	NX_SET_FUNC(init_obj, "audioOscillatorSetType",
 	            nx_audio_oscillator_set_type_cb);
 	NX_SET_FUNC(init_obj, "audioDecode", nx_audio_decode);

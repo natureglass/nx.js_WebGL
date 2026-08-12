@@ -408,6 +408,25 @@ void process_destination(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	memcpy(n->bus, in, sizeof(in));
 }
 
+// AnalyserNode: passthrough (output == summed input, like the destination)
+// PLUS a tap that appends the downmixed (L+R)/2 samples to the ring buffer
+// so JS can visualise the signal. Runs under the graph mutex (render thread).
+void process_analyser(nx_audio_graph *g, nx_audio_node *n, double t0) {
+	float in[NX_AUDIO_CHANNELS][Q];
+	int ch;
+	sum_inputs(g, n, t0, in, &ch);
+	n->bus_ch = ch;
+	memcpy(n->bus, in, sizeof(in));
+	if (n->analyser_ring && n->analyser_ring_size > 0) {
+		uint32_t mask = n->analyser_ring_size - 1; // size is a power of two
+		for (int i = 0; i < Q; i++) {
+			float s = (in[0][i] + in[1][i]) * 0.5f;
+			n->analyser_ring[(uint32_t)(n->analyser_write_pos & mask)] = s;
+			n->analyser_write_pos++;
+		}
+	}
+}
+
 void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	if (n->processed_quantum == g->quantum_id)
 		return; // already rendered this quantum (fan-out memoization)
@@ -437,6 +456,9 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	case NX_AUDIO_NODE_DESTINATION:
 		process_destination(g, n, t0);
 		break;
+	case NX_AUDIO_NODE_ANALYSER:
+		process_analyser(g, n, t0);
+		break;
 	}
 	n->processing = false;
 	n->processed_quantum = g->quantum_id;
@@ -453,6 +475,15 @@ void render_quantum(nx_audio_graph *g) {
 	for (nx_audio_node *n : g->nodes) {
 		if ((n->type == NX_AUDIO_NODE_BUFFER_SOURCE ||
 		     n->type == NX_AUDIO_NODE_OSCILLATOR) &&
+		    n->processed_quantum != g->quantum_id)
+			process_node(g, n, t0);
+	}
+	// AnalyserNodes are taps, not connected to the destination, so the walk
+	// above never reaches them. Process each explicitly (which pulls its
+	// upstream chain — already-processed nodes are memoized) so its ring keeps
+	// filling with the live signal for JS visualisation.
+	for (nx_audio_node *n : g->nodes) {
+		if (n->type == NX_AUDIO_NODE_ANALYSER &&
 		    n->processed_quantum != g->quantum_id)
 			process_node(g, n, t0);
 	}
@@ -514,6 +545,16 @@ nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type) {
 		n->stream_capacity = (uint32_t)g->sample_rate;
 		n->stream_ring = std::make_unique<float[]>(
 		    (size_t)n->stream_capacity * NX_AUDIO_CHANNELS);
+		break;
+	}
+	case NX_AUDIO_NODE_ANALYSER: {
+		// Ring capacity = the max supported fftSize (32768), rounded to a power
+		// of two so the write index masks cleanly. Zero-initialised so an
+		// analyser read before any audio renders returns silence.
+		n->analyser_ring_size = 32768;
+		n->analyser_ring =
+		    std::make_unique<float[]>((size_t)n->analyser_ring_size);
+		n->analyser_write_pos = 0;
 		break;
 	}
 	case NX_AUDIO_NODE_DESTINATION:
@@ -718,6 +759,28 @@ int nx_audio_source_playback_state(nx_audio_node *n) {
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type) {
 	std::lock_guard<std::mutex> lock(n->graph->mutex);
 	n->oscillator_type = type;
+}
+
+void nx_audio_analyser_get_float_time_data(nx_audio_node *n, float *out,
+                                           uint32_t count) {
+	if (!n || !out || count == 0)
+		return;
+	std::lock_guard<std::mutex> lock(n->graph->mutex);
+	uint32_t cap = n->analyser_ring ? n->analyser_ring_size : 0;
+	uint64_t total = n->analyser_write_pos;
+	uint32_t mask = cap ? (cap - 1) : 0;
+	// Return the last `count` samples: positions [total-count, total-1].
+	// Positions before 0 (not enough rendered yet) or older than the ring
+	// still holds (overwritten) read as silence.
+	for (uint32_t i = 0; i < count; i++) {
+		int64_t pos = (int64_t)total - (int64_t)count + (int64_t)i;
+		if (cap == 0 || pos < 0 ||
+		    (uint64_t)((int64_t)total - pos) > (uint64_t)cap) {
+			out[i] = 0.f;
+		} else {
+			out[i] = n->analyser_ring[(uint32_t)((uint64_t)pos & mask)];
+		}
+	}
 }
 
 uint32_t nx_audio_stream_writable(nx_audio_node *n) {

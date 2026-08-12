@@ -1829,8 +1829,17 @@ int main(int argc, char *argv[]) {
 	nx_ctx->config.effective_code_headroom_mb = headroom_mb;
 
 	if (can_jit) {
+		// --wasm-lazy-compilation: defer each wasm function's compilation to
+		// its first call instead of eagerly compiling the whole module at
+		// instantiate. Essential here because we're --single-threaded (no
+		// background compile threads), so eager compilation of a large module
+		// (Unity/Emscripten: 10-60 MB) runs entirely on the main thread and
+		// wedges the event loop / exhausts the code arena. Lazy keeps each
+		// instantiate cheap; it also pairs with the synchronous-WASM shim in
+		// packages/runtime/src/index.ts (async instantiate re-expressed on the
+		// sync constructors) so the inline compile that shim does stays light.
 		V8::SetFlagsFromString("--single-threaded --single-threaded-gc "
-		                       "--predictable");
+		                       "--predictable --wasm-lazy-compilation");
 	} else {
 		V8::SetFlagsFromString("--jitless --single-threaded "
 		                       "--single-threaded-gc "
@@ -2208,6 +2217,22 @@ int main(int argc, char *argv[]) {
 			if (!nx_ctx->had_error) {
 				// libuv: sockets, fs, dns, threadpool afters, timers.
 				uv_run(&loop, UV_RUN_NOWAIT);
+				// Drain V8 foreground platform tasks. NewSingleThreadedDefault-
+				// Platform has no worker threads, so V8 runs all "background"
+				// work — including async WebAssembly compilation jobs AND their
+				// promise-resolution completion — on the foreground task runner.
+				// Nothing else pumps it, so an async WebAssembly.instantiate()
+				// (Emscripten/Unity's load path) never resolves: the loop stays
+				// alive on libuv timers while the instantiate promise hangs
+				// forever. Pump until empty; kDoNotWait never blocks. Runs
+				// BEFORE the microtask checkpoint so a task that resolves a
+				// promise gets its `.then` reactions serviced the same turn.
+				// `platform` (the unique_ptr local) shadows the `v8::platform`
+				// namespace here, hence the fully-qualified call.
+				while (v8::platform::PumpMessageLoop(
+				    platform.get(), iso,
+				    v8::platform::MessageLoopBehavior::kDoNotWait)) {
+				}
 				// Drain V8 microtasks (promise reactions).
 				iso->PerformMicrotaskCheckpoint();
 				// Surface any unhandled rejection collected this turn.

@@ -51,8 +51,21 @@ void nx_memory_usage(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(obj);
 }
 
+// Ask V8 to release as much memory as it can back to the OS *now*. Unlike the
+// `--expose-gc` `gc()` (a normal mark-compact), LowMemoryNotification performs
+// a full, blocking GC AND flushes V8's internal caches — including the
+// WebAssembly engine's memory pool, where a torn-down WASM app's multi-hundred-
+// MB linear memory otherwise sits pooled-for-reuse (invisible to `external_
+// memory()`, hence not reclaimed by `gc()`). Called from the shell's app-exit
+// teardown so the next app launches against reclaimed memory instead of OOMing
+// on the previous run's leftover WASM heap.
+void nx_low_memory_notification(const FunctionCallbackInfo<Value> &info) {
+	info.GetIsolate()->LowMemoryNotification();
+}
+
 } // namespace
 
 void nx_init_memory(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "memoryUsage", nx_memory_usage);
+	NX_SET_FUNC(init_obj, "lowMemoryNotification", nx_low_memory_notification);
 }

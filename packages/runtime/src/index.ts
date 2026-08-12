@@ -151,6 +151,43 @@ import { $ } from './$';
 			WA.instantiate = rej;
 			WA.compileStreaming = rej;
 			WA.instantiateStreaming = rej;
+		} else {
+			// Async-WASM shim. This build runs V8 on a single-threaded platform
+			// with NO worker threads (see `NewSingleThreadedDefaultPlatform` in
+			// source/main.cc — the multi-threaded default's worker threads fault
+			// on Horizon's pthread/abseil sync). V8's ASYNC WebAssembly
+			// compilation posts its compile work as a background Job that never
+			// runs (0 workers), and its promise-resolution completion never lands
+			// on the queues the main loop drains (libuv timers + V8 microtasks),
+			// so `WebAssembly.compile` / `instantiate` (and the `*Streaming`
+			// variants Emscripten/Unity/Godot load through) hang FOREVER — the
+			// event loop stays alive while the returned promise is stuck pending.
+			// The SYNCHRONOUS constructors (`new Module` / `new Instance`) compile
+			// inline on the calling thread and work fine, so re-express the async
+			// API on top of them and resolve via a microtask (which IS drained).
+			// The compile is deferred into a `.then` so errors surface as promise
+			// rejections (matching spec) rather than synchronous throws. Pairs
+			// with the `--wasm-lazy-compilation` default flag so the inline
+			// decode/compile stays cheap (function bodies compile on first call).
+			const M = WA.Module;
+			const I = WA.Instance;
+			const readBytes = (source: any): Promise<any> =>
+				Promise.resolve(source).then((r: any) =>
+					r && typeof r.arrayBuffer === 'function' ? r.arrayBuffer() : r,
+				);
+			WA.compile = (bytes: any) => Promise.resolve().then(() => new M(bytes));
+			WA.instantiate = (src: any, importObject?: any) =>
+				Promise.resolve().then(() => {
+					// `instantiate(Module, imports)` resolves to the Instance;
+					// `instantiate(bytes, imports)` resolves to {module, instance}.
+					if (src instanceof M) return new I(src, importObject);
+					const mod = new M(src);
+					return { module: mod, instance: new I(mod, importObject) };
+				});
+			WA.compileStreaming = (source: any) =>
+				readBytes(source).then((bytes: any) => WA.compile(bytes));
+			WA.instantiateStreaming = (source: any, importObject?: any) =>
+				readBytes(source).then((bytes: any) => WA.instantiate(bytes, importObject));
 		}
 	}
 }

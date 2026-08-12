@@ -6,6 +6,7 @@ import { assertInternalConstructor, def } from '../utils';
 import { AudioBuffer, createAudioBuffer } from './audio-buffer';
 import { AudioBufferSourceNode } from './audio-buffer-source-node';
 import { AudioDestinationNode } from './audio-destination-node';
+import { AnalyserNode } from './analyser-node';
 import { GainNode } from './gain-node';
 import { OscillatorNode } from './oscillator-node';
 import { StereoPannerNode } from './stereo-panner-node';
@@ -209,7 +210,7 @@ export class BaseAudioContext
 	}
 
 	createAnalyser(): AnalyserNode {
-		throw new Error('Method not implemented.');
+		return new AnalyserNode(this);
 	}
 	createBiquadFilter(): BiquadFilterNode {
 		throw new Error('Method not implemented.');

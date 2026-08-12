@@ -428,3 +428,20 @@ export function setMediaPlaybackState(state: boolean) {
 export function memoryUsage(): MemoryUsage {
 	return $.memoryUsage();
 }
+
+/**
+ * Requests that V8 release as much memory as possible back to the operating
+ * system immediately. Performs a full, blocking garbage collection and flushes
+ * V8's internal caches — including the WebAssembly engine's memory pool, which
+ * a plain `gc()` does not reclaim. Heavier than a normal GC; intended for
+ * teardown/quiescent points (e.g. exiting a memory-heavy app), not per-frame.
+ *
+ * @example
+ *
+ * ```typescript
+ * Switch.lowMemoryNotification();
+ * ```
+ */
+export function lowMemoryNotification(): void {
+	$.lowMemoryNotification();
+}

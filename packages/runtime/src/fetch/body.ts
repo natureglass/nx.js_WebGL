@@ -73,6 +73,16 @@ export abstract class Body implements globalThis.Body {
 	body: ReadableStream<Uint8Array> | null;
 	#bodyUsed: boolean;
 	headers: Headers;
+	// Raw in-memory bytes, kept when the body was built from a
+	// string/BufferSource/URLSearchParams (i.e. NOT a live network stream).
+	// `arrayBuffer()` returns these directly, bypassing the ReadableStream
+	// round-trip. The native (V8) ReadableStream stalls reading a single
+	// large chunk on this build's single-threaded platform (its pull/read
+	// scheduling never completes with no worker threads) — which hung every
+	// Emscripten/Unity load at `resp.arrayBuffer()` on the multi-MB
+	// code.wasm / .data, one step before WebAssembly.instantiate was ever
+	// reached. The bytes are already in memory, so this is also just faster.
+	#rawBody: ArrayBuffer | undefined;
 
 	get bodyUsed(): boolean {
 		if (this.#bodyUsed) return true;
@@ -111,6 +121,7 @@ export abstract class Body implements globalThis.Body {
 				// safe to hand to `arrayBufferIterator` without a slice.
 				const encoded = encoder.encode(init);
 				this.body = asyncIteratorToStream(arrayBufferIterator(encoded.buffer));
+				this.#rawBody = encoded.buffer;
 				contentLength = encoded.byteLength;
 				contentType = 'text/plain;charset=UTF-8';
 			} else if (init instanceof Blob) {
@@ -122,6 +133,7 @@ export abstract class Body implements globalThis.Body {
 				// the wire path stays non-chunked, which OAuth endpoints require.
 				const encoded = encoder.encode(String(init));
 				this.body = asyncIteratorToStream(arrayBufferIterator(encoded.buffer));
+				this.#rawBody = encoded.buffer;
 				contentLength = encoded.byteLength;
 				contentType = 'application/x-www-form-urlencoded;charset=UTF-8';
 			} else if (init instanceof ReadableStream) {
@@ -137,6 +149,7 @@ export abstract class Body implements globalThis.Body {
 				const ab = bufferSourceToArrayBuffer(init);
 				contentLength = ab.byteLength;
 				this.body = asyncIteratorToStream(arrayBufferIterator(ab));
+				this.#rawBody = ab;
 			}
 		}
 
@@ -160,6 +173,14 @@ export abstract class Body implements globalThis.Body {
 		if (!this.body) {
 			this.bodyUsed = true;
 			return new ArrayBuffer(0);
+		}
+		// Fast path: in-memory body — return the raw bytes directly instead of
+		// round-tripping through the native ReadableStream (which stalls on a
+		// large single chunk here; see `#rawBody`). Covers arrayBuffer/text/
+		// json/blob, which all funnel through this method.
+		if (this.#rawBody) {
+			this.bodyUsed = true;
+			return this.#rawBody;
 		}
 		let bytes = 0;
 		const chunks: Uint8Array[] = [];

@@ -293,12 +293,17 @@ static void populate_native_extensions() {
 		if (i) s_native_exts_joined.push_back(' ');
 		s_native_exts_joined += s_native_ext_list[i];
 	}
-	// [gl-ext-dump] one-shot — grep target for hardware capture.
+	// [gl-ext-dump] one-shot extension dump — a boot-time diagnostic (~134
+	// lines) used during hardware capture. Disabled for the clean/production
+	// build; the joined list above is still built for capability checks. Set
+	// GL_EXT_DUMP to 1 to re-enable for a hardware-extension audit.
+#if defined(GL_EXT_DUMP) && GL_EXT_DUMP
 	fprintf(stderr, "[gl-ext-dump] count=%d\n", (int)s_native_ext_list.size());
 	for (const auto &e : s_native_ext_list) {
 		fprintf(stderr, "[gl-ext-dump] %s\n", e.c_str());
 	}
 	fflush(stderr);
+#endif
 }
 
 // Phase-1 batch-1 helper — probe whether the driver's native GL extension
@@ -2785,6 +2790,45 @@ FN(w_bind_buffer) {
 	glBindBuffer(target, buf);
 	if (st && target == GL_ARRAY_BUFFER) st->user_snap.array_buffer = (GLint)buf;
 }
+// WebGL2 (srcData, srcOffset[, length]) overload support. Emscripten's GLES3
+// path passes the WHOLE HEAP typed-array as srcData plus a byte srcOffset
+// (and, for buffer/compressed uploads, a length) — see WebGL2 §5.14 bufferData
+// / bufferSubData / texImage* overloads. Without honoring srcOffset/length the
+// handler would upload the whole heap from offset 0 (all zeros), which made
+// every emscripten/Unity WebGL2 vertex + texture upload arrive blank (black
+// screen). WebGL1's emscripten path uses HEAPU8.subarray(...) (already offset)
+// so it was unaffected. Three.js passes the real (already-offset) view in the
+// 3-arg form, so this no-ops for it.
+static size_t ta_elem_size(Local<Value> v) {
+	if (!v.IsEmpty() && v->IsTypedArray()) {
+		Local<TypedArray> ta = v.As<TypedArray>();
+		size_t n = ta->Length();
+		if (n > 0) return ta->ByteLength() / n;
+	}
+	return 1; // DataView / Uint8Array / fallback = byte-addressed
+}
+// Adjust (*pp,*plen) for a call whose srcData is at `srcIdx` and whose numeric
+// srcOffset is at `offIdx` (length, if any, at offIdx+1). srcOffset/length are
+// in ELEMENTS of srcData. No-op unless a numeric srcOffset is actually present.
+static void apply_webgl2_src_offset(const FunctionCallbackInfo<Value> &info,
+                                    int srcIdx, int offIdx, uint8_t **pp,
+                                    size_t *plen, bool have_length) {
+	if (!*pp) return;
+	if (info.Length() <= offIdx || !info[offIdx]->IsNumber()) return;
+	const size_t es = ta_elem_size(info[srcIdx]);
+	const size_t srcOff = (size_t)a_i64(info, offIdx) * es;
+	if (srcOff > *plen) { *plen = 0; return; }
+	*pp += srcOff;
+	*plen -= srcOff;
+	if (have_length && info.Length() > offIdx + 1 &&
+	    info[offIdx + 1]->IsNumber()) {
+		const int64_t lenEl = a_i64(info, offIdx + 1);
+		if (lenEl > 0) {
+			const size_t sub = (size_t)lenEl * es;
+			if (sub < *plen) *plen = sub;
+		}
+	}
+}
 FN(w_buffer_data) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
@@ -2802,6 +2846,7 @@ FN(w_buffer_data) {
 		p = (uint8_t *)ab->Data();
 		len = ab->ByteLength();
 	}
+	apply_webgl2_src_offset(info, 1, 3, &p, &len, true);
 	glBufferData(target, (GLsizeiptr)len, p, usage);
 }
 FN(w_buffer_sub_data) {
@@ -2815,6 +2860,7 @@ FN(w_buffer_sub_data) {
 		p = (uint8_t *)ab->Data();
 		len = ab->ByteLength();
 	}
+	apply_webgl2_src_offset(info, 2, 3, &p, &len, true);
 	if (p) glBufferSubData(target, offset, (GLsizeiptr)len, p);
 }
 
@@ -4665,6 +4711,28 @@ FN(w_framebuffer_texture_layer) {
 	const GLint layer = a_i32(info, 4);
 	glFramebufferTextureLayer(target, attachment, tex, level, layer);
 }
+// The JS "default framebuffer" (name 0) is redirected to our tenant USER FBO.
+// GL_COLOR/GL_DEPTH/GL_STENCIL are only valid attachment tokens on the true
+// default framebuffer; on a user FBO they are GL_INVALID_ENUM. Translate them
+// to the user-FBO forms when the tenant is bound. GLES3-only ops (invalidate*)
+// → v2 context only, which is part of why WebGL1 rendered and WebGL2 didn't.
+// Same class as w_draw_buffers Ledger #109.
+static GLenum xlate_default_fb_attachment(GLenum a) {
+	switch (a) {
+	case GL_COLOR:   return GL_COLOR_ATTACHMENT0;  // 0x1800 -> 0x8CE0
+	case GL_DEPTH:   return GL_DEPTH_ATTACHMENT;   // 0x1801 -> 0x8D00
+	case GL_STENCIL: return GL_STENCIL_ATTACHMENT; // 0x1802 -> 0x8D20
+	default:         return a;
+	}
+}
+static const GLenum *xlate_default_fb_attachments(const int32_t *p, size_t n,
+                                                  GLenum scratch[16]) {
+	if (!(st && st->bound_fbo_js == 0) || n == 0 || n > 16)
+		return (const GLenum *)p;
+	for (size_t i = 0; i < n; ++i)
+		scratch[i] = xlate_default_fb_attachment((GLenum)p[i]);
+	return scratch;
+}
 FN(w_invalidate_framebuffer) {
 	enter_bracket();
 	const GLenum target = a_u32(info, 0);
@@ -4672,7 +4740,9 @@ FN(w_invalidate_framebuffer) {
 	const int32_t *p = nullptr;
 	size_t n = 0;
 	if (!i32_list(info.GetIsolate(), info[1], tmp, &p, &n)) return;
-	glInvalidateFramebuffer(target, (GLsizei)n, (const GLenum *)p);
+	GLenum scratch[16];
+	const GLenum *out = xlate_default_fb_attachments(p, n, scratch);
+	glInvalidateFramebuffer(target, (GLsizei)n, out);
 }
 FN(w_invalidate_sub_framebuffer) {
 	enter_bracket();
@@ -4685,12 +4755,19 @@ FN(w_invalidate_sub_framebuffer) {
 	const GLint y = a_i32(info, 3);
 	const GLsizei w = a_i32(info, 4);
 	const GLsizei h = a_i32(info, 5);
-	glInvalidateSubFramebuffer(target, (GLsizei)n, (const GLenum *)p,
-	                            x, y, w, h);
+	GLenum scratch[16];
+	const GLenum *out = xlate_default_fb_attachments(p, n, scratch);
+	glInvalidateSubFramebuffer(target, (GLsizei)n, out, x, y, w, h);
 }
 FN(w_read_buffer) {
 	enter_bracket();
-	glReadBuffer(a_u32(info, 0));
+	GLenum src = a_u32(info, 0);
+	// Tenant redirect: glReadBuffer(GL_BACK) is INVALID_OPERATION on a user
+	// FBO; map BACK → COLOR_ATTACHMENT0 (the tenant's back buffer). Same class
+	// as w_draw_buffers Ledger #109. GLES3-only → v2 context only.
+	if (st && st->bound_fbo_js == 0 && src == GL_BACK)
+		src = GL_COLOR_ATTACHMENT0;
+	glReadBuffer(src);
 }
 FN(w_renderbuffer_storage_multisample) {
 	enter_bracket();

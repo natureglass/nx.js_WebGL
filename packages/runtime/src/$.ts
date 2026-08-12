@@ -528,6 +528,7 @@ export interface Init {
 
 	// memory.c
 	memoryUsage(): MemoryUsage;
+	lowMemoryNotification(): void;
 
 	// main.c
 	argv: string[];
@@ -761,6 +762,9 @@ export interface Init {
 	): void;
 	audioSourceState(node: AudioNodeHandle): number;
 	audioOscillatorSetType(node: AudioNodeHandle, type: number): void;
+	/** Fill `out` with the analyser's most-recent time-domain samples
+	 * (newest last, each in [-1, 1]). `out.length` samples are returned. */
+	audioAnalyserFloatTimeData(node: AudioNodeHandle, out: Float32Array): void;
 	audioDecode(buffer: ArrayBuffer): Promise<{
 		channelData: ArrayBuffer[];
 		length: number;
