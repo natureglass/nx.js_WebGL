@@ -1,5 +1,6 @@
 import { $, type USBNativeDevice } from '../$';
 import { DOMException } from '../dom-exception';
+import { getDeviceChooser } from './device-chooser';
 import { INTERNAL_SYMBOL } from '../internal';
 import type { BufferSource } from '../types';
 import { assertInternalConstructor, def } from '../utils';
@@ -154,6 +155,17 @@ function deviceFromNative(native: USBNativeDescriptor): USBDevice {
 /** Stable per-physical-device identity used by the hotplug diff. */
 function deviceKey(native: USBNativeDescriptor): string {
 	return `${native.busId}:${native.deviceId}`;
+}
+
+function hex4(n: number): string {
+	return (n >>> 0).toString(16).padStart(4, '0');
+}
+
+/** Secondary chooser line: "vvvv:pppp · Manufacturer" (string descriptors are
+ * usually empty until `open()`, so this is typically just the ids). */
+function usbDetail(native: USBNativeDescriptor): string {
+	const ids = `${hex4(native.vendorId)}:${hex4(native.productId)}`;
+	return native.manufacturerName ? `${ids} · ${native.manufacturerName}` : ids;
 }
 
 /** A USB endpoint descriptor exposed by {@link USBAlternateInterface}. */
@@ -573,14 +585,48 @@ export class USB extends EventTarget {
 		if (!Array.isArray(filters)) {
 			throw new TypeError('USB device filters must be an array');
 		}
+		// Enumerate every device matching ANY filter, deduped by physical
+		// device (bus:device) so a composite device isn't offered twice.
+		const seen = new Set<string>();
+		const matches: USBNativeDescriptor[] = [];
 		for (const filter of filters) {
 			validateFilter(filter);
-			const devices = $.usbGetDevices(filter).map((native) =>
-				deviceFromNative(native as USBNativeDescriptor),
-			);
-			if (devices.length > 0) return devices[0];
+			for (const native of $.usbGetDevices(filter) as USBNativeDescriptor[]) {
+				const key = deviceKey(native);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				matches.push(native);
+			}
 		}
-		throw new DOMException('No USB devices matching the filters were found.', 'NotFoundError');
+		if (matches.length === 0) {
+			throw new DOMException('No USB devices matching the filters were found.', 'NotFoundError');
+		}
+		const chooser = getDeviceChooser();
+		if (!chooser) {
+			// No host picker registered (bare nx.js): preserve the historical
+			// first-match behaviour so standalone apps don't regress.
+			return deviceFromNative(matches[0]);
+		}
+		const chosenId = await chooser({
+			kind: 'usb',
+			mode: 'select',
+			title: 'Select a USB device',
+			candidates: matches.map((native) => ({
+				id: deviceKey(native),
+				name:
+					native.productName ||
+					`USB device ${hex4(native.vendorId)}:${hex4(native.productId)}`,
+				detail: usbDetail(native),
+			})),
+		});
+		if (chosenId == null) {
+			throw new DOMException('No device was selected.', 'NotFoundError');
+		}
+		const chosen = matches.find((native) => deviceKey(native) === chosenId);
+		if (!chosen) {
+			throw new DOMException('The selected device is no longer available.', 'NotFoundError');
+		}
+		return deviceFromNative(chosen);
 	}
 
 	// ---- hotplug (connect / disconnect) ----------------------------------

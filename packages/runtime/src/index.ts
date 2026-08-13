@@ -34,6 +34,10 @@ export type * from './navigator';
 export type * from './navigator/battery';
 export type * from './navigator/bluetooth';
 export type * from './navigator/usb';
+export type * from './navigator/serial';
+export type * from './navigator/hid';
+export type * from './navigator/midi';
+export type * from './nfc';
 export type {
 	Gamepad,
 	GamepadButton,
@@ -102,6 +106,7 @@ def(clearInterval, 'clearInterval');
 def($.queueMicrotask, 'queueMicrotask');
 
 import './navigator';
+import './nfc';
 
 import './source-map';
 import { $ } from './$';

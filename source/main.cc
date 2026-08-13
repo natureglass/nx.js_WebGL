@@ -68,6 +68,7 @@ NX_MODULE(gamepad);
 NX_MODULE(image);
 NX_MODULE(irs);
 NX_MODULE(memory);
+NX_MODULE(nfc);
 NX_MODULE(nifm);
 NX_MODULE(ns);
 NX_MODULE(path2d);
@@ -1091,6 +1092,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_image(iso, init_obj);
 	nx_init_irs(iso, init_obj);
 	nx_init_memory(iso, init_obj);
+	nx_init_nfc(iso, init_obj);
 	nx_init_nifm(iso, init_obj);
 	nx_init_ns(iso, init_obj);
 	nx_init_path2d(iso, init_obj);

@@ -11,6 +11,9 @@ import {
 import { Application, type Vibration } from './switch';
 import { bluetooth } from './navigator/bluetooth';
 import { usb } from './navigator/usb';
+import { serial } from './navigator/serial';
+import { hid } from './navigator/hid';
+import { requestMIDIAccess, type MIDIAccess, type MIDIOptions } from './navigator/midi';
 
 interface NavigatorState {
 	batt?: Promise<BatteryManager>;
@@ -243,6 +246,35 @@ export class Navigator {
 	 */
 	get usb() {
 		return usb;
+	}
+
+	/**
+	 * Entry point to the Web Serial API, for reading from and writing to USB
+	 * CDC-ACM serial devices attached to the Switch's USB-C port.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/Navigator/serial
+	 */
+	get serial() {
+		return serial;
+	}
+
+	/**
+	 * Entry point to the WebHID API, for low-level input/output/feature report
+	 * exchange with USB HID devices attached to the Switch's USB-C port.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/Navigator/hid
+	 */
+	get hid() {
+		return hid;
+	}
+
+	/**
+	 * Requests access to USB-MIDI devices attached to the Switch's USB-C port.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/Navigator/requestMIDIAccess
+	 */
+	requestMIDIAccess(options?: MIDIOptions): Promise<MIDIAccess> {
+		return requestMIDIAccess(options);
 	}
 }
 def(Navigator);

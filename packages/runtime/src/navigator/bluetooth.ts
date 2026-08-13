@@ -5,6 +5,7 @@ import {
 	type BtleService,
 } from '../$';
 import { DOMException } from '../dom-exception';
+import { getDeviceChooser } from './device-chooser';
 import { INTERNAL_SYMBOL as INTERNAL } from '../internal';
 import { Event } from '../polyfills/event';
 import { EventTarget } from '../polyfills/event-target';
@@ -1181,59 +1182,131 @@ export class Bluetooth extends EventTarget {
 		}
 		ensureInit();
 
-		const deadline = Date.now() + 15000;
-		const sliceMs = Math.max(5000, 15000 / modes.length);
-		let match: { address: string; name?: string } | undefined;
-		while (!match && Date.now() < deadline) {
-			for (const mode of modes) {
-				if ('uuid' in mode) {
-					$.btleScanStart(mode.uuid);
-				} else {
-					$.btleScanStart(null, mode.companyId, mode.pattern);
-				}
-				pumpRef();
-				try {
-					match = await waitFor(
-						() => {
-							const results = $.btleScanResults();
-							for (const result of results) {
-								if (
-									acceptAll ||
-									filters!.some((f) =>
-										matchesFilter(result, f),
-									)
-								) {
-									return result;
-								}
-							}
-							return undefined;
-						},
-						Math.min(sliceMs, deadline - Date.now()),
-						'scan slice elapsed',
-					).catch(() => undefined);
-				} finally {
+		const matchesResult = (result: { name?: string }): boolean =>
+			acceptAll || filters!.some((f) => matchesFilter(result, f));
+		const makeDevice = (address: string, name?: string): BluetoothDevice => {
+			const Ctor = BluetoothDevice as any;
+			return new Ctor(
+				INTERNAL,
+				address,
+				name,
+				false,
+				collectServiceUuids(options),
+			) as BluetoothDevice;
+		};
+
+		const chooser = getDeviceChooser();
+
+		if (!chooser) {
+			// No host picker registered (bare nx.js): scan and bind the FIRST
+			// matching device, exactly as before.
+			const deadline = Date.now() + 15000;
+			const sliceMs = Math.max(5000, 15000 / modes.length);
+			let match: { address: string; name?: string } | undefined;
+			while (!match && Date.now() < deadline) {
+				for (const mode of modes) {
+					if ('uuid' in mode) {
+						$.btleScanStart(mode.uuid);
+					} else {
+						$.btleScanStart(null, mode.companyId, mode.pattern);
+					}
+					pumpRef();
 					try {
-						$.btleScanStop();
-					} catch {}
-					pumpUnref();
+						match = await waitFor(
+							() => {
+								for (const result of $.btleScanResults()) {
+									if (matchesResult(result)) return result;
+								}
+								return undefined;
+							},
+							Math.min(sliceMs, deadline - Date.now()),
+							'scan slice elapsed',
+						).catch(() => undefined);
+					} finally {
+						try {
+							$.btleScanStop();
+						} catch {}
+						pumpUnref();
+					}
+					if (match) break;
 				}
-				if (match) break;
+			}
+			if (!match) {
+				throw new DOMException(
+					'No Bluetooth devices matching the filters were found.',
+					'NotFoundError',
+				);
+			}
+			return makeDevice(match.address, match.name);
+		}
+
+		// Host picker registered: collect EVERY matching device across a
+		// bounded scan window (deduped by address), then let the user choose.
+		// Each scan mode runs for one slice and results accumulate — the check
+		// never resolves early so slow advertisers still surface. (A live-
+		// updating picker that streams results as they arrive is a later
+		// refinement; here the list is gathered first, then shown.)
+		const deadline = Date.now() + 8000;
+		const sliceMs = Math.max(2000, Math.floor(8000 / modes.length));
+		const found = new Map<string, { address: string; name?: string }>();
+		for (const mode of modes) {
+			if (Date.now() >= deadline) break;
+			if ('uuid' in mode) {
+				$.btleScanStart(mode.uuid);
+			} else {
+				$.btleScanStart(null, mode.companyId, mode.pattern);
+			}
+			pumpRef();
+			try {
+				await waitFor(
+					() => {
+						for (const result of $.btleScanResults()) {
+							if (matchesResult(result) && !found.has(result.address)) {
+								found.set(result.address, {
+									address: result.address,
+									name: result.name,
+								});
+							}
+						}
+						return undefined; // run the whole slice
+					},
+					Math.min(sliceMs, deadline - Date.now()),
+					'scan slice elapsed',
+				).catch(() => undefined);
+			} finally {
+				try {
+					$.btleScanStop();
+				} catch {}
+				pumpUnref();
 			}
 		}
-		if (!match) {
+		if (found.size === 0) {
 			throw new DOMException(
 				'No Bluetooth devices matching the filters were found.',
 				'NotFoundError',
 			);
 		}
-		const Ctor = BluetoothDevice as any;
-		return new Ctor(
-			INTERNAL,
-			match.address,
-			match.name,
-			false,
-			collectServiceUuids(options),
-		) as BluetoothDevice;
+		const chosenId = await chooser({
+			kind: 'bluetooth',
+			mode: 'select',
+			title: 'Select a Bluetooth device',
+			candidates: [...found.values()].map((d) => ({
+				id: d.address,
+				name: d.name || 'Unknown device',
+				detail: d.address,
+			})),
+		});
+		if (chosenId == null) {
+			throw new DOMException('No device was selected.', 'NotFoundError');
+		}
+		const chosen = found.get(chosenId);
+		if (!chosen) {
+			throw new DOMException(
+				'The selected device is no longer available.',
+				'NotFoundError',
+			);
+		}
+		return makeDevice(chosen.address, chosen.name);
 	}
 }
 def(Bluetooth);

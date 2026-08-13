@@ -927,6 +927,24 @@ export interface Init {
 	): number;
 	usbResetDevice(device: USBNativeDevice): void;
 
+	// nfc.cc — Web NFC over libnx nfc:user (NTAG / Type-2 passthrough)
+	/** Initialize nfc:user + enumerate the reader device. Returns `false`
+	 * (without throwing) when NFC is unsupported, e.g. under Citron. */
+	nfcInit(): boolean;
+	nfcExit(): void;
+	/** True when NFC is enabled in settings AND a reader controller is present. */
+	nfcIsAvailable(): boolean;
+	nfcStartDetection(): void;
+	nfcStopDetection(): void;
+	/** Current NfcDeviceState (0..4; 2=TagFound, 4=TagMounted), -1 if unavailable. */
+	nfcGetState(): number;
+	/** Detected tag's UID + protocol/type, or `undefined` when no tag. */
+	nfcGetTagInfo(): { uid: ArrayBuffer; protocol: number; tagType: number } | undefined;
+	nfcKeepSession(): void;
+	nfcReleaseSession(): void;
+	/** Raw ISO14443-3A command passthrough (e.g. Type-2 READ [0x30,page]). */
+	nfcTransceive(command: BufferSource): ArrayBuffer;
+
 	// video.cc — Video element (ffmpeg media pipeline)
 	videoNew(): VideoHandle;
 	videoLoad(
