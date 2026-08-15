@@ -76,6 +76,7 @@ NX_MODULE(sensors);
 NX_MODULE(service);
 NX_MODULE(swkbd);
 NX_MODULE(tcp);
+NX_MODULE(text);
 NX_MODULE(tls);
 NX_MODULE(udp);
 NX_MODULE(url);
@@ -1100,6 +1101,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_service(iso, init_obj);
 	nx_init_swkbd(iso, init_obj);
 	nx_init_tcp(iso, init_obj);
+	nx_init_text(iso, init_obj);
 	nx_init_tls(iso, init_obj);
 	nx_init_udp(iso, init_obj);
 	nx_init_url(iso, init_obj);

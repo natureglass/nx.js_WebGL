@@ -1,3 +1,4 @@
+import { $ } from '../$';
 import { def } from '../utils';
 
 export interface TextDecodeOptions {
@@ -104,6 +105,21 @@ export class TextDecoder implements globalThis.TextDecoder {
 			bytes = new Uint8Array(input);
 		} else {
 			bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+		}
+
+		// Native fast path: decode the whole buffer into ONE string in C++.
+		// The JS decoders below build the output via `String.fromCharCode.apply`
+		// over the input, which makes V8 allocate ~1 Local handle PER BYTE; on a
+		// multi-MB body that grows V8's HandleScope block reserve by ~14 MiB per
+		// 1.9 MiB decoded and never returns it to the native heap -> eventual
+		// native OOM even while the JS heap stays flat (see
+		// project_brewser_native_oom_probe.md). The native binding produces a
+		// single string with no per-byte handles. Guarded by a capability check
+		// so an older engine without the binding still works via the JS fallback
+		// below. A `fatal` decode error is thrown as a TypeError from native and
+		// propagates unchanged (no catch-and-fallback — that would mask it).
+		if (typeof $.textDecode === 'function') {
+			return $.textDecode(bytes, this.encoding, this.fatal, this.ignoreBOM);
 		}
 
 		// UTF-16 takes a dedicated path; the rest of this method is the

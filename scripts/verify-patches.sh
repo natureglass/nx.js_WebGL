@@ -2,13 +2,13 @@
 # verify-patches.sh — post-pull re-application audit for the nx.js
 # V8-migration fork. Extracts the RE-APPLY / VERIFY NOTE grep for
 # every ledger entry and prints PRESENT / MISSING per entry across
-# both NXJS_PATCHES_NEEDED.md (engine) and brewser-runtime-v8/
+# both NXJS_PATCHES_NEEDED.md (engine) and brewser-runtime/
 # RUNTIME_SHIMS.md (runtime shims).
 #
 # Usage:
 #   scripts/verify-patches.sh                 # verify against defaults
 #   NXJS=/path/to/nxjs-extended \
-#     RUNTIME=/path/to/brewser-runtime-v8 \
+#     RUNTIME=/path/to/brewser-runtime \
 #     APPS=/path/to/brewser-apps \
 #     scripts/verify-patches.sh
 #
@@ -20,9 +20,10 @@ set -euo pipefail
 # Resolve default paths relative to script location if not overridden.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NXJS="${NXJS:-$(cd "$here/.." && pwd)}"
-RUNTIME="${RUNTIME:-$(cd "$here/../../brewser-runtime-v8" 2>/dev/null && pwd || echo "$here/../../brewser-runtime-v8")}"
+RUNTIME="${RUNTIME:-$(cd "$here/../../brewser-runtime" 2>/dev/null && pwd || echo "$here/../../brewser-runtime")}"
 APPS="${APPS:-$(cd "$here/../../brewser-apps" 2>/dev/null && pwd || echo "$here/../../brewser-apps")}"
-BREWSER_V8="${BREWSER_V8:-$(cd "$here/../../brewser-v8" 2>/dev/null && pwd || echo "$here/../../brewser-v8")}"
+# BREWSER_V8 is the historical var name; the folder was renamed brewser-v8 -> brewser (2026-08-01).
+BREWSER_V8="${BREWSER_V8:-$(cd "$here/../../brewser" 2>/dev/null && pwd || echo "$here/../../brewser")}"
 
 fail=0
 have_check=0
@@ -83,6 +84,11 @@ check_file_exists() {
 }
 
 echo "=== engine ledger: NXJS_PATCHES_NEEDED.md (in $NXJS) ==="
+
+# #120 — resolve_entrypoint skips leading `--` flag args (forwarder argv-trap).
+check 120 "main.cc resolve_entrypoint leading-'--' skip (nx120_sel)" \
+    "$NXJS/source/main.cc" \
+    'nx120_sel'
 
 # #1 — image.ts globalThis.fetch deferral
 check 1 "image.ts call-time globalThis.fetch" \

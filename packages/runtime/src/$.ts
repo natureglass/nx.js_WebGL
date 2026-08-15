@@ -346,6 +346,19 @@ export interface Init {
 		handle: DecompressFileHandle,
 	): Promise<ArrayBuffer | null>;
 
+	// text.cc — native TextDecoder.decode(). Decodes the whole buffer into a
+	// single string in C++, avoiding the JS polyfill's ~1-V8-handle-per-byte
+	// `String.fromCharCode.apply` path (which leaks V8 HandleScope block reserve
+	// on large inputs). `encoding` is one of "utf-8" | "utf-16le" | "utf-16be"
+	// (the TextDecoder constructor pre-normalizes the WHATWG label). Throws a
+	// TypeError on invalid input when `fatal`.
+	textDecode(
+		bytes: BufferSource,
+		encoding: string,
+		fatal: boolean,
+		ignoreBOM: boolean,
+	): string;
+
 	// crypto.c
 	cryptoKeyNew(
 		algorithm: Algorithm,

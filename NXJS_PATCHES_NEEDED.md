@@ -117,6 +117,7 @@ proposal verdict.
 | 114 | engine | fork-only (diagnostic extension) | n/a | `audio-graph.h: nx_audio_stream_pending` + `audio-graph.h: nx_audio_stream_underrun_count` + `audio-graph.cc: stream_underrun_count.fetch_add` | Ledger #114 (2026-07-10) — diagnostic extension: audio ring level (`nx_audio_stream_pending`) + render-quantum underrun counter (`nx_audio_stream_underrun_count`) accessors on stream nodes, plus a `stream_underrun_count` field incremented in `process_stream_source` when `avail < Q`. Feeds two new fields into `[md-diag:prs]` output — `aur_pending_min/max` and `aur_underruns` — which pinned #115's audio-underrun root cause. Retained as passive diagnostic; kept live so any future decoder-audio-attached bug surfaces the same fingerprint. |
 | 115 | engine | upstream-candidate (SHIPPED CITRON VERIFIED 2026-07-10) | not-submitted | `media-decoder.cc: Ledger #115 (2026-07-10)` + `media-decoder.cc: RING_SLOTS = 12` + `media-decoder.cc: last_clock` + `media-decoder.cc: ring_newest_pts` | Three-part follow-up cure for the residual periodic stutter that survived Fix B (#113). (a) RING_SLOTS 3 → 12: bigger video buffer prevents the decode thread from constantly blocking in `enqueue_video`, which was starving the shared decoder of time to process audio packets — audio ring was draining to 0 every ~1 s (708 underruns in 3 s on Citron). (b) Monotonic clock gate: `clock_now` clamps its return to `>= m->last_clock`; a small forward pause replaces every visible backward jump when audio resumes below wall-extrapolated `t`. (c) Wall-extrapolation cap during stall: wall time can't exceed `ring_newest_pts + vframe_dur`, so the resume-catch-up gap stays small. Cut #22c deadlock avoidance still works — present() drains ring at capped-wall rate. Post-fix telemetry: `aur_underruns` 708/3s → 0/3s (steady state); `aur_pending_min` 0 → 1077-9125; no_frame 18-24 → 0-6; `t` strictly monotonic. |
 | 117 | engine | upstream-candidate | not-submitted | `request.ts: globalThis as { location?: { href?: string } }` | Request-constructor base URL prefers `globalThis.location.href` over `$.entrypoint` when a `location` global is present (browsing-context shape). Fixes stock Three.js `FileLoader.load(rel)` and any `new Request(rel)` in an embedder — pre-#117 the ctor resolved relative URLs against the app's `main.js` (`romfs:/main.js`), sending fetches to `romfs:/...` where restrictive manifests deny them. Matches WHATWG Fetch spec (env settings object base URL = `document.baseURI` in a browsing context). CLI apps unaffected — no `location` global, resolver falls back to `$.entrypoint` unchanged. |
+| 120 | engine | upstream-candidate | not-submitted | `main.cc: nx120_sel` + `main.cc: #120 (forwarder argv-trap fix)` | `resolve_entrypoint` skips leading `--` flag args when selecting the bootstrap entrypoint (all-flags → standalone `romfsMountSelf`) — lets an app forwarder chainload brewser with `--fwd=1 --app=<id>` without the flags hijacking the entrypoint |
 
 ## DISPOSITION POLICY
 
@@ -144,6 +145,40 @@ UPSTREAM STATUS values:
 - `merged-in(vX)` — landed in upstream at version X; check whether the
   next pull obsoletes this entry.
 - `n/a` — not applicable (brewser-specific / fork-only disposition).
+
+---
+
+## #120 — `resolve_entrypoint` skips leading `--` flag args (forwarder argv-trap fix) — SHIPPED 2026-08-13
+
+**File(s):** [source/main.cc](source/main.cc) — `resolve_entrypoint` (~line 1431), the bootstrap-entrypoint selection.
+
+**Motivation.** The Brewser app-forwarder feature chainloads `brewser.nro` with launch args so JS can read them via `Switch.argv`, e.g. `envSetNextLoad("sdmc:/switch/brewser/brewser.nro", "\"sdmc:/switch/brewser/brewser.nro\" --fwd=1 --app=<id>")`. Pre-#120, `resolve_entrypoint` treated **`argv[1]` as an entrypoint override** unconditionally: a `--`-prefixed token like `--fwd=1` matched neither `nsp:` nor `*.nro`, so it fell into the literal-path branch, did `read_file("--fwd=1")` (ENOENT), and brewser failed to boot instead of loading its own `romfs:/main.js`. Any nx.js embedder wanting to pass CLI-style flags to a chainloaded app hit the same trap.
+
+**Root cause + fix.** The entrypoint selector was hardcoded to `argv[1]`. Fix: scan from `argv[1]`, skip any leading tokens beginning with `--`, and use the first non-`--` token as the entrypoint selector (unchanged `nsp:` / `*.nro` / literal-path dispatch). If none remains (all args are `--` flags, or there were none), fall through to the existing standalone `romfsMountSelf` path — byte-for-byte the same boot a normal launch takes. Flags stay visible in `Switch.argv` (the full vector is always populated). Single-dash (`-x`) and non-dash paths are untouched.
+
+```c
+// pre-fix: if (argc > 1 && argv[1] && argv[1][0]) { ... argv[1] ... }
+// post-fix:
+int nx120_sel = 1;
+while (nx120_sel < argc && argv[nx120_sel] && argv[nx120_sel][0] == '-' &&
+       argv[nx120_sel][1] == '-') {
+    nx120_sel++;
+}
+const char *entry_arg =
+    (nx120_sel < argc && argv[nx120_sel]) ? argv[nx120_sel] : NULL;
+if (entry_arg && entry_arg[0]) { /* nsp: / *.nro / literal — now on entry_arg */ }
+else { /* standalone romfsMountSelf — also the all-flags forwarder case */ }
+```
+
+**Blast radius.** Backward-compatible. `nsp:`, `*.nro`, and literal-entrypoint `argv[1]` are unchanged (none begin with `--`). The only new behavior: a chainload whose post-argv[0] tokens are all `--` flags now boots the standalone self-mount path (the desired forwarder behavior) instead of erroring. The slim launcher convention (`"runtime" "app.nro"`) is unaffected — `app.nro` is not `--`-prefixed.
+
+**DISPOSITION:** `upstream-candidate` — generic: any nx.js embedder passing `--`-style flags to a chainloaded app benefits, and existing entrypoint semantics are preserved. Motivated by the Brewser forwarder (see `brewser/FORWARDER_CONTRACT.md`).
+
+**UPSTREAM STATUS:** `not-submitted` — file a PR to `TooTallNate/nx.js`.
+
+**RE-APPLY / VERIFY NOTE.** *To verify*: `grep -n "nx120_sel" source/main.cc` — the leading-`--` skip loop should precede the `entry_arg` entrypoint dispatch in `resolve_entrypoint`. `scripts/verify-patches.sh` has a `check 120` for the same marker. *To re-apply*: replace the `if (argc > 1 && argv[1] && argv[1][0])` header + its three `argv[1]` uses with the `nx120_sel` skip loop + `entry_arg` dispatch above.
+
+**Recurrence tell.** A forwarder (or any chainload passing `--flags`) boots to a "Failed to load `--fwd=1`" / entrypoint-not-found error instead of the app; or `Switch.entrypoint` is a flag string rather than `romfs:/main.js`. Grep `source/main.cc` for `nx120_sel` — if absent (just `argv[1]` selection remains), regressed.
 
 ---
 
@@ -657,7 +692,7 @@ Without a `Content-Length`, fetch takes the else branch and sends the POST body 
 
 Only affects bodies whose length is knowable at construction time but which the runtime forgot to measure. Blob and ArrayBuffer/typed-array bodies already correctly set `contentLength` (lines 108-109 and 122-124). ReadableStream and FormData bodies genuinely have unknown lengths and correctly stay chunked. String and URLSearchParams are the two known-length shapes that were silently going out chunked.
 
-This is a longstanding upstream nx.js bug, not a V8-migration regression — pre-migration `nxjs-source/packages/runtime/src/fetch/body.ts:143-145` has the same shape. It stayed hidden because Brewser's default boot-fetch surface (GitHub raw, brewser.tech) was hit with GET requests where the issue doesn't manifest. First POST with a string body (device-code auth) exposed it.
+This is a longstanding upstream nx.js bug, not a V8-migration regression — pre-migration `nxjs-source/packages/runtime/src/fetch/body.ts:143-145` has the same shape. It stayed hidden because Brewser's default boot-fetch surface (GitHub raw, brewser.io) was hit with GET requests where the issue doesn't manifest. First POST with a string body (device-code auth) exposed it.
 
 **Exact change.** For the string and URLSearchParams branches, encode once at construction time via `encoder.encode(...)`, set `contentLength = encoded.byteLength`, and feed the encoded bytes to the existing `arrayBufferIterator`. `TextEncoder.prototype.encode` returns a fresh Uint8Array whose backing buffer is exactly the encoded byte range, so `.buffer` is safe to hand off without a slice. `contentLength` propagates to `this.headers.set('content-length', ...)` at [body.ts:133-134](packages/runtime/src/fetch/body.ts), which is the same headers object `Request` inherits (Request extends Body — see [packages/runtime/src/fetch/request.ts:124,164](packages/runtime/src/fetch/request.ts)). fetch.ts's `hasContentLength` check then sees the header and takes the non-chunked path.
 
@@ -683,7 +718,7 @@ Symptom side effect: `stringIterator` is no longer called for these branches. Th
 
 **File(s):** [source/tls.cc](source/tls.cc), [source/types.h](source/types.h), NEW [data/cacert.bin](data/cacert.bin) (189,462 B, byte-identical to QuickJS-era `nxjs-source/data/cacert.bin`).
 
-**Motivation.** After the V8 migration, all outbound HTTPS from device flows started failing silently. Symptom on real Nintendo Switch hardware: `google-auth.js` and `github-auth.js` both `POST` to their respective `/device/code` endpoints, and the fetch never resolves — no response line, no throw. Boot log shows `Loaded 54 system CA certificates` — that's whatever Nintendo's `ssl:` service (`sslGetCertificates()` over IDs 1-3 + 1000-1059) chooses to expose. Nintendo curates this set for its own endpoints (eShop, NPNS, etc.) and it does not consistently cover general HTTPS roots (Google Trust Services, ISRG, some Sectigo chains). The QuickJS-era engine supplemented this set with a bundled Mozilla `cacert.bin` (baked in via `bin2s` and parsed via `mbedtls_x509_crt_parse`); the V8 migration dropped both the bundle and the parse from [source/tls.cc](source/tls.cc). Since nothing in `runtime-defaults.ts`'s boot fetch surface hits Google or Sectigo-signed hosts (all defaults are `api.github.com`/`raw.githubusercontent.com`/`brewser.tech` — Digicert/Let's Encrypt), the regression sat undiscovered until device-auth flow was actually exercised end-to-end.
+**Motivation.** After the V8 migration, all outbound HTTPS from device flows started failing silently. Symptom on real Nintendo Switch hardware: `google-auth.js` and `github-auth.js` both `POST` to their respective `/device/code` endpoints, and the fetch never resolves — no response line, no throw. Boot log shows `Loaded 54 system CA certificates` — that's whatever Nintendo's `ssl:` service (`sslGetCertificates()` over IDs 1-3 + 1000-1059) chooses to expose. Nintendo curates this set for its own endpoints (eShop, NPNS, etc.) and it does not consistently cover general HTTPS roots (Google Trust Services, ISRG, some Sectigo chains). The QuickJS-era engine supplemented this set with a bundled Mozilla `cacert.bin` (baked in via `bin2s` and parsed via `mbedtls_x509_crt_parse`); the V8 migration dropped both the bundle and the parse from [source/tls.cc](source/tls.cc). Since nothing in `runtime-defaults.ts`'s boot fetch surface hits Google or Sectigo-signed hosts (all defaults are `api.github.com`/`raw.githubusercontent.com`/`brewser.io` — Digicert/Let's Encrypt), the regression sat undiscovered until device-auth flow was actually exercised end-to-end.
 
 **Exact change.**
 
