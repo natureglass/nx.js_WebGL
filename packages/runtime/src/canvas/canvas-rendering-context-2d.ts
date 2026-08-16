@@ -111,15 +111,18 @@ export class CanvasRenderingContext2D {
 		}
 		let font = findFont(fonts, parsed);
 		if (!font) {
-			if (
-				parsed.family.includes('system-ui') ||
-				parsed.family.includes('sans-serif')
-			) {
-				font = addSystemFont(fonts);
-			} else if (parsed.family.includes('system-icons')) {
+			if (parsed.family.includes('system-icons')) {
 				font = addIconFont(fonts);
 			} else {
-				return;
+				// Generic-family fallback. The engine registers no serif /
+				// named faces, so any unmatched family (serif, Georgia,
+				// monospace, Times, …) — and system-ui / sans-serif — falls
+				// back to the embedded system face instead of DROPPING the
+				// font-set. Matches a browser's generic-family fallback.
+				// Without this the set was silently ignored and text drew at
+				// the stale 10px default (e.g. app N/E/S/W CanvasTexture
+				// sprites using '600 46px Georgia, serif' came out invisible).
+				font = addSystemFont(fonts);
 			}
 		}
 		$.canvasContext2dSetFont(this, font, px, v);

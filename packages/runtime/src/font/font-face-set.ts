@@ -116,6 +116,14 @@ export function findFont(
 }
 
 export function addSystemFont(fonts: FontFaceSet): FontFace {
+	// Idempotent: the generic-family fallback in the 2D `font` setter now
+	// calls this on every unmatched font-set (weight variants included, since
+	// findFont requires an exact weight match), so re-copying the multi-MB
+	// shared font and appending duplicate FontFaces each time would bloat the
+	// set. Reuse the already-registered system-ui face if present.
+	for (const f of fonts) {
+		if (f.family === 'system-ui') return f;
+	}
 	const data = $.getSystemFont(0 /* PlSharedFontType_Standard */);
 	const f = new FontFace('system-ui', data);
 	fonts.add(f);

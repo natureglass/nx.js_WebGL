@@ -3,8 +3,11 @@ import { createInternal, def, proto } from '../utils';
 import { ImageData } from './image-data';
 import { OffscreenCanvas } from './offscreen-canvas';
 import type { Screen } from '../screen';
-import type { Image } from '../image';
-import type { ImageBitmap } from './image-bitmap';
+// Ledger #85 (WebGL2 parity) — Image / ImageBitmap must be VALUE imports so
+// the canvas-source short-circuit below can `instanceof` them and construct
+// an nx_image_t via `proto($.imageNew(...), ImageBitmap)`.
+import { Image } from '../image';
+import { ImageBitmap } from './image-bitmap';
 
 // Local mirrors of the lib.dom WebGL typedefs. The runtime's public type
 // surface must not reference lib.dom (consumers compile with
@@ -1204,13 +1207,90 @@ function sourceToPixels(src: any): {
 	};
 }
 
+// Ledger #85 — canvas-source short-circuit (ported from webgl-rendering-
+// context.ts to bring the WebGL2 path to parity). A brewser-runtime page
+// <canvas> (LiveElement / CanvasShim) is not a native nx_image_t / nx_canvas_t,
+// so the OffscreenCanvas drawImage() route in sourceToPixels rejects it with
+// "Image or Canvas expected" (thrown at canvas.cc:nx_canvas_context_2d_draw_
+// image) — leaving the texture incomplete so GL samples it as (0,0,0,1).
+// Three.js r128 selects the WebGL2 context first, so every CanvasTexture
+// (sprite glyphs, radial-gradient glows, milky-way alpha mask) hit this.
+// Wrap the canvas's raw pixels into a fresh nx_image_t ImageBitmap and let the
+// ImageBitmap short-circuit in the wraps below route it through native
+// convert_image_source_to_gl_pixels — handling flipY, premultiply, and format
+// conversion exactly as for an ImageBitmap from createImageBitmap.
+//
+// Dims come from ctx.canvas (the underlying nxjs OffscreenCanvas) rather than
+// src.width/height so min-size conformance uploads (which resize only the
+// native canvas, leaving the LiveElement wrapper at the 300×150 HTML default)
+// don't read out of bounds.
+function canvasToNxImageBitmap(src: any): ImageBitmap | null {
+	const ctx2d = src.getContext('2d');
+	if (!ctx2d || typeof ctx2d.getImageData !== 'function') return null;
+	const inner = (ctx2d as { canvas?: { width: number; height: number } })
+		.canvas;
+	const w = inner && typeof inner.width === 'number' ? inner.width : src.width;
+	const h = inner && typeof inner.height === 'number'
+		? inner.height
+		: src.height;
+	if (!(w > 0 && h > 0)) return null;
+	const id = ctx2d.getImageData(0, 0, w, h) as ImageData;
+	const bmp = proto($.imageNew(w, h), ImageBitmap);
+	// getImageData returns unpremultiplied RGBA; nx_image_t storage is
+	// premultiplied BGRA. imageWriteRGBA(..., true) does the unpremul-RGBA →
+	// premul-BGRA transform + swizzle in one pass.
+	$.imageWriteRGBA(bmp, id.data.buffer, true);
+	return bmp;
+}
+
+function isCanvasSource(v: any): boolean {
+	return (
+		v !== null &&
+		typeof v === 'object' &&
+		!(v instanceof ImageBitmap) &&
+		!(v instanceof ImageData) &&
+		!ArrayBuffer.isView(v) &&
+		typeof v.getContext === 'function'
+	);
+}
+
 {
 	const p: any = WebGL2RenderingContext.prototype;
 	const nativeTexImage2D = p.texImage2D;
 	const nativeTexSubImage2D = p.texSubImage2D;
 	if (typeof nativeTexImage2D === 'function') {
 		p.texImage2D = function (...args: any[]) {
-			const last = args[args.length - 1];
+			let last = args[args.length - 1];
+			// Ledger #85 — canvas → ImageBitmap conversion (see helper above).
+			if (isCanvasSource(last)) {
+				const bmp = canvasToNxImageBitmap(last);
+				if (bmp) {
+					last = bmp;
+					args[args.length - 1] = bmp;
+				}
+			}
+			// ImageBitmap / Image passthrough — route to native so flipY /
+			// premultiply / format conversion happen in convert_image_source_
+			// to_gl_pixels rather than the pixelStore-ignoring raw-bytes path.
+			if (last instanceof ImageBitmap || last instanceof Image) {
+				if (args.length === 6) {
+					// (target, level, internalformat, format, type, source)
+					// → (target, level, IF, w, h, 0, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						last.width,
+						last.height,
+						0,
+						args[3],
+						args[4],
+						last,
+					];
+				}
+				// 9-arg: source already at args[8]; pass through unchanged.
+				return nativeTexImage2D.apply(this, args);
+			}
 			if (isTexImageSource(last)) {
 				const px = sourceToPixels(last);
 				if (args.length === 6) {
@@ -1234,7 +1314,33 @@ function sourceToPixels(src: any): {
 			return nativeTexImage2D.apply(this, args);
 		};
 		p.texSubImage2D = function (...args: any[]) {
-			const last = args[args.length - 1];
+			let last = args[args.length - 1];
+			// Ledger #85 — canvas → ImageBitmap conversion. See texImage2D above.
+			if (isCanvasSource(last)) {
+				const bmp = canvasToNxImageBitmap(last);
+				if (bmp) {
+					last = bmp;
+					args[args.length - 1] = bmp;
+				}
+			}
+			if (last instanceof ImageBitmap || last instanceof Image) {
+				if (args.length === 7) {
+					// (target, level, xoff, yoff, format, type, source)
+					// → (target, level, xoff, yoff, w, h, format, type, source)
+					args = [
+						args[0],
+						args[1],
+						args[2],
+						args[3],
+						last.width,
+						last.height,
+						args[4],
+						args[5],
+						last,
+					];
+				}
+				return nativeTexSubImage2D.apply(this, args);
+			}
 			if (isTexImageSource(last)) {
 				const px = sourceToPixels(last);
 				if (args.length === 7) {

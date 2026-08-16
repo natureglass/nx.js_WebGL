@@ -12,6 +12,7 @@
 #include "async.h"
 #include "canvas_path.h"
 #include "cursor.h"
+#include "fps.h"
 #include "dommatrix.h"
 #include "error.h"
 #include "font.h"
@@ -2040,6 +2041,16 @@ void js_clear_cursor_overlay(const FunctionCallbackInfo<Value> &info) {
 	nx_cursor_clear();
 }
 
+// screen.setFpsOverlayEnabled(enabled) — 1 arg. Toggles the engine-side FPS
+// overlay (fps.cc), composited at present time in nx_skia_gpu_present. The C
+// side measures the present rate itself; JS only flips it on/off from the
+// `showFps` config setting.
+void js_set_fps_overlay_enabled(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	const bool enabled = info.Length() > 0 && info[0]->BooleanValue(iso);
+	nx_fps_set_enabled(enabled);
+}
+
 }  // namespace
 
 void nx_canvas_init_class(const FunctionCallbackInfo<Value> &info) {
@@ -2061,6 +2072,9 @@ void nx_canvas_init_class(const FunctionCallbackInfo<Value> &info) {
 	NX_DEF_FUNC(proto, "setAnimatedCursorOverlay", js_set_animated_cursor_overlay, 7);
 	NX_DEF_FUNC(proto, "setCursorOverlayPosition", js_set_cursor_overlay_position, 2);
 	NX_DEF_FUNC(proto, "clearCursorOverlay",       js_clear_cursor_overlay, 0);
+	// FPS overlay binding (fps.cc). Standalone toggle — no feature-detect pair
+	// like the cursor's; the shell calls it directly, guarded by a typeof check.
+	NX_DEF_FUNC(proto, "setFpsOverlayEnabled",     js_set_fps_overlay_enabled, 1);
 }
 
 void nx_canvas_context_2d_new(const FunctionCallbackInfo<Value> &info) {

@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "cursor.h"
+#include "fps.h"
 
 // Boot timing anchor defined in main.cc; populated at the very start of
 // main() so the [skia] (+Nms) log below can report the pre-Skia black
@@ -258,6 +259,11 @@ void nx_skia_gpu_present(void) {
 	// on a synchronous chunk (e.g. navigateTo's grid build). No-op when no
 	// JS code has pushed an overlay via screen.setCursorOverlay et al.
 	nx_cursor_composite(s_fbo.get());
+	// FPS overlay (fps.cc). Drawn AFTER the cursor so the readout sits on top
+	// of everything, and — like the cursor — only onto the EGL back-buffer, so
+	// the persistent canvas surface stays clean (no trail). Measures the
+	// present rate every call; no-op draw unless screen.setFpsOverlayEnabled(true).
+	nx_fps_composite(s_fbo.get());
 	s_gr->flush(s_fbo.get());
 	s_gr->submit();
 	eglSwapBuffers(s_dpy, s_surf);
