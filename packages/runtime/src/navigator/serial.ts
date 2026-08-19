@@ -39,6 +39,21 @@ const REQ_SET_LINE_CODING = 0x20;
 const REQ_SET_CONTROL_LINE_STATE = 0x22;
 const REQ_SEND_BREAK = 0x23;
 
+// --- CP210x (Silicon Labs) vendor protocol --------------------------------
+const CP210X_VID = 0x10c4;
+const CP210X_IFC_ENABLE = 0x00; // wValue: 1 = enable UART, 0 = disable
+const CP210X_SET_LINE_CTL = 0x03; // wValue: (dataBits<<8)|(parity<<4)|stopBits
+const CP210X_SET_BREAK = 0x05; // wValue: 1 = break on, 0 = off
+const CP210X_SET_MHS = 0x07; // wValue: (mask<<8)|state; bit0 DTR, bit1 RTS
+const CP210X_SET_BAUDRATE = 0x1e; // 4-byte LE baud in the data stage
+
+// --- CH340 / CH341 (WCH) vendor protocol ----------------------------------
+const CH340_VID = 0x1a86;
+const CH341_READ_VERSION = 0x5f;
+const CH341_WRITE_REG = 0x9a;
+const CH341_SERIAL_INIT = 0xa1;
+const CH341_MODEM_CTRL = 0xa4; // wValue = ~((DTR?0x20:0)|(RTS?0x40:0))
+
 // --- public option / info shapes ------------------------------------------
 
 export type ParityType = 'none' | 'even' | 'odd';
@@ -146,9 +161,10 @@ function isCdcLike(n: SerialNativeDevice): boolean {
 
 function collectDevices(filters: SerialPortFilter[]): SerialNativeDevice[] {
 	const list = filters.length ? filters : [{}];
-	// With no filters, restrict to CDC-like devices so the picker isn't
-	// cluttered with unrelated peripherals. With explicit vid/pid filters,
-	// trust the caller and list every match (open() still validates CDC).
+	// With no filters, restrict to serial-capable devices (CDC-ACM or a known
+	// USB-UART bridge chip) so the picker isn't cluttered with unrelated
+	// peripherals. With explicit vid/pid filters, trust the caller and list
+	// every match (open() still validates the transport).
 	const requireCdc = filters.length === 0;
 	const seen = new Set<string>();
 	const out: SerialNativeDevice[] = [];
@@ -159,7 +175,7 @@ function collectDevices(filters: SerialPortFilter[]): SerialNativeDevice[] {
 		for (const native of $.usbGetDevices(usbFilter) as unknown as SerialNativeDevice[]) {
 			const k = deviceKey(native);
 			if (seen.has(k)) continue;
-			if (requireCdc && !isCdcLike(native)) continue;
+			if (requireCdc && !isCdcLike(native) && !isKnownBridge(native.vendorId)) continue;
 			seen.add(k);
 			out.push(native);
 		}
@@ -174,6 +190,7 @@ interface CdcLayout {
 	dataInterface: number; // interface # owning the bulk endpoints
 	inEndpoint: number; // bulk IN
 	outEndpoint: number; // bulk OUT
+	inPacketSize: number; // bulk IN wMaxPacketSize (read length must be a multiple)
 }
 
 /** Locate the CDC bulk data path + control interface on an opened device. */
@@ -218,7 +235,191 @@ function resolveCdcLayout(device: USBDevice): CdcLayout | null {
 		dataInterface: dataIface.interfaceNumber,
 		inEndpoint: inEp.endpointNumber,
 		outEndpoint: outEp.endpointNumber,
+		inPacketSize: inEp.packetSize,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// USB-UART bridge chips (non-CDC): CP210x (Silicon Labs) and CH340/CH341 (WCH).
+// These enumerate as a single vendor-specific interface (class 0xff) with a
+// bulk IN/OUT pair and no CDC class descriptors, so they need a chip-specific
+// open sequence. Data still flows over the bulk endpoints exactly like CDC —
+// only the control requests (enable / baud / line format / DTR-RTS) differ.
+// ---------------------------------------------------------------------------
+
+interface SerialLayout {
+	kind: 'cdc' | 'cp210x' | 'ch340';
+	/** Interface the control requests target (CDC comm iface, or the bridge's
+	 *  single vendor interface). */
+	controlInterface: number;
+	/** Interface owning the bulk data endpoints (claimed on open). */
+	dataInterface: number;
+	inEndpoint: number;
+	outEndpoint: number;
+	/** bulk IN wMaxPacketSize — read length must be rounded to a multiple. */
+	inPacketSize: number;
+}
+
+interface SerialConfig {
+	baudRate: number;
+	dataBits: number;
+	stopBits: number;
+	parity: ParityType;
+}
+
+/** True for USB vendor ids we can drive with a bridge-chip serial backend. */
+function isKnownBridge(vendorId: number): boolean {
+	return vendorId === CP210X_VID || vendorId === CH340_VID;
+}
+
+/** First interface exposing both a bulk IN and a bulk OUT endpoint. */
+function findBulkInterface(
+	device: USBDevice,
+): { iface: number; inEp: number; outEp: number; inPacket: number } | null {
+	const config = device.configuration ?? device.configurations[0];
+	if (!config) return null;
+	for (const iface of config.interfaces) {
+		const alt = iface.alternate ?? iface.alternates[0];
+		if (!alt) continue;
+		const inEp = alt.endpoints.find((e) => e.type === 'bulk' && e.direction === 'in');
+		const outEp = alt.endpoints.find((e) => e.type === 'bulk' && e.direction === 'out');
+		if (inEp && outEp) {
+			return {
+				iface: iface.interfaceNumber,
+				inEp: inEp.endpointNumber,
+				outEp: outEp.endpointNumber,
+				inPacket: inEp.packetSize,
+			};
+		}
+	}
+	return null;
+}
+
+/** Pick the transport backend for an opened device: CDC-ACM first, then a
+ *  known USB-UART bridge chip. Returns null for anything else. */
+function resolveLayout(device: USBDevice): SerialLayout | null {
+	const cdc = resolveCdcLayout(device);
+	if (cdc) {
+		return {
+			kind: 'cdc',
+			controlInterface: cdc.commInterface,
+			dataInterface: cdc.dataInterface,
+			inEndpoint: cdc.inEndpoint,
+			outEndpoint: cdc.outEndpoint,
+			inPacketSize: cdc.inPacketSize,
+		};
+	}
+	const bulk = findBulkInterface(device);
+	if (!bulk) return null;
+	const kind: SerialLayout['kind'] | null =
+		device.vendorId === CP210X_VID
+			? 'cp210x'
+			: device.vendorId === CH340_VID
+				? 'ch340'
+				: null;
+	if (!kind) return null;
+	return {
+		kind,
+		controlInterface: bulk.iface,
+		dataInterface: bulk.iface,
+		inEndpoint: bulk.inEp,
+		outEndpoint: bulk.outEp,
+		inPacketSize: bulk.inPacket,
+	};
+}
+
+// vendor control-transfer shorthands (recipient defaults to the interface)
+function vOut(
+	device: USBDevice,
+	request: number,
+	value: number,
+	index: number,
+	data?: BufferSource,
+	recipient: 'interface' | 'device' = 'interface',
+) {
+	return device.controlTransferOut(
+		{ requestType: 'vendor', recipient, request, value, index },
+		data,
+	);
+}
+function vIn(
+	device: USBDevice,
+	request: number,
+	value: number,
+	index: number,
+	length: number,
+	recipient: 'interface' | 'device' = 'interface',
+) {
+	return device.controlTransferIn(
+		{ requestType: 'vendor', recipient, request, value, index },
+		length,
+	);
+}
+
+/** Encode data/parity/stop into each chip's line-control word. */
+function lineCtlBits(
+	dataBits: number,
+	parity: ParityType,
+	stopBits: number,
+): { cp210x: number; ch341: number } {
+	const cp210x =
+		(dataBits << 8) |
+		((parity === 'odd' ? 1 : parity === 'even' ? 2 : 0) << 4) |
+		(stopBits === 2 ? 2 : 0);
+	// CH341 LCR: enable RX (0x80) + TX (0x40) + word length (CS5..CS8 = 0..3).
+	let ch341 = 0x80 | 0x40 | ((Math.max(5, Math.min(8, dataBits)) - 5) & 0x03);
+	if (parity !== 'none') {
+		ch341 |= 0x08;
+		if (parity === 'even') ch341 |= 0x10;
+	}
+	if (stopBits === 2) ch341 |= 0x04;
+	return { cp210x, ch341 };
+}
+
+/** Enable the CP210x UART and set baud / line format. */
+async function configureCp210x(
+	device: USBDevice,
+	L: SerialLayout,
+	o: SerialConfig,
+): Promise<void> {
+	const idx = L.controlInterface;
+	await vOut(device, CP210X_IFC_ENABLE, 0x0001, idx);
+	const baud = new Uint8Array(4);
+	new DataView(baud.buffer).setUint32(0, o.baudRate, true);
+	await vOut(device, CP210X_SET_BAUDRATE, 0x0000, idx, baud);
+	await vOut(device, CP210X_SET_LINE_CTL, lineCtlBits(o.dataBits, o.parity, o.stopBits).cp210x, idx);
+}
+
+/** CH341 baud registers (older ch341.c algorithm — accurate for the standard
+ *  rates 9600..921600). Returns the prescaler/divisor register writes. */
+function ch340BaudRegs(baud: number): { prescaler: number; divisor: number } {
+	let factor = Math.floor(1532620800 / baud);
+	let div = 3;
+	while (factor > 0xfff0 && div > 0) {
+		factor = Math.floor(factor / 8);
+		div--;
+	}
+	if (factor > 0xfff0) {
+		throw new DOMException('Unsupported CH340 baud rate.', 'NotSupportedError');
+	}
+	factor = 0x10000 - factor;
+	return { prescaler: (factor & 0xff00) | div, divisor: factor & 0xff };
+}
+
+/** Initialise a CH340/CH341 and set baud / line format. All CH34x control
+ *  requests are device-recipient (protocol per Linux ch341.c). NOTE: not yet
+ *  exercised on real hardware — verify against a physical CH340 board. */
+async function configureCh340(
+	device: USBDevice,
+	_L: SerialLayout,
+	o: SerialConfig,
+): Promise<void> {
+	await vIn(device, CH341_READ_VERSION, 0, 0, 2, 'device').catch(() => {});
+	await vOut(device, CH341_SERIAL_INIT, 0, 0, undefined, 'device');
+	const { prescaler, divisor } = ch340BaudRegs(o.baudRate);
+	await vOut(device, CH341_WRITE_REG, 0x1312, prescaler, undefined, 'device');
+	await vOut(device, CH341_WRITE_REG, 0x0f2c, divisor, undefined, 'device');
+	await vOut(device, CH341_WRITE_REG, 0x2518, lineCtlBits(o.dataBits, o.parity, o.stopBits).ch341, undefined, 'device');
 }
 
 /**
@@ -231,7 +432,7 @@ export class SerialPort extends EventTarget {
 	#info: SerialPortInfo;
 	#open = false;
 	#closing = false;
-	#layout: CdcLayout | null = null;
+	#layout: SerialLayout | null = null;
 	#readable: ReadableStream<Uint8Array> | null = null;
 	#writable: WritableStream<Uint8Array> | null = null;
 	#dtr = false;
@@ -283,43 +484,52 @@ export class SerialPort extends EventTarget {
 
 		const device = this.#device;
 		await device.open();
-		const layout = resolveCdcLayout(device);
+		const layout = resolveLayout(device);
 		if (!layout) {
 			await device.close().catch(() => {});
 			throw new DOMException(
-				'This USB device is not a CDC-ACM serial port. Vendor-specific adapters (FTDI, CP210x, CH340, PL2303) are not yet supported.',
+				'This USB device is not a supported serial adapter. Only CDC-ACM, CP210x, and CH340/CH341 USB-UART chips are handled (FTDI, PL2303 not yet).',
 				'NotSupportedError',
 			);
 		}
 		this.#layout = layout;
 
-		// Claim the data interface (owns the bulk pipes); best-effort claim the
-		// comm interface so the OS doesn't hold it (control transfers ride EP0
-		// and lazily acquire an interface if none is claimed, so a failure here
-		// is non-fatal).
-		if (layout.commInterface !== layout.dataInterface) {
-			await device.claimInterface(layout.commInterface).catch(() => {});
+		const cfg: SerialConfig = { baudRate: options.baudRate, dataBits, stopBits, parity };
+		if (layout.kind === 'cdc') {
+			// Claim the data interface (owns the bulk pipes); best-effort claim the
+			// comm interface so the OS doesn't hold it (control transfers ride EP0
+			// and lazily acquire an interface if none is claimed, so a failure here
+			// is non-fatal).
+			if (layout.controlInterface !== layout.dataInterface) {
+				await device.claimInterface(layout.controlInterface).catch(() => {});
+			}
+			await device.claimInterface(layout.dataInterface);
+
+			// SET_LINE_CODING — 7-byte payload. Native-USB CDC devices often ignore
+			// baud (their link is USB, not a real UART), so tolerate a STALL here.
+			const coding = new Uint8Array(7);
+			const dv = new DataView(coding.buffer);
+			dv.setUint32(0, options.baudRate, true);
+			dv.setUint8(4, stopBits === 2 ? 2 : 0); // 0 = 1 stop bit, 2 = 2 stop bits
+			dv.setUint8(5, parity === 'odd' ? 1 : parity === 'even' ? 2 : 0);
+			dv.setUint8(6, dataBits);
+			await device
+				.controlTransferOut(
+					{ requestType: 'class', recipient: 'interface', request: REQ_SET_LINE_CODING, value: 0, index: layout.controlInterface },
+					coding,
+				)
+				.catch(() => {});
+		} else {
+			// USB-UART bridge chip: claim its single vendor interface, then run the
+			// chip-specific enable + baud + line-format sequence.
+			await device.claimInterface(layout.dataInterface);
+			if (layout.kind === 'cp210x') await configureCp210x(device, layout, cfg);
+			else await configureCh340(device, layout, cfg);
 		}
-		await device.claimInterface(layout.dataInterface);
 
-		// SET_LINE_CODING — 7-byte payload. Native-USB CDC devices often ignore
-		// baud (their link is USB, not a real UART), so tolerate a STALL here.
-		const coding = new Uint8Array(7);
-		const dv = new DataView(coding.buffer);
-		dv.setUint32(0, options.baudRate, true);
-		dv.setUint8(4, stopBits === 2 ? 2 : 0); // 0 = 1 stop bit, 2 = 2 stop bits
-		dv.setUint8(5, parity === 'odd' ? 1 : parity === 'even' ? 2 : 0);
-		dv.setUint8(6, dataBits);
-		await device
-			.controlTransferOut(
-				{ requestType: 'class', recipient: 'interface', request: REQ_SET_LINE_CODING, value: 0, index: layout.commInterface },
-				coding,
-			)
-			.catch(() => {});
-
-		// Assert DTR + RTS on open: many CDC devices (ESP32 native USB, Arduino)
-		// only stream once a terminal signals it's present. Apps can override
-		// via setSignals().
+		// Assert DTR + RTS on open: many devices (ESP32 native USB, Arduino, and
+		// bridge-chip boards) only stream once a terminal signals it's present.
+		// Apps can override via setSignals().
 		this.#dtr = true;
 		this.#rts = true;
 		await this.#writeControlLineState().catch(() => {});
@@ -330,21 +540,39 @@ export class SerialPort extends EventTarget {
 	}
 
 	async #writeControlLineState(): Promise<void> {
-		if (!this.#layout) return;
-		const value = (this.#dtr ? 0x01 : 0) | (this.#rts ? 0x02 : 0);
-		await this.#device.controlTransferOut({
-			requestType: 'class',
-			recipient: 'interface',
-			request: REQ_SET_CONTROL_LINE_STATE,
-			value,
-			index: this.#layout.commInterface,
-		});
+		const L = this.#layout;
+		if (!L) return;
+		const dtr = this.#dtr;
+		const rts = this.#rts;
+		if (L.kind === 'cdc') {
+			await this.#device.controlTransferOut({
+				requestType: 'class',
+				recipient: 'interface',
+				request: REQ_SET_CONTROL_LINE_STATE,
+				value: (dtr ? 0x01 : 0) | (rts ? 0x02 : 0),
+				index: L.controlInterface,
+			});
+		} else if (L.kind === 'cp210x') {
+			// SET_MHS: high byte is the write mask (DTR+RTS), low byte the state.
+			const state = (dtr ? 0x01 : 0) | (rts ? 0x02 : 0);
+			await vOut(this.#device, CP210X_SET_MHS, (0x03 << 8) | state, L.controlInterface);
+		} else {
+			// CH341 MODEM_CTRL takes the inverted DTR(0x20)/RTS(0x40) bits.
+			const control = (dtr ? 0x20 : 0) | (rts ? 0x40 : 0);
+			await vOut(this.#device, CH341_MODEM_CTRL, ~control & 0xff, 0, undefined, 'device');
+		}
 	}
 
 	#setupStreams(bufferSize: number): void {
 		const device = this.#device;
 		const inEp = this.#layout!.inEndpoint;
 		const outEp = this.#layout!.outEndpoint;
+		// A bulk IN transfer length MUST be a whole multiple of the endpoint's
+		// max packet size — otherwise the host controller overflows the moment a
+		// full packet arrives (module 140 "usb bulk IN transfer failed"). Round
+		// the requested buffer up to the next multiple (at least one packet).
+		const maxPacket = this.#layout!.inPacketSize || 64;
+		const readLen = Math.max(maxPacket, Math.ceil(bufferSize / maxPacket) * maxPacket);
 
 		this.#readable = new ReadableStream<Uint8Array>({
 			pull: async (controller) => {
@@ -353,7 +581,7 @@ export class SerialPort extends EventTarget {
 					return;
 				}
 				try {
-					const result = await device.transferIn(inEp, bufferSize);
+					const result = await device.transferIn(inEp, readLen);
 					if (this.#closing) {
 						try { controller.close(); } catch {}
 						return;
@@ -398,15 +626,21 @@ export class SerialPort extends EventTarget {
 		if (typeof signals.requestToSend === 'boolean') this.#rts = signals.requestToSend;
 		await this.#writeControlLineState().catch(() => {});
 		if (typeof signals.break === 'boolean' && this.#layout) {
-			await this.#device
-				.controlTransferOut({
-					requestType: 'class',
-					recipient: 'interface',
-					request: REQ_SEND_BREAK,
-					value: signals.break ? 0xffff : 0x0000,
-					index: this.#layout.commInterface,
-				})
-				.catch(() => {});
+			const L = this.#layout;
+			if (L.kind === 'cdc') {
+				await this.#device
+					.controlTransferOut({
+						requestType: 'class',
+						recipient: 'interface',
+						request: REQ_SEND_BREAK,
+						value: signals.break ? 0xffff : 0x0000,
+						index: L.controlInterface,
+					})
+					.catch(() => {});
+			} else if (L.kind === 'cp210x') {
+				await vOut(this.#device, CP210X_SET_BREAK, signals.break ? 0x0001 : 0x0000, L.controlInterface).catch(() => {});
+			}
+			// CH340: break signalling not implemented — ignore.
 		}
 	}
 
