@@ -17,16 +17,18 @@ float clampf(float v, float lo, float hi) {
 // AudioParam timeline evaluation
 // ---------------------------------------------------------------------------
 
-// Computes the parameter value at time `t` by walking the (time-sorted) event
-// list. This is a pragmatic implementation of the Web Audio "computedValue"
-// algorithm covering the common shapes: set, linear/exponential ramps,
-// setTarget decay, and value curves. Ramps anchor at the previous event's
-// (time, value); a setTarget remains in effect until the next event.
-float param_value_at(const nx_audio_param *p, double t) {
+// Computes the parameter value at time `t` by walking the first `count`
+// events of the (time-sorted) event list. This is a pragmatic implementation
+// of the Web Audio "computedValue" algorithm covering the common shapes: set,
+// linear/exponential ramps, setTarget decay, and value curves. Ramps anchor at
+// the previous event's (time, value); a setTarget remains in effect until the
+// next event. `count` (<= events.size()) lets param_prune evaluate a prefix in
+// isolation; param_value_at below passes the full list for normal reads.
+float param_value_at_n(const nx_audio_param *p, double t, size_t count) {
 	const auto &evs = p->events;
 	double v_prev = p->value;
 	double t_prev = 0;
-	for (size_t i = 0; i < evs.size(); i++) {
+	for (size_t i = 0; i < count; i++) {
 		const nx_audio_param_event &e = evs[i];
 		if (e.time > t) {
 			// `t` falls before this event takes effect. Ramps interpolate
@@ -86,7 +88,7 @@ float param_value_at(const nx_audio_param *p, double t) {
 			// start time, inclusive), so the comparison is `<=`.
 			double tstop = t;
 			bool next_applies =
-			    i + 1 < evs.size() && evs[i + 1].time <= t;
+			    i + 1 < count && evs[i + 1].time <= t;
 			if (next_applies)
 				tstop = evs[i + 1].time;
 			double val;
@@ -105,6 +107,57 @@ float param_value_at(const nx_audio_param *p, double t) {
 		}
 	}
 	return clampf((float)v_prev, p->min_value, p->max_value);
+}
+
+// Evaluate over the full event list (the common case).
+float param_value_at(const nx_audio_param *p, double t) {
+	return param_value_at_n(p, t, p->events.size());
+}
+
+// Fold away automation events that can no longer influence evaluation at or
+// after `t_now`, keeping each param's event list O(1) instead of growing once
+// per scheduled automation. Without this a control that schedules automation
+// every frame (e.g. a knob dragged with setTargetAtTime per pointermove) makes
+// the list grow without bound, and param_value_at re-walks it from the start
+// for every one of the 128 frames per render quantum — so the render thread's
+// per-quantum cost climbs linearly and eventually starves the main thread.
+//
+// Because context time only advances (the render walks forward and every read
+// uses currentTime), every event strictly before the most recent event with
+// time <= t_now is "settled": its sole remaining role is to hand an anchor
+// value to that event. We compute that value from the prefix, fold it into the
+// param's base `value`, and erase the prefix. Correctness rests on the
+// evaluator's anchoring rules:
+//   * SET_VALUE, and ramps/curves that have completed by their own event time,
+//     are self-anchoring — they overwrite v_prev and ignore the base.
+//   * SET_TARGET consumes only the base as its start value (it reads v_prev,
+//     never t_prev), which is exactly what we fold in.
+//   * A retained *future* ramp still anchors to the kept last-past event (we
+//     only drop events strictly before it), so its interpolation is unchanged.
+// See the "setTargetAtTime spam" / "event pruning is behavior-preserving"
+// regression tests in test/fixtures/webaudio.ts.
+void param_prune(nx_audio_param *p, double t_now) {
+	auto &evs = p->events;
+	if (evs.size() < 2)
+		return;
+	// L = index of the last event with time <= t_now (the active anchor).
+	size_t L = 0;
+	bool found = false;
+	for (size_t i = 0; i < evs.size(); i++) {
+		if (evs[i].time <= t_now) {
+			L = i;
+			found = true;
+		} else {
+			break; // events are time-sorted; nothing later qualifies
+		}
+	}
+	if (!found || L == 0)
+		return; // no settled events precede the anchor
+	// Value the timeline holds just as events[L] takes over, computed only from
+	// the events we are about to drop (the prefix [0, L)).
+	double anchor = param_value_at_n(p, evs[L].time, L);
+	p->value = clampf((float)anchor, p->min_value, p->max_value);
+	evs.erase(evs.begin(), evs.begin() + L);
 }
 
 // Fill `out[0..n)` with a-rate values for frame times t0, t0+1/sr, ...
@@ -469,6 +522,13 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 void render_quantum(nx_audio_graph *g) {
 	g->quantum_id++;
 	double t0 = (double)g->frames_rendered / g->sample_rate;
+	// Fold away settled automation events before evaluating so param timelines
+	// stay bounded no matter how much automation was scheduled. Events in
+	// (t0, t0 + Q/sr) are in the future relative to t0 and are retained, so
+	// this quantum's evaluation is unaffected.
+	for (nx_audio_node *n : g->nodes)
+		for (nx_audio_param &p : n->params)
+			param_prune(&p, t0);
 	process_node(g, g->destination, t0);
 	// Sources not reachable from the destination still progress through their
 	// schedule (so `ended` fires even for unconnected/indirect sources).
@@ -689,6 +749,11 @@ void nx_audio_param_schedule(nx_audio_node *n, nx_audio_param *p,
 	e.value = value;
 	e.time_constant = time_constant;
 	param_insert_event(p, std::move(e));
+	// Collapse now-settled past events. This is the hot path for controls that
+	// automate every frame (e.g. a knob emitting setTargetAtTime per move) and
+	// keeps the list bounded even when the graph is suspended (no render pass
+	// runs to prune it). currentTime = frames_rendered / sample_rate.
+	param_prune(p, (double)n->graph->frames_rendered / n->graph->sample_rate);
 }
 
 void nx_audio_param_set_value_curve(nx_audio_node *n, nx_audio_param *p,

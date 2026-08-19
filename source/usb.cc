@@ -202,7 +202,7 @@ nx_usb_iface_t *iface_for_ep(nx_usb_device_t *dev, uint8_t ep, bool in) {
 		struct usb_endpoint_descriptor *descs =
 		    in ? f->inf.inf.input_endpoint_descs : f->inf.inf.output_endpoint_descs;
 		for (int j = 0; j < 15; j++) {
-			if (descs[j].bLength == USB_DT_ENDPOINT_SIZE &&
+			if (descs[j].bLength >= USB_DT_ENDPOINT_SIZE &&
 			    (descs[j].bEndpointAddress & USB_ENDPOINT_ADDRESS_MASK) == ep)
 				return f;
 		}
@@ -215,7 +215,7 @@ struct usb_endpoint_descriptor *find_endpoint(nx_usb_iface_t *f, uint8_t ep,
 	struct usb_endpoint_descriptor *descs =
 	    in ? f->inf.inf.input_endpoint_descs : f->inf.inf.output_endpoint_descs;
 	for (int i = 0; i < 15; i++) {
-		if (descs[i].bLength == USB_DT_ENDPOINT_SIZE &&
+		if (descs[i].bLength >= USB_DT_ENDPOINT_SIZE &&
 		    (descs[i].bEndpointAddress & USB_ENDPOINT_ADDRESS_MASK) == ep)
 			return &descs[i];
 	}
@@ -312,12 +312,17 @@ Local<Object> interface_to_object(Isolate *iso, const UsbHsInterface *inf) {
 	set_u32(iso, alt, "interfaceProtocol", desc->bInterfaceProtocol);
 	Local<Array> eps = Array::New(iso);
 	uint32_t ep_idx = 0;
+	// A populated endpoint descriptor is >= 7 bytes; unused slots are all-zero
+	// (bLength 0). Use `>=` not `==`: USB-Audio/MIDIStreaming endpoints use the
+	// 9-byte audio endpoint descriptor (adds bRefresh + bSynchAddress), so an
+	// `== USB_DT_ENDPOINT_SIZE` check would drop every MIDI bulk endpoint and the
+	// interface would surface with no endpoints (no MIDI in/out ports).
 	for (int i = 0; i < 15; i++) {
 		const struct usb_endpoint_descriptor *in = &inf->inf.input_endpoint_descs[i];
-		if (in->bLength == USB_DT_ENDPOINT_SIZE)
+		if (in->bLength >= USB_DT_ENDPOINT_SIZE)
 			eps->Set(ctx, ep_idx++, endpoint_to_object(iso, in)).Check();
 		const struct usb_endpoint_descriptor *out = &inf->inf.output_endpoint_descs[i];
-		if (out->bLength == USB_DT_ENDPOINT_SIZE)
+		if (out->bLength >= USB_DT_ENDPOINT_SIZE)
 			eps->Set(ctx, ep_idx++, endpoint_to_object(iso, out)).Check();
 	}
 	alt->Set(ctx, nx_str(iso, "endpoints"), eps).Check();

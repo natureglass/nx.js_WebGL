@@ -61,12 +61,54 @@ interface MidiHandle {
 	outEndpoint: number | null;
 }
 
+interface OpenMidiEntry {
+	usb: USBDevice;
+	native: MidiNativeDevice;
+	input: MIDIInput | null;
+	output: MIDIOutput | null;
+	sysex: boolean;
+}
+
+// Cache of open MIDI devices, keyed by `${busId}:${deviceId}`, kept across
+// requestMIDIAccess calls. This makes requestMIDIAccess idempotent — a repeat
+// call returns the SAME live ports instead of re-claiming an interface this
+// process already holds. It also covers app switches: the usb:hs session and
+// this module are process-global (switching brewser apps doesn't exit the NRO),
+// so a MIDIStreaming interface opened by a prior app instance stays acquired;
+// re-acquiring it fails (usbHsAcquireUsbIf → "in use", module 140 desc 301) and
+// the claim retry can't clear it because *we* are the holder. Reusing the cached
+// entry sidesteps the re-claim entirely.
+const openMidi = new Map<string, OpenMidiEntry>();
+
+function midiKey(native: MidiNativeDevice): string {
+	return `${native.busId}:${native.deviceId}`;
+}
+
+/** Close + release one cached device (aborts its bulk-IN URB, frees the iface). */
+function closeMidiEntry(entry: OpenMidiEntry) {
+	try {
+		$.usbDeviceClose(entry.native as unknown as Parameters<typeof $.usbDeviceClose>[0]);
+	} catch {
+		// best-effort; a stale/disconnected handle may already be gone
+	}
+}
+
+/** Release every cached device — used on full NRO exit (`unload`). */
+function closeAllMidiDevices() {
+	for (const entry of openMidi.values()) closeMidiEntry(entry);
+	openMidi.clear();
+}
+
 let usbReady = false;
 function ensureUsb() {
 	if (usbReady) return;
 	$.usbInit();
 	usbReady = true;
+	// `unload` only fires on full NRO exit (not on a brewser app switch), so this
+	// is a best-effort cleanup for process teardown; cross-app-switch reuse is
+	// handled by the `openMidi` cache in requestMIDIAccess itself.
 	addEventListener('unload', () => {
+		closeAllMidiDevices();
 		usbReady = false;
 	});
 }
@@ -429,13 +471,20 @@ def(MIDIAccess);
 
 // --- requestMIDIAccess -----------------------------------------------------
 
-// Best-effort: a device that fails to open/claim is skipped, not fatal.
-async function openMidiDevice(
-	native: MidiNativeDevice,
-	sysexEnabled: boolean,
-	inputs: Map<string, MIDIInput>,
-	outputs: Map<string, MIDIOutput>,
-): Promise<void> {
+// Ensure a connected MIDI device is open and cached. Reuses an already-open
+// entry (idempotent — no re-claim of an interface we already hold) unless the
+// requested sysex mode differs, in which case it is reopened so the input's
+// SysEx gating matches. Best-effort: a device that fails to open/claim is
+// skipped, not fatal.
+async function ensureMidiOpen(native: MidiNativeDevice, sysex: boolean): Promise<void> {
+	const key = midiKey(native);
+	const existing = openMidi.get(key);
+	if (existing) {
+		if (existing.sysex === sysex) return; // reuse the live ports as-is
+		// SysEx permission changed → reopen with the new setting.
+		closeMidiEntry(existing);
+		openMidi.delete(key);
+	}
 	const usb = new USBDevice(INTERNAL, native as unknown as ConstructorParameters<typeof USBDevice>[1]);
 	try {
 		await usb.open();
@@ -467,17 +516,19 @@ async function openMidiDevice(
 		}
 		await usb.claimInterface(iface.interfaceNumber);
 		const handle: MidiHandle = { usb, inEndpoint: inEp, inPacketSize: inSize, outEndpoint: outEp };
-		const key = `${native.busId}:${native.deviceId}`;
 		const name = native.productName || `USB MIDI ${hex4(native.vendorId)}:${hex4(native.productId)}`;
 		const maker = native.manufacturerName ?? '';
+		let input: MIDIInput | null = null;
+		let output: MIDIOutput | null = null;
 		if (inEp !== null) {
 			// @ts-expect-error internal constructor
-			inputs.set(`${key}:in`, new MIDIInput(INTERNAL, `${key}:in`, name, maker, handle, sysexEnabled));
+			input = new MIDIInput(INTERNAL, `${key}:in`, name, maker, handle, sysex);
 		}
 		if (outEp !== null) {
 			// @ts-expect-error internal constructor
-			outputs.set(`${key}:out`, new MIDIOutput(INTERNAL, `${key}:out`, name, maker, handle));
+			output = new MIDIOutput(INTERNAL, `${key}:out`, name, maker, handle);
 		}
+		openMidi.set(key, { usb, native, input, output, sysex });
 	} catch {
 		await usb.close().catch(() => {});
 	}
@@ -507,12 +558,29 @@ export async function requestMIDIAccess(options: MIDIOptions = {}): Promise<MIDI
 			throw new DOMException('MIDI access request was denied.', 'SecurityError');
 		}
 	}
+	// Reconcile the cache against the currently-connected devices. This is what
+	// makes requestMIDIAccess idempotent AND survives brewser app switches: a
+	// device still connected from a prior call/app is REUSED (no re-claim of an
+	// interface we already hold); one that has been unplugged is closed so its
+	// interface is freed.
+	const present = ($.usbGetDevices() as unknown as MidiNativeDevice[]).filter(isMidiDevice);
+	const presentKeys = new Set(present.map(midiKey));
+	for (const [key, entry] of openMidi) {
+		if (!presentKeys.has(key)) {
+			closeMidiEntry(entry);
+			openMidi.delete(key);
+		}
+	}
+	// Open new devices / reopen on a sysex change; already-open ones are reused.
+	await Promise.all(present.map((n) => ensureMidiOpen(n, sysex)));
+	// Build the access maps from the cache so `access.inputs`/`outputs` are ready
+	// when the caller inspects them right after `await requestMIDIAccess()`.
 	const inputs = new Map<string, MIDIInput>();
 	const outputs = new Map<string, MIDIOutput>();
-	const midiDevices = ($.usbGetDevices() as unknown as MidiNativeDevice[]).filter(isMidiDevice);
-	// Populate the maps before resolving so `access.inputs` is ready when the
-	// caller inspects it right after `await requestMIDIAccess()`.
-	await Promise.all(midiDevices.map((n) => openMidiDevice(n, sysex, inputs, outputs)));
+	for (const [key, entry] of openMidi) {
+		if (entry.input) inputs.set(`${key}:in`, entry.input);
+		if (entry.output) outputs.set(`${key}:out`, entry.output);
+	}
 	// @ts-expect-error internal constructor
 	return new MIDIAccess(INTERNAL, inputs, outputs, sysex);
 }

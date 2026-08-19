@@ -344,6 +344,86 @@ test('gain setTargetAtTime automation', async (t) => {
 	);
 });
 
+// --- setTargetAtTime event pruning ---
+// A control that automates every frame (e.g. a knob dragged with a
+// setTargetAtTime per pointermove) schedules a flood of events. Re-issuing the
+// SAME decay toward an unchanged target with an unchanged time constant is
+// analytically identical to a single continuous decay exp(-t/tc), so the
+// rendered output must match no matter how many events accumulated (and were
+// folded away by param_prune). Exercises pruning across dozens of quanta.
+
+test('gain setTargetAtTime spam stays accurate (event pruning)', async (t) => {
+	const N = 6144; // 48 render quanta
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	const buffer = ctx.createBuffer(1, N, RATE);
+	buffer.getChannelData(0).fill(1);
+
+	const tc = 0.01;
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const gain = ctx.createGain();
+	gain.gain.setValueAtTime(1, 0);
+	// ~192 setTargetAtTime events toward the same target.
+	for (let f = 0; f < N; f += 32) gain.gain.setTargetAtTime(0, f / RATE, tc);
+	source.connect(gain);
+	gain.connect(ctx.destination);
+	source.start();
+
+	const out = (await ctx.startRendering()).getChannelData(0);
+	t.ok(
+		maxDiff(out, (i) => Math.exp(-(i / RATE) / tc)) < 1e-3,
+		'output matches a single continuous decay despite ~192 scheduled events',
+	);
+});
+
+// Rendering the same automation intent with a single event vs. a per-frame
+// flood must produce (near) sample-identical output — pruning is only a
+// performance optimization and must never change what is heard. Also validates
+// the non-zero base-fold path against the closed form B + (A - B) e^(-t/tc).
+
+test('event pruning is behavior-preserving', async (t) => {
+	const N = 4096;
+	const tc = 0.008;
+	const A = 1;
+	const B = 0.3;
+
+	async function render(spam: boolean): Promise<Float32Array> {
+		const ctx = new OfflineAudioContext(1, N, RATE);
+		const buffer = ctx.createBuffer(1, N, RATE);
+		buffer.getChannelData(0).fill(1);
+		const source = ctx.createBufferSource();
+		source.buffer = buffer;
+		const gain = ctx.createGain();
+		gain.gain.setValueAtTime(A, 0);
+		if (spam) {
+			for (let f = 0; f < N; f += 16)
+				gain.gain.setTargetAtTime(B, f / RATE, tc);
+		} else {
+			gain.gain.setTargetAtTime(B, 0, tc);
+		}
+		source.connect(gain);
+		gain.connect(ctx.destination);
+		source.start();
+		return (await ctx.startRendering()).getChannelData(0);
+	}
+
+	const minimal = await render(false);
+	const spammed = await render(true);
+	let max = 0;
+	for (let i = 0; i < N; i++) {
+		const d = Math.abs(minimal[i] - spammed[i]);
+		if (d > max) max = d;
+	}
+	t.ok(
+		max < 1e-5,
+		'spammed (pruned) render is sample-identical to the minimal one',
+	);
+	t.ok(
+		maxDiff(spammed, (i) => B + (A - B) * Math.exp(-(i / RATE) / tc)) < 1e-3,
+		'spammed render matches the closed-form decay',
+	);
+});
+
 // --- setValueCurveAtTime ---
 
 test('gain setValueCurveAtTime automation', async (t) => {
