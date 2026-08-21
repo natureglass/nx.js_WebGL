@@ -47,3 +47,23 @@ bool nx_run_entry_module(v8::Isolate *iso, v8::Local<v8::Context> context,
 
 // Release retained module handles (call before disposing the isolate).
 void nx_modules_teardown();
+
+// ---------------------------------------------------------------------------
+// V8 bytecode code cache (boot-time compile skip).
+//
+// Cold-compiling the two big boot scripts — the embedded runtime.js (~1.2 MB)
+// and the app entry module main.js (~1.9 MB) — costs ~1 s on hardware (V8 runs
+// single-threaded/--predictable, so parse+bytecode-gen blocks the boot thread).
+// These wrappers cache the compiled bytecode to sdmc and consume it on later
+// boots, skipping the parse. V8's CachedData self-validates against source + V8
+// version + flags, so a stale cache is transparently rejected and re-produced;
+// the cache filename is additionally keyed by source length + a content hash so
+// distinct bundles never alias one file. Any I/O or cache miss falls back to a
+// normal cold compile — the cache can never wedge boot. `tag` names the cache
+// file; `src`/`len` are the raw source bytes (for keying).
+v8::MaybeLocal<v8::Script> nx_compile_script_cached(
+    v8::Isolate *iso, v8::Local<v8::Context> ctx, v8::Local<v8::String> source,
+    v8::ScriptOrigin &origin, const char *tag, const char *src, size_t len);
+v8::MaybeLocal<v8::Module> nx_compile_module_cached(
+    v8::Isolate *iso, v8::Local<v8::String> source, v8::ScriptOrigin &origin,
+    const char *tag, const char *src, size_t len);

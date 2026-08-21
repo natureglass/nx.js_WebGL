@@ -1040,8 +1040,12 @@ static bool run_script(Isolate *iso, Local<Context> context, const char *src,
 		return false;
 	}
 	ScriptOrigin origin(nx_str(iso, name));
+	// Bytecode cache: skip the ~1.2 MB cold parse of runtime.js on repeat
+	// boots. Falls back to a normal compile on any miss/rejection.
 	Local<Script> script;
-	if (!Script::Compile(context, source, &origin).ToLocal(&script)) {
+	if (!nx_compile_script_cached(iso, context, source, origin, "runtime", src,
+	                              len)
+	         .ToLocal(&script)) {
 		print_js_error(iso, &try_catch);
 		return false;
 	}

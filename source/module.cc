@@ -2,7 +2,10 @@
 #include "error.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <new>
 #include <string>
 #include <unordered_map>
 
@@ -705,6 +708,142 @@ void nx_module_bindings(Isolate *iso, Local<Object> init_obj) {
 	    .Check();
 }
 
+// ---------------------------------------------------------------------------
+// V8 bytecode code cache — see module.h for the rationale.
+// ---------------------------------------------------------------------------
+
+#define NX_CODECACHE_DIR "sdmc:/switch/nxjs-cache"
+
+static uint64_t nx_cc_hash(const char *data, size_t len) {
+	uint64_t h = 1469598103934665603ULL; // FNV-1a 64
+	for (size_t i = 0; i < len; i++) {
+		h ^= (uint8_t)data[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static void nx_cc_path(char *out, size_t out_sz, const char *tag,
+                       const char *src, size_t len) {
+	snprintf(out, out_sz, "%s/%s.%zu.%016llx.jsc", NX_CODECACHE_DIR, tag, len,
+	         (unsigned long long)nx_cc_hash(src, len));
+}
+
+// Read a whole cache file into a new[] buffer (handed to V8 as BufferOwned, so
+// V8 delete[]s it). Returns nullptr on any miss/short-read.
+static uint8_t *nx_cc_read(const char *path, int *out_len) {
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return nullptr;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return nullptr;
+	}
+	long sz = ftell(f);
+	if (sz <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return nullptr;
+	}
+	uint8_t *buf = new (std::nothrow) uint8_t[(size_t)sz];
+	if (!buf) {
+		fclose(f);
+		return nullptr;
+	}
+	size_t got = fread(buf, 1, (size_t)sz, f);
+	fclose(f);
+	if (got != (size_t)sz) {
+		delete[] buf;
+		return nullptr;
+	}
+	*out_len = (int)sz;
+	return buf;
+}
+
+static void nx_cc_write(const char *path, const uint8_t *data, int len) {
+	mkdir(NX_CODECACHE_DIR, 0777); // best-effort; ignore EEXIST / errors
+	FILE *f = fopen(path, "wb");
+	if (!f)
+		return;
+	fwrite(data, 1, (size_t)len, f);
+	fclose(f);
+}
+
+MaybeLocal<Script> nx_compile_script_cached(Isolate *iso, Local<Context> ctx,
+                                            Local<String> source,
+                                            ScriptOrigin &origin,
+                                            const char *tag, const char *src,
+                                            size_t len) {
+	char path[512];
+	nx_cc_path(path, sizeof(path), tag, src, len);
+	int clen = 0;
+	uint8_t *cbuf = nx_cc_read(path, &clen);
+	ScriptCompiler::CachedData *cached =
+	    cbuf ? new ScriptCompiler::CachedData(
+	               cbuf, clen, ScriptCompiler::CachedData::BufferOwned)
+	         : nullptr;
+	ScriptCompiler::Source ssrc(source, origin, cached);
+	ScriptCompiler::CompileOptions opt =
+	    cached ? ScriptCompiler::kConsumeCodeCache
+	           : ScriptCompiler::kNoCompileOptions;
+	Local<Script> script;
+	if (!ScriptCompiler::Compile(ctx, &ssrc, opt).ToLocal(&script))
+		return MaybeLocal<Script>();
+	// (Re)produce the cache on a cold compile or a rejected (stale) cache.
+	if (cached && !cached->rejected) {
+		fprintf(stderr, "[codecache] %s consumed (%d bytes)\n", tag, clen);
+	} else {
+		if (cached)
+			fprintf(stderr, "[codecache] %s rejected -> recompiled\n", tag);
+		ScriptCompiler::CachedData *produced =
+		    ScriptCompiler::CreateCodeCache(script->GetUnboundScript());
+		if (produced) {
+			nx_cc_write(path, produced->data, produced->length);
+			fprintf(stderr, "[codecache] %s produced (%d bytes)\n", tag,
+			        produced->length);
+			delete produced;
+		}
+	}
+	fflush(stderr);
+	return script;
+}
+
+MaybeLocal<Module> nx_compile_module_cached(Isolate *iso, Local<String> source,
+                                            ScriptOrigin &origin,
+                                            const char *tag, const char *src,
+                                            size_t len) {
+	char path[512];
+	nx_cc_path(path, sizeof(path), tag, src, len);
+	int clen = 0;
+	uint8_t *cbuf = nx_cc_read(path, &clen);
+	ScriptCompiler::CachedData *cached =
+	    cbuf ? new ScriptCompiler::CachedData(
+	               cbuf, clen, ScriptCompiler::CachedData::BufferOwned)
+	         : nullptr;
+	ScriptCompiler::Source ssrc(source, origin, cached);
+	ScriptCompiler::CompileOptions opt =
+	    cached ? ScriptCompiler::kConsumeCodeCache
+	           : ScriptCompiler::kNoCompileOptions;
+	Local<Module> module;
+	if (!ScriptCompiler::CompileModule(iso, &ssrc, opt).ToLocal(&module))
+		return MaybeLocal<Module>();
+	if (cached && !cached->rejected) {
+		fprintf(stderr, "[codecache] %s consumed (%d bytes)\n", tag, clen);
+	} else {
+		if (cached)
+			fprintf(stderr, "[codecache] %s rejected -> recompiled\n", tag);
+		ScriptCompiler::CachedData *produced =
+		    ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript());
+		if (produced) {
+			nx_cc_write(path, produced->data, produced->length);
+			fprintf(stderr, "[codecache] %s produced (%d bytes)\n", tag,
+			        produced->length);
+			delete produced;
+		}
+	}
+	fflush(stderr);
+	return module;
+}
+
 bool nx_run_entry_module(Isolate *iso, Local<Context> context, const char *src,
                          size_t len, const char *name) {
 	HandleScope scope(iso);
@@ -724,9 +863,11 @@ bool nx_run_entry_module(Isolate *iso, Local<Context> context, const char *src,
 
 	ScriptOrigin origin(nx_str(iso, name), 0, 0, false, -1, Local<Value>(),
 	                    false, false, true /* is_module */);
-	ScriptCompiler::Source script_source(source, origin);
+	// Bytecode cache: skip the ~1.9 MB cold parse on repeat boots. Falls back
+	// to a normal compile on any miss/rejection (see nx_compile_module_cached).
 	Local<Module> module;
-	if (!ScriptCompiler::CompileModule(iso, &script_source).ToLocal(&module)) {
+	if (!nx_compile_module_cached(iso, source, origin, "main", src, len)
+	         .ToLocal(&module)) {
 		nx_emit_error_event(iso, &try_catch);
 		return false;
 	}
