@@ -2,8 +2,17 @@
 // accelerometer + fused-angle) sensor as three functions:
 //
 //   $.sensorsSixAxisStart() : boolean
-//   $.sensorsSixAxisRead()  : { acceleration, angularVelocity, angle, ... } | null
+//   $.sensorsSixAxisRead()  : { acceleration, angularVelocity, angle,
+//                               direction, ... } | null
 //   $.sensorsSixAxisStop()  : undefined
+//
+// `direction` is Nintendo's fused 3x3 orientation matrix
+// (HidSixAxisSensorState.direction) serialized row-major as a flat
+// 9-element array [m00,m01,m02, m10,m11,m12, m20,m21,m22]. Unlike the
+// accel vector (gravity-referenced tilt only) this carries a full
+// orientation including a *relative* yaw the deviceorientation polyfill
+// uses to recover `alpha`. There is no magnetometer, so yaw is
+// origin-arbitrary and drifts — see device-orientation.ts.
 //
 // hid is initialized at process boot by libnx + main.cc, so no ensure_hid()
 // is needed — we only guard per-controller start/stop of the sensor itself.
@@ -114,6 +123,14 @@ void nx_sensors_sixaxis_read(const FunctionCallbackInfo<Value> &info) {
 	       make_vec3(iso, ctx, st.angular_velocity))
 	    .Check();
 	o->Set(ctx, nx_str(iso, "angle"), make_vec3(iso, ctx, st.angle)).Check();
+	// Fused 3x3 orientation matrix, row-major flat [m00..m22]. `float
+	// direction[3][3]` is contiguous row-major in C, so &d[0][0] walks
+	// m00,m01,m02,m10,... in order.
+	Local<Array> dir = Array::New(iso, 9);
+	const float *dm = &st.direction.direction[0][0];
+	for (int k = 0; k < 9; k++)
+		dir->Set(ctx, k, Number::New(iso, dm[k])).Check();
+	o->Set(ctx, nx_str(iso, "direction"), dir).Check();
 	o->Set(ctx, nx_str(iso, "samplingNumber"),
 	       BigInt::NewFromUnsigned(iso, st.sampling_number))
 	    .Check();

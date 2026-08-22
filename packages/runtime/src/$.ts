@@ -615,6 +615,8 @@ export interface Init {
 		acceleration: { x: number; y: number; z: number };
 		angularVelocity: { x: number; y: number; z: number };
 		angle: { x: number; y: number; z: number };
+		/** Fused 3x3 orientation matrix, row-major flat [m00..m22]. */
+		direction: number[];
 		samplingNumber: bigint;
 		deltaTime: bigint;
 	} | null;
