@@ -918,6 +918,17 @@ export interface Init {
 		endpointNumber: number,
 		data: BufferSource,
 	): number;
+	/** Post a non-blocking bulk-OUT transfer (one in flight per endpoint). */
+	usbWriteStart(
+		device: USBNativeDevice,
+		endpointNumber: number,
+		data: BufferSource,
+	): void;
+	/** Poll a posted bulk-OUT transfer: `bytesWritten` when done, `undefined` while pending. */
+	usbWritePoll(
+		device: USBNativeDevice,
+		endpointNumber: number,
+	): number | undefined;
 	usbControlTransferIn(
 		device: USBNativeDevice,
 		setup: {

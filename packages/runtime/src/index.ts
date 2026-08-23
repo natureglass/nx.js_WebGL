@@ -53,9 +53,14 @@ export type * from './polyfills/form-data';
 export type * from './polyfills/streams';
 export type { TextDecodeOptions, TextDecoder } from './polyfills/text-decoder';
 export type {
+	TextDecoderStream,
+	TextDecoderStreamOptions,
+} from './polyfills/text-decoder-stream';
+export type {
 	TextEncoder,
 	TextEncoderEncodeIntoResult,
 } from './polyfills/text-encoder';
+export type { TextEncoderStream } from './polyfills/text-encoder-stream';
 export type { URL, URLSearchParams } from './polyfills/url';
 export type {
 	cancelAnimationFrame,

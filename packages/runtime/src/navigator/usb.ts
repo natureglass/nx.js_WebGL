@@ -453,11 +453,19 @@ export class USBDevice {
 	): Promise<USBOutTransferResult> {
 		validateByte('endpointNumber', endpointNumber);
 		const state = _device.get(this)!;
-		await yieldToLoop();
-		return {
-			bytesWritten: $.usbTransferOut(state.native, endpointNumber, data),
-			status: 'ok',
-		};
+		// Non-blocking: post the OUT URB once, then poll it a frame at a time so the
+		// JS event loop (RAF, input, timers) keeps running while the transfer is in
+		// flight. The synchronous alternative ($.usbTransferOut → usbHsEpPostBuffer)
+		// waits U64_MAX, so a device that stalls its OUT endpoint would freeze the
+		// whole runtime — mirror transferIn's async post/poll instead.
+		$.usbWriteStart(state.native, endpointNumber, data);
+		for (;;) {
+			await yieldToLoop();
+			const bytesWritten = $.usbWritePoll(state.native, endpointNumber);
+			if (bytesWritten !== undefined) {
+				return { bytesWritten, status: 'ok' };
+			}
+		}
 	}
 
 	async controlTransferIn(

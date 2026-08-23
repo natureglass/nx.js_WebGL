@@ -572,7 +572,18 @@ export class SerialPort extends EventTarget {
 		// full packet arrives (module 140 "usb bulk IN transfer failed"). Round
 		// the requested buffer up to the next multiple (at least one packet).
 		const maxPacket = this.#layout!.inPacketSize || 64;
-		const readLen = Math.max(maxPacket, Math.ceil(bufferSize / maxPacket) * maxPacket);
+		let readLen = Math.max(maxPacket, Math.ceil(bufferSize / maxPacket) * maxPacket);
+		// Cap the per-transfer read length to a modest, browser-like size. WebSerial
+		// `bufferSize` is the size of the internal read buffer, NOT the USB transfer
+		// length — Chrome reads in small chunks and loops. A huge bufferSize (e.g.
+		// 65536) must NOT become a giant per-URB read: every poll would allocate a
+		// DMA buffer that big, and it also has to fit WebUSB's 16-bit length word
+		// (transferIn() rejects > 0xffff, which would throw on the first pull and
+		// kill the read stream). One frame-sized read per device write is plenty;
+		// anything larger is just wasted allocation and setup.
+		const READ_CAP = 4096;
+		const maxReadLen = Math.max(maxPacket, Math.floor(READ_CAP / maxPacket) * maxPacket);
+		if (readLen > maxReadLen) readLen = maxReadLen;
 
 		this.#readable = new ReadableStream<Uint8Array>({
 			pull: async (controller) => {

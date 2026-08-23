@@ -34,6 +34,10 @@ struct nx_usb_iface_t {
 	bool in_reading[NX_USB_EP];
 	void *in_buf[NX_USB_EP];
 	u64 in_id_counter;
+	// Non-blocking bulk-OUT write state: one in-flight URB per OUT endpoint.
+	bool out_writing[NX_USB_EP];
+	void *out_buf[NX_USB_EP];
+	u64 out_id_counter;
 };
 
 struct nx_usb_device_t {
@@ -98,6 +102,12 @@ void iface_close(nx_usb_iface_t *f) {
 		if (f->out_open[i]) {
 			usbHsEpClose(&f->out_eps[i]);
 			f->out_open[i] = false;
+		}
+		// Endpoint close aborts any in-flight OUT URB; only then free its buffer.
+		if (f->out_writing[i]) {
+			free(f->out_buf[i]);
+			f->out_buf[i] = nullptr;
+			f->out_writing[i] = false;
 		}
 	}
 	if (f->acquired) {
@@ -779,9 +789,133 @@ void nx_usb_read_poll(const FunctionCallbackInfo<Value> &info) {
 		nx_throw_libnx_error(iso, report.res, "usb bulk IN transfer");
 		return;
 	}
+	// Copy the received bytes into a right-sized buffer and free the read DMA
+	// buffer NOW. Handing the raw `buf` straight to V8 (freed only when GC
+	// collects the ArrayBuffer) makes V8 pin up to the full read length while
+	// being told the ArrayBuffer is only `transferredSize` bytes (e.g. a 6-byte
+	// ack backed by a 64 KB read). V8 then under-counts the native memory it
+	// holds and feels no GC pressure, so at a steady read rate the freed-late
+	// buffers pile up in the native heap until usb:hs can't map a DMA buffer and
+	// the link faults (the device re-enumerates). Copying out keeps the external-
+	// memory accounting honest and returns the DMA buffer to the heap immediately.
+	u32 n = report.transferredSize;
+	void *out = malloc(n ? n : 1);
+	if (!out) {
+		free(buf);
+		nx_throw_oom(iso, n ? n : 1);
+		return;
+	}
+	if (n)
+		memcpy(out, buf, n);
+	free(buf);
 	std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
-	    buf, report.transferredSize, [](void *p, size_t, void *) { free(p); }, nullptr);
+	    out, n, [](void *p, size_t, void *) { free(p); }, nullptr);
 	info.GetReturnValue().Set(ArrayBuffer::New(iso, std::move(bs)));
+}
+
+// Non-blocking bulk-OUT: post the URB, reap later with write_poll. Mirrors the
+// read path so a device that stops draining its OUT endpoint can't freeze the JS
+// thread the way the synchronous usbHsEpPostBuffer (which waits U64_MAX) does.
+void nx_usb_write_start(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_usb_device_t *dev = unwrap_device(iso, info[0]);
+	if (!dev)
+		return;
+	uint32_t endpoint = info[1]->Uint32Value(iso->GetCurrentContext()).FromMaybe(0);
+	size_t len = 0;
+	uint8_t *src = NX_GetBufferSource(iso, &len, info[2]);
+	if (!src) {
+		nx_throw(iso, "transferOut data must be a BufferSource");
+		return;
+	}
+	if (len > 0xff0000) {
+		nx_throw(iso, "USB transfer is too large");
+		return;
+	}
+	if (endpoint >= NX_USB_EP) {
+		nx_throw(iso, "Invalid USB endpoint number");
+		return;
+	}
+	nx_usb_iface_t *f = iface_for_ep(dev, (uint8_t)endpoint, false);
+	if (dev->opened && f && f->out_writing[endpoint]) {
+		// The WritableStream serialises writes, so a second start before the first
+		// completes is a caller bug — surface it rather than leaking the prior URB.
+		nx_throw(iso, "USB write already in flight on this endpoint");
+		return;
+	}
+	UsbHsClientEpSession *ep = nullptr;
+	f = resolve_ep(iso, dev, (uint8_t)endpoint, false, (uint32_t)len, &ep);
+	if (!f)
+		return;
+	size_t alloc_size = (len + 0xfff) & ~((size_t)0xfff);
+	if (alloc_size == 0)
+		alloc_size = 0x1000;
+	void *buf = memalign(0x1000, alloc_size);
+	if (!buf) {
+		nx_throw_oom(iso, alloc_size);
+		return;
+	}
+	memset(buf, 0, alloc_size);
+	// Copy out synchronously: the async URB DMAs from `buf`, so the JS-side
+	// BufferSource is free to be reused/GC'd the moment this returns.
+	memcpy(buf, src, len);
+	u64 id = f->out_id_counter++;
+	u32 xferId = 0;
+	Result rc = usbHsEpPostBufferAsync(ep, buf, (u32)len, id, &xferId);
+	if (R_FAILED(rc)) {
+		free(buf);
+		nx_throw_libnx_error(iso, rc, "usbHsEpPostBufferAsync");
+		return;
+	}
+	f->out_buf[endpoint] = buf;
+	f->out_writing[endpoint] = true;
+}
+
+void nx_usb_write_poll(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_usb_device_t *dev = unwrap_device(iso, info[0]);
+	if (!dev)
+		return;
+	uint32_t endpoint = info[1]->Uint32Value(iso->GetCurrentContext()).FromMaybe(0);
+	if (endpoint >= NX_USB_EP)
+		return;
+	nx_usb_iface_t *f = iface_for_ep(dev, (uint8_t)endpoint, false);
+	if (!f || !f->out_writing[endpoint])
+		return; // nothing pending → undefined
+	UsbHsClientEpSession *ep = &f->out_eps[endpoint];
+	Result rc = eventWait(&ep->eventXfer, 0);
+	if (R_FAILED(rc)) {
+		if (R_VALUE(rc) == KERNELRESULT(TimedOut))
+			return; // still in flight → undefined
+		void *buf = f->out_buf[endpoint];
+		f->out_writing[endpoint] = false;
+		f->out_buf[endpoint] = nullptr;
+		free(buf);
+		nx_throw_libnx_error(iso, rc, "eventWait(eventXfer)");
+		return;
+	}
+	UsbHsXferReport report = {0};
+	u32 count = 0;
+	rc = usbHsEpGetXferReport(ep, &report, 1, &count);
+	if (R_FAILED(rc)) {
+		void *buf = f->out_buf[endpoint];
+		f->out_writing[endpoint] = false;
+		f->out_buf[endpoint] = nullptr;
+		free(buf);
+		nx_throw_libnx_error(iso, rc, "usbHsEpGetXferReport");
+		return;
+	}
+	if (count == 0)
+		return; // spurious wake; keep pending state
+	void *buf = f->out_buf[endpoint];
+	f->out_writing[endpoint] = false;
+	f->out_buf[endpoint] = nullptr;
+	free(buf); // we own the OUT buffer (unlike the IN path, which hands it to JS)
+	if (R_FAILED(report.res)) {
+		nx_throw_libnx_error(iso, report.res, "usb bulk OUT transfer");
+		return;
+	}
+	info.GetReturnValue().Set(Integer::NewFromUnsigned(iso, report.transferredSize));
 }
 
 // ---- control transfers ---------------------------------------------------
@@ -1017,6 +1151,8 @@ void nx_init_usb(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "usbReadStart", nx_usb_read_start);
 	NX_SET_FUNC(init_obj, "usbReadPoll", nx_usb_read_poll);
 	NX_SET_FUNC(init_obj, "usbTransferOut", nx_usb_transfer_out);
+	NX_SET_FUNC(init_obj, "usbWriteStart", nx_usb_write_start);
+	NX_SET_FUNC(init_obj, "usbWritePoll", nx_usb_write_poll);
 	NX_SET_FUNC(init_obj, "usbControlTransferIn", nx_usb_control_transfer_in);
 	NX_SET_FUNC(init_obj, "usbControlTransferOut", nx_usb_control_transfer_out);
 	NX_SET_FUNC(init_obj, "usbClearHalt", nx_usb_clear_halt);
