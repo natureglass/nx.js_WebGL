@@ -219,6 +219,16 @@ void nxcp_arc_to(SkPathBuilder &sub, SkPoint p0pt, double x1, double y1,
 	if ((sa < ea) && ((ea - sa) > M_PI))
 		anticlockwise = 1;
 	sub.lineTo(t_p1p0.x, t_p1p0.y);
+	// `arc()` / `ellipse()` normalize the end angle via `adjustEndAngle`
+	// before `path_arc` (which draws the raw signed span `ea - sa`). arcTo
+	// computed `sa`/`ea` as raw [0,2pi) angles plus an `anticlockwise` flag
+	// but passed them through UN-normalized, so a corner whose true sweep
+	// crosses the 0/2pi seam drew the long way (~270deg instead of 90deg) —
+	// a near-full dark circle at that corner. This showed up as a dark dot
+	// at the first corner of any canvas `roundRect()` (moveTo + 4x arcTo).
+	// Normalize the same way arc()/ellipse() do so the sweep is the correct
+	// <=2pi span in the `anticlockwise` direction.
+	ea = (float)adjustEndAngle(sa, ea, anticlockwise != 0);
 	path_arc(sub, p.x, p.y, radius, sa, ea, anticlockwise != 0);
 }
 
