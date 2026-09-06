@@ -94,6 +94,10 @@ export class VideoDecoder {
 	declare readonly height: number;
 	/** Container duration in seconds (0 if unknown). */
 	declare readonly duration: number;
+	/** Content frame rate from the stream's avg_frame_rate (0 while opening /
+	 * unknown). The brewser shell reads this to pick the present cadence:
+	 * >~32fps content runs at 60 Hz instead of the 30 Hz video pacing lock. */
+	declare readonly fps: number;
 	/** True when decode is paused (no frames pushed into the ring). */
 	declare readonly paused: boolean;
 	/** True once the last frame has been delivered. */

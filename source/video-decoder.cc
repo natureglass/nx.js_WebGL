@@ -585,6 +585,15 @@ void nx_vd_get_duration(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(Number::New(info.GetIsolate(),
 	                                       m ? nx_media_duration(m) : 0.0));
 }
+// Content frame rate (0 while opening / unknown). The brewser shell reads this
+// to pick the present cadence: >~32fps => keep 60 Hz (don't engage the 30 Hz
+// video pacing lock, which would halve 60fps content to 30 shown fps).
+void nx_vd_get_fps(const FunctionCallbackInfo<Value> &info) {
+	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
+	nx_media_t *m = ready_media(d);
+	info.GetReturnValue().Set(Number::New(info.GetIsolate(),
+	                                       m ? nx_media_content_fps(m) : 0.0));
+}
 void nx_vd_get_error(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
@@ -680,6 +689,7 @@ void nx_video_decoder_init_class(const FunctionCallbackInfo<Value> &info) {
 	NX_DEF_GET(proto, "width", nx_vd_get_width);
 	NX_DEF_GET(proto, "height", nx_vd_get_height);
 	NX_DEF_GET(proto, "duration", nx_vd_get_duration);
+	NX_DEF_GET(proto, "fps", nx_vd_get_fps);
 	NX_DEF_GET(proto, "error", nx_vd_get_error);
 	NX_DEF_GET(proto, "ended", nx_vd_get_ended);
 	NX_DEF_GET(proto, "usedVideo", nx_vd_get_has_video);

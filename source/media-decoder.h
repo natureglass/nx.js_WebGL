@@ -63,6 +63,7 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 int nx_media_width(nx_media_t *m);
 int nx_media_height(nx_media_t *m);
 double nx_media_duration(nx_media_t *m); // seconds (0 if unknown)
+double nx_media_content_fps(nx_media_t *m); // stream frame rate (0 if unknown)
 bool nx_media_has_audio(nx_media_t *m);
 bool nx_media_has_video(nx_media_t *m);
 

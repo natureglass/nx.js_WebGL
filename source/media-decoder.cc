@@ -1022,6 +1022,21 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 	if (m->fmt->duration != AV_NOPTS_VALUE && m->fmt->duration > 0)
 		m->duration = (double)m->fmt->duration / AV_TIME_BASE;
 
+#if MEDIA_DIAG_112
+	// One-time open summary. For the 60fps-feasibility probe: content_fps tells
+	// us what the device receives (Source direct-play => ~60), and cross-checked
+	// against [md-diag:prs] ring depth it reveals whether SW decode sustains it
+	// (depth full ~11-12 + no_frame=0 => decode keeps up at the present's
+	// ~60 ring-frames/s consumption; draining => decode-bound => slow motion).
+	fprintf(stderr,
+	        "[md-diag:open] %dx%d content_fps=%.3f vframe_dur=%.4f dur=%.2f "
+	        "out_yuv=%d has_audio=%d\n",
+	        m->width, m->height,
+	        m->vframe_dur > 0 ? 1.0 / m->vframe_dur : -1.0, m->vframe_dur,
+	        m->duration, m->out_yuv ? 1 : 0, m->astream >= 0 ? 1 : 0);
+	fflush(stderr);
+#endif
+
 	m->thread = std::thread(decode_thread_main, m);
 	return m;
 
@@ -1033,6 +1048,12 @@ fail:
 int nx_media_width(nx_media_t *m) { return m->width; }
 int nx_media_height(nx_media_t *m) { return m->height; }
 double nx_media_duration(nx_media_t *m) { return m->duration; }
+// Content frame rate (from the stream's avg_frame_rate; see vframe_dur set at
+// open). Drives the shell's swap-interval decision: >~32fps content wants a
+// 60 Hz present, not the 30 Hz pacing lock (which would halve it to 30 shown).
+double nx_media_content_fps(nx_media_t *m) {
+	return m->vframe_dur > 0 ? 1.0 / m->vframe_dur : 0.0;
+}
 bool nx_media_has_audio(nx_media_t *m) { return m->astream >= 0; }
 bool nx_media_has_video(nx_media_t *m) { return m->vstream >= 0; }
 bool nx_media_is_yuv(nx_media_t *m) { return m->out_yuv; }
