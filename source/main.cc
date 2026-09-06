@@ -558,6 +558,19 @@ static void js_chdir(const FunctionCallbackInfo<Value> &info) {
 	}
 }
 
+// gfxSetSwapInterval(interval) — vsync divisor for the GPU present path
+// (1 = 60 Hz, 2 = 30 Hz). The shell uses 2 to pace fullscreen 30 fps video to
+// a clean 30 Hz cadence (see nx_skia_gpu_set_swap_interval). No-op on raster.
+static void js_gfx_set_swap_interval(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	int32_t interval = 1;
+	if (info.Length() >= 1)
+		info[0]->Int32Value(iso->GetCurrentContext()).To(&interval);
+	if (interval < 0)
+		interval = 0;
+	nx_skia_gpu_set_swap_interval(interval);
+}
+
 static void js_getenv(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	String::Utf8Value name(iso, info[0]);
@@ -1125,6 +1138,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	NX_SET_FUNC(init_obj, "printErr", js_print_err);
 	NX_SET_FUNC(init_obj, "getInternalPromiseState",
 	            js_get_internal_promise_state);
+	NX_SET_FUNC(init_obj, "gfxSetSwapInterval", js_gfx_set_swap_interval);
 	NX_SET_FUNC(init_obj, "getenv", js_getenv);
 	NX_SET_FUNC(init_obj, "setenv", js_setenv);
 	NX_SET_FUNC(init_obj, "unsetenv", js_unsetenv);

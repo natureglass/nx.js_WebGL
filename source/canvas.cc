@@ -18,6 +18,7 @@
 #include "font.h"
 #include "path2d.h"
 #include "image.h"
+#include "skia_gpu.h"
 #include "util.h"
 #include "webgl.h"          // Tier 1 (ledger #64) — nx_webgl_snapshot_bridge_rgba8
 #include "webgl_bridge.h"   // Tier-A refine — nx_webgl_bridge_is_initialized + fbo_size
@@ -47,6 +48,11 @@
 #include "include/core/SkStream.h"
 #include "include/core/SkTextBlob.h"
 #include "include/core/SkTileMode.h"
+#include "include/core/SkYUVAInfo.h"
+#include "include/core/SkYUVAPixmaps.h"
+#include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 #include "include/effects/SkDashPathEffect.h"
 #include "include/effects/SkGradient.h"
 #include "include/effects/SkImageFilters.h"
@@ -2475,11 +2481,48 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 		// so the cost is paid a single time per image, not per draw. Released
 		// in close_image via nx_image_release_cache.
 		if (!img->cached_sk_image) {
-			SkImageInfo ii = SkImageInfo::Make(img->width, img->height,
-			                                   kBGRA_8888_SkColorType,
-			                                   kPremul_SkAlphaType);
-			SkPixmap pm(ii, img->data, (size_t)img->width * 4);
-			sk_sp<SkImage> cached = SkImages::RasterFromPixmapCopy(pm);
+			sk_sp<SkImage> cached;
+			if (img->is_yuv) {
+				// Planar-I420 video frame (2026-09-06): upload the Y/U/V
+				// planes as a GPU YUVA image (Skia does YUV→RGB in the
+				// shader). This transfers ~1.5 B/px vs BGRA's 4 B/px — the
+				// per-frame texture upload is the dominant cost on Mesa-
+				// nouveau, so this is the Jellyfin video-perf fix. The memo is
+				// invalidated every frame by imageWriteYUV's release_cache, so
+				// like the BGRA path this rebuilds (re-uploads) per frame, just
+				// with far less data. No raster fallback: the screen is always
+				// GPU here; if the context is somehow absent we skip the draw.
+				GrDirectContext *grctx = nx_skia_gpu_gr_context();
+				if (grctx) {
+					SkYUVColorSpace ycs;
+					switch (img->yuv_colorspace) {
+					case 1: ycs = kRec601_Limited_SkYUVColorSpace; break;
+					case 2: ycs = kJPEG_Full_SkYUVColorSpace; break;
+					case 3: ycs = kRec709_Full_SkYUVColorSpace; break;
+					default: ycs = kRec709_Limited_SkYUVColorSpace; break;
+					}
+					SkYUVAInfo yinfo(SkISize::Make(img->width, img->height),
+					                 SkYUVAInfo::PlaneConfig::kY_U_V,
+					                 SkYUVAInfo::Subsampling::k420, ycs);
+					// nullptr rowBytes → tight packing (W, W/2, W/2), matching
+					// the contiguous Y|U|V the decoder wrote.
+					SkYUVAPixmapInfo pinfo(
+					    yinfo, SkYUVAPixmaps::DataType::kUnorm8, nullptr);
+					SkYUVAPixmaps pixmaps =
+					    SkYUVAPixmaps::FromExternalMemory(pinfo, img->data);
+					if (pixmaps.isValid()) {
+						cached = SkImages::TextureFromYUVAPixmaps(
+						    grctx, pixmaps, skgpu::Mipmapped::kNo, false,
+						    nullptr);
+					}
+				}
+			} else {
+				SkImageInfo ii = SkImageInfo::Make(img->width, img->height,
+				                                   kBGRA_8888_SkColorType,
+				                                   kPremul_SkAlphaType);
+				SkPixmap pm(ii, img->data, (size_t)img->width * 4);
+				cached = SkImages::RasterFromPixmapCopy(pm);
+			}
 			// Only memoize on success: caching a null sk_sp would make a
 			// transient failure (e.g. OOM) permanent — every later draw would
 			// reuse the null and never retry. On failure just skip this draw;

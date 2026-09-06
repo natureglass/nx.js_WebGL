@@ -33,6 +33,7 @@ void close_image(nx_image_t *image) {
 		image->data = NULL;
 	}
 	image->width = image->height = 0;
+	image->is_yuv = false;
 }
 
 void user_read_data(png_structp png_ptr, png_bytep data, png_size_t length) {
@@ -505,6 +506,102 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 	nx_image_release_cache(image);
 }
 
+// imageWriteBGRA(image, bytes) — zero-swizzle counterpart to imageWriteRGBA
+// for decoded video frames (2026-09-05 Fix D). FFmpeg's sws_scale already
+// produces BGRA (Skia's ARGB32 memory order) and video frames are fully
+// opaque (alpha 255, so premultiplied == straight), so this is a plain
+// memcpy — no R↔B swap and no premultiply pass. Feeding Switch.VideoDecoder's
+// BGRA frames through here instead of imageWriteRGBA removes the
+// BGRA→RGBA→BGRA double swizzle (two per-pixel byte loops per frame on the
+// main thread) that the RGBA path incurred. The image must have been
+// constructed via imageNew(w, h).
+void nx_image_write_bgra(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (info.Length() < 2) {
+		nx_throw(iso, "imageWriteBGRA: expected (image, bytes)");
+		return;
+	}
+	nx_image_t *image = nx_get_image(iso, info[0]);
+	if (!image) {
+		nx_throw(iso, "imageWriteBGRA: first arg must be an Image");
+		return;
+	}
+	if (!image->data || image->width == 0 || image->height == 0) {
+		nx_throw(iso,
+		         "imageWriteBGRA: image has no backing buffer — construct via "
+		         "imageNew(width, height)");
+		return;
+	}
+	size_t src_size = 0;
+	uint8_t *src = NX_GetBufferSource(iso, &src_size, info[1]);
+	if (!src) {
+		nx_throw(iso, "imageWriteBGRA: second arg must be ArrayBuffer or "
+		              "TypedArray");
+		return;
+	}
+	size_t expected = (size_t)image->width * (size_t)image->height * 4;
+	if (src_size < expected) {
+		nx_throw(iso, "imageWriteBGRA: buffer smaller than expected");
+		return;
+	}
+	image->unpremultiplied = false; // opaque BGRA == premultiplied BGRA
+	memcpy(image->data, src, expected);
+	// Same cache invalidation rationale as imageWriteRGBA above.
+	nx_image_release_cache(image);
+}
+
+// imageWriteYUV(image, bytes, width, height, [colorSpace]) — store a planar
+// I420 video frame (Y|U|V contiguous, 1.5 B/px) so canvas.cc's drawImage
+// builds a GPU YUVA SkImage (Skia does YUV→RGB in the shader), uploading ~2.6×
+// less per frame than the BGRA path. The image must have been constructed via
+// imageNew(width, height) — its width*height*4 alloc comfortably holds the
+// 1.5*width*height I420, so no reallocation is needed even on reuse. Marks the
+// image `is_yuv`; the next imageWriteBGRA/RGBA would clear it back to RGBA.
+void nx_image_write_yuv(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	if (info.Length() < 4) {
+		nx_throw(iso, "imageWriteYUV: expected (image, bytes, width, height, "
+		              "[colorSpace])");
+		return;
+	}
+	nx_image_t *image = nx_get_image(iso, info[0]);
+	if (!image) {
+		nx_throw(iso, "imageWriteYUV: first arg must be an Image");
+		return;
+	}
+	Local<Context> c = iso->GetCurrentContext();
+	uint32_t w = 0, h = 0;
+	if (!info[2]->Uint32Value(c).To(&w) || !info[3]->Uint32Value(c).To(&h))
+		return;
+	if (!image->data || image->width != w || image->height != h) {
+		nx_throw(iso, "imageWriteYUV: image must be imageNew(width, height) at "
+		              "these dimensions");
+		return;
+	}
+	size_t src_size = 0;
+	uint8_t *src = NX_GetBufferSource(iso, &src_size, info[1]);
+	if (!src) {
+		nx_throw(iso,
+		         "imageWriteYUV: second arg must be ArrayBuffer or TypedArray");
+		return;
+	}
+	const size_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+	const size_t expected = (size_t)w * h + 2 * cw * ch;
+	if (src_size < expected) {
+		nx_throw(iso, "imageWriteYUV: buffer smaller than expected");
+		return;
+	}
+	memcpy(image->data, src, expected);
+	image->is_yuv = true;
+	image->unpremultiplied = false;
+	if (info.Length() >= 5) {
+		int32_t cs = 0;
+		if (info[4]->Int32Value(c).To(&cs))
+			image->yuv_colorspace = cs;
+	}
+	nx_image_release_cache(image);
+}
+
 // Ledger #78 — imageCopyPixels(dst, src, dstPremultiply, flipY). Copies
 // src.data (BGRA) to dst.data (BGRA) with premul-state conversion and
 // optional Y-flip. Bypasses the canvas 2D round-trip that
@@ -659,5 +756,7 @@ void nx_init_image(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "imageDecode", nx_image_decode);
 	NX_SET_FUNC(init_obj, "imageClose", nx_image_close);
 	NX_SET_FUNC(init_obj, "imageWriteRGBA", nx_image_write_rgba);
+	NX_SET_FUNC(init_obj, "imageWriteBGRA", nx_image_write_bgra);
+	NX_SET_FUNC(init_obj, "imageWriteYUV", nx_image_write_yuv);
 	NX_SET_FUNC(init_obj, "imageCopyPixels", nx_image_copy_pixels);
 }

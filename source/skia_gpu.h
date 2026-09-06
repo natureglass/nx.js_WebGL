@@ -48,6 +48,11 @@ sk_sp<SkSurface> nx_skia_gpu_screen_init(u32 width, u32 height, int samples,
 // Flush + submit the GPU surface and eglSwapBuffers (present one frame).
 void nx_skia_gpu_present(void);
 
+// Set the EGL swap interval (vsync divisor): 1 = 60 Hz (default), 2 = 30 Hz.
+// Used by the shell to pace fullscreen 30 fps video to a clean 30 Hz cadence.
+// No-op on the raster fallback. Safe to call every frame (cheap; EGL dedups).
+void nx_skia_gpu_set_swap_interval(int interval);
+
 // Tear down the GPU surface, GrDirectContext, and EGL. Idempotent.
 void nx_skia_gpu_screen_exit(void);
 

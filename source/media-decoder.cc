@@ -104,6 +104,14 @@ struct nx_media {
 	double duration = 0;
 	double vframe_dur = 1.0 / 30; // nominal frame duration (seek slack)
 
+	// ---- output pixel format (2026-09-06) ----
+	// When true, the ring slots hold planar I420 (Y|U|V contiguous, 1.5 B/px)
+	// instead of BGRA (4 B/px) — see nx_media_open's want_yuv. yuv_cs is the
+	// neutral color-space tag (0=709ltd,1=601ltd,2=full,3=709full) derived
+	// from the first decoded frame's colorimetry.
+	bool out_yuv = false;
+	int yuv_cs = 0;
+
 	// ---- video presentation ring (SPSC: decode thread -> main thread) ----
 	video_slot slots[RING_SLOTS];
 	std::atomic<uint64_t> vwrite{0};
@@ -262,16 +270,49 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	uint64_t w = m->vwrite.load(std::memory_order_relaxed);
 	video_slot *slot = &m->slots[w % RING_SLOTS];
 
+	const AVPixelFormat out_fmt =
+	    m->out_yuv ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_BGRA;
 	m->sws = sws_getCachedContext(m->sws, frame->width, frame->height,
 	                              (AVPixelFormat)frame->format, m->width,
-	                              m->height, AV_PIX_FMT_BGRA, SWS_BILINEAR,
+	                              m->height, out_fmt, SWS_BILINEAR,
 	                              NULL, NULL, NULL);
 	if (!m->sws) {
 		set_fatal(m, "failed to create scaler", 0);
 		return false;
 	}
-	uint8_t *dst[4] = {slot->bgra, NULL, NULL, NULL};
-	int dst_stride[4] = {m->width * 4, 0, 0, 0};
+	uint8_t *dst[4];
+	int dst_stride[4];
+	if (m->out_yuv) {
+		// Planar I420 packed contiguously into the slot: Y (W*H) then U then
+		// V (each (W/2)*(H/2)). Matches Skia's SkYUVAPixmaps kY_U_V/k420 tight
+		// layout so the GPU upload reads it directly.
+		const int cw = (m->width + 1) / 2, ch = (m->height + 1) / 2;
+		uint8_t *y = slot->bgra;
+		uint8_t *u = y + (size_t)m->width * m->height;
+		uint8_t *v = u + (size_t)cw * ch;
+		dst[0] = y; dst[1] = u; dst[2] = v; dst[3] = NULL;
+		dst_stride[0] = m->width; dst_stride[1] = cw; dst_stride[2] = cw;
+		dst_stride[3] = 0;
+		// Derive the neutral color-space tag once from the decoded frame's
+		// colorimetry (cheap; the value is stable so re-deriving is harmless).
+		const bool full = frame->color_range == AVCOL_RANGE_JPEG;
+		int cs;
+		if (full) {
+			cs = 2; // JPEG/full range
+		} else if (frame->colorspace == AVCOL_SPC_BT709) {
+			cs = 0; // Rec709 limited
+		} else if (frame->colorspace == AVCOL_SPC_BT470BG ||
+		           frame->colorspace == AVCOL_SPC_SMPTE170M) {
+			cs = 1; // Rec601 limited
+		} else {
+			cs = (m->height >= 720) ? 0 : 1; // unspecified → guess by size
+		}
+		m->yuv_cs = cs;
+	} else {
+		dst[0] = slot->bgra; dst[1] = NULL; dst[2] = NULL; dst[3] = NULL;
+		dst_stride[0] = m->width * 4; dst_stride[1] = 0; dst_stride[2] = 0;
+		dst_stride[3] = 0;
+	}
 #if MEDIA_DIAG_112
 	auto _sws_t0 = std::chrono::steady_clock::now();
 #endif
@@ -636,13 +677,16 @@ static bool nx_is_network_url(const char *path) {
 
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
-                          char *errbuf, size_t errbuf_size) {
+                          char *errbuf, size_t errbuf_size, bool want_yuv) {
 	nx_media *m = new nx_media();
 	m->mem_hold = std::move(keepalive);
+	m->out_yuv = want_yuv;
 	int ret = 0;
 	const AVCodec *vcodec = NULL;
 	const AVCodec *acodec = NULL;
 	unsigned char *avio_buf = NULL;
+	AVDictionary *net_opts = NULL; // declared here so the fail: gotos don't
+	                               // cross its initialization
 
 	const bool is_network = nx_is_network_url(path);
 
@@ -655,7 +699,14 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 			snprintf(errbuf, errbuf_size, "out of memory");
 			goto fail;
 		}
-		ret = avformat_open_input(&m->fmt, path, NULL, NULL);
+		// Bound blocking network reads/writes. The open now runs on a worker
+		// thread (video-decoder.cc), and a close() may join it — without a
+		// timeout a hung/slow server could block the join (and any read
+		// during playback) indefinitely. 30 s (in microseconds) is generous
+		// for a LAN transcode while still guaranteeing forward progress.
+		av_dict_set(&net_opts, "rw_timeout", "30000000", 0);
+		ret = avformat_open_input(&m->fmt, path, NULL, &net_opts);
+		av_dict_free(&net_opts);
 		if (ret < 0) {
 			// Surface the real AVERROR (DNS / TLS handshake / HTTP 4xx /
 			// "Protocol not found") — network opens fail many distinct ways.
@@ -743,9 +794,14 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 			snprintf(errbuf, errbuf_size, "unsupported video dimensions");
 			goto fail;
 		}
+		// Ring slot size depends on the output format: I420 is 1.5 B/px
+		// (Y|U|V contiguous), BGRA is 4 B/px. The field is named `bgra` for
+		// historical reasons; under out_yuv it holds planar I420.
+		const size_t slot_bytes =
+		    m->out_yuv ? nx_media_i420_size(m->width, m->height)
+		               : (size_t)m->width * m->height * 4;
 		for (int i = 0; i < RING_SLOTS; i++) {
-			m->slots[i].bgra =
-			    (uint8_t *)malloc((size_t)m->width * m->height * 4);
+			m->slots[i].bgra = (uint8_t *)malloc(slot_bytes);
 			if (!m->slots[i].bgra) {
 				snprintf(errbuf, errbuf_size, "out of memory");
 				goto fail;
@@ -782,6 +838,8 @@ int nx_media_height(nx_media_t *m) { return m->height; }
 double nx_media_duration(nx_media_t *m) { return m->duration; }
 bool nx_media_has_audio(nx_media_t *m) { return m->astream >= 0; }
 bool nx_media_has_video(nx_media_t *m) { return m->vstream >= 0; }
+bool nx_media_is_yuv(nx_media_t *m) { return m->out_yuv; }
+int nx_media_yuv_colorspace(nx_media_t *m) { return m->yuv_cs; }
 
 void nx_media_set_audio_node(nx_media_t *m, nx_audio_node *node,
                              double sample_rate) {

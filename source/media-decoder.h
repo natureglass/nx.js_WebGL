@@ -46,9 +46,18 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 // nx_media_destroy(), since the decode thread streams from it for the
 // media's whole lifetime. Blocking — call off the main thread. Returns NULL
 // and fills `errbuf` on failure.
+// `want_yuv` (2026-09-06): when true the video ring stores planar I420
+// (Y + U + V, contiguous, 1.5 bytes/px) instead of BGRA (4 bytes/px). This
+// lets the caller upload the frame to the GPU as YUV planes and do YUV→RGB
+// in the shader (Skia's YUVA image path) — ~2.6× less per-frame texture
+// upload than BGRA, which is the dominant per-frame cost on the Switch's
+// Mesa-nouveau GL (see the Jellyfin video-perf work). Default false keeps the
+// documented BGRA contract for the Three.js webgl_materials_video demo and the
+// legacy `<video>` element (video.cc).
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
-                          char *errbuf, size_t errbuf_size);
+                          char *errbuf, size_t errbuf_size,
+                          bool want_yuv = false);
 
 // Metadata (valid after a successful open).
 int nx_media_width(nx_media_t *m);
@@ -56,6 +65,20 @@ int nx_media_height(nx_media_t *m);
 double nx_media_duration(nx_media_t *m); // seconds (0 if unknown)
 bool nx_media_has_audio(nx_media_t *m);
 bool nx_media_has_video(nx_media_t *m);
+
+// True if this media's video ring is planar I420 (opened with want_yuv). The
+// present buffer is then W*H + 2*((W+1)/2)*((H+1)/2) bytes, not W*H*4.
+bool nx_media_is_yuv(nx_media_t *m);
+// Neutral color-space tag for the I420 frames, derived from the stream:
+//   0 = Rec709 limited, 1 = Rec601 limited, 2 = JPEG/full range, 3 = Rec709 full.
+// The GPU draw path maps this to the matching SkYUVColorSpace. Meaningful only
+// when nx_media_is_yuv() is true.
+int nx_media_yuv_colorspace(nx_media_t *m);
+// Size in bytes of one I420 frame for the given luma dimensions.
+static inline size_t nx_media_i420_size(int w, int h) {
+	size_t cw = (size_t)((w + 1) / 2), ch = (size_t)((h + 1) / 2);
+	return (size_t)w * (size_t)h + 2 * cw * ch;
+}
 
 // Attach the audio output. `node` must be an NX_AUDIO_NODE_STREAM_SOURCE
 // whose graph runs at `sample_rate`; the decoder resamples the audio track

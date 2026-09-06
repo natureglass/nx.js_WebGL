@@ -521,6 +521,27 @@ export interface Init {
 		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
 		premultiply?: boolean,
 	): void;
+	// Fix D (2026-09-05) — zero-swizzle BGRA write for decoded video frames
+	// (bytes already in Skia's ARGB32/BGRA order + opaque). Straight memcpy.
+	imageWriteBGRA(
+		img: Image | ImageBitmap,
+		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+	): void;
+	// 2026-09-06 — planar-I420 video-frame write. `bytes` is contiguous
+	// Y|U|V (1.5 B/px). Marks the image YUV so drawImage builds a GPU YUVA
+	// SkImage (Skia does YUV→RGB), uploading ~2.6× less per frame than BGRA.
+	// `colorSpace`: 0=Rec709 ltd, 1=Rec601 ltd, 2=full/JPEG, 3=Rec709 full.
+	imageWriteYUV(
+		img: Image | ImageBitmap,
+		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
+		width: number,
+		height: number,
+		colorSpace?: number,
+	): void;
+	// 2026-09-06 — EGL swap interval (vsync divisor): 1 = 60 Hz, 2 = 30 Hz.
+	// The shell pins fullscreen 30 fps video to 30 Hz for a judder-free 1:1
+	// cadence. No-op on the raster fallback.
+	gfxSetSwapInterval(interval: number): void;
 	// Ledger #78 — engine-side BGRA byte copy with premul-state conversion
 	// + optional Y-flip. Reads src.unpremultiplied and dst premul target
 	// to decide whether to do a same-state memcpy, premultiply, or
@@ -1000,12 +1021,17 @@ export interface Init {
 	videoDecoderPause(dec: unknown): void;
 	videoDecoderSeek(dec: unknown, seconds: number): void;
 	videoDecoderClose(dec: unknown): void;
-	videoDecoderNextFrame(dec: unknown): {
+	videoDecoderNextFrame(dec: unknown, bgra?: boolean): {
 		data: ArrayBuffer | null;
 		width: number;
 		height: number;
 		pts: number;
 		ended: boolean;
+		// 2026-09-06 — set when the decoder was opened with `yuv: true`: `data`
+		// is planar I420 (1.5 B/px), `colorSpace` is the neutral tag for the
+		// GPU YUVA path (0=709 ltd,1=601 ltd,2=full,3=709 full).
+		yuv?: boolean;
+		colorSpace?: number;
 	} | null;
 	// Cut #22b (2026-07-02): audio-graph attach + volume/mute for
 	// Switch.VideoDecoder. Restores playback for audio-bearing sources

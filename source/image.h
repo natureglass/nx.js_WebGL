@@ -43,6 +43,14 @@ typedef struct {
 	// through the createImageBitmap round-trip (canvas 2D storage is premul
 	// and would zero the RGB channels of alpha=0 pixels).
 	bool unpremultiplied;
+	// Planar-I420 video frame (2026-09-06). When true, `data` holds
+	// contiguous Y|U|V (1.5 B/px, `width`×`height` luma) rather than BGRA, and
+	// canvas.cc's drawImage builds a GPU YUVA SkImage (Skia does YUV→RGB in
+	// the shader) instead of RasterFromPixmapCopy — ~2.6× less texture upload
+	// per frame. `yuv_colorspace` is the neutral tag from the decoder
+	// (0=Rec709 ltd, 1=Rec601 ltd, 2=full/JPEG, 3=Rec709 full).
+	bool is_yuv;
+	int yuv_colorspace;
 } nx_image_t;
 
 // Release an image's cached SkImage (if any). Defined in canvas.cc where the

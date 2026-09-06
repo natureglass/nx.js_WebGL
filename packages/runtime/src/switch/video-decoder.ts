@@ -9,6 +9,12 @@ import { proto } from '../utils';
 // `proto()`-produced object; the WeakMap also drops its reference
 // naturally when the decoder is GC'd.
 const gainByDecoder = new WeakMap<VideoDecoder, GainNode>();
+// Async-open (2026-09-05): the native open now runs off-thread, so
+// `usedAudio` is NOT known at construction — audio-graph wiring is deferred
+// to the first `nextFrame()` where `usedAudio` flips true. Remember the
+// `noAudio` intent and one-shot the wiring attempt.
+const noAudioByDecoder = new WeakMap<VideoDecoder, boolean>();
+const audioWireTried = new WeakSet<VideoDecoder>();
 
 export interface VideoDecoderOptions {
 	/** Try the NVTEGRA hardware decoder first (default: true). Falls
@@ -29,6 +35,12 @@ export interface VideoDecoderOptions {
 	 * pass to extract a video's first frame without producing any
 	 * audrv state transitions. Default: false. */
 	noAudio?: boolean;
+	/** 2026-09-06 — deliver frames as planar I420 (Y|U|V, 1.5 B/px) instead of
+	 * BGRA/RGBA, so the caller can upload YUV planes to the GPU (Skia YUVA
+	 * image) and do YUV→RGB in the shader. ~2.6× less per-frame texture upload
+	 * — the dominant per-frame cost on the Switch's Mesa-nouveau GL. When set,
+	 * `nextFrame()`'s result has `yuv: true` + `colorSpace`. Default: false. */
+	yuv?: boolean;
 }
 
 export interface VideoFrameData {
@@ -41,6 +53,14 @@ export interface VideoFrameData {
 	pts: number;
 	/** True for the single end-of-stream sentinel. */
 	ended: boolean;
+	/** 2026-09-06 — true when the decoder was opened with `{ yuv: true }`:
+	 * `data` is planar I420 (Y|U|V contiguous, 1.5 B/px) rather than RGBA/BGRA.
+	 * Feed it to `Switch.createBitmapFromYUV(data, width, height, colorSpace)`
+	 * for the low-bandwidth GPU YUVA upload path. */
+	yuv?: boolean;
+	/** Neutral YUV color-space tag (0=Rec709 ltd, 1=Rec601 ltd, 2=full/JPEG,
+	 * 3=Rec709 full); only meaningful when `yuv` is true. */
+	colorSpace?: number;
 }
 
 /**
@@ -118,36 +138,45 @@ export class VideoDecoder {
 			$.videoDecoderNew(url, opts),
 			VideoDecoder,
 		) as VideoDecoder;
-		// Cut #22b (2026-07-02): wire the audio stream into the shared
-		// audio graph when the source has an audio track. Restores audio
-		// playback for spectraplay's <audio> flow (routed through the
-		// same videoDecoder path as <video>) and audio-bearing <video>.
-		// Skipped for `noAudio: true` (poster-preview path) and for
-		// sources without a usable audio stream.
-		const wantAudio = !(opts && opts.noAudio) && inst.usedAudio;
-		if (wantAudio) {
-			try {
-				const ctx = getSharedAudioContext();
-				const stream = $.videoDecoderCreateAudioNode(
-					inst,
-					ctxInternal(ctx).handle,
-				);
-				if (stream) {
-					const gain = ctx.createGain();
-					gain.connect(ctx.destination);
-					$.audioNodeConnect(
-						stream,
-						nodeInternal(gain).handle,
-					);
-					gainByDecoder.set(inst, gain);
-				}
-			} catch {
-				// Audio-graph setup failure is non-fatal — video (if any)
-				// still plays silently. The caller sees `audioError` /
-				// `usedAudio=false` via the existing getters.
-			}
-		}
+		// The native open is asynchronous now, so `inst.usedAudio` is false
+		// here regardless of the source. Defer audio-graph wiring to the
+		// first `nextFrame()` where the open has landed and reports an audio
+		// stream (see {@link ensureAudioWired}). Just remember the intent.
+		noAudioByDecoder.set(inst, !!(opts && opts.noAudio));
 		return inst;
+	}
+
+	/**
+	 * Wire the source's audio stream into the shared audio graph once the
+	 * async open has completed and reports a usable audio track. One-shot
+	 * (via {@link audioWireTried}); a no-op for `noAudio` sources, sources
+	 * with no audio, and while the open is still in flight (`usedAudio`
+	 * false). Called from {@link nextFrame}, so it runs on the shell tick.
+	 * Restores audio for spectraplay's <audio> flow + audio-bearing <video>.
+	 */
+	private ensureAudioWired(): void {
+		if (audioWireTried.has(this)) return;
+		if (noAudioByDecoder.get(this)) return;
+		if (!this.usedAudio) return; // still opening, or the source has no audio
+		audioWireTried.add(this); // one attempt regardless of outcome
+		try {
+			const ctx = getSharedAudioContext();
+			const stream = $.videoDecoderCreateAudioNode(
+				this,
+				ctxInternal(ctx).handle,
+			);
+			if (stream) {
+				const gain = ctx.createGain();
+				gain.connect(ctx.destination);
+				$.audioNodeConnect(stream, nodeInternal(gain).handle);
+				gainByDecoder.set(this, gain);
+				// Apply any volume/muted set on the wrapper while pending.
+				gain.gain.value = this.muted ? 0 : this.volume;
+			}
+		} catch {
+			// Audio-graph setup failure is non-fatal — video (if any) still
+			// plays silently; the caller sees `audioError` via the getter.
+		}
 	}
 
 	/** Stops the worker thread and releases all FFmpeg + libnx state. */
@@ -230,8 +259,17 @@ export class VideoDecoder {
 	 * presentation. Returns `null` when the decoder is paused or the next
 	 * frame isn't yet due.
 	 */
-	nextFrame(): VideoFrameData | null {
-		return $.videoDecoderNextFrame(this);
+	/**
+	 * Returns the next decoded frame if one is due, else `null`.
+	 * @param bgra when true, `data` is delivered in BGRA order (Skia's
+	 * ARGB32 layout) with no swizzle — feed it to `Switch.imageWriteBGRA`
+	 * for a swizzle-free upload (brewser video path, Fix D). Default false
+	 * keeps the documented RGBA byte order.
+	 */
+	nextFrame(bgra?: boolean): VideoFrameData | null {
+		// Lazily wire audio the first tick the async open reports a stream.
+		this.ensureAudioWired();
+		return $.videoDecoderNextFrame(this, bgra);
 	}
 }
 $.videoDecoderInit(VideoDecoder);

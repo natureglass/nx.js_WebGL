@@ -269,6 +269,18 @@ void nx_skia_gpu_present(void) {
 	eglSwapBuffers(s_dpy, s_surf);
 }
 
+void nx_skia_gpu_set_swap_interval(int interval) {
+	// Frame-pacing control (2026-09-06): eglSwapInterval(2) makes each
+	// eglSwapBuffers wait 2 vsync periods (→ 30 Hz on a 60 Hz panel), which
+	// gives 30 fps video a clean 1:1 cadence (each frame shown once, evenly)
+	// instead of the juddery ~40 fps the free-running loop produces when the
+	// per-frame cost straddles the 16.7 ms vsync boundary. The shell toggles
+	// this to 2 while a fullscreen video is the sole content on screen and
+	// back to 1 (60 Hz) otherwise. No-op on the raster fallback (no EGL).
+	if (s_dpy)
+		eglSwapInterval(s_dpy, interval);
+}
+
 void nx_skia_gpu_screen_exit(void) {
 	// Release any cached cursor SkImages BEFORE the GrDirectContext goes
 	// away — the SkImage handles reference GPU-uploaded raster textures

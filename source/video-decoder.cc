@@ -36,16 +36,50 @@
 #include "media-decoder.h"
 #include "types.h"
 #include "wrap.h"
+#include <atomic>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <thread>
 
 using namespace v8;
 
 namespace {
 
 struct nx_video_decoder_t {
-	nx_media_t *media = nullptr;
+	// ---- async open (2026-09-05) ----------------------------------------
+	// `nx_media_open` blocks on the network for http(s) sources
+	// (avformat_open_input + avformat_find_stream_info fetch the HLS playlist
+	// and probe segments), which — when run on the V8 main thread — froze the
+	// whole shell for the several-second transcode ramp-up. So the open runs
+	// on `open_thread` and the decoder returns immediately "pending":
+	// `media` is null and stays null until the thread publishes it (release)
+	// with `open_done` (acquire) as the synchronising barrier. Read `media`
+	// ONLY via ready_media(); never touch it before `open_done`. On teardown
+	// we JOIN the thread first (bounded by the ffmpeg rw_timeout added to the
+	// network open), so media/audio_node destruction stays single-threaded
+	// and race-free exactly as the synchronous path was.
+	std::thread open_thread;
+	std::string open_url;
+	bool open_want_loop = false;
+	// When true the media ring is opened in planar I420 mode (see
+	// nx_media_open want_yuv): frame_buf holds 1.5 B/px, next_frame delivers
+	// the I420 planes verbatim, and the JS side uploads them as a Skia YUVA
+	// image. Set at construction from the brewser <video> path.
+	bool want_yuv = false;
+	std::atomic<bool> open_done{false};
+	nx_media_t *media = nullptr; // published by open_thread; read via ready_media()
+	char open_err[256] = {};
+	// Controls issued while still pending are remembered and applied on the
+	// MAIN thread the first time next_frame() observes the media ready
+	// (nx_media clock fields are main-thread-only, so the open thread must
+	// NOT call play/seek itself).
+	std::atomic<bool> play_requested{false};
+	std::atomic<bool> seek_pending{false};
+	std::atomic<double> seek_target{0};
+	bool ready_applied = false; // main thread only
+	// ---------------------------------------------------------------------
 	// Stream-source node attached to the media (cut #22b, 2026-07-02).
 	// Released strictly AFTER nx_media_destroy joins the decode thread, so
 	// the producer can never touch a freed node. NULL when the source has
@@ -68,7 +102,28 @@ struct nx_video_decoder_t {
 	float volume = 1.0f;
 };
 
+// Media handle once the async open has published it, else nullptr. The
+// `open_done` acquire load pairs with the open thread's release store so the
+// `media` write is visible before we read it.
+static nx_media_t *ready_media(nx_video_decoder_t *d) {
+	if (!d || !d->open_done.load(std::memory_order_acquire)) return nullptr;
+	return d->media;
+}
+
+// Apply controls that were requested while the open was still in flight.
+// MAIN THREAD ONLY (called from next_frame). One-shot via `ready_applied`.
+static void apply_pending_on_ready(nx_video_decoder_t *d, nx_media_t *m) {
+	if (d->ready_applied) return;
+	d->ready_applied = true;
+	if (d->seek_pending.load(std::memory_order_relaxed))
+		nx_media_seek(m, d->seek_target.load(std::memory_order_relaxed));
+	if (d->play_requested.load(std::memory_order_relaxed))
+		nx_media_play(m);
+}
+
 void free_video_decoder(nx_video_decoder_t *d) {
+	// Join the open thread FIRST so it can't publish/destroy media under us.
+	if (d->open_thread.joinable()) d->open_thread.join();
 	if (d->media) {
 		nx_media_destroy(d->media); // joins decode thread first
 		d->media = nullptr;
@@ -101,6 +156,7 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 	const char *url = *url_val ? *url_val : "";
 
 	bool want_loop = false;
+	bool want_yuv = false;
 	if (info.Length() >= 2 && info[1]->IsObject()) {
 		Local<Object> opts = info[1].As<Object>();
 		Local<Value> loop_val;
@@ -108,43 +164,41 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 		    loop_val->IsBoolean()) {
 			want_loop = loop_val->BooleanValue(iso);
 		}
-		// hwAccel, muted, noAudio: consumed silently. nx_media picks
-		// hw/sw internally; audio path not wired in cut #22.
-	}
-
-	char err_buf[256] = {};
-	nx_media_t *media = nx_media_open(url, nullptr, 0, nullptr,
-	                                   err_buf, sizeof(err_buf));
-	if (!media) {
-		char msg[512];
-		snprintf(msg, sizeof(msg), "VideoDecoder open: %s", err_buf);
-		nx_throw(iso, msg);
-		return;
-	}
-
-	int w = nx_media_width(media);
-	int h = nx_media_height(media);
-	double duration = nx_media_duration(media);
-
-	uint8_t *buf = nullptr;
-	if (nx_media_has_video(media) && w > 0 && h > 0) {
-		buf = (uint8_t *)nx_alloc(iso, (size_t)w * h * 4);
-		if (!buf) {
-			// nx_alloc scheduled the OOM exception on the isolate.
-			nx_media_destroy(media);
-			return;
+		// `yuv: true` (2026-09-06) opens the ring in planar I420 so the
+		// caller can upload YUV planes to the GPU (Skia YUVA image) — ~2.6×
+		// less per-frame texture upload than BGRA. brewser's <video> path
+		// sets it; the Three.js RGBA demo does not.
+		Local<Value> yuv_val;
+		if (opts->Get(ctx, nx_str(iso, "yuv")).ToLocal(&yuv_val) &&
+		    yuv_val->IsBoolean()) {
+			want_yuv = yuv_val->BooleanValue(iso);
 		}
-		memset(buf, 0, (size_t)w * h * 4);
+		// hwAccel, muted, noAudio: consumed silently. nx_media picks
+		// hw/sw internally; the audio graph is wired lazily by the JS
+		// wrapper once the (async) open reports a usable audio stream.
 	}
 
-	if (want_loop) nx_media_set_loop(media, true);
-
+	// Async open: hand the URL to a worker thread and return a "pending"
+	// decoder immediately so the JS main thread never blocks on the network
+	// open. width/height/duration read 0 and nextFrame() returns null until
+	// open_thread publishes the media; frame_buf is allocated lazily in
+	// next_frame() once the real dimensions are known.
 	nx_video_decoder_t *d = new nx_video_decoder_t();
-	d->media = media;
-	d->frame_buf = buf;
-	d->width = w;
-	d->height = h;
-	d->duration = duration;
+	d->open_url = url;
+	d->open_want_loop = want_loop;
+	d->want_yuv = want_yuv;
+	d->open_thread = std::thread([d]() {
+		char err[256] = {};
+		nx_media_t *m = nx_media_open(d->open_url.c_str(), nullptr, 0,
+		                              nullptr, err, sizeof(err), d->want_yuv);
+		if (m) {
+			if (d->open_want_loop) nx_media_set_loop(m, true);
+			d->media = m; // made visible by the open_done release store
+		} else {
+			snprintf(d->open_err, sizeof(d->open_err), "%s", err);
+		}
+		d->open_done.store(true, std::memory_order_release);
+	});
 
 	Local<Object> obj = nx::NewWrapped(iso);
 	nx::Wrap<nx_video_decoder_t>(iso, obj, d, free_video_decoder);
@@ -155,31 +209,43 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 void nx_video_decoder_play(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (d && d->media) {
-		nx_media_play(d->media);
-		d->paused = false;
-	}
+	if (!d) return;
+	// Remember the intent so a play() issued while the open is still in
+	// flight takes effect (apply_pending_on_ready) once the media lands.
+	d->play_requested.store(true, std::memory_order_relaxed);
+	d->paused = false;
+	nx_media_t *m = ready_media(d);
+	if (m) nx_media_play(m);
 }
 
 // videoDecoderPause(dec) → undefined (cut #22b: was deferred in cut #22).
 void nx_video_decoder_pause(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (d && d->media) {
-		nx_media_pause(d->media);
-		d->paused = true;
-	}
+	if (!d) return;
+	d->play_requested.store(false, std::memory_order_relaxed);
+	d->paused = true;
+	nx_media_t *m = ready_media(d);
+	if (m) nx_media_pause(m);
 }
 
 // videoDecoderSeek(dec, seconds) → undefined (cut #22b).
 void nx_video_decoder_seek(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (!d || !d->media) return;
+	if (!d) return;
 	double t = 0;
 	if (!info[1]->NumberValue(iso->GetCurrentContext()).To(&t)) t = 0;
 	if (!(t >= 0)) t = 0;
-	nx_media_seek(d->media, t);
+	nx_media_t *m = ready_media(d);
+	if (m) {
+		nx_media_seek(m, t);
+	} else {
+		// Seek requested before the open finished (e.g. resume-position
+		// seek on a fresh source) — apply it once the media is ready.
+		d->seek_target.store(t, std::memory_order_relaxed);
+		d->seek_pending.store(true, std::memory_order_relaxed);
+	}
 }
 
 // videoDecoderClose(dec) → undefined
@@ -188,6 +254,10 @@ void nx_video_decoder_close(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
 	if (!d || d->closed) return;
 	d->closed = true;
+	// Join the open thread first (bounded by the network rw_timeout) so it
+	// can't publish media after we've torn it down — same ordering as the
+	// finalizer.
+	if (d->open_thread.joinable()) d->open_thread.join();
 	if (d->media) {
 		nx_media_destroy(d->media); // joins decode thread first
 		d->media = nullptr;
@@ -220,14 +290,15 @@ void nx_video_decoder_create_audio_node(const FunctionCallbackInfo<Value> &info)
 		nx_throw(iso, "expected AudioContext handle");
 		return;
 	}
-	if (!d->media || !nx_media_has_audio(d->media) || d->audio_node) {
+	nx_media_t *m = ready_media(d);
+	if (!m || !nx_media_has_audio(m) || d->audio_node) {
 		info.GetReturnValue().SetNull();
 		return;
 	}
 	nx_audio_node *node =
 	    nx_audio_node_create(ctx->graph, NX_AUDIO_NODE_STREAM_SOURCE);
 	d->audio_node = node;
-	nx_media_set_audio_node(d->media, node, ctx->graph->sample_rate);
+	nx_media_set_audio_node(m, node, ctx->graph->sample_rate);
 	Local<Object> obj = nx::NewWrapped(iso);
 	obj->SetAlignedPointerInInternalField(0, node,
 	                                      kEmbedderDataTypeTagDefault);
@@ -281,7 +352,8 @@ float *unwrap_f32(const FunctionCallbackInfo<Value> &info, uint32_t *out_len) {
 void nx_video_decoder_get_waveform(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (!d || !d->media) {
+	nx_media_t *m = ready_media(d);
+	if (!m) {
 		info.GetReturnValue().Set(False(iso));
 		return;
 	}
@@ -291,7 +363,7 @@ void nx_video_decoder_get_waveform(const FunctionCallbackInfo<Value> &info) {
 		info.GetReturnValue().Set(False(iso));
 		return;
 	}
-	bool ok = nx_media_read_waveform(d->media, out, n);
+	bool ok = nx_media_read_waveform(m, out, n);
 	info.GetReturnValue().Set(Boolean::New(iso, ok));
 }
 
@@ -300,7 +372,8 @@ void nx_video_decoder_get_frequency_data(
     const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (!d || !d->media) {
+	nx_media_t *m = ready_media(d);
+	if (!m) {
 		info.GetReturnValue().Set(False(iso));
 		return;
 	}
@@ -310,7 +383,7 @@ void nx_video_decoder_get_frequency_data(
 		info.GetReturnValue().Set(False(iso));
 		return;
 	}
-	bool ok = nx_media_read_spectrum(d->media, out, n);
+	bool ok = nx_media_read_spectrum(m, out, n);
 	info.GetReturnValue().Set(Boolean::New(iso, ok));
 }
 
@@ -321,12 +394,13 @@ void nx_video_decoder_get_audio_levels(
 	Isolate *iso = info.GetIsolate();
 	Local<Context> ctx = iso->GetCurrentContext();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (!d || !d->media) {
+	nx_media_t *m = ready_media(d);
+	if (!m) {
 		info.GetReturnValue().Set(Array::New(iso, 0));
 		return;
 	}
 	float bands[3] = {0, 0, 0};
-	uint32_t n = nx_media_read_audio_levels(d->media, bands, 3);
+	uint32_t n = nx_media_read_audio_levels(m, bands, 3);
 	Local<Array> arr = Array::New(iso, (int)n);
 	for (uint32_t i = 0; i < n; i++) {
 		arr->Set(ctx, i, Number::New(iso, (double)bands[i])).Check();
@@ -339,10 +413,37 @@ void nx_video_decoder_next_frame(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	Local<Context> ctx = iso->GetCurrentContext();
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
-	if (!d || !d->media) return; // undefined → JS null via the wrapper
+	nx_media_t *m = ready_media(d);
+	if (!m) return; // still opening → JS null (the wrapper reads this as buffering)
+
+	// First tick after the async open lands: apply any play()/seek() issued
+	// while pending, latch the real dimensions, and lazily allocate the
+	// presentation buffer (main thread → nx_alloc is safe here). Gated on
+	// d->width == 0 (a ready video always has width > 0, so this is a
+	// reliable "not yet latched" sentinel; audio-only sources have no video
+	// stream and keep width 0 + frame_buf null).
+	apply_pending_on_ready(d, m);
+	if (d->width == 0 && nx_media_has_video(m)) {
+		int w = nx_media_width(m);
+		int h = nx_media_height(m);
+		if (w > 0 && h > 0) {
+			d->width = w;
+			d->height = h;
+			d->duration = nx_media_duration(m);
+			// I420 frames are 1.5 B/px (Y|U|V), BGRA is 4 B/px. The ring
+			// (media) and this presentation buffer must agree on size — both
+			// keyed off the same want_yuv flag passed to nx_media_open.
+			const size_t fb_size = d->want_yuv
+			                           ? nx_media_i420_size(w, h)
+			                           : (size_t)w * h * 4;
+			d->frame_buf = (uint8_t *)nx_alloc(iso, fb_size);
+			if (!d->frame_buf) return; // nx_alloc scheduled the OOM exception
+			memset(d->frame_buf, 0, fb_size);
+		}
+	}
 
 	// End-of-stream: emit one sentinel, then keep returning undefined.
-	if (nx_media_ended(d->media)) {
+	if (nx_media_ended(m)) {
 		if (d->eos_sent) return;
 		d->eos_sent = true;
 		Local<Object> result = Object::New(iso);
@@ -359,25 +460,71 @@ void nx_video_decoder_next_frame(const FunctionCallbackInfo<Value> &info) {
 
 	if (!d->frame_buf) return; // audio-only source; nothing to present
 
-	if (!nx_media_present(d->media, &d->frame_buf)) {
+	if (!nx_media_present(m, &d->frame_buf)) {
 		// Media clock says no new frame is due yet.
 		return;
 	}
 
-	// Have a fresh frame in d->frame_buf (BGRA order). Allocate an
-	// ArrayBuffer and swizzle B↔R while copying — the demo hands the
-	// bytes to a THREE.DataTexture using RGBAFormat/UnsignedByteType.
-	// Cost: ~500 KB/s per frame at Sintel's ~480×204 @ 24 fps — trivial.
+	// Have a fresh frame in d->frame_buf, in BGRA order (Skia's ARGB32
+	// memory layout). Copy it into a JS ArrayBuffer.
+	//   - Default (RGBA): swizzle B↔R while copying — the documented
+	//     nextFrame() contract, consumed by the Three.js webgl_materials_video
+	//     demo's RGBAFormat DataTexture.
+	//   - `bgra` arg true (brewser video path, 2026-09-05 Fix D): a straight
+	//     memcpy, no swizzle. The caller feeds it to Switch.imageWriteBGRA →
+	//     Skia with NO further swap, killing the old BGRA→RGBA→BGRA double
+	//     swizzle (two per-pixel byte loops on the main thread per frame).
+	// YUV path (2026-09-06): the frame is already planar I420 in d->frame_buf.
+	// Deliver it verbatim (no swizzle) plus a `yuv` flag and the color-space
+	// tag so the JS side builds a Skia YUVA image and uploads 1.5 B/px.
+	if (d->want_yuv) {
+		size_t byte_count = nx_media_i420_size(d->width, d->height);
+		// Zero-copy delivery (2026-09-06): wrap the decoder's persistent
+		// frame_buf directly instead of malloc'ing a fresh ~1.4 MB buffer and
+		// memcpy'ing into it every frame. That per-frame large alloc/free
+		// (mmap/munmap at ~42 MB/s @720p30) caused periodic present-time spikes
+		// → the 23–30 fps jitter. Safe because the sole consumer (tickVideo)
+		// copies this into the frame bitmap synchronously, before the next
+		// present() swaps frame_buf back into the decode ring — the view never
+		// outlives its data. No-op deleter: frame_buf is owned by the decoder.
+		std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
+		    d->frame_buf, byte_count,
+		    [](void *, size_t, void *) {}, nullptr);
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, std::move(bs));
+		Local<Object> result = Object::New(iso);
+		result->Set(ctx, nx_str(iso, "data"), ab).Check();
+		result->Set(ctx, nx_str(iso, "width"), Integer::New(iso, d->width))
+		    .Check();
+		result->Set(ctx, nx_str(iso, "height"), Integer::New(iso, d->height))
+		    .Check();
+		result->Set(ctx, nx_str(iso, "pts"),
+		            Number::New(iso, nx_media_current_time(m)))
+		    .Check();
+		result->Set(ctx, nx_str(iso, "yuv"), True(iso)).Check();
+		result->Set(ctx, nx_str(iso, "colorSpace"),
+		            Integer::New(iso, nx_media_yuv_colorspace(m)))
+		    .Check();
+		result->Set(ctx, nx_str(iso, "ended"), False(iso)).Check();
+		info.GetReturnValue().Set(result);
+		return;
+	}
+
+	const bool want_bgra =
+	    info.Length() >= 2 && info[1]->BooleanValue(iso);
 	size_t byte_count = (size_t)d->width * d->height * 4;
 	std::unique_ptr<BackingStore> bs =
 	    ArrayBuffer::NewBackingStore(iso, byte_count);
 	uint8_t *dst = (uint8_t *)bs->Data();
 	const uint8_t *src = d->frame_buf;
-	for (size_t i = 0; i < byte_count; i += 4) {
-		dst[i] = src[i + 2];     // R ← B
-		dst[i + 1] = src[i + 1]; // G
-		dst[i + 2] = src[i];     // B ← R
-		dst[i + 3] = src[i + 3]; // A
+	if (want_bgra) {
+		memcpy(dst, src, byte_count);
+	} else {
+		for (size_t i = 0; i < byte_count; i += 4) {
+			dst[i] = src[i + 2];     // R ← B
+			dst[i + 1] = src[i + 1]; // G
+			dst[i + 2] = src[i];     // B ← R
+			dst[i + 3] = src[i + 3]; // A
+		}
 	}
 	Local<ArrayBuffer> ab = ArrayBuffer::New(iso, std::move(bs));
 
@@ -387,54 +534,67 @@ void nx_video_decoder_next_frame(const FunctionCallbackInfo<Value> &info) {
 	result->Set(ctx, nx_str(iso, "height"), Integer::New(iso, d->height))
 	    .Check();
 	result->Set(ctx, nx_str(iso, "pts"),
-	            Number::New(iso, nx_media_current_time(d->media)))
+	            Number::New(iso, nx_media_current_time(m)))
 	    .Check();
 	result->Set(ctx, nx_str(iso, "ended"), False(iso)).Check();
 	info.GetReturnValue().Set(result);
 }
 
 // Prototype getters. `this` is the JS VideoDecoder instance (wrapped).
+// All media-backed getters read via ready_media() so they report 0 / false /
+// null while the async open is still in flight, and true values the instant
+// it lands.
 void nx_vd_get_width(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	info.GetReturnValue().Set(Integer::New(info.GetIsolate(), d ? d->width : 0));
+	nx_media_t *m = ready_media(d);
+	info.GetReturnValue().Set(Integer::New(info.GetIsolate(), m ? nx_media_width(m) : 0));
 }
 void nx_vd_get_height(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
+	nx_media_t *m = ready_media(d);
 	info.GetReturnValue().Set(Integer::New(info.GetIsolate(),
-	                                        d ? d->height : 0));
+	                                        m ? nx_media_height(m) : 0));
 }
 void nx_vd_get_duration(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
+	nx_media_t *m = ready_media(d);
 	info.GetReturnValue().Set(Number::New(info.GetIsolate(),
-	                                       d ? d->duration : 0.0));
+	                                       m ? nx_media_duration(m) : 0.0));
 }
 void nx_vd_get_error(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	if (!d || !d->media) {
-		info.GetReturnValue().SetNull();
+	nx_media_t *m = ready_media(d);
+	if (m) {
+		const char *err = nx_media_error(m);
+		if (err) info.GetReturnValue().Set(nx_str_lossy(iso, err));
+		else info.GetReturnValue().SetNull();
 		return;
 	}
-	const char *err = nx_media_error(d->media);
-	if (!err) {
-		info.GetReturnValue().SetNull();
+	// Open finished but FAILED (bad URL, TLS handshake, "Protocol not found")
+	// → surface the captured open error. Still-opening → null.
+	if (d && d->open_done.load(std::memory_order_acquire) && d->open_err[0]) {
+		info.GetReturnValue().Set(nx_str_lossy(iso, d->open_err));
 		return;
 	}
-	info.GetReturnValue().Set(nx_str_lossy(iso, err));
+	info.GetReturnValue().SetNull();
 }
 void nx_vd_get_ended(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	bool v = d && d->media && nx_media_ended(d->media);
+	nx_media_t *m = ready_media(d);
+	bool v = m && nx_media_ended(m);
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v));
 }
 void nx_vd_get_has_video(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	bool v = d && d->media && nx_media_has_video(d->media);
+	nx_media_t *m = ready_media(d);
+	bool v = m && nx_media_has_video(m);
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v));
 }
 void nx_vd_get_has_audio(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	bool v = d && d->media && nx_media_has_audio(d->media);
+	nx_media_t *m = ready_media(d);
+	bool v = m && nx_media_has_audio(m);
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v));
 }
 // Deferred (stubs): the demo reads them but doesn't act on them.
@@ -447,8 +607,8 @@ void nx_vd_get_paused(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
 	bool paused = true;
 	if (d) {
-		paused = d->paused ||
-		         (d->media && nx_media_ended(d->media));
+		nx_media_t *m = ready_media(d);
+		paused = d->paused || (m && nx_media_ended(m));
 	}
 	info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), paused));
 }
@@ -468,9 +628,8 @@ void nx_vd_get_volume(const FunctionCallbackInfo<Value> &info) {
 }
 void nx_vd_get_audio_time(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
-	double t = (d && d->media && d->audio_node)
-	               ? nx_media_current_time(d->media)
-	               : 0.0;
+	nx_media_t *m = ready_media(d);
+	double t = (m && d->audio_node) ? nx_media_current_time(m) : 0.0;
 	info.GetReturnValue().Set(Number::New(info.GetIsolate(), t));
 }
 void nx_vd_get_audio_error(const FunctionCallbackInfo<Value> &info) {
