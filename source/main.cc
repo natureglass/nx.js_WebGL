@@ -91,6 +91,107 @@ using namespace v8;
 
 #define LOG_FILENAME "nxjs-debug.log"
 
+// ---- Video frame-timing diagnostic (Jellyfin 720p hitch localization) ------
+// Localizes the periodic 720p video hitch (fps bounces 23<->31, interval prop
+// to 1/framebytes). Two things share the JS-side and present-side buckets:
+//   * JS handler->Call (main.cc frame handler) = $.onFrame => tickVideo+paint,
+//     which INCLUDES the YUV TextureFromYUVAPixmaps upload (canvas.cc drawImage)
+//     AND nx_image_release_cache (imageWriteYUV) — i.e. the per-frame GPU
+//     texture ALLOC+UPLOAD+FREE churn runs here, alongside any V8 GC.
+//   * nx_skia_gpu_present() = Skia grCtx->flush() (runs the YUV->RGB draw +
+//     GrResourceCache purge) + eglSwapBuffers.
+// Timing those two alone is ambiguous (texture churn AND GC both land JS-side),
+// so we ALSO instrument V8 GC via prologue/epilogue callbacks. Verdict logic:
+//   * majGC>=1/s with majGC_max ~= the hitch magnitude, correlating with js
+//     spikes  => it's a major (mark-sweep-compact) GC pause; chase the per-
+//     frame old-gen allocation.
+//   * prs spikes with majGC~=0                    => present-side GPU stall
+//     (flush/purge) => persistent YUV textures.
+//   * js spikes with majGC~=0 and prs low         => synchronous texture
+//     alloc/upload/free in drawImage/release_cache => persistent YUV textures.
+// One line/sec to stderr (sdmc:/switch/nxjs-debug.log). FLIP TO 0 for the
+// clean shipping build.
+//
+// VERDICT (2026-09-06 HW): the 720p hitch was V8 major GC (2-3 mark-compacts/s,
+// ~7.5ms each) driven by a fresh per-frame delivery ArrayBuffer's external
+// accounting; fixed by reusing one ArrayBuffer object (video-decoder.cc
+// deliver_ab) → majGC dropped to 0, steady 30fps. Flag left at 0 (gated
+// diagnostic, like MEDIA_DIAG_112) — flip to 1 to re-probe video frame timing.
+#define VIDEO_FRAME_TIMING_DIAG 0
+
+#if VIDEO_FRAME_TIMING_DIAG
+static u64 s_vft_win_start_ns = 0; // current 1s window start (0 = uninit)
+static u64 s_vft_frames = 0;       // loop iterations this window
+static u64 s_vft_js_max_ns = 0;    // max JS handler->Call this window
+static u64 s_vft_js_over = 0;      // # JS calls over threshold this window
+static u64 s_vft_prs_max_ns = 0;   // max nx_skia_gpu_present() this window
+static u64 s_vft_prs_over = 0;     // # present calls over threshold this window
+// GC: prologue stamps the start, epilogue accumulates. GC is serial (no
+// nesting), so one start-timestamp pairs correctly with its own epilogue.
+static u64 s_vft_gc_start_ns = 0;
+static u64 s_vft_majgc_count = 0;     // major (mark-sweep-compact) GCs
+static u64 s_vft_majgc_total_ns = 0;  // total major-GC pause this window
+static u64 s_vft_majgc_max_ns = 0;    // longest single major-GC pause
+static u64 s_vft_mingc_count = 0;     // minor (scavenge) GCs
+static u64 s_vft_mingc_total_ns = 0;  // total minor-GC pause this window
+// A clean 30fps present is a 33.3ms (2-vsync) budget; flag any single phase
+// over 12ms as a spike candidate (leaves headroom for the other phase + vsync).
+static const u64 s_vft_threshold_ns = 12000000ULL;
+
+static inline u64 vft_now_ns() { return armTicksToNs(armGetSystemTick()); }
+
+static void vft_gc_prologue(Isolate *, GCType, GCCallbackFlags) {
+	s_vft_gc_start_ns = vft_now_ns();
+}
+static void vft_gc_epilogue(Isolate *, GCType type, GCCallbackFlags) {
+	u64 dur = vft_now_ns() - s_vft_gc_start_ns;
+	if (type & kGCTypeMarkSweepCompact) {
+		s_vft_majgc_count++;
+		s_vft_majgc_total_ns += dur;
+		if (dur > s_vft_majgc_max_ns)
+			s_vft_majgc_max_ns = dur;
+	} else if (type & kGCTypeScavenge) {
+		s_vft_mingc_count++;
+		s_vft_mingc_total_ns += dur;
+	}
+}
+
+// Called once per loop iteration; emits one aggregate line/sec then resets.
+static void vft_tick_and_maybe_flush() {
+	u64 now = vft_now_ns();
+	if (s_vft_win_start_ns == 0) {
+		s_vft_win_start_ns = now;
+		return;
+	}
+	u64 elapsed = now - s_vft_win_start_ns;
+	if (elapsed < 1000000000ULL)
+		return;
+	double secs = elapsed / 1e9;
+	fprintf(stderr,
+	        "[vft] fps=%.1f js_max=%.1fms js_over=%llu prs_max=%.1fms "
+	        "prs_over=%llu majGC=%llu majGC_max=%.1fms majGC_tot=%.1fms "
+	        "minGC=%llu minGC_tot=%.1fms\n",
+	        s_vft_frames / secs, s_vft_js_max_ns / 1e6,
+	        (unsigned long long)s_vft_js_over, s_vft_prs_max_ns / 1e6,
+	        (unsigned long long)s_vft_prs_over,
+	        (unsigned long long)s_vft_majgc_count, s_vft_majgc_max_ns / 1e6,
+	        s_vft_majgc_total_ns / 1e6, (unsigned long long)s_vft_mingc_count,
+	        s_vft_mingc_total_ns / 1e6);
+	fflush(stderr);
+	s_vft_win_start_ns = now;
+	s_vft_frames = 0;
+	s_vft_js_max_ns = 0;
+	s_vft_js_over = 0;
+	s_vft_prs_max_ns = 0;
+	s_vft_prs_over = 0;
+	s_vft_majgc_count = 0;
+	s_vft_majgc_total_ns = 0;
+	s_vft_majgc_max_ns = 0;
+	s_vft_mingc_count = 0;
+	s_vft_mingc_total_ns = 0;
+}
+#endif // VIDEO_FRAME_TIMING_DIAG
+
 // runtime.js source, embedded as a byte array by the build (runtime_js.c).
 extern "C" const unsigned char nxjs_runtime_js[];
 extern "C" const unsigned int nxjs_runtime_js_len;
@@ -2063,6 +2164,10 @@ int main(int argc, char *argv[]) {
 	nx_ctx->iso = iso;
 	iso->SetData(0, nx_ctx);
 	iso->SetPromiseRejectCallback(nx_promise_rejection_handler);
+#if VIDEO_FRAME_TIMING_DIAG
+	iso->AddGCPrologueCallback(vft_gc_prologue);
+	iso->AddGCEpilogueCallback(vft_gc_epilogue);
+#endif
 	// V8's automatic stack-limit detection assumes a Node-/desktop-sized
 	// stack; the libnx main-thread stack is the size declared in
 	// npdm.json (currently 0x100000 = 1 MiB). Without configuring V8's
@@ -2290,9 +2395,21 @@ int main(int argc, char *argv[]) {
 				Local<Function> handler = nx_ctx->frame_handler.Get(iso);
 				Local<Value> args[] = {Boolean::New(iso, plusDown)};
 				Local<Value> ret;
+#if VIDEO_FRAME_TIMING_DIAG
+				u64 _vft_js_t0 = vft_now_ns();
+#endif
 				if (!handler->Call(context, Null(iso), 1, args).ToLocal(&ret)) {
 					nx_emit_error_event(iso, &try_catch);
 				}
+#if VIDEO_FRAME_TIMING_DIAG
+				{
+					u64 _dt = vft_now_ns() - _vft_js_t0;
+					if (_dt > s_vft_js_max_ns)
+						s_vft_js_max_ns = _dt;
+					if (_dt > s_vft_threshold_ns)
+						s_vft_js_over++;
+				}
+#endif
 				if (!is_running)
 					break;
 			} else if (plusDown) {
@@ -2334,7 +2451,19 @@ int main(int argc, char *argv[]) {
 					// the persistent surface always holds full current content
 					// (see nx_skia_gpu_present); double buffering no longer
 					// causes flicker.
+#if VIDEO_FRAME_TIMING_DIAG
+					u64 _vft_prs_t0 = vft_now_ns();
+#endif
 					nx_skia_gpu_present();
+#if VIDEO_FRAME_TIMING_DIAG
+					{
+						u64 _dt = vft_now_ns() - _vft_prs_t0;
+						if (_dt > s_vft_prs_max_ns)
+							s_vft_prs_max_ns = _dt;
+						if (_dt > s_vft_threshold_ns)
+							s_vft_prs_over++;
+					}
+#endif
 				} else if (framebuffer != NULL && js_framebuffer != NULL) {
 					u32 stride;
 					u8 *fb = (u8 *)framebufferBegin(framebuffer, &stride);
@@ -2350,6 +2479,11 @@ int main(int argc, char *argv[]) {
 					}
 				}
 			}
+
+#if VIDEO_FRAME_TIMING_DIAG
+			s_vft_frames++;
+			vft_tick_and_maybe_flush();
+#endif
 		}
 
 		// ---- Exit handler ------------------------------------------------

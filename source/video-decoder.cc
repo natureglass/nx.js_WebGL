@@ -85,7 +85,27 @@ struct nx_video_decoder_t {
 	// the producer can never touch a freed node. NULL when the source has
 	// no audio track OR `noAudio: true` was passed at construction.
 	nx_audio_node *audio_node = nullptr;
-	uint8_t *frame_buf = nullptr; // BGRA — nx_media_present output, w*h*4
+	uint8_t *frame_buf = nullptr; // BGRA/I420 — nx_media_present output
+	// Reused delivery backing (2026-09-06): handing V8 a fresh ~1.4 MB external
+	// ArrayBuffer backing every frame made its external-memory accounting fire
+	// a periodic major GC — a video hitch every ~N frames (N ∝ 1/framebytes:
+	// 480p ~1 s, 720p ~0.5 s). Audio runs on its own thread so it was
+	// unaffected. Reuse ONE backing: copy the frame into it and wrap in a small
+	// ArrayBuffer sharing it, so V8's external counter doesn't grow per frame.
+	std::shared_ptr<v8::BackingStore> deliver_bs;
+	size_t deliver_size = 0;
+	// Persistent delivery ArrayBuffer OBJECT (2026-09-06 v2). Reusing only the
+	// backing (above) did NOT stop the periodic major GC: the [vft] frame-timing
+	// probe proved a mark-sweep-compact fires 2-3×/s (~7.5 ms each) during 720p
+	// playback, straddling the 30 Hz (33 ms) present budget → the 24↔30 fps
+	// bounce. Cause: V8 charges each NEW ArrayBuffer's byte length to its
+	// array-buffer/external accounting via a fresh ArrayBufferExtension — EVEN
+	// when the backing store is shared — so minting one ArrayBuffer per frame
+	// still added ~1.4 MB/frame (~42 MB/s at 720p30) of old-gen GC pressure.
+	// Hold ONE ArrayBuffer object across frames (memcpy into its backing each
+	// frame, return the same object): the extension is created once, the
+	// external counter stays flat, and the mark-compact cadence stops.
+	v8::Global<v8::ArrayBuffer> deliver_ab;
 	int width = 0;
 	int height = 0;
 	double duration = 0.0;
@@ -479,18 +499,22 @@ void nx_video_decoder_next_frame(const FunctionCallbackInfo<Value> &info) {
 	// tag so the JS side builds a Skia YUVA image and uploads 1.5 B/px.
 	if (d->want_yuv) {
 		size_t byte_count = nx_media_i420_size(d->width, d->height);
-		// Zero-copy delivery (2026-09-06): wrap the decoder's persistent
-		// frame_buf directly instead of malloc'ing a fresh ~1.4 MB buffer and
-		// memcpy'ing into it every frame. That per-frame large alloc/free
-		// (mmap/munmap at ~42 MB/s @720p30) caused periodic present-time spikes
-		// → the 23–30 fps jitter. Safe because the sole consumer (tickVideo)
-		// copies this into the frame bitmap synchronously, before the next
-		// present() swaps frame_buf back into the decode ring — the view never
-		// outlives its data. No-op deleter: frame_buf is owned by the decoder.
-		std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
-		    d->frame_buf, byte_count,
-		    [](void *, size_t, void *) {}, nullptr);
-		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, std::move(bs));
+		// Reuse ONE ArrayBuffer OBJECT (see struct comment) — not just its
+		// backing — so V8's per-ArrayBuffer external accounting stays flat and
+		// stops firing the periodic major GC that hitched the presenter. Create
+		// the backing + wrapper once per dimension; thereafter just memcpy the
+		// frame into the persistent backing and return the SAME object. Safe
+		// because tickVideo copies this into the frame bitmap synchronously (and
+		// drops its reference — st.frameBytes=null on the YUV path) before the
+		// next present() overwrites the backing.
+		if (d->deliver_size != byte_count || !d->deliver_bs ||
+		    d->deliver_ab.IsEmpty()) {
+			d->deliver_bs = ArrayBuffer::NewBackingStore(iso, byte_count);
+			d->deliver_size = byte_count;
+			d->deliver_ab.Reset(iso, ArrayBuffer::New(iso, d->deliver_bs));
+		}
+		memcpy(d->deliver_bs->Data(), d->frame_buf, byte_count);
+		Local<ArrayBuffer> ab = d->deliver_ab.Get(iso);
 		Local<Object> result = Object::New(iso);
 		result->Set(ctx, nx_str(iso, "data"), ab).Check();
 		result->Set(ctx, nx_str(iso, "width"), Integer::New(iso, d->width))

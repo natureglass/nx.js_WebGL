@@ -16,6 +16,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <math.h>
 #include <mutex>
 #include <stdio.h>
@@ -116,6 +117,21 @@ struct nx_media {
 	video_slot slots[RING_SLOTS];
 	std::atomic<uint64_t> vwrite{0};
 	std::atomic<uint64_t> vread{0};
+
+	// ---- demux-ahead decouple (2026-09-06, decode thread only) ----
+	// The decode thread reads packets into these per-stream queues so that a
+	// full video ring can no longer BLOCK the thread (in enqueue_video) and
+	// thereby stop audio production — the coupling that starved audio and
+	// jittered the video clock at a 30 Hz present. Video is enqueued
+	// non-blocking (a decoded frame that doesn't fit is held in `v_pending`);
+	// audio is decoded only while the audio ring is under a small time target,
+	// so it neither blocks nor runs so far ahead that it starves video.
+	std::deque<AVPacket *> vpktq; // compressed video packets awaiting decode
+	std::deque<AVPacket *> apktq; // compressed audio packets awaiting decode
+	AVFrame *v_pending = nullptr; // decoded video frame the full ring rejected
+	bool v_pending_valid = false;
+	double v_pending_pts = 0;
+	bool demux_eof = false; // av_read_frame hit EOF; queues still draining
 
 	// ---- audio output ----
 	nx_audio_node *audio_node = nullptr;
@@ -258,15 +274,16 @@ bool decode_wait(nx_media *m) {
 	return true;
 }
 
-// Blocks until a ring slot is free, then converts `frame` to BGRA into it.
-// Returns false if interrupted (quit/seek).
-bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
-	while (m->vwrite.load(std::memory_order_relaxed) -
-	           m->vread.load(std::memory_order_acquire) >=
-	       RING_SLOTS) {
-		if (!decode_wait(m))
-			return false;
-	}
+// Non-blocking: convert `frame` into the next ring slot IF one is free.
+// Returns 1 = enqueued, 0 = ring full (caller retries / holds the frame),
+// -1 = fatal. Demux-ahead (2026-09-06): the decode thread must never block on
+// a full video ring — that stalls audio production — so the slow path uses
+// this and stashes a rejected frame in `v_pending` instead of waiting.
+int try_enqueue_video(nx_media *m, AVFrame *frame, double pts) {
+	if (m->vwrite.load(std::memory_order_relaxed) -
+	        m->vread.load(std::memory_order_acquire) >=
+	    RING_SLOTS)
+		return 0; // ring full
 	uint64_t w = m->vwrite.load(std::memory_order_relaxed);
 	video_slot *slot = &m->slots[w % RING_SLOTS];
 
@@ -278,7 +295,7 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	                              NULL, NULL, NULL);
 	if (!m->sws) {
 		set_fatal(m, "failed to create scaler", 0);
-		return false;
+		return -1;
 	}
 	uint8_t *dst[4];
 	int dst_stride[4];
@@ -335,7 +352,23 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 #endif
 	slot->pts = pts;
 	m->vwrite.store(w + 1, std::memory_order_release);
-	return true;
+	return 1;
+}
+
+// Blocking wrapper — waits for a ring slot, then enqueues. Used only by the
+// EOF drain tail (drain_decoders), where the handful of remaining frames can
+// safely block on present; the steady-state loop uses try_enqueue_video.
+// Returns false if interrupted (quit/seek) or on fatal.
+bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
+	for (;;) {
+		int r = try_enqueue_video(m, frame, pts);
+		if (r == 1)
+			return true;
+		if (r < 0)
+			return false;
+		if (!decode_wait(m))
+			return false; // ring full: wait for the presenter to drain
+	}
 }
 
 // Resample an audio frame to interleaved stereo f32 at the output rate and
@@ -511,73 +544,237 @@ void do_seek(nx_media *m, double *seek_drop_until) {
 	}
 }
 
+// Demux-ahead queue bounds (2026-09-06). Generous so a transient stall in one
+// stream (e.g. a briefly-full video ring) doesn't starve the reader of the
+// other stream: while the video ring backs up, the reader keeps pulling
+// packets (up to VPKTQ_MAX ~4 s of video) and routing audio into apktq so
+// audio never underruns. The audio queue is larger in count than the video
+// queue's time-equivalent so it never gates the reader before vpktq does.
+constexpr size_t VPKTQ_MAX = 120;
+constexpr size_t APKTQ_MAX = 400;
+
+// Free all queued packets + any held video frame. Called on seek (before
+// do_seek) and at thread exit so no compressed data or half-decoded frame
+// survives a flush.
+void flush_pktqs(nx_media *m) {
+	while (!m->vpktq.empty()) {
+		AVPacket *p = m->vpktq.front();
+		m->vpktq.pop_front();
+		av_packet_free(&p);
+	}
+	while (!m->apktq.empty()) {
+		AVPacket *p = m->apktq.front();
+		m->apktq.pop_front();
+		av_packet_free(&p);
+	}
+	if (m->v_pending_valid) {
+		av_frame_unref(m->v_pending);
+		m->v_pending_valid = false;
+	}
+	m->demux_eof = false;
+}
+
+// One non-blocking video decode step. `scratch` is the thread's reusable
+// AVFrame. Returns true if it made any progress (sent a packet, produced or
+// enqueued a frame, dropped a pre-seek frame). Never blocks on the video ring:
+// a decoded frame that doesn't fit is stashed in v_pending and retried later.
+bool pump_video(nx_media *m, AVFrame *scratch, double *seek_drop_until) {
+	if (m->vstream < 0 || !m->vctx)
+		return false;
+	// Retry a previously-rejected frame first.
+	if (m->v_pending_valid) {
+		int r = try_enqueue_video(m, m->v_pending, m->v_pending_pts);
+		if (r <= 0)
+			return false; // ring still full (0) or fatal (-1)
+		if (m->seeking.load(std::memory_order_relaxed) &&
+		    *seek_drop_until >= 0)
+			m->seeking.store(false, std::memory_order_release);
+		av_frame_unref(m->v_pending);
+		m->v_pending_valid = false;
+		return true;
+	}
+	// Don't decode more while the ring is full (would have nowhere to go).
+	if (m->vwrite.load(std::memory_order_relaxed) -
+	        m->vread.load(std::memory_order_acquire) >=
+	    RING_SLOTS)
+		return false;
+	int ret = avcodec_receive_frame(m->vctx, scratch);
+	if (ret == AVERROR(EAGAIN)) {
+		if (m->vpktq.empty())
+			return false; // need the reader to supply packets
+		AVPacket *pkt = m->vpktq.front();
+		m->vpktq.pop_front();
+		avcodec_send_packet(m->vctx, pkt); // succeeds: receive just drained
+		av_packet_free(&pkt);
+		return true;
+	}
+	if (ret == AVERROR_EOF)
+		return false;
+	if (ret < 0) {
+		set_fatal(m, "decode error", ret);
+		return false;
+	}
+	double pts = frame_pts_seconds(m, scratch, m->vstream) + m->loop_offset;
+	if (*seek_drop_until >= 0 && pts < *seek_drop_until - m->vframe_dur * 0.5) {
+		av_frame_unref(scratch); // pre-target frame during seek convergence
+		return true;
+	}
+	int r = try_enqueue_video(m, scratch, pts);
+	if (r == 1) {
+		if (m->seeking.load(std::memory_order_relaxed) &&
+		    *seek_drop_until >= 0)
+			m->seeking.store(false, std::memory_order_release);
+		av_frame_unref(scratch);
+	} else if (r == 0) {
+		// Ring filled between the check above and now: hold the frame.
+		av_frame_move_ref(m->v_pending, scratch);
+		m->v_pending_valid = true;
+		m->v_pending_pts = pts;
+	} else {
+		av_frame_unref(scratch); // fatal
+	}
+	return true;
+}
+
+// One audio decode step. Only decodes while the audio ring is under a small
+// buffer target, so it keeps audio fed without blocking or running so far
+// ahead that it stalls the reader (and thereby video). Returns true on
+// progress.
+bool pump_audio(nx_media *m, AVFrame *scratch, double *seek_drop_until) {
+	if (m->astream < 0 || !m->actx || !m->audio_node)
+		return false;
+	// Keep ~0.25 s buffered in the audio ring; above that, yield to video/read.
+	uint32_t target = (uint32_t)(0.25 * m->audio_out_rate);
+	if (nx_audio_stream_pending(m->audio_node) >= target)
+		return false;
+	int ret = avcodec_receive_frame(m->actx, scratch);
+	if (ret == AVERROR(EAGAIN)) {
+		if (m->apktq.empty())
+			return false;
+		AVPacket *pkt = m->apktq.front();
+		m->apktq.pop_front();
+		avcodec_send_packet(m->actx, pkt);
+		av_packet_free(&pkt);
+		return true;
+	}
+	if (ret == AVERROR_EOF)
+		return false;
+	if (ret < 0) {
+		set_fatal(m, "decode error", ret);
+		return false;
+	}
+	double pts = frame_pts_seconds(m, scratch, m->astream) + m->loop_offset;
+	if (*seek_drop_until >= 0 && pts < *seek_drop_until - 0.005) {
+		av_frame_unref(scratch);
+		return true;
+	}
+	// With ~0.25 s of headroom checked above, enqueue_audio won't block here.
+	bool ok = enqueue_audio(m, scratch, pts);
+	av_frame_unref(scratch);
+	return ok;
+}
+
 void decode_thread_main(nx_media *m) {
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
-	if (!pkt || !frame) {
+	m->v_pending = av_frame_alloc();
+	if (!pkt || !frame || !m->v_pending) {
 		set_fatal(m, "out of memory", 0);
 		av_packet_free(&pkt);
 		av_frame_free(&frame);
+		av_frame_free(&m->v_pending);
 		return;
 	}
 	double seek_drop_until = -1;
 
 	while (!m->quit.load()) {
 		if (m->seek_requested.exchange(false)) {
+			flush_pktqs(m); // drop queued packets + pending frame first
 			do_seek(m, &seek_drop_until);
 			continue;
 		}
 		if (m->fatal.load() || m->eof.load()) {
-			// Parked: wait for a command (seek/quit, or loop handled below).
+			// Parked: wait for a command (seek/quit).
 			std::unique_lock<std::mutex> lock(m->ctl_mutex);
 			m->ctl_cv.wait_for(lock, std::chrono::milliseconds(100));
 			continue;
 		}
 
-		int ret = av_read_frame(m->fmt, pkt);
-		if (ret == AVERROR_EOF) {
+		bool progress = false;
+
+		// 1. Refill the packet queues (until one is full or the demuxer ends).
+		// Cap the burst so decoding interleaves with reading — otherwise a big
+		// refill (startup / post-seek, queues empty) would block the pumps and
+		// leave the rings empty longer than necessary.
+		int reads = 0;
+		while (!m->demux_eof && m->vpktq.size() < VPKTQ_MAX &&
+		       m->apktq.size() < APKTQ_MAX && reads++ < 16) {
+			int ret = av_read_frame(m->fmt, pkt);
+			if (ret == AVERROR_EOF) {
+				m->demux_eof = true;
+				break;
+			}
+			if (ret < 0) {
+				set_fatal(m, "demux error", ret);
+				break;
+			}
+			if (pkt->stream_index == m->vstream && m->vctx) {
+				AVPacket *q = av_packet_alloc();
+				av_packet_move_ref(q, pkt);
+				m->vpktq.push_back(q);
+				progress = true;
+			} else if (pkt->stream_index == m->astream && m->actx &&
+			           m->audio_node) {
+				AVPacket *q = av_packet_alloc();
+				av_packet_move_ref(q, pkt);
+				m->apktq.push_back(q);
+				progress = true;
+			} else {
+				av_packet_unref(pkt); // other stream (subtitles, etc.)
+			}
+		}
+
+		// 2. Decode. Audio first (never let it starve), then video.
+		if (pump_audio(m, frame, &seek_drop_until))
+			progress = true;
+		if (pump_video(m, frame, &seek_drop_until))
+			progress = true;
+
+		// Seek converged (first on-target frame enqueued, or audio-only): stop
+		// dropping.
+		if (seek_drop_until >= 0 && !m->seeking.load(std::memory_order_relaxed))
+			seek_drop_until = -1;
+
+		// 3. Finalize at end of stream: reader done, queues empty, no held
+		// frame — flush the decoders for their last buffered frames, then loop
+		// or park.
+		if (m->demux_eof && m->vpktq.empty() && m->apktq.empty() &&
+		    !m->v_pending_valid) {
 			if (!drain_decoders(m, frame, seek_drop_until))
-				continue;
+				continue; // interrupted by quit/seek
 			seek_drop_until = -1;
 			if (m->looping.load()) {
-				// Gapless loop: wrap the container, keep PTS monotonic.
 				double advance = m->duration > 0 ? m->duration : 0;
 				if (!container_seek(m, 0)) {
 					set_fatal(m, "loop seek failed", 0);
 					continue;
 				}
 				m->loop_offset += advance;
+				m->demux_eof = false; // resume reading from the top
 				continue;
 			}
-			m->eof.store(true);
-			continue;
-		}
-		if (ret < 0) {
-			set_fatal(m, "demux error", ret);
-			av_packet_unref(pkt);
+			m->eof.store(true); // top-of-loop park catches it next iteration
 			continue;
 		}
 
-		if (pkt->stream_index == m->vstream && m->vctx) {
-			ret = avcodec_send_packet(m->vctx, pkt);
-			if (ret == 0 || ret == AVERROR(EAGAIN)) {
-				if (receive_frames(m, m->vctx, m->vstream, frame,
-				                   seek_drop_until) &&
-				    seek_drop_until >= 0 && !m->seeking.load()) {
-					seek_drop_until = -1;
-				}
-			}
-		} else if (pkt->stream_index == m->astream && m->actx &&
-		           m->audio_node) {
-			ret = avcodec_send_packet(m->actx, pkt);
-			if (ret == 0 || ret == AVERROR(EAGAIN)) {
-				receive_frames(m, m->actx, m->astream, frame,
-				               seek_drop_until);
-			}
-		}
-		av_packet_unref(pkt);
+		// 4. Nothing advanced (rings full + queues full, waiting on the
+		// presenter/audio to drain): brief sleep to avoid a busy-spin.
+		if (!progress)
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 	}
 
+	flush_pktqs(m);
+	av_frame_free(&m->v_pending);
 	av_packet_free(&pkt);
 	av_frame_free(&frame);
 }
