@@ -40,6 +40,19 @@ enum nx_audio_node_type {
 	// frequency visualisation. Unlike other sinks it isn't reachable from the
 	// destination, so `render_quantum` processes it explicitly each quantum.
 	NX_AUDIO_NODE_ANALYSER = 6,
+	// DelayNode — a variable-length delay line. Output for the current quantum
+	// is read from the line BEFORE this quantum's input is written, so it only
+	// ever reads already-written (past) samples. That decoupling is what lets a
+	// DelayNode legally sit in a feedback cycle (delay -> gain -> delay): the
+	// feedback path reads the delayed output computed this quantum. The delay
+	// is evaluated k-rate and clamped to a minimum of one render quantum (the
+	// Web Audio cycle constraint), so a feedback loop is delayed by >= Q frames.
+	NX_AUDIO_NODE_DELAY = 7,
+	// DynamicsCompressorNode — a feed-forward peak compressor with a soft knee
+	// and attack/release smoothing. No automatic makeup gain (output is only
+	// ever attenuated), so it is safe to drop into a master bus without a
+	// surprise loudness jump. `reduction` (read-only, dB, <= 0) is polled by JS.
+	NX_AUDIO_NODE_DYNAMICS_COMPRESSOR = 8,
 };
 
 // OscillatorNode wave types (matches OscillatorType wire values in JS).
@@ -108,6 +121,9 @@ struct nx_audio_node {
 	//   STEREO_PANNER: 0 = pan
 	//   BUFFER_SOURCE: 0 = playbackRate, 1 = detune
 	//   OSCILLATOR:    0 = frequency, 1 = detune
+	//   DELAY:         0 = delayTime
+	//   DYNAMICS_COMPRESSOR: 0 = threshold, 1 = knee, 2 = ratio,
+	//                        3 = attack, 4 = release
 	std::vector<nx_audio_param> params;
 
 	// ---- OscillatorNode state ----
@@ -155,6 +171,26 @@ struct nx_audio_node {
 	std::unique_ptr<float[]> analyser_ring;
 	uint32_t analyser_ring_size = 0;      // capacity in samples (power of two)
 	uint64_t analyser_write_pos = 0;      // absolute samples written (ring idx = pos & (size-1))
+
+	// ---- delay state (NX_AUDIO_NODE_DELAY) ----
+	// Interleaved stereo delay line. `delay_write_pos` is an absolute frame
+	// counter (never wrapped; ring index = pos % capacity), like the stream
+	// ring. Capacity holds maxDelayTime seconds plus one render quantum of
+	// headroom so a full-length read never overlaps the frames being written
+	// this quantum. `delay_bus_ch` carries the last input's channel count to
+	// the next quantum's output (output is produced before input is summed).
+	std::unique_ptr<float[]> delay_ring;
+	uint32_t delay_capacity = 0;   // frames
+	uint64_t delay_write_pos = 0;  // absolute frames written
+	double delay_max_time = 0;     // seconds
+	int delay_bus_ch = 1;
+
+	// ---- dynamics compressor state (NX_AUDIO_NODE_DYNAMICS_COMPRESSOR) ----
+	// Smoothed gain reduction in dB (<= 0), carried across quanta so attack /
+	// release envelopes are continuous. `comp_reduction` is the value JS reads
+	// back through the read-only `.reduction` property.
+	double comp_env_db = 0.0;
+	float comp_reduction = 0.f;
 };
 
 struct nx_audio_graph {
@@ -181,7 +217,10 @@ void nx_audio_graph_set_suspended(nx_audio_graph *g, bool suspended);
 // graph (disconnecting both directions) and drops that ref. Releasing the
 // destination node only drops the ref (the node itself is graph-owned).
 // Safe to call from a GC finalizer (locks the mutex; no JS API).
-nx_audio_node *nx_audio_node_create(nx_audio_graph *g, nx_audio_node_type type);
+// `aux` is a type-specific creation parameter: for NX_AUDIO_NODE_DELAY it is
+// maxDelayTime in seconds (sizes the delay line); ignored by other types.
+nx_audio_node *nx_audio_node_create(nx_audio_graph *g, nx_audio_node_type type,
+                                    double aux = 0.0);
 void nx_audio_node_release(nx_audio_node *n);
 void nx_audio_node_connect(nx_audio_node *src, nx_audio_node *dst);
 // dst == NULL disconnects all outputs.
@@ -214,6 +253,10 @@ int nx_audio_source_playback_state(nx_audio_node *n);
 
 // ---- oscillator ----
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type);
+
+// ---- dynamics compressor ----
+// Current gain reduction in dB (<= 0), for the read-only `.reduction` property.
+float nx_audio_compressor_reduction(nx_audio_node *n);
 
 // ---- analyser (time-domain readback; locks the graph mutex) ----
 // Fills `out` with the most-recent `count` downmixed output samples (newest

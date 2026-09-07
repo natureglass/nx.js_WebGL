@@ -7,6 +7,8 @@ import { AudioBuffer, createAudioBuffer } from './audio-buffer';
 import { AudioBufferSourceNode } from './audio-buffer-source-node';
 import { AudioDestinationNode } from './audio-destination-node';
 import { AnalyserNode } from './analyser-node';
+import { DelayNode } from './delay-node';
+import { DynamicsCompressorNode } from './dynamics-compressor-node';
 import { GainNode } from './gain-node';
 import { OscillatorNode } from './oscillator-node';
 import { StereoPannerNode } from './stereo-panner-node';
@@ -227,11 +229,23 @@ export class BaseAudioContext
 	createConvolver(): ConvolverNode {
 		throw new Error('Method not implemented.');
 	}
-	createDelay(maxDelayTime?: number): DelayNode {
-		throw new Error('Method not implemented.');
+	/**
+	 * Creates a {@link DelayNode} for delaying its input, up to `maxDelayTime`
+	 * seconds. Can be placed in a feedback cycle to build echo effects.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/createDelay
+	 */
+	createDelay(maxDelayTime = 1): DelayNode {
+		return new DelayNode(this, { maxDelayTime });
 	}
+	/**
+	 * Creates a {@link DynamicsCompressorNode} for compressing the dynamic
+	 * range of its input.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/createDynamicsCompressor
+	 */
 	createDynamicsCompressor(): DynamicsCompressorNode {
-		throw new Error('Method not implemented.');
+		return new DynamicsCompressorNode(this);
 	}
 	createIIRFilter(
 		feedforward: number[] | Iterable<number>,

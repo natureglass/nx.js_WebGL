@@ -255,6 +255,12 @@ export type * from './audio/gain-node';
 import './audio/stereo-panner-node';
 export type * from './audio/stereo-panner-node';
 
+import './audio/delay-node';
+export type * from './audio/delay-node';
+
+import './audio/dynamics-compressor-node';
+export type * from './audio/dynamics-compressor-node';
+
 import './audio/audio-destination-node';
 export type * from './audio/audio-destination-node';
 

@@ -747,3 +747,148 @@ test('AudioNode properties', (t) => {
 	t.equal(panner.pan.maxValue, 1, 'pan maxValue');
 	t.ok(ctx instanceof BaseAudioContext, 'ctx instanceof BaseAudioContext');
 });
+
+// --- DelayNode ---
+
+test('DelayNode basics', (t) => {
+	const ctx = new OfflineAudioContext(1, 384, RATE);
+	const delay = ctx.createDelay();
+	t.ok(delay instanceof DelayNode, 'createDelay returns a DelayNode');
+	t.ok(delay instanceof AudioNode, 'DelayNode instanceof AudioNode');
+	t.equal(delay.numberOfInputs, 1, 'delay numberOfInputs');
+	t.equal(delay.numberOfOutputs, 1, 'delay numberOfOutputs');
+	t.ok(delay.delayTime instanceof AudioParam, 'delayTime is an AudioParam');
+	t.equal(delay.delayTime.value, 0, 'delayTime defaults to 0');
+	t.equal(delay.delayTime.maxValue, 1, 'default maxValue is 1s');
+	const d2 = ctx.createDelay(2.5);
+	t.equal(d2.delayTime.maxValue, 2.5, 'maxDelayTime sets delayTime maxValue');
+	throwsName(
+		t,
+		() => ctx.createDelay(0),
+		'NotSupportedError',
+		'createDelay(0) throws',
+	);
+	throwsName(
+		t,
+		() => ctx.createDelay(200),
+		'NotSupportedError',
+		'createDelay(>=180) throws',
+	);
+});
+
+// Peak absolute value within [lo, hi). Used for cross-engine assertions that
+// tolerate small (sub-quantum) timing differences between nxjs and Chrome.
+function peakAbs(data: Float32Array, lo: number, hi: number): number {
+	let max = 0;
+	for (let i = lo; i < hi && i < data.length; i++) {
+		const v = Math.abs(data[i]);
+		if (v > max) max = v;
+	}
+	return max;
+}
+
+test('DelayNode delays the signal', async (t) => {
+	const N = 2048;
+	const D = 256; // delay in frames (>= one render quantum)
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	const buffer = ctx.createBuffer(1, N, RATE);
+	const data = buffer.getChannelData(0);
+	for (let i = 0; i < N; i++) data[i] = 1;
+
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const delay = ctx.createDelay();
+	delay.delayTime.value = D / RATE;
+	source.connect(delay);
+	delay.connect(ctx.destination);
+	source.start();
+
+	const out = (await ctx.startRendering()).getChannelData(0);
+	// Well before / well after the boundary — sample-accurate in both engines
+	// (the exact boundary sample can differ by interpolation, so it's skipped).
+	t.ok(closeTo(out[64], 0, 1e-4), 'silent well before the delay elapses');
+	t.ok(closeTo(out[D + 128], 1, 1e-4), 'signal present well after the delay');
+	t.ok(closeTo(out[N - 1], 1, 1e-4), 'steady state matches the input');
+});
+
+test('DelayNode supports a feedback echo cycle', async (t) => {
+	const N = 2048;
+	const D = 512; // 4 render quanta — spacing >> any one-quantum cycle latency
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	// Single-sample impulse.
+	const buffer = ctx.createBuffer(1, N, RATE);
+	buffer.getChannelData(0)[0] = 1;
+
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const delay = ctx.createDelay();
+	delay.delayTime.value = D / RATE;
+	const feedback = ctx.createGain();
+	feedback.gain.value = 0.5;
+	source.connect(delay);
+	delay.connect(ctx.destination);
+	delay.connect(feedback);
+	feedback.connect(delay); // <-- the cycle a DelayNode is allowed to close
+	source.start();
+
+	const out = (await ctx.startRendering()).getChannelData(0);
+	// Windowed peaks tolerate a possible one-quantum cycle-latency difference
+	// between engines; the amplitudes (feedback 0.5 => 1, 0.5, 0.25) are
+	// engine-invariant for an integer-frame delay.
+	const W = 160;
+	t.ok(peakAbs(out, 0, D - W) < 0.02, 'silent before the first echo');
+	t.ok(closeTo(peakAbs(out, D - W, D + W), 1, 0.06), 'first echo ~1.0');
+	t.ok(
+		closeTo(peakAbs(out, 2 * D - W, 2 * D + W), 0.5, 0.06),
+		'second echo ~0.5 (one feedback pass)',
+	);
+	t.ok(
+		closeTo(peakAbs(out, 3 * D - W, 3 * D + W), 0.25, 0.06),
+		'third echo ~0.25 (two feedback passes)',
+	);
+});
+
+// --- DynamicsCompressorNode ---
+
+test('DynamicsCompressorNode basics', (t) => {
+	const ctx = new OfflineAudioContext(1, 384, RATE);
+	const comp = ctx.createDynamicsCompressor();
+	t.ok(
+		comp instanceof DynamicsCompressorNode,
+		'createDynamicsCompressor returns a DynamicsCompressorNode',
+	);
+	t.equal(comp.threshold.value, -24, 'threshold default');
+	t.equal(comp.knee.value, 30, 'knee default');
+	t.equal(comp.ratio.value, 12, 'ratio default');
+	t.ok(closeTo(comp.attack.value, 0.003, 1e-6), 'attack default');
+	t.equal(comp.release.value, 0.25, 'release default');
+	t.equal(comp.reduction, 0, 'reduction starts at 0');
+});
+
+test('DynamicsCompressorNode compresses a loud signal', async (t) => {
+	// A loud 1 kHz sine (0 dBFS) well above the threshold. Exact gain values
+	// differ between engines (Chrome uses lookahead + makeup), so we assert only
+	// cross-engine invariants: the compressor reports gain reduction, still
+	// passes audio, and does not blow up.
+	const N = 8192; // >> attack (3 ms) so the envelope settles
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	const buffer = ctx.createBuffer(1, N, RATE);
+	const data = buffer.getChannelData(0);
+	for (let i = 0; i < N; i++) data[i] = Math.sin((2 * Math.PI * 1000 * i) / RATE);
+
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const comp = ctx.createDynamicsCompressor();
+	comp.threshold.value = -30;
+	source.connect(comp);
+	comp.connect(ctx.destination);
+	source.start();
+
+	const out = (await ctx.startRendering()).getChannelData(0);
+	const steadyPeak = peakAbs(out, N / 2, N);
+	// Cross-engine invariants only — exact levels differ (Chrome adds makeup
+	// gain + lookahead; nxjs does neither).
+	t.ok(comp.reduction < -3, 'reports substantial gain reduction (dB, < 0)');
+	t.ok(Number.isFinite(steadyPeak) && steadyPeak > 0, 'still passes audio');
+	t.ok(steadyPeak < 1.5, 'output stays bounded (no runaway gain)');
+});

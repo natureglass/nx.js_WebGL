@@ -66,6 +66,8 @@ export const NODE_TYPE_STEREO_PANNER = 2;
 export const NODE_TYPE_BUFFER_SOURCE = 3;
 export const NODE_TYPE_OSCILLATOR = 5;
 export const NODE_TYPE_ANALYSER = 6;
+export const NODE_TYPE_DELAY = 7;
+export const NODE_TYPE_DYNAMICS_COMPRESSOR = 8;
 
 // OscillatorNode wave types — must match `nx_audio_oscillator_type` in
 // `source/audio-graph.h`. `'custom'` (PeriodicWave) is not yet supported.

@@ -756,7 +756,13 @@ export interface Init {
 	audioContextResume(ctx: AudioContextHandle): void;
 	audioContextCurrentTime(ctx: AudioContextHandle): number;
 	audioContextDestination(ctx: AudioContextHandle): AudioNodeHandle;
-	audioNodeNew(ctx: AudioContextHandle, type: number): AudioNodeHandle;
+	/** `aux` is a type-specific creation parameter (DelayNode: maxDelayTime in
+	 * seconds); ignored by other node types. */
+	audioNodeNew(
+		ctx: AudioContextHandle,
+		type: number,
+		aux?: number,
+	): AudioNodeHandle;
 	audioNodeConnect(src: AudioNodeHandle, dst: AudioNodeHandle): void;
 	audioNodeDisconnect(src: AudioNodeHandle, dst?: AudioNodeHandle): void;
 	audioParamValue(node: AudioNodeHandle, index: number): number;
@@ -798,6 +804,8 @@ export interface Init {
 	): void;
 	audioSourceState(node: AudioNodeHandle): number;
 	audioOscillatorSetType(node: AudioNodeHandle, type: number): void;
+	/** Current gain reduction in dB (<= 0) for DynamicsCompressorNode.reduction. */
+	audioCompressorReduction(node: AudioNodeHandle): number;
 	/** Fill `out` with the analyser's most-recent time-domain samples
 	 * (newest last, each in [-1, 1]). `out.length` samples are returned. */
 	audioAnalyserFloatTimeData(node: AudioNodeHandle, out: Float32Array): void;

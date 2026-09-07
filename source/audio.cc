@@ -168,17 +168,22 @@ void nx_audio_node_new(const FunctionCallbackInfo<Value> &info) {
 	if (!ctx)
 		return;
 	int type = arg_i32(info, 1);
-	// JS may create GAIN, STEREO_PANNER, BUFFER_SOURCE, OSCILLATOR, and
-	// ANALYSER nodes; STREAM_SOURCE (4) is engine-internal (media elements)
-	// and is explicitly rejected.
+	// JS may create GAIN, STEREO_PANNER, BUFFER_SOURCE, OSCILLATOR, ANALYSER,
+	// DELAY and DYNAMICS_COMPRESSOR nodes; STREAM_SOURCE (4) is engine-internal
+	// (media elements) and is explicitly rejected.
 	if (type != NX_AUDIO_NODE_GAIN && type != NX_AUDIO_NODE_STEREO_PANNER &&
 	    type != NX_AUDIO_NODE_BUFFER_SOURCE &&
-	    type != NX_AUDIO_NODE_OSCILLATOR && type != NX_AUDIO_NODE_ANALYSER) {
+	    type != NX_AUDIO_NODE_OSCILLATOR && type != NX_AUDIO_NODE_ANALYSER &&
+	    type != NX_AUDIO_NODE_DELAY &&
+	    type != NX_AUDIO_NODE_DYNAMICS_COMPRESSOR) {
 		nx_throw(iso, "invalid AudioNode type");
 		return;
 	}
+	// Optional third arg is a type-specific creation parameter (DelayNode:
+	// maxDelayTime in seconds). Harmless for other types.
+	double aux = arg_f64(info, 2);
 	nx_audio_node *n =
-	    nx_audio_node_create(ctx->graph, (nx_audio_node_type)type);
+	    nx_audio_node_create(ctx->graph, (nx_audio_node_type)type, aux);
 	Local<Object> obj = nx::NewWrapped(iso);
 	nx::Wrap<nx_audio_node>(iso, obj, n, release_node);
 	info.GetReturnValue().Set(obj);
@@ -401,6 +406,20 @@ void nx_audio_oscillator_set_type_cb(const FunctionCallbackInfo<Value> &info) {
 	nx_audio_oscillator_set_type(n, type);
 }
 
+// ---------------------------------------------------------------------------
+// DynamicsCompressorNode
+// ---------------------------------------------------------------------------
+
+// audioCompressorReduction(node) -> current gain reduction in dB (<= 0)
+void nx_audio_compressor_reduction_cb(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_audio_node *n = get_node(iso, info[0]);
+	if (!n)
+		return;
+	info.GetReturnValue().Set(
+	    Number::New(iso, nx_audio_compressor_reduction(n)));
+}
+
 // audioAnalyserFloatTimeData(node, out: Float32Array) — fills `out` with the
 // most-recent `out.length` downmixed output samples (newest last, each in
 // [-1, 1]). JS derives byte-time-domain + frequency data from this window.
@@ -607,6 +626,8 @@ void nx_init_audio(Isolate *iso, Local<Object> init_obj) {
 	            nx_audio_analyser_float_time_data_cb);
 	NX_SET_FUNC(init_obj, "audioOscillatorSetType",
 	            nx_audio_oscillator_set_type_cb);
+	NX_SET_FUNC(init_obj, "audioCompressorReduction",
+	            nx_audio_compressor_reduction_cb);
 	NX_SET_FUNC(init_obj, "audioDecode", nx_audio_decode);
 	NX_SET_FUNC(init_obj, "audioOfflineRender", nx_audio_offline_render);
 }

@@ -480,12 +480,133 @@ void process_analyser(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	}
 }
 
+// DelayNode: a stereo delay line. The current quantum's OUTPUT is read from the
+// line (samples written in prior quanta) BEFORE this quantum's INPUT is summed
+// and appended. Because we mark the node processed before pulling inputs, a
+// feedback path that loops back into this delay reads the delayed output
+// computed here (via process_node's memoization short-circuit) instead of
+// re-entering — which is exactly how a DelayNode legalises an audio cycle. The
+// delay is k-rate and floored at one render quantum so every read index is
+// strictly behind the write head (and the Web Audio cycle constraint holds).
+void process_delay(nx_audio_graph *g, nx_audio_node *n, double t0) {
+	double sr = g->sample_rate;
+	double delay_sec = param_value_at(&n->params[0], t0);
+	if (delay_sec > n->delay_max_time)
+		delay_sec = n->delay_max_time;
+	if (delay_sec < 0)
+		delay_sec = 0;
+	double delay_frames = delay_sec * sr;
+	if (delay_frames < (double)Q)
+		delay_frames = (double)Q;
+
+	const float *ring = n->delay_ring.get();
+	uint32_t cap = n->delay_capacity;
+	n->bus_ch = n->delay_bus_ch;
+	if (ring && cap > 0) {
+		for (int i = 0; i < Q; i++) {
+			double rp =
+			    (double)(n->delay_write_pos + (uint64_t)i) - delay_frames;
+			if (rp < 0) {
+				n->bus[0][i] = 0.f;
+				n->bus[1][i] = 0.f;
+				continue;
+			}
+			uint64_t i0 = (uint64_t)rp;
+			double frac = rp - (double)i0;
+			uint32_t k0 = (uint32_t)(i0 % cap);
+			uint32_t k1 = (uint32_t)((i0 + 1) % cap);
+			float l0 = ring[k0 * 2], l1 = ring[k1 * 2];
+			float r0 = ring[k0 * 2 + 1], r1 = ring[k1 * 2 + 1];
+			n->bus[0][i] = (float)(l0 + (l1 - l0) * frac);
+			n->bus[1][i] = (float)(r0 + (r1 - r0) * frac);
+		}
+	} else {
+		zero_bus(n);
+	}
+
+	// Mark processed BEFORE summing inputs so a feedback cycle reads the output
+	// computed above rather than re-rendering or being silenced by the cycle
+	// guard. process_node re-affirms this after we return (idempotent).
+	n->processed_quantum = g->quantum_id;
+
+	float in[NX_AUDIO_CHANNELS][Q];
+	int ch;
+	sum_inputs(g, n, t0, in, &ch);
+	n->delay_bus_ch = ch;
+
+	if (n->delay_ring && cap > 0) {
+		float *w = n->delay_ring.get();
+		for (int i = 0; i < Q; i++) {
+			uint32_t k = (uint32_t)((n->delay_write_pos + (uint64_t)i) % cap);
+			w[k * 2] = in[0][i];
+			w[k * 2 + 1] = in[1][i];
+		}
+		n->delay_write_pos += Q;
+	}
+}
+
+// DynamicsCompressorNode: a feed-forward peak compressor. A soft-knee static
+// curve maps the per-sample input level to a target gain reduction, which is
+// smoothed with attack/release one-pole envelopes. No automatic makeup gain
+// (output is only ever attenuated), so it is safe to drop onto a master bus.
+// Params are evaluated k-rate (once per quantum), like the other effect nodes.
+void process_dynamics_compressor(nx_audio_graph *g, nx_audio_node *n,
+                                 double t0) {
+	float in[NX_AUDIO_CHANNELS][Q];
+	int ch;
+	sum_inputs(g, n, t0, in, &ch);
+	n->bus_ch = ch;
+
+	double sr = g->sample_rate;
+	double threshold = param_value_at(&n->params[0], t0); // dB
+	double knee = param_value_at(&n->params[1], t0);      // dB
+	double ratio = param_value_at(&n->params[2], t0);
+	double attack = param_value_at(&n->params[3], t0);  // s
+	double release = param_value_at(&n->params[4], t0); // s
+	if (ratio < 1.0)
+		ratio = 1.0;
+	double att_coef = attack > 0 ? exp(-1.0 / (attack * sr)) : 0.0;
+	double rel_coef = release > 0 ? exp(-1.0 / (release * sr)) : 0.0;
+
+	double env = n->comp_env_db; // current gain reduction (dB, <= 0)
+	for (int i = 0; i < Q; i++) {
+		double s = fabs(in[0][i]);
+		double sr2 = fabs(in[1][i]);
+		if (sr2 > s)
+			s = sr2;
+		double in_db = s > 1e-6 ? 20.0 * log10(s) : -120.0;
+		// Soft-knee gain computer -> output level (dB).
+		double diff = in_db - threshold;
+		double out_db;
+		if (2.0 * diff < -knee) {
+			out_db = in_db;
+		} else if (knee > 0 && 2.0 * fabs(diff) <= knee) {
+			double x = diff + knee / 2.0;
+			out_db = in_db + (1.0 / ratio - 1.0) * x * x / (2.0 * knee);
+		} else {
+			out_db = threshold + diff / ratio;
+		}
+		double target = out_db - in_db; // gain reduction, <= 0
+		if (target < env)
+			env = target + (env - target) * att_coef; // attack (more reduction)
+		else
+			env = target + (env - target) * rel_coef; // release
+		double gain = pow(10.0, env / 20.0);
+		n->bus[0][i] = (float)(in[0][i] * gain);
+		n->bus[1][i] = (float)(in[1][i] * gain);
+	}
+	n->comp_env_db = env;
+	n->comp_reduction = (float)env;
+}
+
 void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	if (n->processed_quantum == g->quantum_id)
 		return; // already rendered this quantum (fan-out memoization)
 	if (n->processing) {
-		// Cycle (not legal in Web Audio without a DelayNode, which we don't
-		// implement) — break it with silence.
+		// Cycle without a DelayNode to break it (a DelayNode marks itself
+		// processed before pulling inputs, so it is short-circuited above and
+		// never reaches here). Such a cycle is not legal in Web Audio — break
+		// it with silence.
 		zero_bus(n);
 		return;
 	}
@@ -511,6 +632,12 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 		break;
 	case NX_AUDIO_NODE_ANALYSER:
 		process_analyser(g, n, t0);
+		break;
+	case NX_AUDIO_NODE_DELAY:
+		process_delay(g, n, t0);
+		break;
+	case NX_AUDIO_NODE_DYNAMICS_COMPRESSOR:
+		process_dynamics_compressor(g, n, t0);
 		break;
 	}
 	n->processing = false;
@@ -556,7 +683,8 @@ void graph_destroy(nx_audio_graph *g) {
 	delete g;
 }
 
-nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type) {
+nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type,
+                        double aux = 0.0) {
 	nx_audio_node *n = new nx_audio_node();
 	n->graph = g;
 	n->type = type;
@@ -617,6 +745,59 @@ nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type) {
 		n->analyser_write_pos = 0;
 		break;
 	}
+	case NX_AUDIO_NODE_DELAY: {
+		nx_audio_param delay_time;
+		delay_time.value = 0.f;
+		delay_time.min_value = 0.f;
+		// aux = maxDelayTime (seconds); default 1s, clamp to the spec's (0, 180)
+		// bound. Sizes the delay line and caps delayTime.
+		double max_time = aux;
+		if (!(max_time > 0.0))
+			max_time = 1.0;
+		if (max_time > 180.0)
+			max_time = 180.0;
+		n->delay_max_time = max_time;
+		delay_time.max_value = (float)max_time;
+		n->params.push_back(delay_time);
+		// maxDelay frames + one render quantum of headroom (+ a little slack for
+		// the interpolation's +1 read and rounding). Zero-initialised silence.
+		uint32_t frames = (uint32_t)(max_time * g->sample_rate) + Q + 4;
+		n->delay_capacity = frames;
+		n->delay_ring =
+		    std::make_unique<float[]>((size_t)frames * NX_AUDIO_CHANNELS);
+		n->delay_write_pos = 0;
+		break;
+	}
+	case NX_AUDIO_NODE_DYNAMICS_COMPRESSOR: {
+		// threshold (dB), knee (dB), ratio, attack (s), release (s) — spec
+		// defaults and value ranges.
+		nx_audio_param threshold;
+		threshold.value = -24.f;
+		threshold.min_value = -100.f;
+		threshold.max_value = 0.f;
+		n->params.push_back(threshold);
+		nx_audio_param knee;
+		knee.value = 30.f;
+		knee.min_value = 0.f;
+		knee.max_value = 40.f;
+		n->params.push_back(knee);
+		nx_audio_param ratio;
+		ratio.value = 12.f;
+		ratio.min_value = 1.f;
+		ratio.max_value = 20.f;
+		n->params.push_back(ratio);
+		nx_audio_param attack;
+		attack.value = 0.003f;
+		attack.min_value = 0.f;
+		attack.max_value = 1.f;
+		n->params.push_back(attack);
+		nx_audio_param release;
+		release.value = 0.25f;
+		release.min_value = 0.f;
+		release.max_value = 1.f;
+		n->params.push_back(release);
+		break;
+	}
 	case NX_AUDIO_NODE_DESTINATION:
 		break;
 	}
@@ -654,11 +835,11 @@ void nx_audio_graph_set_suspended(nx_audio_graph *g, bool suspended) {
 	g->suspended = suspended;
 }
 
-nx_audio_node *nx_audio_node_create(nx_audio_graph *g,
-                                    nx_audio_node_type type) {
+nx_audio_node *nx_audio_node_create(nx_audio_graph *g, nx_audio_node_type type,
+                                    double aux) {
 	nx_audio_graph_ref(g);
 	std::lock_guard<std::mutex> lock(g->mutex);
-	return node_new(g, type);
+	return node_new(g, type, aux);
 }
 
 void nx_audio_node_release(nx_audio_node *n) {
@@ -824,6 +1005,11 @@ int nx_audio_source_playback_state(nx_audio_node *n) {
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type) {
 	std::lock_guard<std::mutex> lock(n->graph->mutex);
 	n->oscillator_type = type;
+}
+
+float nx_audio_compressor_reduction(nx_audio_node *n) {
+	std::lock_guard<std::mutex> lock(n->graph->mutex);
+	return n->comp_reduction;
 }
 
 void nx_audio_analyser_get_float_time_data(nx_audio_node *n, float *out,
